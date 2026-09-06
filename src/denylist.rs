@@ -1,0 +1,1 @@
+//! Self-protection path matching.

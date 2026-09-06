@@ -1,0 +1,5 @@
+/target
+
+# Design docs, plans and investigations live in the private parent repo,
+# never in the published history.
+/docs/
