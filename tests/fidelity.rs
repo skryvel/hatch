@@ -186,3 +186,115 @@ fn what_a_variable_resolves_to_is_the_environment_it_was_given() {
     assert_eq!(value(&second), Some(Some("/home/two".to_string())));
     assert_eq!(value(&BTreeMap::new()), Some(None), "and an absent name is shown unset");
 }
+
+// ---------------------------------------------------------------------------
+// The same two invariants, over a `swap_file` diff.
+//
+// A diff splits its input into lines and lays them out in two columns, which
+// gives invariant 1 two new ways to fail that a command rendering does not
+// have: a row can be dropped or reordered, and a line terminator can be
+// normalised on the way in. So the invariant reads twice here, once per
+// column -- rejoining the left reproduces the current file and rejoining the
+// right reproduces the proposed content, byte for byte.
+//
+// These duplicate properties that `render::diff` also checks internally, on
+// purpose: this file is the crate's statement of what may never break, and it
+// runs against the public API. A later refactor that quietly stops classifying
+// diff lines should fail here as well as there.
+// ---------------------------------------------------------------------------
+
+use hatch::render::diff::{Row, Side, rejoin_left, rejoin_right, side_by_side};
+
+/// Files assembled from the pieces that break diffs: both terminators, a lone
+/// `\r`, blank lines, and characters that must be chipped rather than drawn.
+fn file() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            "[a-z ]{0,6}",
+            Just("\n".to_string()),
+            Just("\r\n".to_string()),
+            Just("\r".to_string()),
+            Just("\t".to_string()),
+            Just("\u{202E}".to_string()), // bidi override
+            Just("\u{200B}".to_string()), // zero-width space
+            Just("\u{00A0}".to_string()), // non-breaking space
+            Just("é".to_string()),
+        ],
+        0..24,
+    )
+    .prop_map(|parts| parts.concat())
+}
+
+proptest! {
+    #[test]
+    fn a_diff_round_trips_to_both_of_its_sides(before in file(), after in file()) {
+        let rows = side_by_side(&before, &after);
+        prop_assert_eq!(rejoin_left(&rows), before.clone());
+        prop_assert_eq!(rejoin_right(&rows), after.clone());
+    }
+}
+
+proptest! {
+    #[test]
+    fn nothing_in_a_diff_is_hidden_behind_a_label(before in file(), after in file()) {
+        for row in side_by_side(&before, &after) {
+            prop_assert!(
+                row.left().is_some() || row.right().is_some(),
+                "a row with neither side is a row the reader cannot read"
+            );
+            for side in [row.left(), row.right()].into_iter().flatten() {
+                for span in side.spans() {
+                    match span.kind() {
+                        SpanKind::Chip { .. } => prop_assert_eq!(
+                            span.text().chars().count(),
+                            1,
+                            "a chip may stand in for one codepoint at most"
+                        ),
+                        _ => prop_assert_eq!(
+                            span.display_text(),
+                            span.text(),
+                            "a span that is not a chip must be drawn exactly as its text"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_diff_does_not_normalise_line_endings() {
+    // The diff-shaped version of `semicolon_survives_segmentation`. Rewriting
+    // every line ending in a file is a real write, and a view that trimmed
+    // terminators before comparing would draw two identical columns over it.
+    let rows = side_by_side("a\r\nb\r\n", "a\nb\n");
+    assert_eq!(rejoin_left(&rows), "a\r\nb\r\n");
+    assert_eq!(rejoin_right(&rows), "a\nb\n");
+    assert!(rows.iter().all(Row::changed), "every line of this file changed");
+}
+
+#[test]
+fn a_diff_does_not_invent_a_line_into_an_empty_file() {
+    // Creating a file is `before == ""`. One blank row here would rejoin to
+    // "\n" and tell the reader they are replacing an empty line in a file
+    // that has no lines at all.
+    let rows = side_by_side("", "hello\n");
+    assert!(rows.iter().all(|r| r.left().is_none()));
+    assert_eq!(rejoin_left(&rows), "");
+    assert_eq!(rejoin_right(&rows), "hello\n");
+}
+
+#[test]
+fn a_row_cannot_cover_the_rest_of_the_file() {
+    // The diff-shaped version of `a_chip_cannot_cover_the_rest_of_the_command`:
+    // the payload has to reach the reader's eye, not merely survive the
+    // round trip.
+    let rows = side_by_side("harmless\n", "harmless\nrm -rf /\n");
+    let shown: String = rows
+        .iter()
+        .filter_map(Row::right)
+        .flat_map(Side::spans)
+        .map(|s| s.display_text())
+        .collect();
+    assert!(shown.contains("rm -rf /"), "the added line must be readable, not just present");
+}

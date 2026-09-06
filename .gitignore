@@ -3,3 +3,6 @@
 # Design docs, plans and investigations live in the private parent repo,
 # never in the published history.
 /docs/
+
+# cargo-mutants scratch output; every task ends with a mutation matrix.
+/mutants.out*/
