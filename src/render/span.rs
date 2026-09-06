@@ -86,7 +86,11 @@ pub enum SpanKind {
     /// `;` `&&` `||` `|` — dimmed, kept on screen.
     Separator,
     /// `$NAME` or `${NAME}`, and what that name is worth in the environment
-    /// the command will actually run in — `None` when it is unset there.
+    /// the command will actually run in — `None` when the child will see it
+    /// unset. That reading is only sound because [`variable_name`] refuses
+    /// every name the shell supplies for itself, so a `None` here means the
+    /// expansion really is empty and not merely that hatch did not configure
+    /// it.
     ///
     /// `resolved` is *derived* data hanging off the kind, which is a shape the
     /// rest of this module deliberately avoids: [`Span::chip_codepoint`] is
@@ -269,8 +273,76 @@ fn assert_chip_stands_for_one_codepoint(text: &str, kind: &SpanKind) {
     }
 }
 
+/// Names the shell supplies by itself, whatever environment it is handed.
+///
+/// These pass the `[A-Za-z_][A-Za-z0-9_]*` grammar and are still not
+/// references this window may claim, because none of them is answered by the
+/// environment hatch constructs. `build_child_env` contains no `PWD`, so a
+/// naive reading resolves `$PWD` to `None` and the window prints *unset* —
+/// while the shell will substitute the working directory:
+///
+/// ```text
+/// $ env -i /bin/sh -c 'echo "PWD=[$PWD] IFS=[$IFS] PPID=[$PPID]"'
+/// PWD=[/tmp] IFS=[ \t\n] PPID=[854946]
+/// ```
+///
+/// `rm -rf $PWD/build` drawn with *PWD: unset* invites the reader to parse
+/// the argument as `/build` when it is `/tmp/build`. That is a false negative
+/// in a display whose job is to be believed, and it fails the same test that
+/// put `$1` and `$@` outside the grammar: the shell substitutes it from
+/// somewhere other than the environment we construct.
+///
+/// So the rule is: **a name the shell will supply independently of the
+/// environment hatch builds is never drawn as a variable at all.** Left
+/// `Plain`, exactly like `$?` and `$@`, which is silence rather than a wrong
+/// answer.
+///
+/// # This holds even when the name is in `exec_env`
+///
+/// Deliberately not conditional on the config, and structurally cannot be:
+/// this function has no environment to consult. A user who sets `PWD` in
+/// `exec_env` does not thereby win — the shell overwrites `PWD`, `IFS`,
+/// `SHLVL` and friends at startup regardless of what it inherits — and for
+/// the rest we cannot tell which value survives. "We cannot know which wins,
+/// so we say nothing" is the same answer as everywhere else here.
+///
+/// # Why `PATH` is not on the list
+///
+/// It is the one name in this family that hatch itself always supplies:
+/// [`crate::exec::env::build_child_env`] inserts it unconditionally, and a
+/// shell that finds `PATH` already set uses it rather than its compiled-in
+/// default. So `$PATH` can never be drawn as unset and can never resolve to
+/// something the child will not see. `HOME` is not here either, for a simpler
+/// reason — no shell invents one. Both are pinned by tests.
+///
+/// The list is bash's and POSIX sh's, read off `compgen -v` in an empty
+/// environment plus the names those shells maintain during a run (`REPLY`
+/// from `read`, `OPTARG` from `getopts`, `OLDPWD` from `cd`). Like every
+/// other list in this tree it claims to be useful rather than complete: a
+/// name missing from it is over-tagged, which is the direction that costs a
+/// wrong label, so it is worth extending when one is found.
+const SHELL_MAINTAINED: &[&str] = &[
+    "_", "COMP_WORDBREAKS", "DIRSTACK", "EPOCHREALTIME", "EPOCHSECONDS", "EUID", "FUNCNAME",
+    "GROUPS", "HISTCMD", "HOSTNAME", "HOSTTYPE", "IFS", "LINENO", "MACHTYPE", "OLDPWD",
+    "OPTARG", "OPTERR", "OPTIND", "OSTYPE", "PIPESTATUS", "PPID", "PS1", "PS2", "PS3", "PS4",
+    "PWD", "RANDOM", "REPLY", "SECONDS", "SHELL", "SHELLOPTS", "SHLVL", "SRANDOM", "TERM",
+    "UID",
+];
+
+/// Every `BASH…` name is the shell's too — `BASH`, `BASHPID`, `BASHOPTS` and
+/// the whole `BASH_*` family. A prefix rather than thirty entries, which
+/// over-declines a user variable called `BASHFUL`: over-declining costs a
+/// label, and the alternative costs a wrong one.
+const SHELL_MAINTAINED_PREFIX: &str = "BASH";
+
+/// True for a name no environment hatch constructs can answer for.
+fn is_shell_maintained(name: &str) -> bool {
+    name.starts_with(SHELL_MAINTAINED_PREFIX) || SHELL_MAINTAINED.contains(&name)
+}
+
 /// The name inside `text`, if `text` is exactly one variable reference:
-/// `$NAME` or `${NAME}`, where `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
+/// `$NAME` or `${NAME}`, where `NAME` is `[A-Za-z_][A-Za-z0-9_]*` and is not
+/// a name the shell maintains itself — see `SHELL_MAINTAINED`.
 ///
 /// This is the whole of what hatch claims to understand about `$`. It lives
 /// here, beside the kind it bounds, rather than in the renderer that finds
@@ -282,10 +354,11 @@ fn assert_chip_stands_for_one_codepoint(text: &str, kind: &SpanKind) {
 /// text `Plain`. Positional and special parameters (`$1`, `$@`, `$?`, `$$`,
 /// `$*`, `$#`), brace expansions with a modifier (`${HOME:-/tmp}`,
 /// `${#HOME}`), command and arithmetic substitution (`$(id)`, `$((1+1))`) and
-/// an unterminated `${HOME` are all outside it. They are outside for one
-/// reason: a `Variable` span promises the reader a value out of the child
-/// environment, and for each of those the shell substitutes something that
-/// environment does not contain. Saying nothing is honest; guessing is not.
+/// an unterminated `${HOME` are all outside it, and so is `$PWD`. They are
+/// outside for one reason: a `Variable` span promises the reader a value out
+/// of the child environment, and for each of those the shell substitutes
+/// something that environment does not contain. Saying nothing is honest;
+/// guessing is not, and *unset* is a guess like any other.
 pub fn variable_name(text: &str) -> Option<&str> {
     let name = match text.as_bytes() {
         [b'$', b'{', .., b'}'] => &text[2..text.len() - 1],
@@ -296,7 +369,7 @@ pub fn variable_name(text: &str) -> Option<&str> {
     let first = chars.next()?;
     let start = first.is_ascii_alphabetic() || first == '_';
     let rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    (start && rest).then_some(name)
+    (start && rest && !is_shell_maintained(name)).then_some(name)
 }
 
 /// The bound on [`SpanKind::Variable`], enforced where the kind meets the
@@ -866,7 +939,7 @@ mod tests {
         for (text, name) in [
             ("$HOME", "HOME"),
             ("${HOME}", "HOME"),
-            ("$_", "_"),
+            ("$PATH", "PATH"),
             ("$_a9", "_a9"),
             ("$A", "A"),
             ("${_a9}", "_a9"),
@@ -884,9 +957,67 @@ mod tests {
             "", "$", "HOME", "$1", "$$", "$?", "$@", "$*", "$#", "$-", "$!", "${}", "${1}",
             "${HOME:-/tmp}", "${#HOME}", "${HOME", "$HOME}", "${HOME}x", "x${HOME}", "$HO ME",
             "$HOME $HOME", "$(id)", "$é", "${é}", "${HOME }",
+            // The shell's own names, in both forms.
+            "$PWD", "${PWD}", "$IFS", "$_", "$SHLVL", "$BASH_SOURCE", "$RANDOM",
         ] {
             assert_eq!(variable_name(text), None, "{text:?} must not read as a reference");
         }
+    }
+
+
+    #[test]
+    fn a_name_the_shell_maintains_is_not_a_reference_this_window_may_claim() {
+        // Each of these is answered by the shell, not by the environment
+        // hatch constructs, so `build_child_env` has no entry for it and a
+        // naive reading would draw it as *unset*. `rm -rf $PWD/build` shown
+        // with "PWD: unset" reads as `/build`; it is `/tmp/build`.
+        for name in [
+            "PWD", "OLDPWD", "IFS", "RANDOM", "SECONDS", "LINENO", "PPID", "UID", "EUID",
+            "HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "SHLVL", "SHELL", "OPTIND",
+            "OPTARG", "OPTERR", "REPLY", "FUNCNAME", "GROUPS", "DIRSTACK", "PIPESTATUS",
+            "HISTCMD", "SHELLOPTS", "EPOCHSECONDS", "EPOCHREALTIME", "SRANDOM",
+            "COMP_WORDBREAKS", "TERM", "PS1", "PS2", "PS3", "PS4", "_",
+            "BASH", "BASHPID", "BASHOPTS", "BASH_SOURCE", "BASH_VERSION", "BASH_REMATCH",
+        ] {
+            assert!(is_shell_maintained(name), "{name} is the shell's, not the environment's");
+            assert_eq!(variable_name(&format!("${name}")), None, "${name}");
+            assert_eq!(variable_name(&format!("${{{name}}}")), None, "${{{name}}}");
+        }
+    }
+
+    #[test]
+    fn path_and_home_are_still_ours_to_answer_for() {
+        // The two exceptions, and each has its own reason. `PATH` is inserted
+        // unconditionally by `build_child_env`, and a shell that finds it set
+        // uses it rather than its compiled-in default -- so it can never be
+        // drawn as unset and never resolves to something the child will not
+        // see. No shell invents a `HOME` at all.
+        assert!(!is_shell_maintained("PATH"));
+        assert!(!is_shell_maintained("HOME"));
+        assert_eq!(variable_name("$PATH"), Some("PATH"));
+        assert_eq!(variable_name("${HOME}"), Some("HOME"));
+    }
+
+    #[test]
+    fn an_ordinary_name_is_not_declined_just_for_looking_like_one() {
+        for name in ["HOME", "PATH", "MY_VAR", "x", "_a9", "PWDX", "TERMINAL", "SHELLS"] {
+            assert!(!is_shell_maintained(name), "{name} is nobody's but the user's");
+        }
+    }
+
+    #[test]
+    fn a_shell_maintained_name_cannot_be_tagged_even_by_hand() {
+        // The decline lives in the grammar rather than in the renderer, so it
+        // is not merely that the pass declines to tag `$PWD` -- the model
+        // refuses to hold the tag at all, and a later pass cannot reintroduce
+        // the claim.
+        let mut builder = SpanBuilder::new("$PWD");
+        builder.push_rest(SpanKind::Plain);
+        let mut spans = builder.finish();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spans.set_kind(0, SpanKind::Variable { resolved: None });
+        }));
+        assert!(panicked.is_err(), "the model must refuse a Variable over $PWD");
     }
 
     #[test]

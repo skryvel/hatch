@@ -16,7 +16,9 @@
 //! builds the environment it will hand the child, from config alone, and
 //! renders against exactly that. [`build_child_env`] is the single source of
 //! truth: the annotator in [`crate::render::command`] resolves `$HOME`
-//! against its result, and the spawner hands its result to the child. A
+//! against its result, and the spawner will hand the same map to the child
+//! once execution lands — nothing spawns yet, so for now this is the
+//! display's source of truth and only that. A
 //! window that resolved variables against `std::env` would print a value that
 //! looks authoritative and is wrong, which is the worst failure available to
 //! a display whose whole job is to be believed — worse than printing nothing,
@@ -61,23 +63,29 @@ pub fn build_child_env(config: &Config) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
 
-    /// A name no real environment has, so finding it in the child environment
-    /// can only mean it was inherited.
-    const CANARY: &str = "HATCH_INHERITANCE_CANARY";
-
     #[test]
     fn child_env_is_constructed_not_inherited() {
-        // SAFETY: single-threaded assertion about this process's own
-        // environment; nothing else in this test reads or writes it.
-        unsafe { std::env::set_var(CANARY, "leaked") };
-        let env = build_child_env(&Config::default());
-        unsafe { std::env::remove_var(CANARY) };
+        // Reads the process environment and never writes it. An earlier
+        // version planted a canary with `set_var` under a comment claiming a
+        // single-threaded test; the comment was false -- the default harness
+        // runs tests in parallel and other tests reach `dirs::home_dir`,
+        // which calls `getenv` concurrently, which is exactly what edition
+        // 2024 made `set_var` unsafe for. Reading is sound, and asking about
+        // the *whole* real environment is the stronger question anyway: no
+        // key this process holds may appear in the child's unless the config
+        // put it there.
+        let config = Config::default();
+        let env = build_child_env(&config);
 
-        assert!(
-            !env.contains_key(CANARY),
-            "the child environment is built, not inherited from this process"
-        );
-        assert!(env.contains_key("PATH"), "but it is not empty either");
+        let inheritable: Vec<String> = std::env::vars()
+            .map(|(key, _)| key)
+            .filter(|key| key != "PATH" && !config.exec_env.contains_key(key))
+            .collect();
+        assert!(!inheritable.is_empty(), "this process must have an environment to inherit");
+        for key in inheritable {
+            assert!(!env.contains_key(&key), "{key} was inherited from this process");
+        }
+        assert!(env.contains_key("PATH"), "but the result is not empty either");
     }
 
     #[test]

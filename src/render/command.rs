@@ -121,11 +121,38 @@
 //! this window could put beside them that would be true. Under-tagging costs
 //! the reader a hint; a wrong value costs them the reason to read at all.
 //!
+//! Names the shell maintains itself — `$PWD`, `$IFS`, `$RANDOM`, `$SHLVL`,
+//! the `BASH*` family — are declined for the same reason, and it is worth
+//! stating separately because they *do* fit the grammar. `build_child_env`
+//! has no entry for `PWD`, so tagging it would draw *unset* over an argument
+//! the shell is about to fill in: `rm -rf $PWD/build` read as `/build` when
+//! it is `/tmp/build`. [`super::variable_name`] holds that list, so the
+//! refusal is the model's and not this pass's.
+//!
 //! Declining is not the same as ignoring: `dollar_extent` steps over the
 //! whole of what it declines, so a rejected construct cannot be re-read as an
 //! accepted one. `$$HOME` is the case — the shell reads `$$` and then the
 //! literal `HOME`, and a pass that resumed one byte later would find `$HOME`
 //! and announce an expansion that never happens.
+//!
+//! ## Over-annotation: the same gaps the segmenter has
+//!
+//! Annotation asks the same scanner the same question, so it inherits the
+//! same model gaps, in the same direction. Where an unmodelled construct
+//! makes a `$` inert, it is annotated anyway. Each was checked against a real
+//! shell:
+//!
+//! * `$'a\'$HOME'` — ANSI-C quoting, where `\'` does not close the string, so
+//!   the whole of `a'$HOME` is literal.
+//! * `echo # $HOME` — inside a comment.
+//! * A heredoc with a quoted delimiter (`<<'EOF'`), whose body never expands.
+//!
+//! The cost is bounded the same way, and more tightly than for segmentation:
+//! the text is still on screen drawn as itself, and what is wrong is a label
+//! and a value shown beside a `$` that will not expand. A reader who
+//! distrusts the annotation can read straight through it. `over_annotation_
+//! where_the_model_stops` pins the list, so a change here has to be a
+//! deliberate one.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -427,11 +454,28 @@ pub fn segment(command: &str) -> Spans {
 /// Tag every variable reference in `spans` and hang the value it will
 /// actually have on it.
 ///
-/// A refinement pass, not a renderer: it splits existing spans and retags the
-/// halves, so it adds and removes no text and invariant 1 is safe by
-/// construction. It is the third pass in [`super::render_command`] and runs
-/// after segmentation, which is what lets it find the span a reference lives
-/// in rather than having to build one.
+/// A refinement pass: it subdivides the spans it is given at each reference
+/// and leaves every other span exactly as it found it. It is the third pass
+/// in [`super::render_command`] and runs after segmentation, which is what
+/// lets it work with the span a reference lives in rather than having to find
+/// the structure again.
+///
+/// # Why it rebuilds rather than splitting in place
+///
+/// [`Spans::split`] is the obvious tool and the wrong one at this scale.
+/// Splitting copies both halves' text, so subdividing one long run at every
+/// reference re-copies the whole tail each time: quadratic in the number of
+/// references, and the number of references is chosen by the agent. Measured
+/// in release, `$A ` repeated: 100 KB took 940 ms with a rescan from index
+/// zero, 68 ms once the search carried a moving start index, and 1 MB still
+/// took 6.3 s — the copying is the part the moving index cannot reach.
+///
+/// Walking the existing spans once into a fresh [`SpanBuilder`] copies every
+/// byte exactly once instead, and gives up nothing: the
+/// builder cuts every span from the same source, so no text can be invented,
+/// and [`SpanBuilder::finish`] re-checks that the result tiles the source
+/// from scratch rather than inheriting that guarantee from the input. The
+/// same 1 MB takes 63 ms, and 100 KB takes 7 ms.
 ///
 /// # `env` is the child environment, and nothing else will do
 ///
@@ -447,62 +491,68 @@ pub fn segment(command: &str) -> Spans {
 /// lookup: there is no default that is not a guess.
 ///
 /// A name that environment does not contain resolves to `None` — shown as
-/// unset, which is exactly what the child will see.
+/// unset. That is only a true claim because [`super::variable_name`] refuses
+/// every name the shell supplies for itself, so a `None` here cannot be
+/// hatch's ignorance of `$PWD` wearing the appearance of an empty expansion.
 ///
 /// # What a reference lands on
 ///
 /// Every character a reference can contain is drawn as itself and is not a
 /// separator, so a reference always lies wholly inside one `Plain` span and
-/// never straddles a chip or a separator. A span that is neither `Plain` nor
-/// already a `Variable` is left alone: some other pass has claimed that text,
-/// and this one does not overrule it. Re-running against a different
-/// environment does re-resolve, so the last environment applied is the one on
-/// screen.
+/// never straddles a chip or a separator. That is what lets the two ordered
+/// sequences — spans and references — be merged in one walk. Re-running
+/// against a different environment does re-resolve, so the last environment
+/// applied is the one on screen.
 ///
 /// # Panics
 ///
-/// If a reference is not contained in any single span, which would mean the
-/// spans no longer tile their source — a bug in this module. A panicking
+/// If a reference straddles a span boundary, which would mean the claim above
+/// no longer holds: the builder refuses the out-of-order push. A panicking
 /// prompt window is a dead prompt window, and hatch treats that as a denial,
 /// so failing this way fails closed.
-pub fn annotate_variables(mut spans: Spans, env: &BTreeMap<String, String>) -> Spans {
-    for reference in references(spans.source()) {
-        let mut index = spans
-            .iter()
-            .position(|span| {
-                span.range().start <= reference.start && reference.end <= span.range().end
-            })
-            .expect(
-                "a reference lies inside one span: every character of one is drawn as itself",
-            );
+pub fn annotate_variables(spans: Spans, env: &BTreeMap<String, String>) -> Spans {
+    let source = spans.source();
+    let references = references(source);
+    let mut builder = SpanBuilder::new(source);
+    let mut next = 0;
 
-        if !matches!(spans[index].kind(), SpanKind::Plain | SpanKind::Variable { .. }) {
-            continue;
+    for span in spans.iter() {
+        // The break belongs to whatever starts where this span started, which
+        // is the first sub-span emitted for it. A pending break survives an
+        // empty push, so a reference sitting at the very start of the span
+        // inherits it, exactly as `Spans::split` would have left it.
+        if span.break_before() {
+            builder.break_next();
         }
 
-        // Trim the span down to the reference from each end in turn. `split`
-        // returns the right half's index, which is the one still holding the
-        // reference; after the second split the left half at `index` is the
-        // reference exactly.
-        if spans[index].range().start < reference.start {
-            index = spans.split(index, reference.start);
-        }
-        if reference.end < spans[index].range().end {
-            spans.split(index, reference.end);
-        }
+        let end = span.range().end;
+        // A span that is neither `Plain` nor already a `Variable` belongs to
+        // some other pass, and this one does not overrule it: it is re-emitted
+        // with its kind and any reference inside it is skipped rather than
+        // tagged.
+        let annotatable = matches!(span.kind(), SpanKind::Plain | SpanKind::Variable { .. });
 
-        let resolved = {
-            let name = variable_name(spans[index].text())
-                .expect("the span was cut to the extent the scanner matched");
+        while next < references.len() && references[next].end <= end {
+            let reference = references[next].clone();
+            next += 1;
+            if !annotatable {
+                continue;
+            }
+            builder.push_to(reference.start, SpanKind::Plain);
+            let name = variable_name(&source[reference.clone()])
+                .expect("the scanner matched this range as a whole reference");
             // Defanged on the way in, not on the way out: the value is not
             // approved text and cannot be a span, so the window has no chip
             // machinery to protect it with. See `unicode::defang`.
-            env.get(name).map(|value| unicode::defang(value))
-        };
-        spans.set_kind(index, SpanKind::Variable { resolved });
+            let resolved = env.get(name).map(|value| unicode::defang(value));
+            builder.push_to(reference.end, SpanKind::Variable { resolved });
+        }
+
+        let rest = if annotatable { SpanKind::Plain } else { span.kind().clone() };
+        builder.push_to(end, rest);
     }
 
-    spans
+    builder.finish()
 }
 
 #[cfg(test)]
@@ -521,6 +571,14 @@ mod tests {
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// The whole pipeline, which is what the window actually shows. Preferred
+    /// over `annotate_variables(render_command(..), ..)` everywhere the
+    /// composition itself is not the subject: a test that drives the pass
+    /// directly would keep passing if the pass were unwired.
+    fn rendered(command: &str, env: &BTreeMap<String, String>) -> Spans {
+        crate::render::render_command(command, env)
     }
 
     /// Deliberately driven through `render_command` rather than through
@@ -918,7 +976,7 @@ mod tests {
         // mirror lie: the reader would be shown a literal where a
         // substitution happens.
         let env = env(&[("HOME", "/home/user")]);
-        let spans = annotate_variables(render_command("echo \"$HOME/x\""), &env);
+        let spans = rendered("echo \"$HOME/x\"", &env);
         assert_eq!(variables(&spans), vec![("$HOME", Some("/home/user"))]);
     }
 
@@ -927,7 +985,7 @@ mod tests {
         // Otherwise "not annotated inside single quotes" would pass for a
         // pass that simply gave up at the first quote character.
         let env = env(&[("A", "1"), ("B", "2")]);
-        let spans = annotate_variables(render_command("echo '$A' $B"), &env);
+        let spans = rendered("echo '$A' $B", &env);
         assert_eq!(variables(&spans), vec![("$B", Some("2"))]);
     }
 
@@ -935,16 +993,16 @@ mod tests {
     fn an_escaped_dollar_is_not_a_variable() {
         // `\$HOME` and `"\$HOME"` are both the literal five characters.
         let env = env(&[("HOME", "/home/user")]);
-        assert!(variables(&annotate_variables(render_command(r"echo \$HOME"), &env)).is_empty());
+        assert!(variables(&rendered(r"echo \$HOME", &env)).is_empty());
         assert!(
-            variables(&annotate_variables(render_command(r#"echo "\$HOME""#), &env)).is_empty()
+            variables(&rendered(r#"echo "\$HOME""#, &env)).is_empty()
         );
     }
 
     #[test]
     fn the_braced_form_is_annotated_and_keeps_its_braces() {
         let env = env(&[("HOME", "/home/user")]);
-        let spans = annotate_variables(render_command("ls ${HOME}x"), &env);
+        let spans = rendered("ls ${HOME}x", &env);
         assert_eq!(variables(&spans), vec![("${HOME}", Some("/home/user"))]);
         let braced = spans.iter().find(|s| s.variable().is_some()).unwrap();
         assert_eq!(braced.variable().unwrap().0, "HOME", "the name is the interior");
@@ -957,7 +1015,7 @@ mod tests {
         // left Plain round-trips perfectly and hides nothing. This test and
         // its siblings are the only thing that requires the tagging at all.
         let env = env(&[("A", "1"), ("B", "2"), ("C", "3")]);
-        let spans = annotate_variables(render_command("$A x ${B}; echo $C"), &env);
+        let spans = rendered("$A x ${B}; echo $C", &env);
         assert_eq!(
             variables(&spans),
             vec![("$A", Some("1")), ("${B}", Some("2")), ("$C", Some("3"))]
@@ -967,7 +1025,7 @@ mod tests {
     #[test]
     fn a_reference_beside_a_separator_or_a_chip_keeps_everything() {
         let env = env(&[("HOME", "/home/user")]);
-        let spans = annotate_variables(render_command("echo $HOME;\u{202E}$HOME"), &env);
+        let spans = rendered("echo $HOME;\u{202E}$HOME", &env);
         assert_eq!(separators(&spans), vec![";"]);
         assert_eq!(chips(&spans), vec!['\u{202E}']);
         assert_eq!(
@@ -980,7 +1038,7 @@ mod tests {
     #[test]
     fn a_reference_that_is_the_whole_command_needs_no_split() {
         let env = env(&[("A", "1")]);
-        let spans = annotate_variables(render_command("$A"), &env);
+        let spans = rendered("$A", &env);
         assert_eq!(spans.len(), 1);
         assert_eq!(variables(&spans), vec![("$A", Some("1"))]);
     }
@@ -992,10 +1050,10 @@ mod tests {
         // it -- and one that *is* the start of a line must keep it.
         let env = env(&[("A", "1")]);
 
-        let spans = annotate_variables(render_command("x; $A"), &env);
+        let spans = rendered("x; $A", &env);
         assert_eq!(breaks(&spans), vec![" "], "the space is still what starts the line");
 
-        let spans = annotate_variables(render_command("x;$A"), &env);
+        let spans = rendered("x;$A", &env);
         assert_eq!(breaks(&spans), vec!["$A"]);
         assert_eq!(variables(&spans), vec![("$A", Some("1"))]);
     }
@@ -1004,7 +1062,7 @@ mod tests {
     fn a_name_may_start_with_an_underscore_and_carry_digits() {
         let env = env(&[("_x9", "ok")]);
         assert_eq!(
-            variables(&annotate_variables(render_command("echo $_x9"), &env)),
+            variables(&rendered("echo $_x9", &env)),
             vec![("$_x9", Some("ok"))]
         );
     }
@@ -1012,9 +1070,48 @@ mod tests {
     #[test]
     fn a_name_stops_at_the_first_character_that_is_not_one() {
         let env = env(&[("A", "1")]);
-        let spans = annotate_variables(render_command("echo $A-$A/$A."), &env);
+        let spans = rendered("echo $A-$A/$A.", &env);
         assert_eq!(variables(&spans), vec![("$A", Some("1")); 3]);
         assert_eq!(unrender(&spans), "echo $A-$A/$A.");
+    }
+
+
+
+    #[test]
+    fn a_span_another_pass_has_claimed_is_left_exactly_as_it_was() {
+        // The guard that keeps this pass from overruling another one. Today
+        // it is unreachable through `render_command`, because annotation runs
+        // before any pass that could retag a run -- so it is reached here by
+        // hand, which is the only way to require that it works before the
+        // pass that needs it exists. Without the guard the reference inside a
+        // claimed span would be tagged and the claim silently dropped.
+        let env = env(&[("HOME", "/home/user")]);
+        // `segment` rather than the shadowed `render_command`, which already
+        // annotates and would leave nothing whole to claim.
+        let mut spans = segment("rm -rf $HOME");
+        assert_eq!(spans.len(), 1, "one Plain run to claim");
+        spans.set_kind(0, SpanKind::Danger);
+
+        let spans = annotate_variables(spans, &env);
+        assert!(variables(&spans).is_empty(), "the claimed run is not re-tagged");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].kind(), &SpanKind::Danger, "and the other pass keeps its claim");
+        assert_eq!(unrender(&spans), "rm -rf $HOME");
+    }
+
+    #[test]
+    fn a_command_of_nothing_but_references_is_annotated_throughout() {
+        // Exercises the merge walk at a size where a quadratic pass is
+        // noticeable and, more to the point, where an off-by-one in stepping
+        // the two ordered sequences would show up. The count is asserted, so
+        // a walk that quietly stopped early would not pass.
+        let count = 5_000;
+        let command = "$A ".repeat(count);
+        let spans = rendered(&command, &env(&[("A", "/home/user")]));
+        assert_eq!(variables(&spans).len(), count);
+        assert!(variables(&spans).iter().all(|v| *v == ("$A", Some("/home/user"))));
+        assert_eq!(unrender(&spans), command);
+        assert!(spans.covers_source());
     }
 
     // --- the boundary of what `$` is claimed to mean ----------------------
@@ -1031,7 +1128,7 @@ mod tests {
             "echo $1", "echo $@", "echo $?", "echo $$", "echo $*", "echo $#", "echo $-",
             "echo $!", "echo $0", "echo $$HOME", "echo $1HOME", "echo $", "echo $ HOME",
         ] {
-            let spans = annotate_variables(render_command(command), &env);
+            let spans = rendered(command, &env);
             assert!(variables(&spans).is_empty(), "{command:?} claims a variable it should not");
             assert_eq!(unrender(&spans), command);
         }
@@ -1056,7 +1153,7 @@ mod tests {
             "echo ${HOME",
             "echo ${ HOME }",
         ] {
-            let spans = annotate_variables(render_command(command), &env);
+            let spans = rendered(command, &env);
             assert!(variables(&spans).is_empty(), "{command:?} claims a variable it should not");
             assert_eq!(unrender(&spans), command);
         }
@@ -1068,16 +1165,93 @@ mod tests {
         // and it is the case that keeps the rule above from being written as
         // "anything after a `$(` is off limits".
         let env = env(&[("HOME", "/home/user")]);
-        let spans = annotate_variables(render_command("echo $(ls $HOME)"), &env);
+        let spans = rendered("echo $(ls $HOME)", &env);
         assert_eq!(variables(&spans), vec![("$HOME", Some("/home/user"))]);
     }
 
     #[test]
-    fn an_ansi_c_string_hides_its_references_like_any_single_quoted_one() {
-        // `$'…'` does not expand parameters. The scanner reaches the right
-        // answer through the `'`, which is the ordinary single-quote rule.
+    fn an_unescaped_ansi_c_string_hides_its_references_by_accident() {
+        // `$'…'` does not expand parameters, and this case comes out right --
+        // but through the ordinary single-quote rule, not through any model
+        // of `$'…'`. The distinction is not pedantic: the moment the string
+        // contains `\'` the same accident stops working, which is the first
+        // entry in `over_annotation_where_the_model_stops` below.
         let env = env(&[("HOME", "/home/user")]);
-        assert!(variables(&annotate_variables(render_command("echo $'$HOME'"), &env)).is_empty());
+        assert!(variables(&rendered("echo $'$HOME'", &env)).is_empty());
+    }
+
+    #[test]
+    fn over_annotation_where_the_model_stops() {
+        // The mirror of `over_segmentation_where_the_model_stops`, and it
+        // exists for the same reason: annotation asks the same scanner the
+        // same question, so it inherits the same gaps. Where an unmodelled
+        // construct makes a `$` inert, it is annotated anyway. Each case was
+        // checked against a real shell; this test is what stops the list
+        // drifting from the docs.
+        let env = env(&[("HOME", "/home/user")]);
+        for (command, why) in [
+            (r"echo $'a\'$HOME'", "ANSI-C quoting: `\\'` does not close the string"),
+            ("echo # $HOME", "inside a comment"),
+            ("cat <<'EOF'\n$HOME\nEOF", "a quoted heredoc delimiter never expands"),
+        ] {
+            let spans = rendered(command, &env);
+            assert_eq!(
+                variables(&spans),
+                vec![("$HOME", Some("/home/user"))],
+                "{why}: {command:?} is annotated, and this test records that"
+            );
+            // The bound on the cost: the text is untouched and drawn as
+            // itself, so what is wrong is a label beside a `$`, not the
+            // command the reader approves.
+            assert_eq!(unrender(&spans), command);
+        }
+    }
+
+    #[test]
+    fn names_the_shell_maintains_are_left_plain() {
+        // The sibling of `positional_and_special_parameters_are_left_plain`,
+        // and it fails the same test those do: the shell substitutes these
+        // from somewhere other than the environment hatch constructs. They
+        // differ only in fitting the grammar, which is what makes drawing
+        // them as *unset* possible and wrong. `$PWD` shown unset turns
+        // `rm -rf $PWD/build` into an argument the reader parses as `/build`.
+        //
+        // The second environment is the point of the `exec_env` half: even
+        // configured, they stay Plain, because the shell overwrites `PWD` and
+        // `IFS` at startup regardless of what it inherits and we cannot tell
+        // which value wins.
+        for env in [
+            env(&[]),
+            env(&[("PWD", "/configured"), ("IFS", ":"), ("SHLVL", "9"), ("TERM", "xterm")]),
+        ] {
+            for command in [
+                "rm -rf $PWD/build", "echo ${PWD}", "echo $IFS", "echo $RANDOM",
+                "echo $SECONDS", "echo $LINENO", "echo $PPID", "echo $UID", "echo $EUID",
+                "echo $HOSTNAME", "echo $OPTARG", "echo $SHLVL", "echo $_", "echo $OLDPWD",
+                "echo $OPTIND", "echo $REPLY", "echo $FUNCNAME", "echo $BASH_SOURCE",
+                "echo $PS1", "echo $PS4", "echo $SHELL", "echo $TERM",
+            ] {
+                let spans = rendered(command, &env);
+                assert!(
+                    variables(&spans).is_empty(),
+                    "{command:?} must not be drawn as a variable, set or unset"
+                );
+                assert_eq!(unrender(&spans), command);
+            }
+        }
+    }
+
+    #[test]
+    fn path_and_home_are_still_annotated() {
+        // The two names in that family hatch can answer for. `PATH` because
+        // `build_child_env` always supplies it and a shell that finds it set
+        // uses it; `HOME` because no shell invents one.
+        let env = env(&[("PATH", "/usr/bin"), ("HOME", "/home/user")]);
+        let spans = rendered("PATH=$PATH ls $HOME", &env);
+        assert_eq!(
+            variables(&spans),
+            vec![("$PATH", Some("/usr/bin")), ("$HOME", Some("/home/user"))]
+        );
     }
 
     // --- the value is beside the text, and it is defanged -----------------
@@ -1090,7 +1264,7 @@ mod tests {
         // is what is drawn, and the value is reachable only through a
         // separate accessor.
         let env = env(&[("HOME", "/home/user")]);
-        let spans = annotate_variables(render_command("ls $HOME"), &env);
+        let spans = rendered("ls $HOME", &env);
         let variable = spans.iter().find(|s| s.variable().is_some()).unwrap();
         assert_eq!(variable.display_text(), "$HOME");
         assert_eq!(variable.chip_codepoint(), None, "it is not a chip and may not become one");
@@ -1106,7 +1280,7 @@ mod tests {
         // reorder or split the line the command is read on, so it arrives
         // flattened to the same chip vocabulary the command itself uses.
         let env = env(&[("V", "/a\u{202E}b\nc\u{200B}")]);
-        let spans = annotate_variables(render_command("echo $V"), &env);
+        let spans = rendered("echo $V", &env);
         assert_eq!(variables(&spans), vec![("$V", Some("/a[RLO]b[LF]c[ZWSP]"))]);
         let (_, value) = spans.iter().find_map(Span::variable).unwrap();
         assert!(
@@ -1117,7 +1291,7 @@ mod tests {
 
     #[test]
     fn an_empty_value_is_not_the_same_as_an_unset_one() {
-        let spans = annotate_variables(render_command("echo $A"), &env(&[("A", "")]));
+        let spans = rendered("echo $A", &env(&[("A", "")]));
         assert_eq!(variables(&spans), vec![("$A", Some(""))]);
     }
 
@@ -1126,7 +1300,7 @@ mod tests {
         // The pass is idempotent in shape and current in content: a span that
         // is already a Variable is re-resolved rather than left carrying a
         // value from some other environment.
-        let spans = annotate_variables(render_command("ls $HOME"), &env(&[("HOME", "/first")]));
+        let spans = rendered("ls $HOME", &env(&[("HOME", "/first")]));
         let spans = annotate_variables(spans, &env(&[("HOME", "/second")]));
         assert_eq!(variables(&spans), vec![("$HOME", Some("/second"))]);
     }
@@ -1140,7 +1314,7 @@ mod tests {
         for command in [
             "$A", "x$A", "$A x", "x$A x", "${HOME}$A", "$A;$A", "echo \"$A\"", "$A\u{202E}$A",
         ] {
-            let spans = annotate_variables(render_command(command), &env);
+            let spans = rendered(command, &env);
             for span in spans.iter() {
                 if let SpanKind::Variable { .. } = span.kind() {
                     assert!(
@@ -1169,7 +1343,7 @@ mod tests {
             "ünïcödé $A ✓",
             "$A\n$A",
         ] {
-            let spans = annotate_variables(render_command(command), &env);
+            let spans = rendered(command, &env);
             assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
             assert!(spans.covers_source(), "{command:?} is not tiled by its spans");
         }
