@@ -97,7 +97,14 @@ pub enum SpanKind {
     /// The codepoint is deliberately not stored beside the text. It is
     /// [`Span::chip_codepoint`], read from the text on demand, so the label's
     /// subject and the approved character cannot drift apart.
-    Chip { name: &'static str },
+    ///
+    /// `name` is a `Cow` because most labels are known in advance — `[RLO]`,
+    /// `[NBSP]` — but a character nobody named still has to chip, and the
+    /// only label available for it is computed from its own codepoint
+    /// (`[U+1D7CE]`). The alternative, leaking a `&'static str` per unknown
+    /// codepoint, would let agent-controlled input grow the process's memory
+    /// without bound. Named labels still borrow and allocate nothing.
+    Chip { name: Cow<'static, str> },
 }
 
 impl Span {
@@ -177,7 +184,7 @@ impl Span {
     /// kind is drawn as itself.
     pub fn display_text(&self) -> Cow<'_, str> {
         match &self.kind {
-            SpanKind::Chip { name } => Cow::Borrowed(name),
+            SpanKind::Chip { name } => Cow::Borrowed(name.as_ref()),
             _ => Cow::Borrowed(&self.text),
         }
     }
@@ -459,7 +466,7 @@ mod tests {
         builder.push_to(1, SpanKind::Command);
         builder.push_to(2, SpanKind::Separator);
         builder.break_next();
-        builder.push_to(5, SpanKind::Chip { name: "[RLO]" });
+        builder.push_to(5, SpanKind::Chip { name: "[RLO]".into() });
         builder.push_rest(SpanKind::Plain);
         let spans = builder.finish();
         (source, spans)
@@ -571,7 +578,7 @@ mod tests {
         let source = "echo hi; rm -rf /";
         let mut builder = SpanBuilder::new(source);
         builder.push_to(7, SpanKind::Plain);
-        builder.push_rest(SpanKind::Chip { name: "[NBSP]" });
+        builder.push_rest(SpanKind::Chip { name: "[NBSP]".into() });
         builder.finish();
     }
 
@@ -582,7 +589,7 @@ mod tests {
         builder.push_rest(SpanKind::Plain);
         builder
             .finish()
-            .set_kind(0, SpanKind::Chip { name: "[NBSP]" });
+            .set_kind(0, SpanKind::Chip { name: "[NBSP]".into() });
     }
 
     #[test]

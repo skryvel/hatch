@@ -16,16 +16,15 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender};
 
 /// Render a command for the approval window.
 ///
-/// Today this is one `Plain` span over the whole command: the invariant holds
-/// trivially, and the renderers that follow — chips, segmentation, variable
-/// and binary annotation, danger markers — each refine this result while
-/// keeping it holding. That order is deliberate. `tests/fidelity.rs` passes
-/// before there is anything to break, so no later renderer can be written
-/// without it.
+/// Today this is Unicode classification alone: plain runs of ASCII printable
+/// text, and one chip per character that must not be drawn as itself. The
+/// renderers that follow — segmentation, variable and binary annotation,
+/// danger markers — each refine this result while keeping the invariants
+/// holding. That order is deliberate. `tests/fidelity.rs` passed before there
+/// was anything to break, so no later renderer can be written without it, and
+/// wiring each pass in here is what puts it under those properties.
 pub fn render_command(command: &str) -> Spans {
-    let mut spans = SpanBuilder::new(command);
-    spans.push_rest(SpanKind::Plain);
-    spans.finish()
+    unicode::classify(command)
 }
 
 #[cfg(test)]
@@ -39,6 +38,19 @@ mod tests {
         assert_eq!(spans[0].text(), "ls -la /etc");
         assert_eq!(spans[0].kind(), &SpanKind::Plain);
         assert!(!spans[0].break_before());
+    }
+
+    #[test]
+    fn rendering_chips_what_must_not_be_drawn_as_itself() {
+        // That `render_command` is wired to the classifier at all. Every
+        // invariant in `tests/fidelity.rs` holds trivially for one Plain span
+        // over the whole command, so nothing there would notice the pass being
+        // skipped — and a skipped pass draws a bidi override as itself.
+        let command = "ls\u{202E}txt";
+        let spans = render_command(command);
+        let chips: Vec<char> = spans.iter().filter_map(Span::chip_codepoint).collect();
+        assert_eq!(chips, vec!['\u{202E}']);
+        assert_eq!(unrender(&spans), command, "and the character still survives");
     }
 
     #[test]
