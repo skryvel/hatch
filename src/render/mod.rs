@@ -16,15 +16,23 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender};
 
 /// Render a command for the approval window.
 ///
-/// Today this is Unicode classification alone: plain runs of ASCII printable
-/// text, and one chip per character that must not be drawn as itself. The
-/// renderers that follow — segmentation, variable and binary annotation,
-/// danger markers — each refine this result while keeping the invariants
-/// holding. That order is deliberate. `tests/fidelity.rs` passed before there
-/// was anything to break, so no later renderer can be written without it, and
-/// wiring each pass in here is what puts it under those properties.
+/// Two passes so far, and they compose through a single `SpanBuilder` rather
+/// than by splicing their results: [`command::segment`] walks the command,
+/// tags the separators it finds outside quotes and asks for a line break on
+/// each span that follows one, and hands every run in between to
+/// [`unicode::classify_into`], which draws as itself only what is
+/// unambiguously safe to draw and chips the rest.
+///
+/// Both passes are additive. Neither removes a character to make room for
+/// layout or for a label, which is what keeps `tests/fidelity.rs` green.
+///
+/// The renderers still to come — variable and binary annotation, danger
+/// markers — refine this result the same way. That order is deliberate:
+/// `tests/fidelity.rs` passed before there was anything to break, so no later
+/// renderer can be written without it, and wiring each pass in here is what
+/// puts it under those properties.
 pub fn render_command(command: &str) -> Spans {
-    unicode::classify(command)
+    command::segment(command)
 }
 
 #[cfg(test)]
@@ -51,6 +59,23 @@ mod tests {
         let chips: Vec<char> = spans.iter().filter_map(Span::chip_codepoint).collect();
         assert_eq!(chips, vec!['\u{202E}']);
         assert_eq!(unrender(&spans), command, "and the character still survives");
+    }
+
+    #[test]
+    fn rendering_segmenting_what_the_shell_would_run_separately() {
+        // The sibling of the test above, and it is here for the same reason:
+        // every invariant in `tests/fidelity.rs` holds trivially for one
+        // Plain span over the whole command, so nothing there would notice
+        // the segmentation pass being dropped out of this function. The two
+        // wiring guards live together because the wiring does.
+        let spans = render_command("a; b");
+        let separators: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.kind() == &SpanKind::Separator)
+            .map(Span::text)
+            .collect();
+        assert_eq!(separators, vec![";"]);
+        assert!(spans.iter().any(Span::break_before), "and the break it asked for");
     }
 
     #[test]
