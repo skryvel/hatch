@@ -95,16 +95,40 @@ const NAMED: &[(char, &str)] = &[
     ('\u{FEFF}', "[BOM]"),
 ];
 
-/// The characters that carry no ink of their own, or that pass for a space —
-/// the ones a reader cannot see even when they are drawn faithfully.
+/// Inclusive ranges of characters that carry no ink of their own, or that
+/// pass for an ordinary space.
 ///
-/// This is [`ScanReport::invisible`]'s subject, not a chipping rule: a
-/// homoglyph is perfectly visible and still chips, an invisible character is
-/// merely the subset a summary line can usefully count.
-const INVISIBLE: &[char] = &[
-    '\u{00A0}', '\u{00AD}', '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}',
-    '\u{2028}', '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}',
-    '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+/// **Best-effort, and deliberately not a security boundary.** Nothing here
+/// decides what is chipped — [`is_plain`] alone does that, and it is a
+/// whitelist, so a character missing from this table is drawn as a chip just
+/// the same. The only cost of an omission is that [`ScanReport::invisible`]
+/// under-reports, and the only cost of an over-inclusion is that it
+/// over-reports. Unicode adds characters that draw as nothing faster than any
+/// hand-written list tracks them, so this one claims to be useful rather than
+/// complete; the alternative, a `Default_Ignorable_Code_Point` predicate, is
+/// a whole dependency bought for a count in a summary line.
+///
+/// It is also not a subset of "non-ASCII": C0 and C1 controls are folded in
+/// separately by [`is_invisible`] through [`char::is_control`].
+const INVISIBLE: &[(char, char)] = &[
+    ('\u{00A0}', '\u{00A0}'),   // no-break space
+    ('\u{00AD}', '\u{00AD}'),   // soft hyphen
+    ('\u{061C}', '\u{061C}'),   // Arabic letter mark
+    ('\u{115F}', '\u{1160}'),   // Hangul choseong and jungseong fillers
+    ('\u{1680}', '\u{1680}'),   // Ogham space mark
+    ('\u{17B4}', '\u{17B5}'),   // Khmer inherent vowels
+    ('\u{180B}', '\u{180E}'),   // Mongolian variation selectors and vowel separator
+    ('\u{2000}', '\u{200F}'),   // the fixed-width spaces, the zero-width set, LRM and RLM
+    ('\u{2028}', '\u{202F}'),   // line and paragraph separator, the bidi embeddings, NNBSP
+    ('\u{205F}', '\u{2064}'),   // medium mathematical space, word joiner, invisible operators
+    ('\u{2066}', '\u{2069}'),   // the bidi isolates
+    ('\u{3000}', '\u{3000}'),   // ideographic space
+    ('\u{3164}', '\u{3164}'),   // Hangul filler
+    ('\u{FE00}', '\u{FE0F}'),   // variation selectors
+    ('\u{FEFF}', '\u{FEFF}'),   // BOM, also read as zero-width no-break space
+    ('\u{FFA0}', '\u{FFA0}'),   // halfwidth Hangul filler
+    ('\u{E0000}', '\u{E007F}'), // language tag and the tag characters
+    ('\u{E0100}', '\u{E01EF}'), // variation selectors supplement
 ];
 
 /// What a chip for `c` shows in its place.
@@ -121,12 +145,14 @@ fn chip_label(c: char) -> Cow<'static, str> {
     }
 }
 
-/// True for a character that carries no ink or passes for a space.
+/// True for a character that carries no ink or passes for a space, as far as
+/// [`INVISIBLE`] knows — see there for why that is a best-effort answer and
+/// why nothing unsafe follows from a wrong one.
 ///
 /// C0 and C1 controls are included through [`char::is_control`]: they print as
 /// nothing, or as whatever the terminal does when it obeys them.
 fn is_invisible(c: char) -> bool {
-    c.is_control() || INVISIBLE.contains(&c)
+    c.is_control() || INVISIBLE.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c))
 }
 
 /// Classify `source` into plain runs and one chip per character that must not
@@ -158,6 +184,13 @@ pub fn classify(source: &str) -> Spans {
 /// character boundary.
 pub fn classify_into(builder: &mut SpanBuilder<'_>, end: usize) {
     let start = builder.cursor();
+    // Checked before the slice, which would otherwise fold this into the
+    // out-of-bounds case and point a caller with a stale `end` at the wrong
+    // mistake. `SpanBuilder::push_to` says the same thing the same way.
+    assert!(
+        end >= start,
+        "runs must be classified in source order: end {end} is behind cursor {start}"
+    );
     let run = match builder.source().get(start..end) {
         Some(run) => run,
         None => panic!(
@@ -193,6 +226,11 @@ pub struct ScanReport {
     pub non_ascii: usize,
     /// Characters that carry no ink of their own or pass for a space,
     /// including ASCII controls. A subset of what chips, not of `non_ascii`.
+    ///
+    /// A floor rather than an exact figure: it counts what [`INVISIBLE`]
+    /// knows about, and that table is best-effort. Under-counting here costs
+    /// a reader some context in the summary line and costs the display
+    /// nothing, since every one of these characters chips either way.
     pub invisible: usize,
     /// The string is not in Normalization Form C, so at least one visible
     /// glyph is spelled with more codepoints than it needs — the shape a
@@ -233,6 +271,50 @@ mod tests {
     fn chips(spans: &Spans) -> Vec<char> {
         spans.iter().filter_map(Span::chip_codepoint).collect()
     }
+
+    /// Every label this module promises, written out by hand.
+    ///
+    /// Deliberately a second copy rather than a walk of `NAMED`: a test that
+    /// reads its expectations out of the table it is testing agrees with any
+    /// table, including one an entry has been deleted from. The spec names
+    /// NBSP, the soft hyphen, the BOM and the line and paragraph separators
+    /// specifically, and that requirement is only enforced if losing one of
+    /// them turns something red.
+    const EXPECTED_LABELS: &[(char, &str)] = &[
+        ('\u{0009}', "[TAB]"),
+        ('\u{000A}', "[LF]"),
+        ('\u{000D}', "[CR]"),
+        ('\u{00A0}', "[NBSP]"),
+        ('\u{00AD}', "[SHY]"),
+        ('\u{061C}', "[ALM]"),
+        ('\u{200B}', "[ZWSP]"),
+        ('\u{200C}', "[ZWNJ]"),
+        ('\u{200D}', "[ZWJ]"),
+        ('\u{200E}', "[LRM]"),
+        ('\u{200F}', "[RLM]"),
+        ('\u{2028}', "[LS]"),
+        ('\u{2029}', "[PS]"),
+        ('\u{202A}', "[LRE]"),
+        ('\u{202B}', "[RLE]"),
+        ('\u{202C}', "[PDF]"),
+        ('\u{202D}', "[LRO]"),
+        ('\u{202E}', "[RLO]"),
+        ('\u{2066}', "[LRI]"),
+        ('\u{2067}', "[RLI]"),
+        ('\u{2068}', "[FSI]"),
+        ('\u{2069}', "[PDI]"),
+        ('\u{FEFF}', "[BOM]"),
+    ];
+
+    /// Characters that must be counted invisible, written out by hand for the
+    /// same reason. The spec's own set, plus the omissions that motivated
+    /// widening the table to ranges.
+    const EXPECTED_INVISIBLE: &[char] = &[
+        '\u{0009}', '\u{001B}', '\u{0085}', '\u{00A0}', '\u{00AD}', '\u{061C}', '\u{115F}',
+        '\u{1160}', '\u{180E}', '\u{2000}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}',
+        '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202E}', '\u{202F}', '\u{2060}',
+        '\u{2066}', '\u{2069}', '\u{3000}', '\u{3164}', '\u{FE0F}', '\u{FEFF}', '\u{E0001}',
+    ];
 
     fn labels(spans: &Spans) -> Vec<String> {
         spans
@@ -376,17 +458,25 @@ mod tests {
 
     #[test]
     fn named_characters_get_their_names() {
-        for (c, name) in NAMED {
+        for (c, expected) in EXPECTED_LABELS {
+            assert_eq!(chip_label(*c), *expected, "U+{:04X}", *c as u32);
             let spans = classify(&c.to_string());
-            assert_eq!(labels(&spans), vec![*name], "U+{:04X}", *c as u32);
+            assert_eq!(labels(&spans), vec![expected.to_string()], "U+{:04X}", *c as u32);
         }
+        assert_eq!(
+            NAMED.len(),
+            EXPECTED_LABELS.len(),
+            "a label was added to or removed from NAMED without saying so here"
+        );
     }
 
     #[test]
     fn the_whole_named_table_is_outside_the_plain_set() {
         // A name for a character that never chips would be dead weight, and a
-        // sign the two rules had drifted apart.
-        for (c, name) in NAMED {
+        // sign the two rules had drifted apart. Checked against the literal
+        // list as well as the table, so deleting an entry cannot make this
+        // vacuous.
+        for (c, name) in EXPECTED_LABELS.iter().chain(NAMED) {
             assert!(!is_plain(*c), "{name} names U+{:04X}, which is drawn as itself", *c as u32);
         }
     }
@@ -448,6 +538,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "end 1 is behind cursor 3")]
+    fn classify_into_rejects_going_backwards() {
+        // A stale `end` from a caller that split its runs wrongly. Folding
+        // this into the out-of-bounds case would point them at the wrong
+        // mistake, since the slice is `None` either way.
+        let mut builder = SpanBuilder::new("abc");
+        classify_into(&mut builder, 3);
+        classify_into(&mut builder, 1);
+    }
+
+    #[test]
     #[should_panic(expected = "not on a character boundary")]
     fn classify_into_rejects_a_split_character() {
         let mut builder = SpanBuilder::new("\u{202E}");
@@ -481,11 +582,21 @@ mod tests {
 
     #[test]
     fn every_invisible_is_invisible_and_chips() {
-        for c in INVISIBLE {
-            assert!(is_invisible(*c), "U+{:04X} is listed but not counted", *c as u32);
-            assert!(!is_plain(*c), "U+{:04X} is counted but drawn as itself", *c as u32);
+        // The literal list first, so that shrinking a range in INVISIBLE is
+        // caught rather than agreed with.
+        for c in EXPECTED_INVISIBLE {
+            assert!(is_invisible(*c), "U+{:04X} is not counted invisible", *c as u32);
+        }
+        // Then the table itself: an entry that is counted but still drawn as
+        // itself would mean the two rules had drifted apart.
+        for (lo, hi) in INVISIBLE {
+            for c in (*lo as u32..=*hi as u32).filter_map(char::from_u32) {
+                assert!(is_invisible(c), "U+{:04X} is listed but not counted", c as u32);
+                assert!(!is_plain(c), "U+{:04X} is counted but drawn as itself", c as u32);
+            }
         }
         assert!(!is_invisible('a'), "a visible character is not invisible");
+        assert!(!is_invisible(' '), "an ordinary space is not what this counts");
         assert!(!is_invisible('\u{0430}'), "a homoglyph is visible; it is merely not what it looks like");
         assert!(is_invisible('\u{001b}'), "an ANSI escape carries no ink");
     }
