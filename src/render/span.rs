@@ -85,8 +85,42 @@ pub enum SpanKind {
     Plain,
     /// `;` `&&` `||` `|` — dimmed, kept on screen.
     Separator,
-    /// `$VAR` / `${VAR}`.
-    Variable,
+    /// `$NAME` or `${NAME}`, and what that name is worth in the environment
+    /// the command will actually run in — `None` when it is unset there.
+    ///
+    /// `resolved` is *derived* data hanging off the kind, which is a shape the
+    /// rest of this module deliberately avoids: [`Span::chip_codepoint`] is
+    /// read out of the text precisely so a stored copy cannot drift from the
+    /// character the user approved. A resolution cannot be read out of the
+    /// text — the environment is not in the command — so it has to be stored,
+    /// and storing it opens two ways for it to come to describe text it does
+    /// not belong to. Both are closed here rather than documented at:
+    ///
+    /// * **Retagging.** `Variable` over `ls $HOME`, or over `$HO`, would put
+    ///   a value beside text that does not name it.
+    ///   `assert_variable_is_one_reference` rejects any text that is not
+    ///   exactly one reference, at construction and at
+    ///   [`Spans::set_kind`] — the same move, and the same two call sites, as
+    ///   the chip check.
+    /// * **Splitting.** [`Spans::split`] clones the kind into both halves, so
+    ///   splitting `$HOME` would produce two spans each claiming the whole
+    ///   value. Since neither half is a whole reference, that same assertion
+    ///   makes the split panic instead. Nothing needs to split a reference —
+    ///   it is one token — so a pass that wants to must retag it first, and
+    ///   say so.
+    ///
+    /// What is *not* enforced is that `resolved` is the value of this span's
+    /// own name: that needs the environment, which the model does not have.
+    /// It is [`super::command::annotate_variables`]'s job, and its tests'.
+    ///
+    /// The value is display-only. It never reaches [`unrender`], and by
+    /// invariant 1b it is never drawn *instead of* the text — a `Variable`
+    /// span is drawn as itself, so the window puts the value beside the
+    /// reference. It arrives already defanged by
+    /// [`super::unicode::defang`], because it is shown in the same window as
+    /// agent-chosen text and a raw bidi override in a config value would
+    /// reorder the command around it.
+    Variable { resolved: Option<String> },
     /// The first word of a segment.
     Command,
     Danger,
@@ -133,6 +167,7 @@ impl Span {
             ),
         };
         assert_chip_stands_for_one_codepoint(&text, &kind);
+        assert_variable_is_one_reference(&text, &kind);
         Span {
             text,
             range,
@@ -175,6 +210,28 @@ impl Span {
         }
     }
 
+    /// For a `Variable` span, its name and what that name resolves to in the
+    /// child environment — `Some((name, None))` when the variable is unset
+    /// there. `None` for every other kind.
+    ///
+    /// The name is parsed out of the text rather than stored, for the reason
+    /// [`Span::chip_codepoint`] gives: a name that could disagree with the
+    /// reference the user approved would be worse than no name. Only the
+    /// value has to be carried, and only because it is not in the text.
+    ///
+    /// This is what a window shows *beside* the reference. It is never a
+    /// substitute for it — see [`Span::display_text`], which draws a
+    /// `Variable` as its own text.
+    pub fn variable(&self) -> Option<(&str, Option<&str>)> {
+        match &self.kind {
+            SpanKind::Variable { resolved } => Some((
+                variable_name(&self.text).expect("a Variable span is exactly one reference"),
+                resolved.as_deref(),
+            )),
+            _ => None,
+        }
+    }
+
     /// What the UI draws: the chip label for a chip, the original text
     /// otherwise.
     ///
@@ -208,6 +265,60 @@ fn assert_chip_stands_for_one_codepoint(text: &str, kind: &SpanKind) {
             "a chip stands for exactly one codepoint, not {}: a label may not \
              hide more text than it replaces",
             text.chars().count()
+        );
+    }
+}
+
+/// The name inside `text`, if `text` is exactly one variable reference:
+/// `$NAME` or `${NAME}`, where `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// This is the whole of what hatch claims to understand about `$`. It lives
+/// here, beside the kind it bounds, rather than in the renderer that finds
+/// references: the model has to be able to reject a `Variable` on text that
+/// is not one, and a check that borrowed its definition from the pass it is
+/// checking would only ever confirm that pass agreed with itself.
+///
+/// Everything else is `None`, and a renderer that gets `None` must leave the
+/// text `Plain`. Positional and special parameters (`$1`, `$@`, `$?`, `$$`,
+/// `$*`, `$#`), brace expansions with a modifier (`${HOME:-/tmp}`,
+/// `${#HOME}`), command and arithmetic substitution (`$(id)`, `$((1+1))`) and
+/// an unterminated `${HOME` are all outside it. They are outside for one
+/// reason: a `Variable` span promises the reader a value out of the child
+/// environment, and for each of those the shell substitutes something that
+/// environment does not contain. Saying nothing is honest; guessing is not.
+pub fn variable_name(text: &str) -> Option<&str> {
+    let name = match text.as_bytes() {
+        [b'$', b'{', .., b'}'] => &text[2..text.len() - 1],
+        [b'$', ..] => &text[1..],
+        _ => return None,
+    };
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    let start = first.is_ascii_alphabetic() || first == '_';
+    let rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (start && rest).then_some(name)
+}
+
+/// The bound on [`SpanKind::Variable`], enforced where the kind meets the
+/// text it labels — the same move as [`assert_chip_stands_for_one_codepoint`]
+/// and for a related reason.
+///
+/// A chip is bounded because it draws something other than its text. A
+/// `Variable` draws its own text, but it carries a value *beside* it, and a
+/// value beside the wrong text misinforms the reader just as effectively. So
+/// the text a resolution may sit next to is exactly one reference: not a
+/// fragment of one, and not a reference plus its surroundings.
+///
+/// The message carries neither the text nor the value, so a panic cannot copy
+/// a command or an environment variable somewhere it was not approved for.
+fn assert_variable_is_one_reference(text: &str, kind: &SpanKind) {
+    if matches!(kind, SpanKind::Variable { .. }) {
+        assert!(
+            variable_name(text).is_some(),
+            "a Variable span is exactly one reference -- $NAME or ${{NAME}} -- and a \
+             {}-byte span is not one: a resolved value beside the wrong text is a \
+             claim about text that does not make it",
+            text.len()
         );
     }
 }
@@ -274,12 +385,14 @@ impl Spans {
     ///
     /// # Panics
     ///
-    /// If `index` is out of bounds, or the new kind is a chip and the span
-    /// stands for more than one codepoint. Retagging is the other way a chip
-    /// could come to cover a whole command, so it is checked here as well as
-    /// at construction.
+    /// If `index` is out of bounds, or the new kind does not fit the text it
+    /// is being put on: a chip over more than one codepoint, or a `Variable`
+    /// over text that is not exactly one reference. Retagging is the other
+    /// way either could happen, so both are checked here as well as at
+    /// construction.
     pub fn set_kind(&mut self, index: usize, kind: SpanKind) {
         assert_chip_stands_for_one_codepoint(self.spans[index].text(), &kind);
+        assert_variable_is_one_reference(self.spans[index].text(), &kind);
         self.spans[index].kind = kind;
     }
 
@@ -312,7 +425,10 @@ impl Spans {
     ///
     /// If `index` is out of bounds, or `at` does not fall strictly inside that
     /// span on a character boundary. A chip is one codepoint, so it has no
-    /// interior boundary and can never be split.
+    /// interior boundary and can never be split. A `Variable` has an interior
+    /// but no valid split: both halves would inherit the whole resolution
+    /// while covering part of the name, so `assert_variable_is_one_reference`
+    /// rejects them and the split panics. Retag first if a later pass really means to cut one up.
     pub fn split(&mut self, index: usize, at: usize) -> usize {
         let span = &self.spans[index];
         assert!(
@@ -662,6 +778,38 @@ mod tests {
     }
 
     #[test]
+    fn set_break_before_both_sets_and_clears_the_flag() {
+        // `retagging_and_relayout_cannot_change_the_text` only asks that this
+        // leaves the text alone, which a no-op does perfectly. Layout is the
+        // one thing a break is for, so it has to be asserted somewhere.
+        let (_, mut spans) = sample();
+        assert!(spans[2].break_before(), "the sample starts with one");
+        spans.set_break_before(2, false);
+        assert!(!spans[2].break_before());
+        spans.set_break_before(0, true);
+        assert!(spans[0].break_before());
+    }
+
+    #[test]
+    fn covers_source_really_checks_the_source() {
+        // The builder cannot produce a `Spans` that fails this, so every
+        // other use of it is an assertion that passes -- and would go on
+        // passing if it simply returned true. Building a broken one by hand
+        // here is the only way to require that it does not.
+        let (_, good) = sample();
+        assert!(good.covers_source());
+
+        let liar = Spans {
+            source: "different".to_string(),
+            spans: good.spans.clone(),
+        };
+        assert!(
+            !liar.covers_source(),
+            "spans that tile some other string do not tile this one"
+        );
+    }
+
+    #[test]
     fn covers_exactly_accepts_a_faithful_rendering() {
         let (source, spans) = sample();
         assert!(covers_exactly(&spans, &source));
@@ -709,5 +857,128 @@ mod tests {
             !covers_exactly(&[span], "abcd"),
             "a span whose text was rewritten must be caught even though its range still fits"
         );
+    }
+
+    // --- variables: a value may only sit beside the text it names ---------
+
+    #[test]
+    fn variable_name_accepts_exactly_the_two_forms_it_claims() {
+        for (text, name) in [
+            ("$HOME", "HOME"),
+            ("${HOME}", "HOME"),
+            ("$_", "_"),
+            ("$_a9", "_a9"),
+            ("$A", "A"),
+            ("${_a9}", "_a9"),
+        ] {
+            assert_eq!(variable_name(text), Some(name), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn variable_name_rejects_everything_outside_them() {
+        // Each of these is something the shell substitutes from somewhere
+        // other than the child environment, or is not one reference at all.
+        // A `None` here is what keeps the renderer from claiming a value.
+        for text in [
+            "", "$", "HOME", "$1", "$$", "$?", "$@", "$*", "$#", "$-", "$!", "${}", "${1}",
+            "${HOME:-/tmp}", "${#HOME}", "${HOME", "$HOME}", "${HOME}x", "x${HOME}", "$HO ME",
+            "$HOME $HOME", "$(id)", "$é", "${é}", "${HOME }",
+        ] {
+            assert_eq!(variable_name(text), None, "{text:?} must not read as a reference");
+        }
+    }
+
+    #[test]
+    fn a_variable_reports_its_name_and_the_value_beside_it() {
+        let mut builder = SpanBuilder::new("$HOME");
+        builder.push_rest(SpanKind::Variable {
+            resolved: Some("/home/user".to_string()),
+        });
+        let spans = builder.finish();
+        assert_eq!(spans[0].variable(), Some(("HOME", Some("/home/user"))));
+        assert_eq!(spans[0].text(), "$HOME");
+    }
+
+    #[test]
+    fn an_unset_variable_is_a_variable_with_no_value() {
+        let mut builder = SpanBuilder::new("$NOPE");
+        builder.push_rest(SpanKind::Variable { resolved: None });
+        let spans = builder.finish();
+        assert_eq!(spans[0].variable(), Some(("NOPE", None)));
+    }
+
+    #[test]
+    fn only_a_variable_reports_one() {
+        let (_, spans) = sample();
+        assert!(spans.iter().all(|s| s.variable().is_none()));
+    }
+
+    #[test]
+    fn a_variable_is_drawn_as_its_own_text_and_never_as_its_value() {
+        // Invariant 1b: only a chip may draw something other than its text.
+        // If the value were substituted here, the reader would approve
+        // `$HOME` while reading `/home/user`, and the two could differ by the
+        // time the command ran.
+        let mut builder = SpanBuilder::new("$HOME");
+        builder.push_rest(SpanKind::Variable {
+            resolved: Some("/home/user".to_string()),
+        });
+        let spans = builder.finish();
+        assert_eq!(spans[0].display_text(), "$HOME");
+        assert_eq!(unrender(&spans), "$HOME");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one reference")]
+    fn a_variable_may_not_be_built_over_more_than_a_reference() {
+        // The retagging hazard for a kind that carries derived data: a value
+        // beside `ls $HOME` is a claim about text that does not make it.
+        Span::new(
+            "ls $HOME",
+            0..8,
+            SpanKind::Variable {
+                resolved: Some("/home/user".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one reference")]
+    fn a_span_may_not_be_retagged_into_a_variable_it_does_not_name() {
+        let mut builder = SpanBuilder::new("sudo");
+        builder.push_rest(SpanKind::Plain);
+        builder.finish().set_kind(0, SpanKind::Variable { resolved: None });
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one reference")]
+    fn splitting_a_variable_is_refused_rather_than_duplicating_its_value() {
+        // `split` clones the kind into both halves, so without the check each
+        // of `$HO` and `ME` would claim the whole of `/home/user`. Nothing
+        // needs to split a reference; a pass that means to must retag first.
+        let mut builder = SpanBuilder::new("$HOME");
+        builder.push_rest(SpanKind::Variable {
+            resolved: Some("/home/user".to_string()),
+        });
+        builder.finish().split(0, 3);
+    }
+
+    #[test]
+    fn a_variable_carries_no_text_of_its_own_into_the_rendering() {
+        // The value is derived data hanging off the kind, and `unrender`
+        // ignores kinds entirely -- which is the reason it is allowed to be
+        // there at all.
+        let source = "ls $HOME";
+        let mut builder = SpanBuilder::new(source);
+        builder.push_to(3, SpanKind::Plain);
+        builder.push_rest(SpanKind::Variable {
+            resolved: Some("; rm -rf /".to_string()),
+        });
+        let spans = builder.finish();
+        assert_eq!(unrender(&spans), source);
+        assert!(spans.covers_source());
+        let shown: String = spans.iter().map(|s| s.display_text()).collect();
+        assert_eq!(shown, source, "and nothing of the value reaches the drawn line");
     }
 }

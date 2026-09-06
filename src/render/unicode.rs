@@ -155,6 +155,37 @@ fn is_invisible(c: char) -> bool {
     c.is_control() || INVISIBLE.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c))
 }
 
+/// The same substitution [`classify`] makes, applied to a string that is
+/// **not** part of the command: every character that must not be drawn as
+/// itself is replaced by the label that names it.
+///
+/// This is deliberately lossy, and that is only safe because of what it is
+/// used on. A span's text is approved text and may never be rewritten — hence
+/// chips, which keep the character and change only what is drawn. But hatch
+/// also puts a few strings in the same window that the user is *not*
+/// approving and that `unrender` never reads: the value of a `$VAR`, resolved
+/// out of the child environment. Those cannot be spans, because a span's text
+/// must come from the command; so they are flattened here instead, and the
+/// window renders the result as ordinary text.
+///
+/// The threat is not that the config file attacks its own owner. It is that
+/// the value is drawn beside agent-chosen text: the agent picks *which*
+/// variable to write, so it chooses which configured value appears on screen,
+/// and a value carrying a bidi override or a newline would reorder or split
+/// the line the command is being read on. Selection is enough — the agent
+/// never has to author the string to weaponise it.
+pub fn defang(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if is_plain(c) {
+            out.push(c);
+        } else {
+            out.push_str(&chip_label(c));
+        }
+    }
+    out
+}
+
 /// Classify `source` into plain runs and one chip per character that must not
 /// be drawn as itself.
 ///
@@ -227,7 +258,7 @@ pub struct ScanReport {
     /// Characters that carry no ink of their own or pass for a space,
     /// including ASCII controls. A subset of what chips, not of `non_ascii`.
     ///
-    /// A floor rather than an exact figure: it counts what [`INVISIBLE`]
+    /// A floor rather than an exact figure: it counts what `INVISIBLE`
     /// knows about, and that table is best-effort. Under-counting here costs
     /// a reader some context in the summary line and costs the display
     /// nothing, since every one of these characters chips either way.
@@ -599,5 +630,53 @@ mod tests {
         assert!(!is_invisible(' '), "an ordinary space is not what this counts");
         assert!(!is_invisible('\u{0430}'), "a homoglyph is visible; it is merely not what it looks like");
         assert!(is_invisible('\u{001b}'), "an ANSI escape carries no ink");
+    }
+
+    // --- defang: display-only text that is not part of the command --------
+
+    #[test]
+    fn defang_leaves_ordinary_text_exactly_as_it_is() {
+        for text in ["", "/home/user", "xterm-256color", "a b~!", "-"] {
+            assert_eq!(defang(text), text);
+        }
+    }
+
+    #[test]
+    fn defang_replaces_what_must_not_be_drawn_as_itself_with_its_label() {
+        assert_eq!(defang("/a\u{202E}b"), "/a[RLO]b");
+        assert_eq!(defang("a\nb\tc\rd"), "a[LF]b[TAB]c[CR]d");
+        assert_eq!(defang("x\u{200B}y\u{00A0}z"), "x[ZWSP]y[NBSP]z");
+        // An unnamed character still gets a label.
+        assert_eq!(defang("\u{1D7CE}"), "[U+1D7CE]");
+        assert_eq!(defang("ünïcödé"), "[U+00FC]n[U+00EF]c[U+00F6]d[U+00E9]");
+    }
+
+    #[test]
+    fn defang_output_is_entirely_drawable_as_itself() {
+        // The point of the function: whatever went in, what comes out can be
+        // put in a window beside agent-chosen text without reordering it,
+        // clearing a line, or hiding a character.
+        for text in [
+            "\u{202E}\u{200B}\u{00A0}\n\r\u{1b}[2K\u{9b}",
+            "а",
+            "\u{2069}\u{2066}",
+            "plain",
+        ] {
+            assert!(
+                defang(text).chars().all(is_plain),
+                "{text:?} defanged to something that is still not drawable"
+            );
+        }
+    }
+
+    #[test]
+    fn defang_is_not_a_span_and_says_so_by_being_lossy() {
+        // Deliberately not reversible, unlike everything the span model
+        // does. That is only safe because it is never applied to command
+        // text: a literal `[LF]` in a config value defangs to itself and
+        // becomes indistinguishable from a real newline's label. For approved
+        // text that ambiguity would be unacceptable, which is exactly why
+        // approved text gets chips instead.
+        assert_eq!(defang("[LF]"), defang("\n"));
     }
 }

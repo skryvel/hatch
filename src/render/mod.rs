@@ -6,38 +6,63 @@
 //! text. See that module for what the invariant is and why it is enforced by
 //! construction rather than by review.
 
+use std::collections::BTreeMap;
+
 pub mod command;
 pub mod danger;
 pub mod diff;
 mod span;
 pub mod unicode;
 
-pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender};
+pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, variable_name};
 
-/// Render a command for the approval window.
+/// Render a command for the approval window, against the environment it will
+/// actually run in.
 ///
-/// Two passes so far, and they compose through a single `SpanBuilder` rather
+/// Three passes. The first two compose through a single `SpanBuilder` rather
 /// than by splicing their results: [`command::segment`] walks the command,
 /// tags the separators it finds outside quotes and asks for a line break on
 /// each span that follows one, and hands every run in between to
 /// [`unicode::classify_into`], which draws as itself only what is
-/// unambiguously safe to draw and chips the rest.
+/// unambiguously safe to draw and chips the rest. The third,
+/// [`command::annotate_variables`], refines that result in place: it splits
+/// existing spans down to each `$NAME` and tags them with the value the child
+/// will see.
 ///
-/// Both passes are additive. Neither removes a character to make room for
-/// layout or for a label, which is what keeps `tests/fidelity.rs` green.
+/// Every pass is additive. None removes a character to make room for layout,
+/// for a label or for a value, which is what keeps `tests/fidelity.rs` green.
 ///
-/// The renderers still to come — variable and binary annotation, danger
-/// markers — refine this result the same way. That order is deliberate:
-/// `tests/fidelity.rs` passed before there was anything to break, so no later
-/// renderer can be written without it, and wiring each pass in here is what
-/// puts it under those properties.
-pub fn render_command(command: &str) -> Spans {
-    command::segment(command)
+/// # Why `env` is a parameter
+///
+/// It is the whole point of the third pass. hatch constructs the child
+/// environment rather than inheriting one, so there are three environments
+/// around — the daemon's, the sandbox's, and the one that will be handed to
+/// the command — and only the last is the one the window can speak for. A
+/// `$HOME` resolved against `std::env` would print a value that looks
+/// authoritative and is wrong. Callers pass
+/// [`crate::exec::env::build_child_env`]'s result, and there is deliberately
+/// no overload that supplies a default, because every available default is a
+/// guess.
+///
+/// The renderers still to come — binary annotation, danger markers — refine
+/// this result the same way. That order is deliberate: `tests/fidelity.rs`
+/// passed before there was anything to break, so no later renderer can be
+/// written without it, and wiring each pass in here is what puts it under
+/// those properties.
+pub fn render_command(command: &str, env: &BTreeMap<String, String>) -> Spans {
+    command::annotate_variables(command::segment(command), env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two-argument form is the only one there is, on purpose. These
+    /// tests are about wiring rather than about any particular environment,
+    /// so they mostly render against an empty one.
+    fn render_command(command: &str) -> Spans {
+        super::render_command(command, &BTreeMap::new())
+    }
 
     #[test]
     fn whole_command_is_one_plain_span() {
@@ -76,6 +101,22 @@ mod tests {
             .collect();
         assert_eq!(separators, vec![";"]);
         assert!(spans.iter().any(Span::break_before), "and the break it asked for");
+    }
+
+    #[test]
+    fn rendering_resolves_variables_against_the_environment_it_was_given() {
+        // The third wiring guard, here for the same reason as the two above:
+        // every invariant in `tests/fidelity.rs` holds trivially for one
+        // Plain span over the whole command, so nothing there would notice
+        // this pass being dropped out of this function. What it would cost is
+        // a window that says nothing about `$HOME` -- or, worse, a later
+        // edit that resolves it against the wrong environment, which is why
+        // the assertion is on the *value* and not merely on the tag.
+        let env = BTreeMap::from([("HOME".to_string(), "/home/user".to_string())]);
+        let spans = super::render_command("ls $HOME", &env);
+        let annotated: Vec<_> = spans.iter().filter_map(Span::variable).collect();
+        assert_eq!(annotated, vec![("HOME", Some("/home/user"))]);
+        assert_eq!(unrender(&spans), "ls $HOME", "and the reference still survives");
     }
 
     #[test]
