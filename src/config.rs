@@ -38,7 +38,9 @@ pub struct Config {
     pub exec_path: String,
     /// Terminal command used for interactive runs; argv, program first.
     pub terminal: Vec<String>,
-    /// Extra denylist patterns, appended to the built-in ones.
+    /// Extra denylist patterns, appended to the built-in ones. Each entry must
+    /// be an **absolute, literal path prefix**: `~` is not expanded and a
+    /// relative entry can never match, so either one silently protects nothing.
     pub denylist_extra: Vec<String>,
     /// The complete child environment, on top of `exec_path` as `PATH`.
     pub exec_env: BTreeMap<String, String>,
