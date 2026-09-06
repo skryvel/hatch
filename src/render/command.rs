@@ -13,8 +13,8 @@
 //!
 //! * The separator stays on screen as a [`SpanKind::Separator`] span at the
 //!   end of the segment it closes, drawn as itself and dimmed by the UI.
-//! * The line break is [`Span::break_before`] on the *following* span —
-//!   metadata beside the text, not an edit to it.
+//! * The line break is [`Span::break_before`](super::Span::break_before) on
+//!   the *following* span — metadata beside the text, not an edit to it.
 //!
 //! Nothing is trimmed either. `a; b` segments into `a`, `;`, ` b`: the space
 //! that happens to follow the separator is part of the command and stays in
@@ -30,25 +30,61 @@
 //!
 //! So the scanner tracks quoting: separators are recognised only outside
 //! quotes. It is not a shell parser and does not want to be. It answers one
-//! question — *is this byte a command boundary?* — and it is written to be
-//! wrong only in the direction of finding no boundary, never in the direction
-//! of inventing one.
+//! question — *is this byte a command boundary?* — and **for the two
+//! constructs it models, quoting and backslash escaping, it is wrong only in
+//! the direction of finding no boundary.**
 //!
-//! # What is not recognised, and what follows
+//! That qualifier is load-bearing and an earlier draft of these docs left it
+//! out, claiming flatly that the scanner never invents a boundary. It does.
+//! The guarantee stops where the model stops, and the next section says
+//! where that is in both directions — because a docs page that overstates
+//! its own safety argument is the same failure as a display that overstates
+//! what it shows.
 //!
-//! Five separators: `;`, `&&`, `||`, `|`, and a literal newline. Real shell
-//! structure this ignores includes backgrounding (`&`), subshells (`(`, `)`),
-//! and command substitution (`` ` `` and `$(`).
+//! # Where the model stops, and what it costs
 //!
-//! The consequence is bounded and it is always the same shape:
-//! **under-segmentation**. `sleep 60 & wait` draws as one segment though the
-//! shell runs two; `(cd /tmp; rm -rf x)` splits at the `;` but says nothing
-//! about the parentheses that nest it; `echo $(rm -rf /)` draws the whole
-//! substitution inside one segment. A reader is shown less structure than
-//! exists, never more, and every byte is still on screen drawn as itself —
-//! neither invariant is touched. `$(a; b)` is the one case worth naming for a
-//! later task: the `;` there is split, so a real boundary is shown at the
-//! wrong nesting level rather than a false one being invented.
+//! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting
+//! and backslash escaping around them. The rest of shell grammar is outside
+//! the model, and the cost falls in both directions.
+//!
+//! ## Under-segmentation: structure the shell has that the screen does not
+//!
+//! Backgrounding (`&`), subshells (`(`, `)`) and command substitution
+//! (`` ` `` and `$(`) are not recognised. `sleep 60 & wait` draws as one
+//! segment though the shell runs two; `(cd /tmp; rm -rf x)` splits at the `;`
+//! but says nothing about the parentheses that nest it; `echo $(rm -rf /)`
+//! draws the whole substitution inside one segment. `$(a; b)` is the case
+//! worth naming for a later task: the `;` there really is a boundary, so it
+//! is drawn at the wrong nesting level rather than fabricated.
+//!
+//! ## Over-segmentation: boundaries on screen the shell does not have
+//!
+//! A separator character that some unmodelled construct gives another meaning
+//! to is split on anyway. Each of these was checked against a real shell:
+//!
+//! * `echo a # b; c` — `; c` is inside a comment.
+//! * `echo $((1 || 0))` — arithmetic OR.
+//! * `[[ -n x || -n y ]]` — conditional OR.
+//! * `echo x >| out.txt` — `>|` is one redirection operator.
+//! * `$'a\'b; c'` — ANSI-C quoting, where `\'` does not end the string, so
+//!   the `;` is data.
+//! * A heredoc whose body contains `a; b` — the body is data.
+//! * `case x in a) echo 1;; esac` — `;;` is one `case` terminator, drawn as
+//!   two separators.
+//!
+//! ## Why neither direction breaks an invariant
+//!
+//! Both hold throughout: every byte is on screen, drawn as itself, and
+//! `unrender` still reproduces the command exactly. What is wrong in these
+//! cases is the *layout*, and layout here is metadata — a reader who
+//! distrusts a break can read straight through it and still see the command
+//! that will run, which is the whole reason breaks are not characters.
+//! Widening the model would move cases out of these two lists; it would not
+//! change what either invariant guarantees.
+//!
+//! Both lists are pinned by tests — `structure_outside_the_five_separators_
+//! is_left_unsegmented` and `over_segmentation_where_the_model_stops` — so a
+//! change in either direction has to be a deliberate one.
 
 use std::ops::Range;
 
@@ -134,7 +170,7 @@ fn boundaries(command: &str) -> Vec<Boundary> {
 
     while cursor < command.len() {
         let rest = &command[cursor..];
-        let c = rest.chars().next().expect("the cursor is on a character boundary");
+        let c = rest.chars().next().expect("cursor left a character boundary");
         let mut width = c.len_utf8();
 
         if escaped {
@@ -365,9 +401,9 @@ mod tests {
 
     #[test]
     fn an_unterminated_quote_protects_the_rest_of_the_command() {
-        // Under-segmentation, which is the direction this scanner is allowed
-        // to be wrong in: it shows less structure than the shell would find,
-        // rather than a boundary that is not there.
+        // Under-segmentation, which is the direction the scanner is allowed
+        // to be wrong in for the constructs it models: an open quote hides
+        // structure rather than fabricating it.
         assert!(separators(&render_command("echo 'a; b")).is_empty());
         assert_eq!(unrender(&render_command("echo 'a; b")), "echo 'a; b");
     }
@@ -463,17 +499,51 @@ mod tests {
         assert_eq!(unrender(&spans), "a\u{202E};\u{200B}b");
     }
 
-    // --- scope: what this pass deliberately does not recognise ------------
+    // --- scope: where the model stops, in both directions -----------------
 
     #[test]
     fn structure_outside_the_five_separators_is_left_unsegmented() {
-        // Not a wish list. These record the bounded cost of the scope: the
-        // reader is shown less structure than the shell will find, never a
-        // boundary that is not there. See the module docs.
+        // Not a wish list. These record one half of the bounded cost of the
+        // scope: structure the shell has that the screen does not. See the
+        // module docs, and the mirror below.
         assert!(separators(&render_command("sleep 60 & wait")).is_empty(), "backgrounding");
         assert!(separators(&render_command("(cd /tmp)")).is_empty(), "subshells");
         assert!(separators(&render_command("echo `id`")).is_empty(), "backticks");
         assert!(separators(&render_command("echo $(id)")).is_empty(), "substitution");
+    }
+
+    #[test]
+    fn over_segmentation_where_the_model_stops() {
+        // The other half, and the correction of a claim these docs used to
+        // make. The scanner is wrong only in the direction of finding no
+        // boundary *for the constructs it models* — quoting and escaping.
+        // A separator character that some unmodelled construct gives another
+        // meaning to is split on anyway. Each case was checked against a real
+        // shell; this test is what stops the list drifting from the docs.
+        assert_eq!(separators(&render_command("echo a # b; c")), vec![";"], "comment");
+        assert_eq!(separators(&render_command("echo $((1 || 0))")), vec!["||"], "arithmetic");
+        assert_eq!(separators(&render_command("[[ -n x || -n y ]]")), vec!["||"], "conditional");
+        assert_eq!(separators(&render_command("echo x >| out.txt")), vec!["|"], "redirection");
+        assert_eq!(separators(&render_command(r"$'a\'b; c'")), vec![";"], "ANSI-C quoting");
+        assert_eq!(separators(&render_command("cat <<EOF\na; b\nEOF")), vec![";"], "heredoc");
+        assert_eq!(
+            separators(&render_command("case x in a) echo 1;; esac")),
+            vec![";", ";"],
+            "the case terminator is one token, drawn as two separators"
+        );
+    }
+
+    #[test]
+    fn an_over_segmented_command_is_still_rendered_exactly() {
+        // The reason this is a docs bug and not a fidelity bug: what is wrong
+        // is the layout, and layout is metadata. Every byte is still on
+        // screen, drawn as itself.
+        for command in ["echo a # b; c", "case x in a) echo 1;; esac", "echo $((1 || 0))"] {
+            let spans = render_command(command);
+            assert_eq!(unrender(&spans), command);
+            let shown: String = spans.iter().map(|s| s.display_text()).collect();
+            assert_eq!(shown, command, "{command:?} is drawn as itself throughout");
+        }
     }
 
     #[test]
