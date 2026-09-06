@@ -55,6 +55,23 @@ pub enum LogVerdict {
 }
 
 impl LogVerdict {
+    /// Every verdict, once. A new variant belongs here as well as in the
+    /// exhaustive match below, so that callers and tests which must cover the
+    /// whole set have one list to read rather than a copy of their own.
+    pub const ALL: [LogVerdict; 11] = [
+        LogVerdict::Approve,
+        LogVerdict::Deny,
+        LogVerdict::Explain,
+        LogVerdict::Simplify,
+        LogVerdict::SelfRun,
+        LogVerdict::Timeout,
+        LogVerdict::ElevationFailed,
+        LogVerdict::Cancelled,
+        LogVerdict::Disconnected,
+        LogVerdict::PromptDied,
+        LogVerdict::Refused,
+    ];
+
     /// The verdict as it is written to the log. `Display` and the serialized
     /// tag are the same string, so a line printed by `hatch log` can be
     /// grepped for out of the file it came from.
@@ -235,8 +252,41 @@ impl AuditLog {
 fn render_line(line: &str) -> String {
     match serde_json::from_str::<AuditRecord>(line) {
         Ok(record) => record.summary(),
-        Err(_) => line.to_string(),
+        Err(_) => visible(line),
     }
+}
+
+/// Text that reaches the terminal, with the characters that command a
+/// terminal turned into the characters that name them.
+///
+/// Every string in a record is chosen by the agent, and the threat model is an
+/// agent that has been talked into lying. A newline in a `title` would let one
+/// record print as two, forging a benign entry and shifting the real one out
+/// of place; an ANSI escape would let it clear the line, recolour it or move
+/// the cursor. So C0, DEL and C1 are rendered rather than obeyed.
+///
+/// They are shown, not dropped: a title that contains an escape is itself
+/// worth seeing, and deleting it would hide the attempt. A literal backslash
+/// is left alone, because `\n` typed into a title is as harmless on screen as
+/// a real newline now is, and doubling every backslash would make the common
+/// case -- a command full of them -- harder to read. The stored JSONL is the
+/// record of what was actually written; this is only its rendering.
+fn visible(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // The rest of C0, DEL, and C1 -- everything else that can start an
+            // escape sequence or move the cursor.
+            c if (c as u32) < 0x20 || ('\u{7f}'..='\u{9f}').contains(&c) => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl AuditRecord {
@@ -247,11 +297,11 @@ impl AuditRecord {
             "{}  {:<16}  {}  |  {}",
             self.ts.format("%Y-%m-%d %H:%M:%S"),
             self.verdict,
-            self.title,
+            visible(&self.title),
             self.detail.summary()
         );
         if let Some(note) = &self.note {
-            line.push_str(&format!("  |  note: {note}"));
+            line.push_str(&format!("  |  note: {}", visible(note)));
         }
         line
     }
@@ -261,7 +311,8 @@ impl LogDetail {
     fn summary(&self) -> String {
         match self {
             LogDetail::RunCommand(run) => {
-                let mut s = format!("{} {}", if run.root { "#" } else { "$" }, run.command);
+                let mut s =
+                    format!("{} {}", if run.root { "#" } else { "$" }, visible(&run.command));
                 if let Some(code) = run.exit_code {
                     s.push_str(&format!("  (exit {code}"));
                     if let Some(ms) = run.duration_ms {
@@ -281,14 +332,15 @@ impl LogDetail {
                 s
             }
             LogDetail::SwapFile(swap) => {
-                let mut s = format!("{} {}", if swap.root { "#" } else { "$" }, swap.path);
+                let mut s =
+                    format!("{} {}", if swap.root { "#" } else { "$" }, visible(&swap.path));
                 if let Some(bytes) = swap.bytes {
                     s.push_str(&format!("  ({bytes} bytes"));
                     if let Some(mode) = &swap.mode {
-                        s.push_str(&format!(", {mode}"));
+                        s.push_str(&format!(", {}", visible(mode)));
                     }
                     if let Some(owner) = &swap.owner {
-                        s.push_str(&format!(", {owner}"));
+                        s.push_str(&format!(", {}", visible(owner)));
                     }
                     s.push(')');
                 }
@@ -486,14 +538,17 @@ mod tests {
     #[test]
     fn a_printed_verdict_is_the_tag_it_was_logged_under() {
         // `hatch log` output must be greppable against the file it came from.
-        use LogVerdict::*;
-        for v in [
-            Approve, Deny, Explain, Simplify, SelfRun, Timeout, ElevationFailed, Cancelled,
-            Disconnected, PromptDied, Refused,
-        ] {
+        for v in LogVerdict::ALL {
             let tag = serde_json::to_string(&v).unwrap();
             assert_eq!(format!("\"{v}\""), tag);
         }
+    }
+
+    #[test]
+    fn every_verdict_is_listed_once_in_all() {
+        let tags: std::collections::HashSet<_> =
+            LogVerdict::ALL.iter().map(|v| v.as_str()).collect();
+        assert_eq!(tags.len(), LogVerdict::ALL.len(), "a verdict is listed twice in ALL");
     }
 
     #[test]
@@ -522,6 +577,56 @@ mod tests {
 
         let alien = r#"{"ts":"2027-01-01T00:00:00+00:00","tool":"summon_daemon"}"#;
         assert_eq!(render_line(alien), alien, "an unreadable record must not vanish");
+
+        // A line this build cannot parse is a line it cannot vouch for
+        // either, so it is defanged on the way to the terminal like any other.
+        let hostile = "not json \u{1b}[2K\u{1b}[31m";
+        let shown = render_line(hostile);
+        assert!(!shown.contains('\u{1b}'), "no raw ESC: {shown:?}");
+        assert!(shown.contains("\\x1b[2K"), "shown, not dropped: {shown}");
+    }
+
+    #[test]
+    fn a_newline_in_a_title_cannot_forge_a_second_line() {
+        // The agent writes the title. If it could put a newline in one, a
+        // single refused record could print as two, inventing a benign entry
+        // and pushing the real one out of the position a reader expects.
+        let mut record = sample_record(LogVerdict::Refused);
+        record.title = "harmless\n2026-09-06 12:00:01  approve           Routine cleanup".into();
+        let line = record.summary();
+        assert_eq!(line.lines().count(), 1, "one record is one line: {line}");
+        assert!(!line.contains('\n'), "no raw newline: {line:?}");
+        assert!(line.contains("harmless\\n2026-09-06"), "shown, not dropped: {line}");
+    }
+
+    #[test]
+    fn an_ansi_escape_in_a_note_is_printed_not_obeyed() {
+        let mut record = sample_record(LogVerdict::Deny);
+        record.note = Some("\u{1b}[2K\u{1b}[31mnothing to see here\u{9b}0m".into());
+        let line = record.summary();
+        assert!(!line.contains('\u{1b}'), "no raw ESC: {line:?}");
+        assert!(!line.contains('\u{9b}'), "no raw C1 control: {line:?}");
+        assert!(line.contains("\\x1b[2K"), "the escape must still be visible: {line}");
+        assert!(line.contains("\\x9b"), "the C1 control must still be visible: {line}");
+    }
+
+    #[test]
+    fn control_characters_in_a_command_or_a_path_are_defanged() {
+        // The other two agent-controlled strings that reach the terminal.
+        let mut run = sample_record(LogVerdict::Approve);
+        if let LogDetail::RunCommand(detail) = &mut run.detail {
+            detail.command = "echo ok\r\u{1b}[Aeverything is fine".into();
+        }
+        let mut swap = swap_record();
+        if let LogDetail::SwapFile(detail) = &mut swap.detail {
+            detail.path = "/etc/hosts\n2026-09-06 12:00:01  approve".into();
+        }
+        for record in [run, swap] {
+            let line = record.summary();
+            assert_eq!(line.lines().count(), 1, "one record is one line: {line}");
+            assert!(!line.contains('\u{1b}'), "no raw ESC: {line:?}");
+            assert!(!line.contains('\r'), "no raw carriage return: {line:?}");
+        }
     }
 
     fn swap_record() -> AuditRecord {
