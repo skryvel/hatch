@@ -1,5 +1,5 @@
-//! `swap_file` validation and planning: everything decided before a human is
-//! asked anything.
+//! `swap_file`: everything decided before a human is asked anything, and
+//! everything decided again before a byte is written.
 //!
 //! [`validate`] is the set of refusals, and every one of them happens *before*
 //! a prompt exists. That placement is the point. Prompting for a request that
@@ -14,7 +14,10 @@
 //! nothing about the *content* — that is [`crate::render::diff`] — only about
 //! the file: create or replace, at what mode, owned by whom, over what.
 //!
-//! Applying is Task 13's; nothing here writes.
+//! [`apply`] is what happens after a human says yes: the same checks again,
+//! because everything the other two established was established before a
+//! person spent time reading, and then one `rename` that either happened or
+//! did not.
 //!
 //! # The order of the checks, and what each one buys
 //!
@@ -94,16 +97,122 @@
 //! attributes, a full disk and a read-only mount are all discovered at apply
 //! time, and a prompt that promised otherwise would be lying. Validation
 //! refuses what is *knowably* wrong, not everything that could fail.
+//!
+//! # Applying: everything is re-checked, and one window stays open
+//!
+//! [`apply`] runs after a human has said yes, and the gap between the plan the
+//! human read and the write it authorises is a human-sized one: seconds while
+//! they read the diff, minutes if they went to look something up. Everything
+//! [`validate`] and [`plan`] established was established at the start of that
+//! gap. So none of it is trusted, and [`apply`] establishes all of it again,
+//! in this order:
+//!
+//! 1. **[`validate`] in full**, not the hash alone. This is what re-closes the
+//!    symlinked-ancestor bypass: `/tmp/x/config.toml` where `/tmp/x` became a
+//!    link to `~/.hatch` while the prompt was up is a *different file* under
+//!    the same name, and a content hash cannot see that, because the hash only
+//!    ever describes whichever file the name currently means — which for a
+//!    create is quite legitimately no file at all. It also re-closes the
+//!    target itself becoming a symlink, the parent being replaced by a file,
+//!    and the parent being removed.
+//! 2. **The content hash**, compared as [`Option`] against
+//!    [`SwapPlan::hash_before`]. Step 1 defends the path; this defends the
+//!    human's decision. They approved a diff against particular bytes, and if
+//!    those bytes moved — edited, replaced, deleted, or created where nothing
+//!    was — the diff they read is not the change this would make. Comparing
+//!    the options rather than the strings is what makes "a file appeared under
+//!    an approved create" visible; see [`SwapPlan::hash_before`].
+//! 3. **The staged file's own mode, uid and gid**, by `fstat` on the
+//!    descriptor, against what the window said. See "What a rename does not
+//!    preserve" below.
+//! 4. **`RENAME_NOREPLACE` for a create**, which is the kernel making check 2
+//!    again, atomically, for the microseconds after hatch made it.
+//!
+//! Nothing is created on disk until all of 1 and 2 have passed, which is why a
+//! refusal leaves the directory byte-for-byte as it was rather than a
+//! half-written neighbour to explain.
+//!
+//! ## The residual
+//!
+//! Between the last syscall of step 1 and the `rename` of step 4 there is a
+//! window of microseconds, and it is not closed. An attacker who already has
+//! write access to a *directory* in the path can, in that window, replace that
+//! directory with a symbolic link, and the rename will resolve the new one and
+//! land the file somewhere hatch did not check.
+//!
+//! Two things bound it. The first is that it is microseconds rather than
+//! minutes: re-running the checks does not close the window, it collapses it
+//! from human time to syscall time, which is the whole reason step 1 exists.
+//! The second is that `rename(2)` never follows a symbolic link in its *final*
+//! component — it replaces the link itself — so the final component being
+//! swapped, which is the easy half of the attack, cannot redirect the bytes
+//! anywhere; the worst it achieves is that the approved content lands under
+//! the approved name and a link is gone.
+//!
+//! Closing the directory half properly means never naming the parent twice:
+//! opening it once with `O_DIRECTORY` during validation and using `openat` and
+//! `renameat` against that descriptor thereafter, so that the write goes to an
+//! inode rather than to a path that can be re-pointed. That is a worthwhile
+//! change and it is not made here, because it means abandoning
+//! [`tempfile::NamedTempFile`]'s staging and writing the `openat`/`linkat`
+//! dance by hand, which is a larger and more dangerous piece of code than the
+//! one it protects. It is recorded as the way in, not waved away.
+//!
+//! ## What a rename does not preserve
+//!
+//! A swap is not an edit. `rename` replaces the target's directory entry with
+//! *this process's* file, and that file has this process's uid and gid — so a
+//! replacement of a file belonging to somebody else, in a directory hatch can
+//! write to, silently transfers the file to whoever hatch runs as. The window
+//! said `owner: www-data`; the file would come out owned by the user.
+//!
+//! So step 3 `fstat`s the staged descriptor and refuses
+//! ([`ApplyError::NotAsApproved`]) unless its mode, uid and gid are the ones
+//! the window stated. The same check catches the kernel silently dropping a
+//! setgid bit from an `fchmod` by a user who is not in the file's group. A
+//! request that genuinely has to keep another owner is a root request, and
+//! root requests are `install`'s, not this function's.
+//!
+//! The mirror of that check lives in `created_group`: a directory with the
+//! setgid bit gives its own group to files created inside it, so the plan has
+//! to say so, or step 3 would refuse every create in `/srv` and every shared
+//! project tree forever.
+//!
+//! ## Durability
+//!
+//! The staged file is `fsync`ed before the rename. The directory is not
+//! `fsync`ed after it.
+//!
+//! The asymmetry is deliberate and it is about which crash costs the user
+//! something. Without the first, a machine that loses power just after the
+//! rename can come back with the directory entry pointing at a file whose data
+//! never reached the disk: the old contents gone and the new contents not
+//! there either, which is the one outcome that is worse than both of the
+//! honest ones. It costs one flush of bytes a human is already waiting on, in
+//! a workflow gated on a human clicking a button, so it is bought without
+//! hesitation.
+//!
+//! Without the second, the same crash can lose the rename itself, and the user
+//! comes back to the old file with the change simply not applied — safe, and
+//! recoverable by asking again. What it costs instead is honesty: `fsync` on
+//! the directory can only be issued *after* the rename has already happened,
+//! so a failure there would have to be reported as a failure of a write that
+//! in fact succeeded, or swallowed silently. Neither is worth having in
+//! exchange for turning one safe outcome into another safe outcome. The
+//! accepted residual is that hatch's audit log can record `applied` for a swap
+//! a crash then loses; a caller that needs more than that can `fsync` the
+//! directory itself.
 
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use nix::unistd::{Gid, Group, Uid, User, getegid, geteuid};
+use tempfile::NamedTempFile;
 use sha2::{Digest, Sha256};
 
 use crate::denylist::Denylist;
@@ -442,7 +551,7 @@ pub struct SwapPlan {
     /// there is no file.
     ///
     /// `None` rather than the hash of no bytes, and the distinction is
-    /// load-bearing for Task 13. The re-check before applying has to catch
+    /// load-bearing for [`apply`]. The re-check before writing has to catch
     /// "the file appeared between the plan and the apply", and an empty file
     /// hashes to `e3b0c442…` — the same value a hash-of-nothing convention
     /// would store for absence. The two would then be indistinguishable, and a
@@ -511,16 +620,19 @@ pub fn plan(path: &Path, content: &[u8], root: bool) -> anyhow::Result<SwapPlan>
             landing_mode: md.permissions().mode() & 0o7777,
             landing_owner: Principal::user(md.uid()),
             landing_group: Principal::group(md.gid()),
-            hash_before: Some(hash_file(path)?),
+            hash_before: Some(
+                hash_file(path).with_context(|| format!("reading {}", path.display()))?,
+            ),
             size_delta: delta(content.len(), md.len()),
         }),
         None => {
             let (uid, gid) = if root {
                 (0, 0)
             } else {
-                // The effective ids, because they are what the kernel will
-                // stamp on a file this process creates.
-                (geteuid().as_raw(), getegid().as_raw())
+                // What the kernel will stamp on a file this process creates
+                // here — which is not simply the effective ids, see
+                // `created_group`.
+                (geteuid().as_raw(), created_group(path))
             };
             Ok(SwapPlan {
                 kind: PlanKind::Create,
@@ -542,21 +654,44 @@ fn delta(after: usize, before: u64) -> i64 {
     after as i64 - before as i64
 }
 
+/// The group a file created at `path` would belong to.
+///
+/// Normally the process's effective gid, but a directory carrying the setgid
+/// bit hands its own group to everything created inside it, and `/srv`,
+/// `/var/www` and shared project trees are routinely set up that way. Stating
+/// the effective gid there would put a group in the window that the file does
+/// not end up with, and [`apply`]'s landing check — which refuses to write
+/// anything the window did not describe — would then refuse every create in
+/// such a directory, permanently and for no reason the user could act on.
+///
+/// A parent that cannot be examined falls back to the effective gid rather
+/// than failing: [`validate`] has already established that it is a directory,
+/// and a plan is not the place to relitigate that.
+fn created_group(path: &Path) -> u32 {
+    let egid = getegid().as_raw();
+    let Some(parent) = path.parent() else { return egid };
+    match fs::metadata(parent) {
+        Ok(md) if md.mode() & 0o2000 != 0 => md.gid(),
+        _ => egid,
+    }
+}
+
 /// Lowercase hex SHA-256 of the file at `path`, streamed.
 ///
 /// The same form and the same algorithm as
 /// [`crate::render::diff::render_content`]'s summary hash, so a user comparing
 /// the metadata panel against the diff panel — or against `sha256sum` in a
 /// terminal — sees one number and not two.
-fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+///
+/// The error is the operating system's, unwrapped: [`plan`] wants it as
+/// context on an `anyhow` chain and [`hash_now`] wants to ask it whether the
+/// file was simply absent, and only one of those survives a `with_context`.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_CHUNK];
     loop {
-        let read = file
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let read = file.read(&mut buf)?;
         if read == 0 {
             break;
         }
@@ -572,6 +707,368 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+// ---- applying -------------------------------------------------------------
+
+/// Why an approved swap did not happen.
+///
+/// Every variant carries the same fact about the filesystem: **nothing was
+/// written, and the file that is there was not touched.** That is the property
+/// the whole module exists to hold, so it is stated once here rather than
+/// re-derived at each call site, and every [`fmt::Display`] text says it in
+/// words as well, because the sentence reaches a human and an agent that both
+/// have to know whether to retry.
+///
+/// Like [`Refusal`], this is a message as much as a control-flow value, and it
+/// carries owned strings rather than an [`std::io::Error`] so that it can be
+/// compared and logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyError {
+    /// The path stopped being one hatch will write to, between the approval
+    /// and the write. [`validate`] is re-run immediately before the swap and
+    /// this is whatever it said the second time.
+    ///
+    /// The interesting member is [`Refusal::Denied`]: a directory in the path
+    /// having become a symbolic link into the protected set is the one attack
+    /// the content hash cannot see, because the file at the resolved path is a
+    /// *different* file that may perfectly well be absent, exactly as a create
+    /// expects.
+    Refused(Refusal),
+    /// The bytes on disk are not the bytes the plan was made against, so the
+    /// diff the human read is not the change that would happen.
+    ///
+    /// Both fields are [`Option`] and the comparison is between the options,
+    /// not between the strings: `None` against `Some` is a file that appeared
+    /// under an approved create, and `Some` against `None` is one that was
+    /// deleted under an approved replacement. Reducing either to "the hash
+    /// differs" would let a file the user never saw be destroyed by a plan
+    /// that was made when nothing was there.
+    ///
+    /// # On naming the hashes
+    ///
+    /// The message states both. That is a disclosure — it tells the agent the
+    /// SHA-256 of bytes it was never shown — and the trade is the same shape
+    /// as [`Refusal::Symlink`]'s and comes out the same way. It is reachable
+    /// only for a path a human has already approved a write to, of a file
+    /// hatch could read as the user it runs as; the plan's own hash was
+    /// already on the screen that human approved; and without both numbers
+    /// neither the human nor the agent can tell which version is on disk, so
+    /// the message would be unactionable at the one moment it matters.
+    Drift {
+        /// The hash the plan was made against, `None` if the file did not
+        /// exist then.
+        expected: Option<String>,
+        /// The hash of what is there now, `None` if nothing is.
+        found: Option<String>,
+    },
+    /// A create lost the last instant: between the drift check and the rename,
+    /// a file appeared at the path, and the rename refused to overwrite it.
+    ///
+    /// Distinct from [`ApplyError::Drift`] because it is a different mechanism
+    /// answering at a different time — the kernel's, inside `renameat2`, with
+    /// no chance to look at what it found. To a caller both mean "the world
+    /// moved, ask again"; to a reader of the audit log the difference says how
+    /// narrow the race was.
+    Collision,
+    /// The staged file cannot be made into the file the window described.
+    ///
+    /// The window states a mode and an owner, and a rename replaces the target
+    /// with *this process's* file, at this process's uid and gid. So a
+    /// replacement of a file belonging to somebody else does not preserve
+    /// their ownership — it silently transfers the file to whoever hatch runs
+    /// as. Rather than do that, hatch refuses and says so.
+    NotAsApproved {
+        /// What the approved plan said the file would be.
+        approved: String,
+        /// What this process can actually produce.
+        staged: String,
+    },
+    /// The write failed for an ordinary operating-system reason: a directory
+    /// that cannot be written into, a read-only mount, a full disk, a
+    /// directory that has since been removed.
+    ///
+    /// [`validate`] deliberately does not check writability — a prompt that
+    /// promised the write would succeed would be lying — so these first appear
+    /// here, after a human has already said yes. The text therefore has to be
+    /// worth reading: what was being attempted, what the system said, and
+    /// where that leaves the reader.
+    Failed {
+        /// What was being attempted, naming the path it was attempted on.
+        doing: String,
+        /// The operating system's reason, as text.
+        error: String,
+        /// What the reader can do about it, when the error kind is one with a
+        /// known answer.
+        remedy: Option<&'static str>,
+    },
+}
+
+impl fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApplyError::Refused(refusal) => write!(
+                f,
+                "hatch re-checked the path immediately before writing and refused it, so \
+                 nothing was written: {refusal}"
+            ),
+            ApplyError::Drift { expected: None, found: Some(found) } => write!(
+                f,
+                "a file appeared at this path after the request was approved (it is now sha256 \
+                 {found}); nothing was written and it was not touched"
+            ),
+            ApplyError::Drift { expected: Some(expected), found: None } => write!(
+                f,
+                "the file was deleted after the request was approved (it was sha256 {expected}); \
+                 nothing was written"
+            ),
+            ApplyError::Drift { expected: Some(expected), found: Some(found) } => write!(
+                f,
+                "the file changed after the request was approved: it was sha256 {expected} and is \
+                 now sha256 {found}; nothing was written, because the diff that was approved is \
+                 not the change this would make"
+            ),
+            // Not reachable while the only constructor is a comparison that
+            // found a difference, since `None` and `None` are equal. Worded so
+            // that it still says the true and useful thing if it ever is.
+            ApplyError::Drift { expected: None, found: None } => f.write_str(
+                "the file changed after the request was approved; nothing was written",
+            ),
+            ApplyError::Collision => f.write_str(
+                "a file appeared at this path in the instant before the write; nothing was \
+                 written and it was not touched",
+            ),
+            ApplyError::NotAsApproved { approved, staged } => write!(
+                f,
+                "the window said the file would land as {approved}, and a write from this process \
+                 would leave it as {staged}; nothing was written, because hatch will not apply \
+                 something other than what was approved — a change that keeps another owner has \
+                 to be applied as root"
+            ),
+            ApplyError::Failed { doing, error, remedy } => {
+                write!(f, "{doing} failed: {error}; nothing was written")?;
+                match remedy {
+                    Some(remedy) => write!(f, " — {remedy}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+/// Write `content` to `path` as `plan` described it, or write nothing at all.
+///
+/// The steps are the module documentation's "Applying" section; the short
+/// version is validate again, hash again, stage a neighbour, set its mode,
+/// check it is what was promised, flush it, rename it into place.
+///
+/// **Preconditions: `plan` came from [`plan`] for this same `path`, and a human
+/// approved what it described.** `apply` re-establishes what it can of that on
+/// its own — it never trusts the earlier [`validate`] — but it cannot know
+/// whether anybody was asked, and it applies a plan it is given.
+///
+/// This is the unelevated write, performed as whoever runs hatch. A request
+/// that needs root is a different mechanism (`install` under the elevation
+/// path), and a plan whose landing owner this process cannot produce is
+/// refused here rather than quietly applied as somebody else.
+pub fn apply(
+    path: &Path,
+    content: &[u8],
+    plan: &SwapPlan,
+    deny: &Denylist,
+) -> Result<(), ApplyError> {
+    // 1. The path, again, in full. Not the hash alone: the hash cannot see a
+    //    path that has become a symlink or an ancestor that now resolves into
+    //    the protected set, because those change *which file* the name means,
+    //    and the hash only ever describes whichever file that is.
+    validate(path, deny).map_err(ApplyError::Refused)?;
+
+    // 2. The bytes, again. This is the check that defends the human's
+    //    decision rather than the path: they approved a diff against a
+    //    specific file, and if those bytes moved, the diff they read is not
+    //    the change this would make.
+    let found = hash_now(path)?;
+    if found != plan.hash_before {
+        return Err(ApplyError::Drift { expected: plan.hash_before.clone(), found });
+    }
+
+    // Nothing has been created yet and nothing will be if either check above
+    // refused, which is what makes a refusal leave the directory exactly as it
+    // was.
+    let Some(parent) = path.parent() else {
+        // Only `/` has no parent, and validation has already refused it as a
+        // directory. Fail closed rather than reason about a case that cannot
+        // arrive, exactly as `validate` does with the same shape.
+        return Err(ApplyError::Refused(Refusal::MissingParent { parent: path.to_path_buf() }));
+    };
+
+    // 3. Stage a neighbour: the same directory, therefore the same filesystem,
+    //    therefore a `rename` that is a rename. `NamedTempFile::new()` would
+    //    put it under $TMPDIR, and a rename across filesystems does not
+    //    silently copy — it fails with EXDEV, after the user has already said
+    //    yes. `tempfile` creates it 0600 and O_EXCL.
+    let mut staged = NamedTempFile::new_in(parent)
+        .map_err(|e| failed(format!("creating a temporary file in {}", parent.display()), &e))?;
+
+    // 4. All of the content, before the mode is widened. The order matters:
+    //    between the temporary file's creation and the `fchmod` it is readable
+    //    only by hatch's own user, so no half-written prefix is ever visible
+    //    at the mode the finished file will carry — which for a 0644 target is
+    //    a partial read by anybody and for a setuid one is a partial
+    //    *executable*.
+    staged
+        .as_file_mut()
+        .write_all(content)
+        .map_err(|e| failed(format!("writing a temporary file in {}", parent.display()), &e))?;
+
+    // 5. The mode the window stated, all twelve bits, on the file descriptor
+    //    rather than on the path. `fchmod` cannot be pointed at another file
+    //    by anything that happens to the temporary name in the meantime, which
+    //    `fs::set_permissions` on the path could be.
+    staged
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(plan.landing_mode))
+        .map_err(|e| {
+            failed(format!("setting the mode of a temporary file in {}", parent.display()), &e)
+        })?;
+
+    // 6. Confirm, on the same descriptor, that the thing about to be renamed
+    //    into place is the thing the window described. The kernel is entitled
+    //    to disagree with both of the previous steps: a setgid bit is dropped
+    //    on an `fchmod` by a user who is not in the file's group, and the uid
+    //    and gid of the staged file are this process's, which are not the
+    //    owner of a file that belongs to somebody else.
+    //
+    //    Compared as numbers and only *printed* as names: a uid that resolves
+    //    to a name in one moment and not the next — a directory service that
+    //    blinked, a container-mapped id — must not be able to turn a correct
+    //    write into a refusal.
+    let md = staged
+        .as_file()
+        .metadata()
+        .map_err(|e| failed(format!("examining a temporary file in {}", parent.display()), &e))?;
+    if md.mode() & 0o7777 != plan.landing_mode
+        || md.uid() != plan.landing_owner.id
+        || md.gid() != plan.landing_group.id
+    {
+        return Err(ApplyError::NotAsApproved {
+            approved: landing(plan.landing_mode, &plan.landing_owner, &plan.landing_group),
+            staged: landing(
+                md.mode() & 0o7777,
+                &Principal::user(md.uid()),
+                &Principal::group(md.gid()),
+            ),
+        });
+    }
+
+    // 7. Durability, as far as it is worth paying for. See the module docs:
+    //    the data is flushed, the directory entry is not.
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|e| failed(format!("flushing a temporary file in {}", parent.display()), &e))?;
+
+    // 8. One rename, which either happened or did not.
+    land(staged, path, plan.kind)
+}
+
+/// The rename, and the difference between a replacement and a create.
+///
+/// Split out from [`apply`] because it is the one step that is not a check,
+/// and because the choice of syscall here is the difference between replacing
+/// the file the user was shown and destroying one they never saw: a create
+/// must not overwrite, a replacement must.
+///
+/// `persist` is `rename(2)` and clobbers. `persist_noclobber` is
+/// `renameat2(RENAME_NOREPLACE)`, falling back to `link(2)`, and fails with
+/// `EEXIST` instead. [`ApplyError::Drift`] has already refused the create whose
+/// file appeared while a human was reading; this is the same refusal for the
+/// microseconds after that check, made by the kernel, atomically.
+fn land(staged: NamedTempFile, path: &Path, kind: PlanKind) -> Result<(), ApplyError> {
+    let landed = match kind {
+        PlanKind::Replace => staged.persist(path),
+        PlanKind::Create => staged.persist_noclobber(path),
+    };
+    match landed {
+        Ok(_) => Ok(()),
+        // The temporary file is inside the error and is deleted when it drops,
+        // so a failed rename leaves the directory as it found it.
+        Err(e) if kind == PlanKind::Create && e.error.kind() == ErrorKind::AlreadyExists => {
+            Err(ApplyError::Collision)
+        }
+        Err(e) => Err(failed(
+            format!("renaming a temporary file into place at {}", path.display()),
+            &e.error,
+        )),
+    }
+}
+
+/// The hash of whatever is at `path` right now, `None` when nothing is.
+///
+/// The `None` is the whole reason this is not [`hash_file`]: absence has to
+/// survive as absence all the way to the comparison, or a file appearing under
+/// an approved create is indistinguishable from an empty one.
+fn hash_now(path: &Path) -> Result<Option<String>, ApplyError> {
+    match hash_file(path) {
+        Ok(hash) => Ok(Some(hash)),
+        Err(e) if is_absent(&e) => Ok(None),
+        Err(e) => Err(failed(format!("re-reading {}", path.display()), &e)),
+    }
+}
+
+/// A mode and an owner as one sentence, so that what was approved and what
+/// would land are compared and printed as the same kind of thing.
+///
+/// Four octal digits, because a setuid or sticky file that quietly lost a bit
+/// is exactly what a reader has to be able to see.
+fn landing(mode: u32, owner: &Principal, group: &Principal) -> String {
+    format!("mode {mode:04o}, owned by {owner}:{group}")
+}
+
+/// An [`ApplyError::Failed`] with the operating system's reason and, where
+/// there is one, what to do about it.
+fn failed(doing: String, e: &std::io::Error) -> ApplyError {
+    ApplyError::Failed { doing, error: e.to_string(), remedy: remedy(e.kind()) }
+}
+
+/// What a reader can do about an error kind, for the four or five that a swap
+/// actually meets.
+///
+/// A bare `Permission denied (os error 13)` is true and useless: hatch knows
+/// something the reader may not, which is that it writes as the user it runs
+/// as and that the same request applied as root is a different question. The
+/// kinds with no honest advice get none rather than a guess.
+fn remedy(kind: ErrorKind) -> Option<&'static str> {
+    match kind {
+        ErrorKind::PermissionDenied => Some(
+            "hatch writes as the user it runs as; either the directory's permissions have to \
+             change or the request has to be made again as a root request",
+        ),
+        ErrorKind::ReadOnlyFilesystem => Some(
+            "the filesystem is mounted read-only, so nothing can be written there until it is \
+             remounted",
+        ),
+        ErrorKind::StorageFull => {
+            Some("the filesystem is full; free some space and ask again")
+        }
+        ErrorKind::QuotaExceeded => {
+            Some("the disk quota for the user hatch runs as is exhausted")
+        }
+        ErrorKind::NotFound => Some(
+            "the directory was there when the request was approved and is not now; ask again if \
+             it is meant to be recreated",
+        ),
+        // EXDEV. Unreachable while the temporary file is a neighbour of the
+        // target, and worth saying plainly if it ever is reached, because it
+        // means the swap stopped being atomic.
+        ErrorKind::CrossesDevices => Some(
+            "the temporary file was not on the target's filesystem, which is a bug in hatch: the \
+             swap is only atomic when the two are the same",
+        ),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1197,4 +1694,430 @@ mod tests {
         assert!(!is_absent(&Error::from(ErrorKind::PermissionDenied)));
         assert!(!is_absent(&Error::from(ErrorKind::Other)));
     }
+
+    // ---- apply: what is re-checked, and what each re-check catches --------
+
+    /// The names in a directory, sorted, for the tests that care that nothing
+    /// was left behind.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_re_check_catches_an_ancestor_that_became_a_symlink_into_protected_space() {
+        // The reason `apply` re-runs the whole of `validate` and not only the
+        // hash. At plan time `victim/sub` is an ordinary directory and the
+        // target does not exist. While the human reads the diff, `sub` becomes
+        // a link into the protected directory — and the *hash* still says
+        // exactly what it said before, because there is still no file at the
+        // resolved path. Only the path check can see this, and without it the
+        // approved bytes land inside hatch's own state.
+        let victim = tempfile::tempdir().unwrap();
+        let protected = tempfile::tempdir().unwrap();
+        let deny = deny_dir(&fs::canonicalize(protected.path()).unwrap());
+
+        let sub = victim.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let target = sub.join("file");
+
+        let p = plan(&target, b"payload", false).unwrap();
+        assert_eq!(p.kind, PlanKind::Create);
+        assert_eq!(validate(&target, &deny), Ok(()), "it was allowed when the plan was made");
+
+        fs::remove_dir(&sub).unwrap();
+        std::os::unix::fs::symlink(protected.path(), &sub).unwrap();
+
+        assert_eq!(
+            hash_now(&target),
+            Ok(None),
+            "the hash cannot see it: there is still nothing at the name"
+        );
+        assert_eq!(
+            apply(&target, b"payload", &p, &deny),
+            Err(ApplyError::Refused(Refusal::Denied))
+        );
+        assert_eq!(entries(protected.path()), [] as [String; 0], "and nothing reached it");
+    }
+
+    #[test]
+    fn the_re_check_catches_a_target_that_became_a_symlink() {
+        // The same blindness, one component further down: a dangling link
+        // hashes as absence, which is precisely what an approved create
+        // expects to find.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f");
+        let p = plan(&target, b"payload", false).unwrap();
+
+        std::os::unix::fs::symlink("nowhere", &target).unwrap();
+
+        assert_eq!(hash_now(&target), Ok(None), "a dangling link reads as nothing there");
+        assert_eq!(
+            apply(&target, b"payload", &p, &deny()),
+            Err(ApplyError::Refused(Refusal::Symlink { target: PathBuf::from("nowhere") }))
+        );
+        assert!(
+            fs::symlink_metadata(&target).unwrap().file_type().is_symlink(),
+            "the link is still a link, and nothing was written through it or over it"
+        );
+    }
+
+    #[test]
+    fn a_create_will_not_overwrite_and_a_replacement_will() {
+        // The syscall choice, isolated: the drift check has already refused
+        // the create whose file appeared while a human was reading, so this is
+        // the same refusal for the microseconds afterwards, and it is the
+        // kernel's rather than hatch's.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f");
+        fs::write(&target, "theirs").unwrap();
+
+        let mut staged = NamedTempFile::new_in(dir.path()).unwrap();
+        staged.as_file_mut().write_all(b"ours").unwrap();
+        assert_eq!(land(staged, &target, PlanKind::Create), Err(ApplyError::Collision));
+        assert_eq!(fs::read(&target).unwrap(), b"theirs", "a create never destroys");
+        assert_eq!(entries(dir.path()), ["f"], "and the temporary file went with the refusal");
+
+        let mut staged = NamedTempFile::new_in(dir.path()).unwrap();
+        staged.as_file_mut().write_all(b"ours").unwrap();
+        assert_eq!(land(staged, &target, PlanKind::Replace), Ok(()));
+        assert_eq!(fs::read(&target).unwrap(), b"ours", "a replacement always does");
+        assert_eq!(entries(dir.path()), ["f"]);
+
+        // A rename that fails for any other reason is a failure and says so.
+        // Only `EEXIST`, and only under a create, means the thing that was
+        // already there was left alone on purpose; reporting anything else as
+        // a collision would tell a reader a file exists that does not.
+        let gone = dir.path().join("gone").join("f");
+        for kind in [PlanKind::Create, PlanKind::Replace] {
+            let staged = NamedTempFile::new_in(dir.path()).unwrap();
+            match land(staged, &gone, kind) {
+                Err(ApplyError::Failed { doing, .. }) => {
+                    assert!(doing.contains("renaming"), "{doing}");
+                    assert!(doing.contains(&gone.display().to_string()), "{doing}");
+                }
+                other => panic!("expected a rename failure for {kind:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(entries(dir.path()), ["f"], "and each one took its temporary file with it");
+    }
+
+    #[test]
+    fn the_approved_mode_lands_including_the_bits_a_umask_would_have_eaten() {
+        // Twelve bits from the plan, on the file that lands, whatever the
+        // temporary file was created at and whatever the process umask says.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        fs::write(&f, "old").unwrap();
+        set_mode(&f, 0o4711);
+
+        let p = plan(&f, b"new", false).unwrap();
+        assert_eq!(p.landing_mode, 0o4711);
+        apply(&f, b"new", &p, &deny()).unwrap();
+
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o4711);
+        assert_eq!(fs::read(&f).unwrap(), b"new");
+    }
+
+    #[test]
+    fn an_apply_that_would_change_the_files_owner_is_refused() {
+        // A rename hands the name to *this process's* file, so a replacement
+        // of somebody else's file quietly transfers it. Simulated by a plan
+        // that says root, because a test cannot make a file it does not own.
+        if geteuid().is_root() {
+            eprintln!("skipped: running as root, where the plan and the process agree");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        fs::write(&f, "old").unwrap();
+        set_mode(&f, 0o600);
+        let mut p = plan(&f, b"new", false).unwrap();
+        p.landing_owner = Principal::user(0);
+
+        match apply(&f, b"new", &p, &deny()) {
+            Err(ApplyError::NotAsApproved { approved, staged }) => {
+                assert!(approved.contains("root"), "{approved}");
+                assert_ne!(approved, staged);
+                // Both halves describe the same mode, and it is the real one:
+                // a reader comparing the two sentences has to be able to see
+                // that the owner is the only thing that differs.
+                assert!(approved.starts_with("mode 0600, "), "{approved}");
+                assert!(staged.starts_with("mode 0600, "), "{staged}");
+            }
+            other => panic!("expected a refusal to change the owner, got {other:?}"),
+        }
+        assert_eq!(fs::read(&f).unwrap(), b"old", "and the file was left alone");
+        assert_eq!(entries(dir.path()), ["f"]);
+
+        // The group is the same question and is checked against the staged
+        // file rather than assumed: a file belonging to a group hatch does not
+        // run as would come out belonging to one it does.
+        let mut p = plan(&f, b"new", false).unwrap();
+        p.landing_group = Principal::group(0);
+        match apply(&f, b"new", &p, &deny()) {
+            Err(ApplyError::NotAsApproved { approved, staged }) => {
+                assert_ne!(approved, staged, "{approved} / {staged}");
+            }
+            other => panic!("expected a refusal to change the group, got {other:?}"),
+        }
+        assert_eq!(fs::read(&f).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_root_plan_is_refused_here_rather_than_applied_as_the_user() {
+        // `root: true` plans belong to the elevated path. Applying one here
+        // would create the file owned by whoever runs hatch while the window
+        // said root — an approved change quietly becoming a different one.
+        if geteuid().is_root() {
+            eprintln!("skipped: running as root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("brand-new");
+        let p = plan(&f, b"new", true).unwrap();
+
+        assert!(matches!(
+            apply(&f, b"new", &p, &deny()),
+            Err(ApplyError::NotAsApproved { .. })
+        ));
+        assert!(!f.exists(), "and nothing was created");
+        assert_eq!(entries(dir.path()), [] as [String; 0]);
+    }
+
+    #[test]
+    fn a_create_in_a_setgid_directory_is_planned_and_applied_with_that_group() {
+        // A setgid directory hands its own group to what is created inside it.
+        // The plan has to say so — otherwise the window states a group the
+        // file will not have, and the landing check refuses every create in
+        // such a directory forever.
+        let Some(other) = a_group_we_are_in_but_do_not_run_as() else {
+            eprintln!("skipped: the running user is in only one group");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), None, Some(other)).unwrap();
+        set_mode(dir.path(), 0o2755);
+
+        let f = dir.path().join("brand-new");
+        let p = plan(&f, b"new", false).unwrap();
+        assert_eq!(p.landing_group.id, other, "the directory's group, not the process's");
+        assert_ne!(p.landing_group.id, getegid().as_raw());
+
+        apply(&f, b"new", &p, &deny()).unwrap();
+        assert_eq!(fs::metadata(&f).unwrap().gid(), other);
+
+        // It is the setgid bit that does this and not the directory's group:
+        // the same directory without the bit hands new files the effective
+        // gid, and a plan that read the directory's group unconditionally
+        // would state the wrong one everywhere.
+        set_mode(dir.path(), 0o755);
+        assert_eq!(
+            plan(&dir.path().join("second"), b"new", false).unwrap().landing_group.id,
+            getegid().as_raw()
+        );
+
+        // And an ordinary directory is still the effective gid.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            plan(&plain.path().join("x"), b"new", false).unwrap().landing_group.id,
+            getegid().as_raw()
+        );
+    }
+
+    /// A gid the running user may create files with but does not run as, or
+    /// `None` on a machine where there is no such group.
+    fn a_group_we_are_in_but_do_not_run_as() -> Option<u32> {
+        let egid = getegid().as_raw();
+        nix::unistd::getgroups()
+            .ok()?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != egid)
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_read_is_a_failure_and_not_a_disappearance() {
+        // Reading the error as absence would report it as a file that had been
+        // deleted, which is a different thing to be told and a different thing
+        // to do about it.
+        if geteuid().is_root() {
+            eprintln!("skipped: running as root, where a mode of 0 is no obstacle");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        fs::write(&f, "old").unwrap();
+        let p = plan(&f, b"new", false).unwrap();
+        set_mode(&f, 0o000);
+
+        match apply(&f, b"new", &p, &deny()) {
+            Err(ApplyError::Failed { doing, error, remedy }) => {
+                assert!(doing.contains("re-reading"), "{doing}");
+                assert!(doing.contains(&f.display().to_string()), "{doing}");
+                assert!(error.contains("Permission denied"), "{error}");
+                assert!(remedy.is_some(), "permission denied has an answer worth giving");
+            }
+            other => panic!("expected a read failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_is_staged_before_both_re_checks_have_passed() {
+        // The property behind "no partial file remains": the temporary file is
+        // not created until the path and the bytes have both been re-checked,
+        // so a refusal has nothing to clean up and cannot fail to.
+        //
+        // The payload is asserted exactly rather than by shape, because the
+        // two hashes are what tell a reader which of the two files is on disk,
+        // and a message that has them the wrong way round says the opposite of
+        // the truth while still being a `Drift`.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        fs::write(&f, "old").unwrap();
+        let p = plan(&f, b"new", false).unwrap();
+        fs::write(&f, "new").unwrap();
+
+        assert_eq!(
+            apply(&f, b"new", &p, &deny()),
+            Err(ApplyError::Drift {
+                expected: Some(SHA_OLD.to_string()),
+                found: Some(SHA_NEW.to_string()),
+            })
+        );
+        assert_eq!(entries(dir.path()), ["f"]);
+    }
+
+    #[test]
+    fn the_path_is_re_checked_before_the_bytes_are() {
+        // The two re-checks do not commute in what they say. A target that
+        // became a directory is a path problem, and the hash has no vocabulary
+        // for it: reading a directory fails with EISDIR, which would surface
+        // as "re-reading the file failed" — true, unhelpful, and hiding the
+        // fact that the name now means something that can never be swapped.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        fs::write(&f, "old").unwrap();
+        let p = plan(&f, b"new", false).unwrap();
+
+        fs::remove_file(&f).unwrap();
+        fs::create_dir(&f).unwrap();
+
+        assert_eq!(
+            apply(&f, b"new", &p, &deny()),
+            Err(ApplyError::Refused(Refusal::NotARegularFile { what: "a directory" }))
+        );
+        assert!(f.is_dir(), "and it is still a directory");
+    }
+
+    // ---- apply: the messages ---------------------------------------------
+
+    #[test]
+    fn drift_says_which_way_the_file_moved() {
+        let appeared =
+            ApplyError::Drift { expected: None, found: Some(SHA_NEW.to_string()) }.to_string();
+        assert!(appeared.contains("appeared"), "{appeared}");
+        assert!(appeared.contains(SHA_NEW), "{appeared}");
+
+        let deleted =
+            ApplyError::Drift { expected: Some(SHA_OLD.to_string()), found: None }.to_string();
+        assert!(deleted.contains("deleted"), "{deleted}");
+        assert!(deleted.contains(SHA_OLD), "{deleted}");
+
+        let changed = ApplyError::Drift {
+            expected: Some(SHA_OLD.to_string()),
+            found: Some(SHA_NEW.to_string()),
+        }
+        .to_string();
+        assert!(changed.contains("changed"), "{changed}");
+        assert!(changed.contains(SHA_OLD) && changed.contains(SHA_NEW), "{changed}");
+
+        // Unreachable while the only constructor is a comparison, and still a
+        // true sentence rather than a panic if it ever is reached.
+        let neither = ApplyError::Drift { expected: None, found: None }.to_string();
+        assert!(neither.contains("changed"), "{neither}");
+
+        for message in [appeared, deleted, changed, neither] {
+            assert!(message.contains("nothing was written"), "{message}");
+        }
+    }
+
+    #[test]
+    fn every_apply_error_says_that_nothing_was_written() {
+        // The one fact a reader has to be able to take from any of them
+        // without reasoning: the file on disk is untouched, so a retry is
+        // safe and no half-applied state has to be unpicked.
+        let errors = [
+            ApplyError::Refused(Refusal::Denied),
+            ApplyError::Drift { expected: None, found: Some(SHA_NEW.to_string()) },
+            ApplyError::Collision,
+            ApplyError::NotAsApproved {
+                approved: "mode 0644, owned by root:root".to_string(),
+                staged: "mode 0644, owned by user:user".to_string(),
+            },
+            ApplyError::Failed {
+                doing: "creating a temporary file in /etc".to_string(),
+                error: "Permission denied (os error 13)".to_string(),
+                remedy: None,
+            },
+        ];
+        for e in errors {
+            let text = e.to_string();
+            assert!(
+                text.contains("nothing was written") || text.contains("not touched"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_re_check_refusal_says_it_was_re_checked_and_repeats_the_reason() {
+        // The same refusal means something different here: not "this request
+        // was never going to work" but "this stopped being true while you were
+        // reading".
+        let e = ApplyError::Refused(Refusal::Denied).to_string();
+        assert!(e.contains("immediately before writing"), "{e}");
+        assert!(e.contains(&Refusal::Denied.to_string()), "{e}");
+    }
+
+    #[test]
+    fn a_failure_carries_the_systems_reason_and_what_to_do_about_it() {
+        use std::io::{Error, ErrorKind};
+
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        let e = failed("creating a temporary file in /etc".to_string(), &denied);
+        let text = e.to_string();
+        assert!(text.contains("creating a temporary file in /etc"), "{text}");
+        assert!(text.contains("permission denied"), "{text}");
+        assert!(text.contains("as a root request"), "the advice is the actionable half: {text}");
+
+        assert!(remedy(ErrorKind::ReadOnlyFilesystem).unwrap().contains("read-only"));
+        assert!(remedy(ErrorKind::StorageFull).unwrap().contains("full"));
+        assert!(remedy(ErrorKind::QuotaExceeded).unwrap().contains("quota"));
+        assert!(remedy(ErrorKind::NotFound).unwrap().contains("was there when"));
+        assert!(remedy(ErrorKind::CrossesDevices).unwrap().contains("atomic"));
+        assert_eq!(remedy(ErrorKind::Interrupted), None, "no guess where there is no answer");
+    }
+
+    #[test]
+    fn a_landing_is_four_octal_digits_and_both_principals() {
+        // Four digits so a setuid file staying setuid is visible; three would
+        // print 0o4644 as 644 and hide the bit that matters.
+        assert_eq!(
+            landing(0o4644, &Principal { id: 0, name: Some("root".into()) }, &Principal {
+                id: 4,
+                name: None
+            }),
+            "mode 4644, owned by root:4"
+        );
+        assert_eq!(
+            landing(0o644, &Principal { id: 0, name: None }, &Principal { id: 0, name: None }),
+            "mode 0644, owned by 0:0"
+        );
+    }
+
 }
