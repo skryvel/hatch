@@ -26,6 +26,12 @@
 //! window that is already running all reach a state that is no longer waiting
 //! for a verdict, and get nothing to send.
 //!
+//! # Input
+//!
+//! Nothing here reads a key. Every event of every frame goes to
+//! [`guard::intercept`] first, which decides what the window may act on and
+//! what a widget may even see; see [`guard`] for why that is the only door.
+//!
 //! # Failing closed
 //!
 //! A window may not assume its frames are well-formed. When one is not — an
@@ -44,12 +50,13 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, OnceLock};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
 
 use crate::exec::Stream;
+use crate::prompt_ui::guard::{Action, Guard, intercept};
 use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
 
 /// The window's application id.
@@ -411,6 +418,12 @@ struct PromptApp {
     stream: bool,
     /// What the user is telling the agent, for every verdict but Approve.
     note: String,
+    /// The one thing between a keystroke meant for another window and an
+    /// approved command.
+    guard: Guard,
+    /// Whether the guard was open when this frame's input was judged, so the
+    /// drawing half of the frame agrees with the judging half.
+    guard_open: bool,
     fatal: Arc<OnceLock<String>>,
 }
 
@@ -426,6 +439,8 @@ impl PromptApp {
             out,
             stream: true,
             note: String::new(),
+            guard: Guard::new(Instant::now()),
+            guard_open: false,
             fatal,
         }
     }
@@ -474,6 +489,13 @@ fn arm_exit_backstop(fatal: Arc<OnceLock<String>>) {
 impl eframe::App for PromptApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         drain(&mut self.state, &self.inbox);
+        // Before anything is drawn, and before any widget sees the frame.
+        // Whatever the guard did not hand back is gone from this frame.
+        let now = Instant::now();
+        for action in intercept(&mut self.guard, ctx, now) {
+            self.act(action);
+        }
+        self.guard_open = self.guard.is_open(now);
         if self.state.take_close() {
             if let Some(why) = self.state.broken() {
                 let _ = self.fatal.set(why.to_string());
@@ -508,7 +530,10 @@ impl eframe::App for PromptApp {
             ui.label(format!("{:?}", self.state.phase()));
 
             match self.state.phase() {
-                Phase::AwaitingVerdict => self.verdict_buttons(ui),
+                Phase::AwaitingVerdict => {
+                    let open = self.guard_open;
+                    self.verdict_area(ui, open);
+                }
                 Phase::Running => {
                     if ui.button("Kill").clicked() {
                         let kill = self.state.request_kill();
@@ -522,29 +547,78 @@ impl eframe::App for PromptApp {
 }
 
 impl PromptApp {
+    /// Carry out one decision the guard made.
+    ///
+    /// A decision, not a suggestion: it is applied where it is received. The
+    /// state machine is what makes a doubled one harmless — it answers only
+    /// while the window awaits a verdict, and it leaves that phase on the way
+    /// out.
+    fn act(&mut self, action: Action) {
+        let verdict = match action {
+            Action::Approve => Verdict::Approve { stream: self.stream },
+            Action::Deny => Verdict::Deny { note: self.note.clone() },
+            Action::Ignored | Action::Passthrough => return,
+        };
+        let frame = self.state.decide(verdict);
+        answer(&mut self.out, &mut self.state, frame);
+    }
+
+    /// The verdict area, shut while the guard is.
+    ///
+    /// Disabled rather than hidden, and this is the guard's second layer, not
+    /// decoration: egui works out pointer clicks from this frame's events
+    /// before [`guard::intercept`] ever sees them, so emptying the event
+    /// queue does not stop a mouse. A disabled widget reports no click at
+    /// all, real or faked, which is what stops someone double-clicking at
+    /// another window from answering this one.
+    ///
+    /// Returns the Approve button, so a test can ask egui itself what it
+    /// would do with it.
+    fn verdict_area(&mut self, ui: &mut egui::Ui, guard_open: bool) -> egui::Response {
+        let approve = ui.add_enabled_ui(guard_open, |ui| self.verdict_buttons(ui)).inner;
+        if !guard_open {
+            ui.label(
+                "Waiting a moment, so a keystroke meant for another window \
+                 cannot answer this one…",
+            );
+        }
+        approve
+    }
+
     /// The buttons, and nothing more than the buttons.
     ///
-    /// The layout, the typing guard and the diff view are other work; this is
-    /// here to prove that a press becomes a frame on the wire.
-    fn verdict_buttons(&mut self, ui: &mut egui::Ui) {
+    /// The layout and the diff view are other work; this is here to prove
+    /// that a press becomes a frame on the wire.
+    ///
+    /// Every one of them is built with [`egui::Sense::CLICK`] rather than
+    /// [`egui::Sense::click`], which is the same thing without `FOCUSABLE`.
+    /// egui fakes a primary click on the *focused* widget when Space or Enter
+    /// is pressed, so a button that can never hold focus can never be
+    /// activated by a key at all — which is the hole that taking Enter out of
+    /// the frame leaves open on its own, because Space is ordinary typing and
+    /// has to reach the note field. Do not swap these back to `ui.button`.
+    ///
+    /// Returns the Approve button.
+    fn verdict_buttons(&mut self, ui: &mut egui::Ui) -> egui::Response {
         ui.checkbox(&mut self.stream, "Stream output");
         ui.text_edit_singleline(&mut self.note);
 
         let note = self.note.clone();
         let mut decided = None;
-        if ui.button("Approve").clicked() {
+        let approve = unfocusable(ui, "Approve");
+        if approve.clicked() {
             decided = Some(Verdict::Approve { stream: self.stream });
         }
-        if ui.button("Deny").clicked() {
+        if unfocusable(ui, "Deny").clicked() {
             decided = Some(Verdict::Deny { note: note.clone() });
         }
-        if ui.button("Explain").clicked() {
+        if unfocusable(ui, "Explain").clicked() {
             decided = Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
         }
-        if ui.button("Simplify").clicked() {
+        if unfocusable(ui, "Simplify").clicked() {
             decided = Some(Verdict::Revise { kind: ReviseKind::Simplify, note: note.clone() });
         }
-        if ui.button("I'll run it myself").clicked() {
+        if unfocusable(ui, "I'll run it myself").clicked() {
             decided = Some(Verdict::SelfRun { note });
         }
 
@@ -552,7 +626,16 @@ impl PromptApp {
             let frame = self.state.decide(verdict);
             answer(&mut self.out, &mut self.state, frame);
         }
+        approve
     }
+}
+
+/// A button a mouse can press and a keyboard cannot reach.
+///
+/// See [`PromptApp::verdict_buttons`] for why every button that decides
+/// something is built this way.
+fn unfocusable(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(label).sense(egui::Sense::CLICK))
 }
 
 #[cfg(test)]
@@ -1081,6 +1164,136 @@ mod tests {
 
         let left = state.seconds_remaining(Utc::now()).expect("a request sets the deadline");
         assert!((left - 42).abs() <= 1, "the countdown said {left}s, not 42s");
+    }
+
+    // ---- the guard's second layer, against real egui widget handling ------
+    //
+    // The guard takes Enter out of the frame, and that covers Enter. It does
+    // not cover a mouse — egui works clicks out from this frame's events
+    // before the guard is called — and it must not cover Space, which is
+    // ordinary typing and has to reach the note field. Those two are held by
+    // the widgets themselves: disabled while the guard is shut, and never
+    // focusable. Both are asserted here through egui's own handling rather
+    // than by reading the code, because that is the only way to know egui
+    // agrees. No display is needed for any of it.
+
+    /// A window in the phase where it has buttons, writing where a test can
+    /// read what went out.
+    fn an_awaiting_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app =
+            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()));
+        app.state.handle(DaemonMsg::Request(a_request(90)));
+        (app, sink)
+    }
+
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Draw the verdict area for one frame and hand back the Approve button.
+    fn draw(
+        app: &mut PromptApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        open: bool,
+    ) -> egui::Response {
+        let mut approve = None;
+        // The same entry point eframe uses to hand an app its root `Ui`.
+        let mut out = ctx.run_ui(raw(events), |ui| {
+            approve = Some(
+                egui::CentralPanel::default().show(ui, |ui| app.verdict_area(ui, open)).inner,
+            );
+        });
+        // epaint refuses to be dropped holding texture deltas nobody applied.
+        out.textures_delta.clear();
+        approve.expect("the central panel drew")
+    }
+
+    /// Press and release the mouse on the Approve button, the way a hand
+    /// would: one frame to place the pointer, one to press, one to release.
+    fn click_approve(open: bool) -> Vec<u8> {
+        let (mut app, sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+        let at = draw(&mut app, &ctx, Vec::new(), open).rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(&mut app, &ctx, vec![egui::Event::PointerMoved(at)], open);
+        draw(&mut app, &ctx, vec![button(true)], open);
+        draw(&mut app, &ctx, vec![button(false)], open);
+        sink.lock().expect("sink").clone()
+    }
+
+    #[test]
+    fn a_mouse_click_during_the_guard_approves_nothing() {
+        assert!(
+            click_approve(false).is_empty(),
+            "a click landed on Approve while the guard was shut"
+        );
+    }
+
+    #[test]
+    fn the_same_click_after_the_guard_does_approve() {
+        // The control for the test above: without this, a click that never
+        // lands would look like a guard that works.
+        let out = String::from_utf8(click_approve(true)).expect("utf-8");
+        assert!(out.contains("approve"), "the click did not reach Approve at all: {out:?}");
+    }
+
+    #[test]
+    fn egui_will_not_give_a_verdict_button_the_focus_that_space_activates() {
+        let (mut app, _sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+
+        let approve = draw(&mut app, &ctx, Vec::new(), true);
+        assert!(
+            !approve.sense.is_focusable(),
+            "a verdict button asks for focus, so Space would activate it"
+        );
+
+        // And egui agrees, when asked the hard way: focus requested, and
+        // surrendered again by the next frame because the button is not the
+        // sort of thing that holds it.
+        approve.request_focus();
+        let approve = draw(&mut app, &ctx, Vec::new(), true);
+        assert!(!approve.has_focus(), "egui gave a verdict button the keyboard focus");
+    }
+
+    #[test]
+    fn the_verdict_buttons_are_dead_to_every_kind_of_press_while_the_guard_is_shut() {
+        let (mut app, _sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+
+        let shut = draw(&mut app, &ctx, Vec::new(), false);
+        assert!(!shut.enabled(), "the buttons are live while the guard is shut");
+
+        let open = draw(&mut app, &ctx, Vec::new(), true);
+        assert!(open.enabled(), "the buttons never become live at all");
     }
 }
 
