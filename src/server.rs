@@ -96,6 +96,7 @@ use rmcp::ErrorData;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
+    ProtocolVersion,
     CallToolResult, ClientJsonRpcMessage, ClientNotification, ContentBlock, GetExtensions,
     ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, RequestId,
     ServerJsonRpcMessage, Tool,
@@ -1727,6 +1728,23 @@ impl ServerHandler for Hatch {
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult::with_all_items(self.described_tools()))
     }
+
+    /// Speak only the protocol version this build actually implements.
+    ///
+    /// The default advertises every version the SDK knows the *name* of,
+    /// including ones whose semantics it does not implement. A client that
+    /// negotiates one of those gets answers in the older shape and rejects
+    /// them — observed as `tools/list` failing validation on `ttlMs` and
+    /// `cacheScope`, fields that belong to the newer discovery result and
+    /// that nothing here produces.
+    ///
+    /// Claiming a version is a promise about the whole protocol, not about
+    /// the parts that happen to overlap. Narrowing this to what is
+    /// implemented makes a client negotiate down and work, instead of
+    /// negotiating up and failing.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(&[ProtocolVersion::V_2025_11_25])
+    }
 }
 
 /// SHA-256 of `bytes`.
@@ -1936,6 +1954,20 @@ pub fn run_serve() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_the_protocol_version_this_build_implements_is_offered() {
+        // Advertising a version whose semantics are not implemented makes a
+        // newer client negotiate up and then reject the answers: observed as
+        // tools/list failing validation on ttlMs and cacheScope, fields of a
+        // discovery result nothing here produces. Narrow beats optimistic.
+        let offered = ServerHandler::supported_protocol_versions(&Hatch::new(bare_daemon(test_config())));
+        assert_eq!(&*offered, &[ProtocolVersion::V_2025_11_25]);
+        assert!(
+            !offered.contains(&ProtocolVersion::V_2026_07_28),
+            "a version is a promise about the whole protocol, not the overlapping parts"
+        );
+    }
     use super::*;
     use crate::config::Config;
     use std::sync::Arc;
