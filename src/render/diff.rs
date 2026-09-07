@@ -119,6 +119,31 @@ impl Side {
         &self.spans[self.content_spans..]
     }
 
+    /// Rebuild a side from a rendering of its own line -- the receiving end
+    /// of the wire form in [`crate::protocol`].
+    ///
+    /// `content_spans` is recomputed here rather than taken as an argument,
+    /// for the reason [`Span::chip_codepoint`] is read out of the text rather
+    /// than stored beside it: a transmitted copy could disagree with the line
+    /// it describes, and a terminator boundary in the wrong place draws part
+    /// of the line in the terminator slot. Nothing is transmitted, so nothing
+    /// can drift.
+    ///
+    /// `None` on exactly the condition `Side::new` asserts on: the spans do
+    /// not break where the terminator starts. A refusal rather than a panic
+    /// because this input arrived over a pipe -- a malformed frame is
+    /// something to fail closed on, not something to crash the reader with.
+    ///
+    /// [`Span::chip_codepoint`]: super::Span::chip_codepoint
+    pub fn from_rendering(spans: Spans) -> Option<Side> {
+        let content_len = spans.source().len() - terminator_len(spans.source());
+        let content_spans = spans.iter().take_while(|s| s.range().end <= content_len).count();
+        spans
+            .get(content_spans)
+            .is_none_or(|s| s.range().start == content_len)
+            .then_some(Side { spans, content_spans })
+    }
+
     /// The exact line, terminator included.
     ///
     /// Paired with [`Side::spans`] this is also how a caller re-checks
@@ -183,6 +208,18 @@ impl Row {
     /// wrongly marked unchanged costs them the change itself.
     pub fn changed(&self) -> bool {
         self.changed
+    }
+
+    /// Assemble a row from two rendered sides -- the receiving end of the
+    /// wire form in [`crate::protocol`].
+    ///
+    /// `changed` is carried rather than recomputed, and that is the one thing
+    /// here that could not be derived at the far end anyway: it comes from
+    /// the diff operation this row was cut from, and comparing the two lines
+    /// would answer a different question -- see [`Row::changed`] for why a
+    /// `Replace` block may pair two identical lines and still be marked.
+    pub fn from_sides(left: Option<Side>, right: Option<Side>, changed: bool) -> Row {
+        Row { left, right, changed }
     }
 }
 

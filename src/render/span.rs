@@ -66,6 +66,8 @@
 use std::borrow::Cow;
 use std::ops::{Deref, Range};
 
+use serde::{Deserialize, Serialize};
+
 /// One unit of rendered output.
 ///
 /// `text` is ALWAYS the exact original substring. Presentation lives in `kind`
@@ -80,7 +82,26 @@ pub struct Span {
 
 /// What a span is, for the benefit of the screen. Never for the benefit of
 /// [`unrender`], which ignores this entirely.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Why this crosses the pipe and [`Span`] does not
+///
+/// A kind is display metadata and carries no invariant of its own: every
+/// invariant in this module is a relation between a kind and *the text it
+/// sits on* — a chip stands for one codepoint, a resolution sits beside one
+/// reference — and both are checked where the two meet, at construction and
+/// at [`Spans::set_kind`]. So a kind can be deserialised from anywhere
+/// without weakening anything: it becomes a claim only when it is attached
+/// to text, and attaching it goes through those checks.
+///
+/// [`Span`] and [`Spans`] deliberately have no `Deserialize`. A derived one
+/// would build spans without [`SpanBuilder`], and the builder is the entire
+/// proof that a sequence tiles its source: a deserialised `Spans` would be a
+/// rendering nobody ever checked, indistinguishable at the type level from
+/// one that was. See [`crate::protocol`] for how a rendering does cross the
+/// pipe — as its source text plus the offsets the spans end at, rebuilt
+/// through the real builder on arrival.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SpanKind {
     Plain,
     /// `;` `&&` `||` `|` — dimmed, kept on screen.

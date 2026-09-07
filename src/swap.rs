@@ -212,6 +212,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use nix::unistd::{Gid, Group, Uid, User, getegid, geteuid};
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use sha2::{Digest, Sha256};
 
@@ -471,7 +472,8 @@ fn describe(md: &fs::Metadata) -> &'static str {
 
 /// Whether the target exists already, which is the difference between a diff
 /// against a file and a diff against nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanKind {
     /// Nothing is there; the file will be brought into existence.
     Create,
@@ -497,7 +499,7 @@ pub enum PlanKind {
 /// system with a *user literally named* `1000` whose uid is not 1000 — is
 /// noted and accepted; `install` would resolve the name, which is the same
 /// thing every other tool on the system does with that string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     /// The uid or gid itself.
     pub id: u32,
@@ -530,7 +532,21 @@ impl fmt::Display for Principal {
 
 /// Where the bytes will land, as the window states it and as the apply uses
 /// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Why this crosses the pipe as itself
+///
+/// Unlike a rendering, a plan carries no invariant that construction
+/// enforces: every field is a fact about the target read off the filesystem,
+/// and nothing about the *shape* of the value could be wrong in a way a
+/// constructor would have caught. Deserialising one therefore gives up
+/// nothing, and there is nothing for the window to re-derive.
+///
+/// It is also advisory. The window states the plan; [`apply`] re-stats and
+/// re-hashes the target and refuses on drift, so the copy the prompt holds
+/// never decides anything. It travels daemon-to-prompt only — no message in
+/// the other direction carries a plan — so a prompt cannot hand a plan of its
+/// own back to be applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapPlan {
     /// Create or replace.
     pub kind: PlanKind,

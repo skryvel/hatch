@@ -46,6 +46,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
+use serde::{Deserialize, Serialize};
 use nix::unistd::{Pid, setsid};
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
@@ -97,8 +98,11 @@ pub struct RunOpts {
 ///
 /// Kept apart all the way to the sink rather than interleaved into one text:
 /// the window colours them differently, and a diagnostic that a command wrote
-/// to stderr must not be read as part of its answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// to stderr must not be read as part of its answer. That separation has to
+/// survive the trip to the prompt window, so this is also a wire type — see
+/// [`crate::protocol::DaemonMsg::Output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stream {
     /// Standard output.
     Stdout,
