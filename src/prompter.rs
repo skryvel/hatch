@@ -1450,6 +1450,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_badge_that_fell_behind_catches_up_rather_than_freezing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frames");
+        let p = window_recording_to(&path);
+        let (tx, rx) = no_depth();
+        let session = within(p.prompt(sample_request(), rx)).await.unwrap();
+
+        // Twelve values into an eight-deep channel, with nothing awaited in
+        // between: on a current-thread runtime the writer cannot drain the
+        // channel while it fills, so it wakes to a `Lagged`. The badge is a
+        // latest-value display, so the four it missed were superseded before it
+        // could have drawn them, and the answer is to read on -- treating
+        // `Lagged` as the queue going away would freeze the badge at its
+        // opening value for the life of the window.
+        for depth in 0..12 {
+            tx.send(depth).unwrap();
+        }
+
+        let seen = frames(&path, 9).await;
+        assert_eq!(seen.last().unwrap(), &DaemonMsg::QueueDepth { depth: 11 });
+        within(session.close()).await;
+    }
+
+    #[tokio::test]
     async fn output_and_the_outcome_reach_the_window_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frames");
