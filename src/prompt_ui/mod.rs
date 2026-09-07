@@ -437,7 +437,9 @@ impl PromptApp {
             state: PromptState::new(),
             inbox,
             out,
-            stream: true,
+            // Headless by default: streaming is what the reader opts into
+            // when they want to watch, not what they get for asking.
+            stream: false,
             note: String::new(),
             guard: Guard::new(Instant::now()),
             guard_open: false,
@@ -667,6 +669,16 @@ mod tests {
     }
 
     // ---- the close latch ---------------------------------------------------
+
+    #[test]
+    fn output_is_not_streamed_unless_the_reader_asks_for_it() {
+        // The spec makes execution headless by default; the checkbox is the
+        // opt-in. Defaulting it on means every approval silently chooses the
+        // mode the reader never picked.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        assert!(!app.stream, "streaming is opted into, not defaulted on");
+    }
 
     #[test]
     fn the_close_is_taken_once_and_only_once() {

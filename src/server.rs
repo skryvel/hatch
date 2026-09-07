@@ -555,8 +555,9 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          work into a single command — chain it with `&&`, or write a short script — instead of \
          making a run of separate calls, because each extra call is another interruption.\n\
          \n\
-         The person may reject the command, or edit it before it runs. You get back what \
-         actually happened, which is not always what you asked for.\n\
+         The person may refuse the command, ask you to explain it, ask for a form of it that \
+         is easier to read, or decide to run it themselves. You get back what actually \
+         happened, which is not always what you asked for.\n\
          \n\
          Fields:\n\
          - title: the intent in one plain line. It is the first thing the person reads, so write \
