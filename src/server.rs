@@ -30,10 +30,60 @@
 //! And behind all of it: reaching the tools is not the same as getting
 //! anything to happen. Every operation still has to be rendered to a person
 //! and approved.
+//!
+//! # One request, in order
+//!
+//! `Daemon::decide` is the whole of it, and the order of its steps is the
+//! design rather than an implementation detail.
+//!
+//! 1. **Validate and render.** Everything hatch can refuse without asking
+//!    anybody is refused here: a protected path, a symlink, a missing parent,
+//!    a working directory that is not one, a request for something this build
+//!    cannot do. Prompting for a request that is going to be refused spends
+//!    the scarcest resource in the design — a person's attention — on nothing,
+//!    so no refusal ever reaches the queue.
+//! 2. **Take the approval lock.** One window at a time on this machine, in
+//!    arrival order. The wait here is bounded only by the client: see below.
+//! 3. **Open the window, and only now start the clock.** The approval deadline
+//!    runs from the moment the window is spawned, so a request that spent ten
+//!    minutes queued still gets a full window rather than one that is already
+//!    expiring.
+//! 4. **Wait for a verdict, or for one of the four ways there will never be
+//!    one.** The window is answered, the deadline passes, the client cancels,
+//!    or the client's connection dies — and the window can also end without
+//!    deciding, which arrives on the same await as the verdict. Every one of
+//!    those denies.
+//! 5. **Release the lock at the verdict**, not at completion, and then carry
+//!    the operation out. From here the deny rule no longer applies: a window
+//!    that dies now costs the Kill button and the live view, and nothing else.
+//! 6. **Write exactly one audit line.**
+//!
+//! ## Why there is exactly one audit line
+//!
+//! Not because every exit path remembers to write one. `Outcome` is the
+//! return type of the flow, so a path that ends without saying how it ended
+//! does not compile, and `Daemon::serve` is the single place that turns one
+//! into a record. Seven exit paths that each remember to log would be seven
+//! chances to forget.
+//!
+//! ## What the agent is told
+//!
+//! Everything that is not an approval is a *recoverable* tool error: an
+//! `Ok(CallToolResult)` with `isError` and the reason in its content, never
+//! `Err(ErrorData)`. Clients render a protocol error opaquely, so `Err` would
+//! tell an agent the server is broken where a person merely said no. The
+//! wording of each is chosen so the agent can tell a decision from a
+//! non-decision: a denial names the user, a timeout says nobody answered, a
+//! size cap and an unsupported request both say plainly that nobody was asked.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
@@ -41,19 +91,41 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use chrono::{Local, Utc};
 use rmcp::ErrorData;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ListToolsResult, PaginatedRequestParams, Tool};
-use rmcp::service::RequestContext;
+use rmcp::model::{
+    CallToolResult, ClientJsonRpcMessage, ClientNotification, ContentBlock, GetExtensions,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, RequestId,
+    ServerJsonRpcMessage, Tool,
+};
+use rmcp::service::{Peer, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::session::{
+    RestoreOutcome, ServerSseMessage, SessionId, SessionManager,
+};
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
+use crate::audit::{AuditLog, AuditRecord, LogDetail, LogVerdict, RunDetail, SwapDetail};
 use crate::config::{self, Config};
+use crate::denylist::Denylist;
+use crate::exec::env::build_child_env;
+use crate::exec::{Chunk, Env, Output, RunOpts};
+use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
+use crate::protocol::{Payload, Request as PromptRequest, ReviseKind, Verdict};
+use crate::render::diff::{FileDiff, diff_files};
+use crate::render::render_command;
+use crate::render::unicode::defang;
+use crate::queue::ApprovalQueue;
+use crate::swap::{ApplyError, PlanKind, SwapPlan};
+use crate::{exec, protocol, swap};
 
 /// Caps on the agent-controlled strings, in **bytes** of UTF-8, not
 /// characters.
@@ -91,16 +163,14 @@ pub struct RunCommandParams {
     /// Request root. Accepted because it is part of the tool contract;
     /// refused for now.
     #[serde(default)]
-    // Read by the request flow, which lands next.
-    #[allow(dead_code)]
     pub root: bool,
-    /// Absolute working directory.
+    /// Absolute working directory. Defaults to the child environment's
+    /// `HOME`, which is the one the command will actually see.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Whether the command needs a terminal.
+    /// Whether the command needs a terminal. Accepted because it is part of
+    /// the tool contract; refused for now.
     #[serde(default)]
-    // Read by the request flow, which lands next.
-    #[allow(dead_code)]
     pub interactive: bool,
 }
 
@@ -118,8 +188,6 @@ pub struct SwapFileParams {
     /// Request root. Accepted because it is part of the tool contract;
     /// refused for now.
     #[serde(default)]
-    // Read by the request flow, which lands next.
-    #[allow(dead_code)]
     pub root: bool,
 }
 
@@ -166,6 +234,268 @@ fn check_swap_file(params: &SwapFileParams) -> Result<(), String> {
     within_cap("content", &params.content, MAX_CONTENT_BYTES)?;
     within_cap("reason", &params.reason, MAX_FIELD_BYTES)?;
     Ok(())
+}
+
+
+// ---- what the transport knows and a tool handler cannot --------------------
+
+/// One in-flight call's connection, as the transport sees it.
+///
+/// # Why this exists at all
+///
+/// A request has two ways to be abandoned and the daemon has to tell them
+/// apart, because a window left on a person's screen for a client that is
+/// already gone is exactly the failure the approval flow exists to prevent,
+/// and because a log that cannot distinguish them cannot show that both are
+/// handled.
+///
+/// * **Cancellation.** The client sends `notifications/cancelled`. rmcp routes
+///   that to the injected [`CancellationToken`], which is the arm the flow
+///   selects on.
+/// * **Disconnect.** The client's process dies and its HTTP connection drops.
+///   Nothing in rmcp reports this to a tool handler, and the obvious guess is
+///   wrong in a way worth writing down: **a dropped connection does not drop
+///   the handler future.** rmcp spawns every request handler as a detached
+///   task, so a drop guard held for the lifetime of the handler never fires;
+///   the injected token stays uncancelled; and a progress notification sent
+///   into the dead stream still reports success, because the session layer
+///   swallows the send error. Measured, not assumed.
+///
+/// What *is* observable is the response stream. The transport builds one SSE
+/// stream per request, hands it to the HTTP layer as the response body, and
+/// the body is dropped when the connection dies. [`WatchedSessions`] wraps the
+/// session manager so that stream's end cancels `Hangup::gone`, and puts
+/// this handle in the request's extensions where the flow can find it.
+///
+/// # Why the two stay distinguishable
+///
+/// A cancellation *also* ends the response stream — the session worker closes
+/// the request-wise channel the moment it sees the notification — so `gone`
+/// fires for both, and it fires for a cancellation slightly *before* the
+/// injected token does. Whichever wakes the flow first, the classification is
+/// the flag: `WatchedSessions::accept_message` sets `cancelled` when it sees
+/// the notification, strictly before it hands the notification on to the
+/// session that closes the stream. So a call whose stream ended and whose flag
+/// is set was cancelled, and one whose stream ended with no flag was dropped.
+#[derive(Clone)]
+pub struct Hangup(Arc<HangupState>);
+
+#[derive(Default)]
+struct HangupState {
+    gone: CancellationToken,
+    cancelled: AtomicBool,
+}
+
+impl Hangup {
+    fn new() -> Hangup {
+        Hangup(Arc::new(HangupState::default()))
+    }
+
+    /// Fires when the response stream carrying this call is dropped.
+    fn gone(&self) -> CancellationToken {
+        self.0.gone.clone()
+    }
+
+    /// Record that the client asked for this call to be cancelled.
+    fn note_cancelled(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a `notifications/cancelled` named this call.
+    fn was_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// The calls whose response streams are still open, by request id.
+///
+/// Small and self-emptying: an entry is made when a request's stream is
+/// created and removed when that stream is dropped, which for every request is
+/// exactly once. It exists only so that a `notifications/cancelled` arriving
+/// on a *different* HTTP connection can find the call it names.
+#[derive(Default)]
+pub struct Calls(Mutex<HashMap<RequestId, Hangup>>);
+
+impl Calls {
+    fn begin(&self, id: RequestId) -> Hangup {
+        let hangup = Hangup::new();
+        locked(&self.0).insert(id, hangup.clone());
+        hangup
+    }
+
+    fn forget(&self, id: &RequestId) {
+        locked(&self.0).remove(id);
+    }
+
+    /// Flag the call `id` as cancelled, if it is still open.
+    fn note_cancelled(&self, id: &RequestId) {
+        if let Some(hangup) = locked(&self.0).get(id) {
+            hangup.note_cancelled();
+        }
+    }
+
+    /// How many calls are open. Diagnostics, and the test that proves an entry
+    /// is not left behind.
+    #[cfg(test)]
+    fn open(&self) -> usize {
+        locked(&self.0).len()
+    }
+}
+
+/// A poisoned lock here means a thread panicked while holding it, which cannot
+/// leave the map in a state worth protecting: every operation on it is a whole
+/// insert or a whole remove. Take the map back rather than propagating a panic
+/// into a request that has nothing to do with it.
+fn locked<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The response stream for one call, with the end of it wired to a token.
+///
+/// The inner stream is boxed rather than projected because it is an opaque
+/// `impl Stream` from the wrapped manager: boxing costs one allocation per
+/// request and buys a `Drop` this type can write for itself.
+struct Watched {
+    inner: Pin<Box<dyn futures_core::Stream<Item = ServerSseMessage> + Send + Sync>>,
+    _end: Option<StreamEnd>,
+}
+
+impl futures_core::Stream for Watched {
+    type Item = ServerSseMessage;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Says the connection is over, however the stream it lives in ended.
+///
+/// A separate type rather than a `Drop` on [`Watched`] so that the field can
+/// be `Option`: a message that is not a request gets no token and no entry.
+struct StreamEnd {
+    id: RequestId,
+    hangup: Hangup,
+    calls: Arc<Calls>,
+}
+
+impl Drop for StreamEnd {
+    fn drop(&mut self) {
+        self.calls.forget(&self.id);
+        self.hangup.0.gone.cancel();
+    }
+}
+
+/// [`LocalSessionManager`], plus the one fact it does not pass on.
+///
+/// Every method but two is a straight delegation. `create_stream` mints a
+/// [`Hangup`] for the request, puts it in the request's extensions — which
+/// rmcp carries all the way into [`RequestContext::extensions`] — and wraps
+/// the stream so its end cancels the token. `accept_message` watches for a
+/// cancellation notification and flags the call it names before passing it on.
+///
+/// Wrapping the *session manager* rather than the HTTP layer is what makes
+/// this cheap: the manager is handed the already-parsed JSON-RPC message, so
+/// the request id and the request's extensions are both in hand, and nothing
+/// has to re-read or buffer a body.
+pub struct WatchedSessions {
+    inner: LocalSessionManager,
+    calls: Arc<Calls>,
+}
+
+impl WatchedSessions {
+    /// A session manager that reports its disconnects into `calls`.
+    pub fn new(calls: Arc<Calls>) -> WatchedSessions {
+        WatchedSessions { inner: LocalSessionManager::default(), calls }
+    }
+}
+
+impl SessionManager for WatchedSessions {
+    type Error = <LocalSessionManager as SessionManager>::Error;
+    type Transport = <LocalSessionManager as SessionManager>::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        self.inner.create_session().await
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.inner.initialize_session(id, message).await
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.inner.close_session(id).await
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl futures_core::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
+    {
+        let mut message = message;
+        // The token is registered and planted *before* the message is pushed
+        // into the session, so the handler cannot start without it, and a
+        // client that hangs up in the same instant finds it already cancelled.
+        let end = match &mut message {
+            ClientJsonRpcMessage::Request(request) => {
+                let hangup = self.calls.begin(request.id.clone());
+                request.request.extensions_mut().insert(hangup.clone());
+                Some(StreamEnd { id: request.id.clone(), hangup, calls: Arc::clone(&self.calls) })
+            }
+            _ => None,
+        };
+        let inner = self.inner.create_stream(id, message).await?;
+        Ok(Watched { inner: Box::pin(inner), _end: end })
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        if let ClientJsonRpcMessage::Notification(notification) = &message
+            && let ClientNotification::CancelledNotification(cancelled) =
+                &notification.notification
+            && let Some(request_id) = &cancelled.params.request_id
+        {
+            // Before the delegation, not after: passing it on is what closes
+            // the response stream, and the flag has to be readable by the time
+            // the flow wakes up to find the stream gone.
+            self.calls.note_cancelled(request_id);
+        }
+        self.inner.accept_message(id, message).await
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl futures_core::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
+    {
+        self.inner.create_standalone_stream(id).await
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl futures_core::Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>
+    {
+        self.inner.resume(id, last_event_id).await
+    }
+
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        self.inner.restore_session(id).await
+    }
 }
 
 /// The tool descriptions the client actually sees.
@@ -268,17 +598,17 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
 }
 
 /// The MCP server. One is built per client session by the transport's
-/// factory; they share the daemon's config.
+/// factory; they all share the one daemon behind them.
 pub struct Hatch {
-    config: Arc<Config>,
+    daemon: Arc<Daemon>,
     tool_router: ToolRouter<Hatch>,
 }
 
 #[tool_router]
 impl Hatch {
-    /// A server bound to `config`.
-    pub fn new(config: Arc<Config>) -> Hatch {
-        Hatch { config, tool_router: Hatch::tool_router() }
+    /// A server in front of `daemon`.
+    pub fn new(daemon: Arc<Daemon>) -> Hatch {
+        Hatch { daemon, tool_router: Hatch::tool_router() }
     }
 
     /// The declared tools, with their static descriptions replaced by the
@@ -288,7 +618,7 @@ impl Hatch {
     /// losing it; `every_tool_has_a_runtime_description` is what makes sure
     /// that fallback is never actually taken.
     fn described_tools(&self) -> Vec<Tool> {
-        let descriptions = tool_descriptions(&self.config);
+        let descriptions = tool_descriptions(self.daemon.config());
         self.tool_router
             .list_all()
             .into_iter()
@@ -304,18 +634,22 @@ impl Hatch {
     // The `description` here is a placeholder the macro requires as a string
     // literal. `list_tools` replaces it with the runtime text, which is the
     // one a client ever sees.
+    //
+    // `RequestContext` is taken and not ignored: it carries the cancellation
+    // token, the progress token and the connection this call arrived on, which
+    // between them are three of the four ways a request ends without a
+    // verdict.
     #[tool(description = "Run a shell command on the host, outside the sandbox.")]
     async fn run_command(
         &self,
         Parameters(params): Parameters<RunCommandParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        // The cap runs before anything else touches these strings. Rendering
-        // is where the super-linear work lives, so checking afterwards would
-        // check nothing.
-        if let Err(refusal) = check_run_command(&params) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
-        }
-        Ok(not_implemented_yet("run a command"))
+        // `Ok`, always: every outcome a person or a clock can produce is a
+        // recoverable tool error the agent can read. `Err(ErrorData)` is
+        // reserved for parameters rmcp could not deserialise at all, which it
+        // rejects before reaching here.
+        Ok(self.daemon.run_command(params, Caller::of(&context)).await)
     }
 
     // See the note on `run_command`: this description is a placeholder.
@@ -323,25 +657,1056 @@ impl Hatch {
     async fn swap_file(
         &self,
         Parameters(params): Parameters<SwapFileParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(refusal) = check_swap_file(&params) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(refusal)]));
-        }
-        Ok(not_implemented_yet("write a file"))
+        Ok(self.daemon.swap_file(params, Caller::of(&context)).await)
     }
 }
 
-/// The stand-in body every tool returns until the request flow exists.
+// ---- the daemon ------------------------------------------------------------
+
+/// How long the daemon gives a window to draw the final outcome before it is
+/// killed.
 ///
-/// The request flow — queue admission, the approval window, the verdict and
-/// the execution it authorises — lands next. It is a tool error, not a
-/// protocol error, so the agent reads the sentence instead of being told the
-/// server is broken.
-fn not_implemented_yet(what: &str) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(format!(
-        "hatch cannot {what} yet: this build declares the tool but does not carry the approval \
-         flow behind it. Nothing was shown to anyone and nothing ran."
-    ))])
+/// The window closes on the `Finished` frame by itself, so this is the time it
+/// takes to read one line and exit, not a period anybody looks at anything.
+/// It is bounded because [`PromptSession::close`] is unconditional and a
+/// wedged window must not be able to hold a finished request open.
+const FINAL_FRAME_GRACE: Duration = Duration::from_millis(500);
+
+/// How often the client is told the request is still alive.
+///
+/// The whole request is covered — the queue wait, the approval wait and the
+/// execution — because the longest silence is in the middle and a client that
+/// hears nothing for ninety seconds is a client that gives up on a window
+/// somebody is still reading.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many output chunks may be queued for the live view before the reader
+/// waits.
+///
+/// Bounded, and drained by a task of its own: the task awaiting
+/// [`exec::run`] must never be the task forwarding its output, or a window
+/// that stops reading stalls the command it is watching.
+const OUTPUT_QUEUE: usize = 64;
+
+/// Everything one daemon shares across every session and every request.
+///
+/// One of these exists per `hatch serve`. The queue in particular has to be
+/// shared: an approval window at a time means *at a time on this machine*, not
+/// per MCP session, and several sandboxed agents can hold sessions at once.
+pub struct Daemon {
+    config: Arc<Config>,
+    prompter: Arc<dyn Prompter>,
+    queue: ApprovalQueue,
+    audit: AuditLog,
+    denylist: Denylist,
+}
+
+impl Daemon {
+    /// A daemon over the hatch directory `dir`, asking `prompter` for
+    /// decisions.
+    pub fn new(dir: &Path, config: Config, prompter: Arc<dyn Prompter>) -> Daemon {
+        let denylist = Denylist::new(dir, &config.denylist_extra);
+        Daemon {
+            config: Arc::new(config),
+            prompter,
+            queue: ApprovalQueue::new(),
+            audit: AuditLog::new(&dir.join("log")),
+            denylist,
+        }
+    }
+
+    /// The running config, for the tool descriptions.
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+}
+
+/// What the request flow needs from the client's side of one call.
+///
+/// A plain struct rather than [`RequestContext`] itself, so that the flow is
+/// reachable from a test without building an rmcp peer, and so that the two
+/// abandonment signals arrive as two named fields instead of as one context
+/// whose behaviour has to be remembered.
+pub struct Caller {
+    /// Fires when the client sends `notifications/cancelled` for this call.
+    cancelled: CancellationToken,
+    /// The call's connection, when it has one. Absent only for a call that did
+    /// not arrive over the streamable-HTTP transport, which in production is
+    /// nothing and in tests is most things.
+    hangup: Option<Hangup>,
+    /// Where progress goes, and only when the client asked for it: a progress
+    /// notification with no token from the request's `_meta` is one no client
+    /// can associate with anything.
+    progress: Option<(Peer<RoleServer>, ProgressToken)>,
+}
+
+impl Caller {
+    /// The caller behind one rmcp request.
+    fn of(context: &RequestContext<RoleServer>) -> Caller {
+        Caller {
+            cancelled: context.ct.clone(),
+            hangup: context.extensions.get::<Hangup>().cloned(),
+            progress: context
+                .meta
+                .get_progress_token()
+                .map(|token| (context.peer.clone(), token)),
+        }
+    }
+
+    /// A caller that never cancels, never hangs up and wants no progress.
+    #[cfg(test)]
+    fn quiet() -> Caller {
+        Caller { cancelled: CancellationToken::new(), hangup: None, progress: None }
+    }
+
+    /// Resolves when the client's connection ends.
+    ///
+    /// Pending forever when there is no connection to watch, which is the
+    /// right answer rather than a missing one: an arm that is never ready
+    /// simply never wins its select.
+    async fn hung_up(&self) {
+        match &self.hangup {
+            Some(hangup) => hangup.gone().cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Which of the two abandonments this was.
+    ///
+    /// Asked only once the connection is known to be gone. See [`Hangup`] for
+    /// why the flag decides it and the timing does not.
+    fn abandonment(&self) -> LogVerdict {
+        let cancelled =
+            self.cancelled.is_cancelled() || self.hangup.as_ref().is_some_and(Hangup::was_cancelled);
+        if cancelled { LogVerdict::Cancelled } else { LogVerdict::Disconnected }
+    }
+}
+
+// ---- one request, from arrival to audit line -------------------------------
+
+/// Which of the three long waits a request is in, for the progress ticker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Phase {
+    Queued = 0,
+    AwaitingApproval = 1,
+    Executing = 2,
+}
+
+impl Phase {
+    fn message(self) -> &'static str {
+        match self {
+            Phase::Queued => "queued behind another approval",
+            Phase::AwaitingApproval => "awaiting the user's decision",
+            Phase::Executing => "approved; running",
+        }
+    }
+
+    fn of(value: u8) -> Phase {
+        match value {
+            0 => Phase::Queued,
+            1 => Phase::AwaitingApproval,
+            _ => Phase::Executing,
+        }
+    }
+}
+
+/// The progress ticker for one request.
+///
+/// Dropping it stops the ticker, which is the only reason it is a value at
+/// all: "stopped when the request ends" then holds on every path out of the
+/// flow, including the ones that return early, rather than on the paths
+/// somebody remembered.
+struct Progress {
+    phase: Arc<AtomicU8>,
+    stop: CancellationToken,
+}
+
+impl Progress {
+    /// Start ticking for `caller`, if the client asked for progress.
+    fn start(caller: &Caller) -> Progress {
+        let phase = Arc::new(AtomicU8::new(Phase::Queued as u8));
+        let stop = CancellationToken::new();
+        if let Some((peer, token)) = caller.progress.clone() {
+            let (phase, stop) = (Arc::clone(&phase), stop.clone());
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                loop {
+                    // Before the first wait, not after it: a client learns
+                    // that its call is alive and queued at once rather than
+                    // one interval later, and that first frame is also what
+                    // says the request was accepted at all.
+                    let message = Phase::of(phase.load(Ordering::Relaxed)).message();
+                    let sent = peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(
+                                token.clone(),
+                                started.elapsed().as_secs_f64(),
+                            )
+                            .with_message(message),
+                        )
+                        .await;
+                    // A send that fails says the peer is no longer taking
+                    // notifications, and says nothing at all about whether the
+                    // request should continue: the transport reports a dead
+                    // stream as a successful send anyway, so this is not a
+                    // disconnect signal and is deliberately not treated as
+                    // one. Stop ticking; the request goes on being decided by
+                    // the user, the deadline and `Hangup`.
+                    if sent.is_err() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = tokio::time::sleep(PROGRESS_INTERVAL) => {}
+                    }
+                }
+            });
+        }
+        Progress { phase, stop }
+    }
+
+    fn enter(&self, phase: Phase) {
+        self.phase.store(phase as u8, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// How one request ended: the line for the log and the answer for the agent,
+/// as one value.
+///
+/// This type is why there is exactly one audit record per request. Every exit
+/// from the flow — a refusal, a denial, a timeout, a cancellation, a dropped
+/// client, a dead window, a command that ran — is a `return` of one of these,
+/// so the flow cannot end without saying how it ended, and
+/// `Daemon::serve` appends in the single place that receives it. Seven exit
+/// paths that each remember to log would be seven chances to forget; a return
+/// type cannot be forgotten.
+struct Outcome {
+    verdict: LogVerdict,
+    /// What the user typed, when a user typed anything.
+    note: Option<String>,
+    /// The tool-specific half of the record, as complete as this outcome
+    /// knows how to make it.
+    detail: LogDetail,
+    /// What the agent gets back.
+    result: CallToolResult,
+}
+
+impl Outcome {
+    /// An outcome that carries a recoverable tool error.
+    ///
+    /// Every non-approval is one of these. Never `Err(ErrorData)`: that is a
+    /// protocol error, and MCP clients render protocol errors opaquely, so an
+    /// agent would be told the server is broken instead of being told what the
+    /// person decided.
+    fn refusing(
+        verdict: LogVerdict,
+        note: Option<String>,
+        detail: LogDetail,
+        message: String,
+    ) -> Outcome {
+        Outcome {
+            verdict,
+            note,
+            detail,
+            result: CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+}
+
+/// One request as it arrived, before anything has been validated.
+enum Asked {
+    Run(RunCommandParams),
+    Swap(SwapFileParams),
+}
+
+impl Asked {
+    /// The two agent-written lines every window and every log record carries,
+    /// defanged: the agent chooses this text and it frames the whole decision,
+    /// so a bidi override in it would reorder everything the reader sees.
+    fn headline(&self) -> (String, String) {
+        match self {
+            Asked::Run(p) => (defang(&p.title), defang(&p.reason)),
+            Asked::Swap(p) => (defang(&p.title), defang(&p.reason)),
+        }
+    }
+}
+
+/// A request that has passed validation and been rendered: everything needed
+/// to show it, and everything needed to carry it out if it is approved.
+struct Job {
+    payload: Payload,
+    detail: LogDetail,
+    work: Work,
+}
+
+/// What an approval authorises.
+enum Work {
+    Run { argv: Vec<String>, env: Env, cwd: PathBuf },
+    Swap { path: PathBuf, content: Vec<u8>, plan: SwapPlan },
+}
+
+impl Daemon {
+    /// Run one `run_command` call to its end.
+    pub async fn run_command(&self, params: RunCommandParams, caller: Caller) -> CallToolResult {
+        // The caps run before anything else touches these strings. Rendering
+        // is where the super-linear work lives, so checking afterwards would
+        // check nothing.
+        //
+        // A call refused here is deliberately *not* an audit line. It never
+        // became a request: nothing was rendered, no window was opened, and
+        // the record would have to carry the very field that is too large to
+        // handle in the first place.
+        match check_run_command(&params) {
+            Ok(()) => self.serve(Asked::Run(params), caller).await,
+            Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
+        }
+    }
+
+    /// Run one `swap_file` call to its end.
+    pub async fn swap_file(&self, params: SwapFileParams, caller: Caller) -> CallToolResult {
+        // See `run_command` on why this is here and why it is not logged.
+        match check_swap_file(&params) {
+            Ok(()) => self.serve(Asked::Swap(params), caller).await,
+            Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
+        }
+    }
+
+    /// One request, and the one place an audit record is written.
+    async fn serve(&self, asked: Asked, caller: Caller) -> CallToolResult {
+        let (title, reason) = asked.headline();
+        let outcome = self.decide(asked, caller, &title, &reason).await;
+
+        // The only `append` in the crate's request path. See `Outcome`.
+        let record = AuditRecord {
+            ts: Local::now(),
+            title,
+            reason,
+            verdict: outcome.verdict,
+            note: outcome.note,
+            detail: outcome.detail,
+        };
+        if let Err(error) = self.audit.append(&record) {
+            // The operation has already happened, or has already been refused.
+            // Turning a log failure into a tool error would report an outcome
+            // that is not the one the user got; the honest thing is to say so
+            // where the daemon's own output goes and answer the agent with
+            // what actually happened.
+            eprintln!("hatch could not write an audit record: {error:#}");
+        }
+        outcome.result
+    }
+
+    /// Everything between arrival and the outcome.
+    ///
+    /// The order is the whole design: refuse before queueing, queue before
+    /// prompting, start the clock at the window and not at the queue, and stop
+    /// applying the deny rule the moment a verdict arrives.
+    async fn decide(
+        &self,
+        asked: Asked,
+        caller: Caller,
+        title: &str,
+        reason: &str,
+    ) -> Outcome {
+        // Step 1. Validate and render. A refusal never reaches a person:
+        // prompting for something that is going to be refused spends the
+        // scarcest resource in the design on nothing.
+        let job = match self.prepare(asked) {
+            Prepared::Ready(job) => job,
+            Prepared::Refused(refused) => return refused,
+        };
+        let Job { payload, mut detail, work } = job;
+
+        // Started here and stopped by its own `Drop`, so it covers the queue
+        // wait, the approval wait and the execution, and cannot outlive any
+        // path out of this function.
+        let progress = Progress::start(&caller);
+
+        // Step 2. The approval lock, in arrival order. The wait is bounded by
+        // the client and by nothing else: the approval deadline has not
+        // started, because a request that spent its window queueing would open
+        // one that is already expiring.
+        let admission = tokio::select! {
+            admission = self.queue.acquire() => admission,
+            () = caller.cancelled.cancelled() => {
+                return abandoned(LogVerdict::Cancelled, detail);
+            }
+            () = caller.hung_up() => {
+                return abandoned(caller.abandonment(), detail);
+            }
+        };
+        let badge = admission.queue_depth();
+        let (permit, depths) = admission.into_parts();
+
+        // Step 3. The window, and only now the clock. The deadline is computed
+        // before the window is opened so that the countdown it draws and the
+        // timer that enforces it are the same instant.
+        progress.enter(Phase::AwaitingApproval);
+        let window = Duration::from_secs(self.config.timeout_secs);
+        let expires_at = tokio::time::Instant::now() + window;
+        let request = PromptRequest {
+            title: title.to_string(),
+            reason: reason.to_string(),
+            deadline: Utc::now() + chrono::Duration::seconds(self.config.timeout_secs as i64),
+            queue_depth: badge,
+            payload,
+        };
+        let mut session = match self.prompter.prompt(request, depths).await {
+            Ok(session) => session,
+            Err(error) => {
+                return Outcome::refusing(
+                    LogVerdict::PromptDied,
+                    None,
+                    detail,
+                    format!(
+                        "hatch could not open the approval window, so nobody was asked and \
+                         nothing ran: {error:#}. This is not a decision by the user."
+                    ),
+                );
+            }
+        };
+
+        // Step 4. The verdict, or one of the four ways there is never going to
+        // be one. Every one of those four denies.
+        let ending = tokio::select! {
+            // Biased, and the verdict first: a decision that arrives in the
+            // same instant as the deadline is a decision, not a timeout.
+            biased;
+            verdict = session.verdict() => Ending::Decided(verdict),
+            () = caller.cancelled.cancelled() => Ending::Cancelled,
+            () = caller.hung_up() => Ending::HungUp,
+            () = tokio::time::sleep_until(expires_at) => Ending::Expired,
+        };
+        let verdict = match ending {
+            Ending::Decided(Ok(verdict)) => verdict,
+            Ending::Decided(Err(gone)) => {
+                session.close().await;
+                return Outcome::refusing(
+                    LogVerdict::PromptDied,
+                    None,
+                    detail,
+                    format!(
+                        "{gone}, so nothing ran. The window was closed or its process died \
+                         before anyone decided; this is not a decision by the user, and you may \
+                         ask again."
+                    ),
+                );
+            }
+            Ending::Expired => {
+                session.close().await;
+                return Outcome::refusing(
+                    LogVerdict::Timeout,
+                    None,
+                    detail,
+                    format!(
+                        "timed out awaiting the user after {}s. Nobody answered the window, so \
+                         nothing ran and nobody decided anything. You may ask again, or find \
+                         another way to make progress without them.",
+                        self.config.timeout_secs
+                    ),
+                );
+            }
+            Ending::Cancelled => {
+                session.close().await;
+                return abandoned(LogVerdict::Cancelled, detail);
+            }
+            Ending::HungUp => {
+                session.close().await;
+                return abandoned(caller.abandonment(), detail);
+            }
+        };
+
+        // Step 5. A verdict has arrived, so the lock is released now — not
+        // when the command it authorised finishes. A five-minute upgrade must
+        // not hold every other agent behind it.
+        drop(permit);
+
+        let stream = match verdict {
+            Verdict::Approve { stream } => stream,
+            other => {
+                session.close().await;
+                return declined(other, detail);
+            }
+        };
+
+        // From here the deny rule no longer applies. The command is
+        // authorised: a window that dies now loses the Kill button and the
+        // live view, and nothing else. Killing it could leave a half-finished
+        // state the user never asked for.
+        progress.enter(Phase::Executing);
+        let result = match work {
+            Work::Run { argv, env, cwd } => {
+                self.run_it(&argv, &env, &cwd, stream, &session, &mut detail).await
+            }
+            Work::Swap { path, content, plan } => {
+                self.swap_it(&path, &content, &plan, &session, &mut detail).await
+            }
+        };
+
+        // Step 6 is elevation, which lands with the root path: an elevation
+        // failure is its own outcome and must never be reported as a nonzero
+        // exit code. Nothing here can produce one, because `root: true` is
+        // refused in `prepare`.
+
+        note_prompt_death(&session, &mut detail);
+        // The window closes on the frame that was just sent; this waits for it
+        // to do so, under a bound of the daemon's own, and then ends it.
+        let _ = tokio::time::timeout(FINAL_FRAME_GRACE, session.window_gone().cancelled()).await;
+        session.close().await;
+
+        Outcome { verdict: LogVerdict::Approve, note: None, detail, result }
+    }
+}
+
+/// The two ways preparation can end.
+///
+/// An enum rather than a `Result`, because both arms are ordinary and neither
+/// is an error: a refusal is a complete outcome with its own audit line, and
+/// it is as large as a success, which `Result` would make every caller pay for
+/// on the way past.
+enum Prepared {
+    /// Validated and rendered, ready to be shown to a person.
+    Ready(Job),
+    /// Refused before anyone was interrupted.
+    Refused(Outcome),
+}
+
+/// Which of the four things happened while the window was open.
+enum Ending {
+    Decided(Result<Verdict, crate::prompter::PromptGone>),
+    Expired,
+    Cancelled,
+    HungUp,
+}
+
+// ---- step 1: validate and render, before anybody is interrupted ------------
+
+/// What the agent is told when it asks for something this build cannot do.
+///
+/// Worded as a limit and not as a decision, for the same reason the size caps
+/// are: an agent that reads this as a person saying no will report a denial
+/// that never happened.
+fn not_yet(what: &str, instead: &str) -> String {
+    format!(
+        "hatch cannot {what} yet: this build does not carry that path. Nothing was rendered, \
+         nobody was asked and nothing ran — this is a missing feature, not a decision by the \
+         user. {instead}"
+    )
+}
+
+/// What the agent is told when hatch refuses a request outright.
+fn refusal_text(reason: &str) -> String {
+    format!(
+        "hatch refused this before showing it to anyone: {reason}. Nothing was rendered, nobody \
+         was asked and nothing ran — this is hatch's own rule, not a decision by the user."
+    )
+}
+
+impl Daemon {
+    /// Validate and render one request, or refuse it.
+    ///
+    /// Every refusal that can be known without asking a person is known here:
+    /// an unsupported request, a working directory that is not one, a path
+    /// hatch protects, a symlink, a missing parent, content nothing can draw
+    /// a diff of. All of them return an outcome carrying
+    /// [`LogVerdict::Refused`], and all of them return it before the queue is
+    /// touched.
+    fn prepare(&self, asked: Asked) -> Prepared {
+        match asked {
+            Asked::Run(params) => self.prepare_run(params),
+            Asked::Swap(params) => self.prepare_swap(params),
+        }
+    }
+
+    fn prepare_run(&self, params: RunCommandParams) -> Prepared {
+        let env = build_child_env(&self.config);
+        // `$HOME` as the child will see it, not as the daemon sees it: the
+        // window states the directory, and a directory taken from a different
+        // environment than the one the command runs in would be a stated fact
+        // that is not true.
+        let cwd = match &params.cwd {
+            Some(given) => PathBuf::from(given),
+            None => PathBuf::from(env.get("HOME").map_or("/", String::as_str)),
+        };
+        let detail = |cwd: &Path| {
+            LogDetail::RunCommand(RunDetail {
+                command: params.command.clone(),
+                root: params.root,
+                cwd: cwd.display().to_string(),
+                exit_code: None,
+                duration_ms: None,
+                killed_by_user: None,
+                timed_out: None,
+                prompt_died_after_approve: None,
+            })
+        };
+        let refuse = |message: String| {
+            Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(&cwd), message))
+        };
+
+        if params.root {
+            return refuse(not_yet(
+                "run a command as root",
+                "Ask for the unelevated form, or ask the user to run it themselves.",
+            ));
+        }
+        if params.interactive {
+            return refuse(not_yet(
+                "run a command in a terminal",
+                "Ask for a form that does not need a terminal — a non-interactive flag, or a \
+                 command whose output you can read.",
+            ));
+        }
+        // Absolute, because a relative directory is resolved against hatch's
+        // own working directory, which is not the one the request was written
+        // against and is not the one the window would be describing.
+        if !cwd.is_absolute() {
+            return refuse(refusal_text(&format!(
+                "the working directory {} is not absolute",
+                cwd.display()
+            )));
+        }
+        // Checked here rather than inside `exec::run`, so a directory that
+        // does not exist costs the user no attention at all.
+        match std::fs::metadata(&cwd) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => {
+                return refuse(refusal_text(&format!(
+                    "the working directory {} is not a directory",
+                    cwd.display()
+                )));
+            }
+            Err(error) => {
+                return refuse(refusal_text(&format!(
+                    "the working directory {} cannot be used: {error}",
+                    cwd.display()
+                )));
+            }
+        }
+
+        let spans = render_command(&params.command, &env);
+        // Danger markers are display-only and land with the marker heuristics;
+        // an empty list has never been a claim that a command is safe.
+        let payload = Payload::command(&spans, Vec::new(), cwd.clone(), false, false);
+        Prepared::Ready(Job {
+            detail: detail(&cwd),
+            payload,
+            // A direct argv, never a string handed to another shell: the
+            // rendering above is a rendering *of these three arguments*.
+            work: Work::Run {
+                argv: vec!["bash".to_string(), "-c".to_string(), params.command],
+                env,
+                cwd,
+            },
+        })
+    }
+
+    fn prepare_swap(&self, params: SwapFileParams) -> Prepared {
+        let path = PathBuf::from(&params.path);
+        let content = params.content.into_bytes();
+        let detail = |hash_before: Option<String>| {
+            LogDetail::SwapFile(SwapDetail {
+                path: params.path.clone(),
+                root: params.root,
+                hash_before,
+                hash_after: None,
+                mode: None,
+                owner: None,
+                bytes: None,
+            })
+        };
+        let refuse = |message: String| {
+            Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(None), message))
+        };
+
+        if params.root {
+            return refuse(not_yet(
+                "write a file as root",
+                "Ask for a path this user can write, or ask the user to place the file \
+                 themselves.",
+            ));
+        }
+        if let Err(refusal) = swap::validate(&path, &self.denylist) {
+            return refuse(refusal_text(&refusal.to_string()));
+        }
+
+        let plan = match swap::plan(&path, &content, false) {
+            Ok(plan) => plan,
+            Err(error) => return refuse(refusal_text(&format!("{error:#}"))),
+        };
+        let before = match plan.kind {
+            PlanKind::Create => Vec::new(),
+            PlanKind::Replace => match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Prepared::Refused(Outcome::refusing(
+                        LogVerdict::Refused,
+                        None,
+                        detail(plan.hash_before.clone()),
+                        refusal_text(&format!("{} cannot be read: {error}", path.display())),
+                    ));
+                }
+            },
+        };
+
+        let rows = match diff_files(&before, &content, self.config.output_cap_bytes) {
+            FileDiff::Rows(rows) => rows,
+            // Binary or oversized: there is no diff to draw, and the window's
+            // wire format has no way yet to say "here is a summary instead of
+            // a comparison". Drawing an empty diff would tell the reader
+            // nothing changes, which is the one thing it must never say, so
+            // the request is refused until the summary form exists.
+            FileDiff::Unrenderable { .. } => {
+                return Prepared::Refused(Outcome::refusing(
+                    LogVerdict::Refused,
+                    None,
+                    detail(plan.hash_before.clone()),
+                    not_yet(
+                        "show a diff of this file",
+                        "One side of it is binary or larger than the display cap, and hatch will \
+                         not ask anyone to approve a change it cannot draw. Send a smaller, \
+                         textual replacement.",
+                    ),
+                ));
+            }
+        };
+
+        Prepared::Ready(Job {
+            detail: detail(plan.hash_before.clone()),
+            payload: Payload::swap(path.clone(), plan.clone(), &rows),
+            work: Work::Swap { path, content, plan },
+        })
+    }
+}
+
+// ---- step 5: what an approval authorises -----------------------------------
+
+impl Daemon {
+    /// Run an approved command to completion and describe what happened.
+    async fn run_it(
+        &self,
+        argv: &[String],
+        env: &Env,
+        cwd: &Path,
+        stream: bool,
+        session: &PromptSession,
+        detail: &mut LogDetail,
+    ) -> CallToolResult {
+        // The live view is a display preference and nothing else: execution is
+        // identical either way, so the only difference is whether a sink is
+        // wired at all.
+        let (chunks, pump) = if stream {
+            let (tx, rx) = mpsc::channel(OUTPUT_QUEUE);
+            // A task of its own. The task awaiting `run` must not be the one
+            // forwarding output, or a window that stops reading stalls the
+            // command it is watching.
+            (Some(tx), Some(tokio::spawn(pump_output(rx, session.outbox()))))
+        } else {
+            (None, None)
+        };
+
+        let started = std::time::Instant::now();
+        let ran = exec::run(
+            argv,
+            env,
+            cwd,
+            RunOpts {
+                timeout: Some(Duration::from_secs(self.config.exec_timeout_secs)),
+                cancel: session.kill_requested(),
+                cap_bytes: self.config.output_cap_bytes,
+                chunks,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        if let Some(pump) = pump {
+            let _ = pump.await;
+        }
+
+        let output = match ran {
+            Ok(output) => output,
+            // Nothing was executed. The user approved and hatch could not
+            // carry it out, which is neither an approval that happened nor a
+            // decision anybody made, so the agent is told plainly and may
+            // retry without wondering what already ran.
+            Err(error) => {
+                // No `Finished` frame: the wire can only say "exited" or
+                // "was signalled", and both would be a plausible-looking lie
+                // about a command that never started. The window is closed
+                // instead, and the agent is told the truth.
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "the user approved this, but hatch could not start it, so nothing ran: \
+                     {error}"
+                ))]);
+            }
+        };
+
+        if let LogDetail::RunCommand(run) = detail {
+            run.exit_code = output.exit_code;
+            run.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            run.killed_by_user = Some(output.killed_by_user);
+            run.timed_out = Some(output.timed_out);
+        }
+        if let Some(frame) = finished_frame(&output) {
+            let _ = session.outbox().finished(frame).await;
+        }
+        CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))])
+    }
+
+    /// Apply an approved file replacement and describe what happened.
+    async fn swap_it(
+        &self,
+        path: &Path,
+        content: &[u8],
+        plan: &SwapPlan,
+        session: &PromptSession,
+        detail: &mut LogDetail,
+    ) -> CallToolResult {
+        // Re-validated and re-hashed inside `apply`, which is what makes every
+        // error here a guarantee that the file on disk was not touched.
+        let applied = swap::apply(path, content, plan, &self.denylist);
+        let landed = applied.is_ok();
+
+        if landed && let LogDetail::SwapFile(swap) = detail {
+            swap.hash_after = Some(sha256_hex(content));
+            swap.mode = Some(format!("{:04o}", plan.landing_mode));
+            swap.owner = Some(format!("{}:{}", plan.landing_owner, plan.landing_group));
+            swap.bytes = Some(content.len() as u64);
+        }
+
+        // The window closes on this frame. A swap has no process and so no
+        // exit code of its own; zero for "it landed" and one for "it did not"
+        // is the whole of what the wire can carry today, and it is the same
+        // fact the tool result states.
+        let _ = session
+            .outbox()
+            .finished(protocol::Outcome::Exit { code: i32::from(!landed) })
+            .await;
+
+        match applied {
+            Ok(()) => CallToolResult::success(vec![ContentBlock::text(format!(
+                "wrote {}: {} bytes, mode {:04o}, owner {}:{}",
+                path.display(),
+                content.len(),
+                plan.landing_mode,
+                plan.landing_owner,
+                plan.landing_group,
+            ))]),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
+        }
+    }
+}
+
+/// The tool error for an apply that did not happen.
+///
+/// Every [`ApplyError`] guarantees the file on disk is untouched, so every one
+/// of them is safe to retry — and saying so is the difference between an agent
+/// that re-reads the file and asks again and one that gives up.
+fn describe_apply(error: &ApplyError) -> String {
+    format!(
+        "the user approved this, but the write did not happen: {error}. The file on disk is \
+         exactly as it was, so reading it again and asking again is safe."
+    )
+}
+
+/// How the window is told the command ended, or `None` when nothing true can
+/// be said about it.
+///
+/// A child that neither exited nor was signalled is not a state Linux reports,
+/// so this arm is unreachable — and it answers `None` rather than picking a
+/// number, because the window closes on this frame and an invented exit code
+/// is the last thing a person would see.
+fn finished_frame(output: &Output) -> Option<protocol::Outcome> {
+    match (output.exit_code, output.signal) {
+        (Some(code), _) => Some(protocol::Outcome::Exit { code }),
+        (None, Some(signal)) => Some(protocol::Outcome::Signal { signal }),
+        (None, None) => None,
+    }
+}
+
+/// What the agent reads about a command that ran.
+///
+/// The two streams are kept apart, because a diagnostic the command wrote to
+/// stderr is not part of its answer, and every way the run was cut short is
+/// named: a truncated result that reads as a complete one is the failure this
+/// whole project is built to avoid.
+fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
+    let mut text = String::new();
+    match output.exit_code {
+        Some(code) => text.push_str(&format!("exit code: {code}\n")),
+        None => match output.signal {
+            Some(signal) => text.push_str(&format!("ended by signal {signal}\n")),
+            None => text.push_str("ended without an exit code\n"),
+        },
+    }
+    text.push_str(&format!("duration: {}ms\n", elapsed.as_millis()));
+    if output.timed_out {
+        text.push_str("timed out: hatch killed it at the execution deadline\n");
+    }
+    if output.killed_by_user {
+        text.push_str("killed: the user pressed Kill while it ran\n");
+    }
+    for (name, body, truncated) in [
+        ("stdout", &output.stdout, output.stdout_truncated),
+        ("stderr", &output.stderr, output.stderr_truncated),
+    ] {
+        text.push_str(&format!("\n{name}:\n"));
+        if body.is_empty() {
+            text.push_str("(empty)\n");
+        } else {
+            text.push_str(body);
+            if !body.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        if truncated {
+            text.push_str(&format!("({name} was truncated at hatch's output cap)\n"));
+        }
+    }
+    text
+}
+
+/// Lowercase hex SHA-256, the same form `sha256sum` prints.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+// ---- the outcomes that are not an approval ---------------------------------
+
+/// The tool error for a request whose client stopped waiting.
+///
+/// Both forms deny and both close the window; only the log tells them apart.
+/// The agent very often never reads this at all — for a disconnect its
+/// connection is gone by definition — so it is written for the case where it
+/// does: a cancelled call whose client is still there.
+fn abandoned(verdict: LogVerdict, detail: LogDetail) -> Outcome {
+    let how = match verdict {
+        LogVerdict::Cancelled => "your client cancelled this call",
+        _ => "the connection carrying this call was lost",
+    };
+    Outcome::refusing(
+        verdict,
+        None,
+        detail,
+        format!(
+            "{how} before anyone decided, so the approval window was closed and nothing ran. \
+             Nobody refused this."
+        ),
+    )
+}
+
+/// The tool error for each verdict that is not an approval.
+///
+/// The note the user typed is returned verbatim in the text *and* stored on
+/// the audit line, so the person's own words are what the agent acts on.
+fn declined(verdict: Verdict, detail: LogDetail) -> Outcome {
+    let (log_verdict, note, message) = match verdict {
+        Verdict::Deny { note } => (
+            LogVerdict::Deny,
+            note.clone(),
+            format!("denied by user: {note}"),
+        ),
+        Verdict::Revise { kind: ReviseKind::Explain, note } => (
+            LogVerdict::Explain,
+            note.clone(),
+            format!("not run — the user asks you to explain: {note}"),
+        ),
+        Verdict::Revise { kind: ReviseKind::Simplify, note } => (
+            LogVerdict::Simplify,
+            note.clone(),
+            format!("not run — the user asks for a more legible form: {note}"),
+        ),
+        Verdict::SelfRun { note } => (
+            LogVerdict::SelfRun,
+            note.clone(),
+            format!(
+                "not run — the user will run this themselves; ask them for the output rather \
+                 than retrying: {note}"
+            ),
+        ),
+        // `decide` matches `Approve` out before calling this, so reaching here
+        // would mean an approval was about to be reported as a refusal. Fail
+        // closed and say so rather than silently denying an approved request.
+        Verdict::Approve { .. } => (
+            LogVerdict::Deny,
+            String::new(),
+            "hatch mishandled an approval and did not run it; nothing happened".to_string(),
+        ),
+    };
+    Outcome::refusing(log_verdict, Some(note), detail, message)
+}
+
+/// Record whether the window died while the approved operation ran.
+///
+/// Not a verdict of its own: the verdict was already given, and what was lost
+/// is the Kill button and the live view rather than the authorisation.
+fn note_prompt_death(session: &PromptSession, detail: &mut LogDetail) {
+    let died = session.window_gone().is_cancelled();
+    if let LogDetail::RunCommand(run) = detail {
+        run.prompt_died_after_approve = Some(died);
+    }
+}
+
+// ---- the live view ---------------------------------------------------------
+
+/// Forward an approved command's output to the window, decoding across chunk
+/// boundaries.
+///
+/// The daemon decodes and the window draws. A chunk boundary falls wherever
+/// the kernel split the output, very often mid-character, so a window that
+/// decoded for itself would draw a replacement character for a character that
+/// was never broken.
+async fn pump_output(mut chunks: mpsc::Receiver<Chunk>, outbox: Outbox) {
+    let mut tails: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    while let Some(chunk) = chunks.recv().await {
+        let slot = usize::from(chunk.stream == exec::Stream::Stderr);
+        tails[slot].extend_from_slice(&chunk.bytes);
+        if let Some(text) = take_decodable(&mut tails[slot]) {
+            // A window that has gone is not an error after an approval and
+            // must not stop the command, so the answer is ignored.
+            outbox.output(chunk.stream, text).await;
+        }
+    }
+    // Whatever is left is all there is ever going to be, so a partial
+    // character at the end is drawn as the replacement it is.
+    for (slot, stream) in [(0, exec::Stream::Stdout), (1, exec::Stream::Stderr)] {
+        if !tails[slot].is_empty() {
+            outbox.output(stream, String::from_utf8_lossy(&tails[slot]).into_owned()).await;
+        }
+    }
+}
+
+/// Split off the longest prefix of `buffer` that is text, leaving the rest.
+///
+/// A tail that is an *unfinished* character is kept for the next chunk; a
+/// sequence that is simply wrong is taken now, because no later byte will ever
+/// make it valid and holding it back would stall the view forever.
+fn take_decodable(buffer: &mut Vec<u8>) -> Option<String> {
+    let take = match std::str::from_utf8(buffer) {
+        Ok(_) => buffer.len(),
+        Err(error) => match error.error_len() {
+            Some(bad) => error.valid_up_to() + bad,
+            None => error.valid_up_to(),
+        },
+    };
+    if take == 0 {
+        return None;
+    }
+    let head: Vec<u8> = buffer.drain(..take).collect();
+    Some(String::from_utf8_lossy(&head).into_owned())
 }
 
 #[tool_handler(
@@ -478,15 +1843,16 @@ fn loopback_hosts() -> Vec<String> {
 /// The layer goes on the router, not on the route, so it also covers the
 /// fallback: an unauthenticated request to any path at all gets the same 401
 /// and cannot be used to map what this daemon serves.
-pub fn app(config: Arc<Config>) -> Router {
-    let expected = Arc::new(digest(config.token.as_bytes()));
+pub fn app(daemon: Arc<Daemon>) -> Router {
+    let expected = Arc::new(digest(daemon.config().token.as_bytes()));
 
+    // The registry is shared between the transport, which fills it in, and
+    // every `Hatch` the factory builds, which read out of it through the
+    // request extensions the transport plants. See `Hangup`.
+    let calls = Arc::new(Calls::default());
     let service = StreamableHttpService::new(
-        {
-            let config = Arc::clone(&config);
-            move || Ok(Hatch::new(Arc::clone(&config)))
-        },
-        Arc::new(LocalSessionManager::default()),
+        move || Ok(Hatch::new(Arc::clone(&daemon))),
+        Arc::new(WatchedSessions::new(Arc::clone(&calls))),
         StreamableHttpServerConfig::default().with_allowed_hosts(loopback_hosts()),
     );
 
@@ -553,11 +1919,18 @@ pub fn run_serve() -> anyhow::Result<()> {
     let config = Config::load_or_create(&dir)?;
     sweep_stage(&dir)?;
 
+    // Located before the listener is bound, so a build that cannot find its
+    // own executable fails at startup rather than on the first request, when
+    // the failure would be a window that never opens.
+    let prompter = Arc::new(ProcessPrompter::new()?);
+    let port = config.port;
+    let daemon = Arc::new(Daemon::new(&dir, config, prompter));
+
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
-        let listener = bind(config.port).await?;
-        config::print_client_line_for(&config)?;
-        axum::serve(listener, app(Arc::new(config))).await.context("serving MCP")
+        let listener = bind(port).await?;
+        config::print_client_line_for(daemon.config())?;
+        axum::serve(listener, app(daemon)).await.context("serving MCP")
     })
 }
 
@@ -568,15 +1941,34 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Every test here waits on a socket or a task. None may outlive this.
+    /// Every test here waits on a socket, a task, a channel or a child. None
+    /// may outlive this.
     const CEILING: Duration = Duration::from_secs(10);
+
+    /// A hard ceiling on anything that waits for a decision that may never
+    /// come. A test that can hang forever takes the whole run with it.
+    async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(CEILING, fut)
+            .await
+            .expect("this waited on something that never happened")
+    }
+
+    /// A daemon for the tests that only need a server to answer, and never
+    /// reach a tool: the hatch directory is therefore never touched, and the
+    /// window is a program that exits at once.
+    fn bare_daemon(config: Config) -> Arc<Daemon> {
+        Arc::new(Daemon::new(
+            Path::new("/nonexistent-hatch-directory"),
+            config,
+            Arc::new(crate::prompter::ProcessPrompter::with_argv(["false"])),
+        ))
+    }
 
     /// Bind a server on an ephemeral loopback port and return its address.
     async fn spawn(config: Config) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let config = Arc::new(config);
         let listener = bind(0).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = app(config);
+        let app = app(bare_daemon(config));
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -585,6 +1977,19 @@ mod tests {
 
     fn test_config() -> Config {
         Config { token: "test-token".to_string(), ..Config::default() }
+    }
+
+    /// A daemon over a real, temporary hatch directory, for the tests that do
+    /// reach a tool but are not about the verdict.
+    fn scratch_daemon() -> (tempfile::TempDir, Arc<Daemon>) {
+        let dir = tempfile::tempdir().unwrap();
+        Config::load_or_create(dir.path()).unwrap();
+        let daemon = Arc::new(Daemon::new(
+            dir.path(),
+            test_config(),
+            Arc::new(crate::prompter::ProcessPrompter::with_argv(["false"])),
+        ));
+        (dir, daemon)
     }
 
     #[tokio::test]
@@ -932,9 +2337,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_cap_refuses_before_the_tool_body_runs() {
-        let hatch = Hatch::new(Arc::new(test_config()));
+        let (_dir, daemon) = scratch_daemon();
         let over = run_params("command", "a".repeat(MAX_COMMAND_BYTES + 1));
-        let result = hatch.run_command(Parameters(over)).await.unwrap();
+        let result = within(daemon.run_command(over, Caller::quiet())).await;
         assert_eq!(result.is_error, Some(true));
         let text = result_text(&result);
         assert!(text.contains("`command` is"), "the cap must answer, not the body: {text}");
@@ -942,14 +2347,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_within_the_cap_reaches_the_body() {
-        let hatch = Hatch::new(Arc::new(test_config()));
-        let within = run_params("command", "a".repeat(MAX_COMMAND_BYTES));
-        let text = result_text(&hatch.run_command(Parameters(within)).await.unwrap());
-        assert!(text.contains("cannot run a command yet"), "{text}");
+        // The window here is a program that exits at once, so reaching the
+        // body reads as a dead prompt — which is the point: it is not the
+        // cap's refusal.
+        let (_dir, daemon) = scratch_daemon();
+        let at_the_cap = run_params("command", "a".repeat(MAX_COMMAND_BYTES));
+        let text = result_text(&within(daemon.run_command(at_the_cap, Caller::quiet())).await);
+        assert!(!text.contains("byte limit"), "the cap must not answer: {text}");
 
-        let within = swap_params("content", "a".repeat(MAX_CONTENT_BYTES));
-        let text = result_text(&hatch.swap_file(Parameters(within)).await.unwrap());
-        assert!(text.contains("cannot write a file yet"), "{text}");
+        let at_the_cap = swap_params("content", "a".repeat(MAX_CONTENT_BYTES));
+        let text = result_text(&within(daemon.swap_file(at_the_cap, Caller::quiet())).await);
+        assert!(!text.contains("byte limit"), "the cap must not answer: {text}");
     }
 
     fn result_text(result: &CallToolResult) -> String {
@@ -965,7 +2373,7 @@ mod tests {
 
     #[test]
     fn declares_exactly_the_two_tools() {
-        let names: Vec<String> = Hatch::new(Arc::new(test_config()))
+        let names: Vec<String> = Hatch::new(bare_daemon(test_config()))
             .described_tools()
             .into_iter()
             .map(|t| t.name.to_string())
@@ -977,7 +2385,7 @@ mod tests {
     fn every_tool_has_a_runtime_description() {
         let config = test_config();
         let descriptions = tool_descriptions(&config);
-        for tool in Hatch::new(Arc::new(config)).described_tools() {
+        for tool in Hatch::new(bare_daemon(config)).described_tools() {
             assert!(
                 descriptions.for_tool(&tool.name).is_some(),
                 "{} would ship the macro's placeholder",
@@ -990,7 +2398,7 @@ mod tests {
     fn the_listed_descriptions_are_the_runtime_ones() {
         let config = test_config();
         let descriptions = tool_descriptions(&config);
-        for tool in Hatch::new(Arc::new(config)).described_tools() {
+        for tool in Hatch::new(bare_daemon(config)).described_tools() {
             assert_eq!(
                 tool.description.as_deref(),
                 descriptions.for_tool(&tool.name),
@@ -1176,5 +2584,1597 @@ mod tests {
         })
         .await
         .expect("binding must not hang");
+    }
+
+    // --- the request flow -------------------------------------------------
+
+    /// The verdict mapping, the deadline, the two abandonments and the
+    /// post-approval rule, driven against a scripted window.
+    ///
+    /// Behind the feature and not `cfg(test)` for the same reason
+    /// `StubPrompter` is: the integration tests link the library compiled
+    /// without `cfg(test)`.
+    #[cfg(feature = "test-stub-prompter")]
+    mod flow {
+        use super::*;
+        use crate::audit::LogVerdict;
+        use crate::prompter::{ProcessPrompter, Reply, StubPrompter};
+        use crate::protocol::{ReviseKind, Verdict};
+
+        /// One daemon over a temporary hatch directory, with a scripted
+        /// window in front of it.
+        struct Harness {
+            dir: tempfile::TempDir,
+            daemon: Arc<Daemon>,
+            prompter: Arc<StubPrompter>,
+        }
+
+        /// A config whose two clocks are short enough for a test to wait out
+        /// and long enough that a working path never hits them.
+        fn quick(dir: &std::path::Path) -> Config {
+            let mut config = Config::load_or_create(dir).unwrap();
+            config.timeout_secs = 1;
+            config.exec_timeout_secs = 8;
+            // The default `cwd`. A directory that exists, and one this test
+            // owns, so nothing depends on the machine's real home.
+            config.exec_env.insert("HOME".to_string(), dir.display().to_string());
+            config
+        }
+
+        impl Harness {
+            fn new(script: Vec<Reply>) -> Harness {
+                let dir = tempfile::tempdir().unwrap();
+                let config = quick(dir.path());
+                let prompter = Arc::new(StubPrompter::new(script));
+                let daemon =
+                    Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+                Harness { dir, daemon, prompter }
+            }
+
+            /// Every audit record written so far, decoded.
+            fn logged(&self) -> Vec<serde_json::Value> {
+                let path = AuditLog::new(&self.dir.path().join("log")).current_path();
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+            }
+
+            /// The one record this request produced. Exactly one: the count is
+            /// asserted here so that every test which reads a verdict also
+            /// proves the record was not written twice or not at all.
+            fn only_record(&self) -> serde_json::Value {
+                let records = self.logged();
+                assert_eq!(records.len(), 1, "exactly one record per request: {records:?}");
+                records.into_iter().next().unwrap()
+            }
+
+            fn verdict(&self) -> String {
+                self.only_record()["verdict"].as_str().unwrap().to_string()
+            }
+        }
+
+        fn run_of(command: &str) -> RunCommandParams {
+            RunCommandParams {
+                title: "a test".to_string(),
+                command: command.to_string(),
+                reason: "because a test asked".to_string(),
+                root: false,
+                cwd: None,
+                interactive: false,
+            }
+        }
+
+        fn approve() -> Reply {
+            Reply::verdict(Verdict::Approve { stream: false })
+        }
+
+        // --- verdict mapping ----------------------------------------------
+
+        #[tokio::test]
+        async fn every_non_approve_verdict_is_a_recoverable_tool_error() {
+            for (verdict, needle, logged) in [
+                (
+                    Verdict::Deny { note: "no".to_string() },
+                    "denied by user: no",
+                    LogVerdict::Deny,
+                ),
+                (
+                    Verdict::Revise { kind: ReviseKind::Explain, note: "why?".to_string() },
+                    "explain: why?",
+                    LogVerdict::Explain,
+                ),
+                (
+                    Verdict::Revise { kind: ReviseKind::Simplify, note: "shorter".to_string() },
+                    "more legible form: shorter",
+                    LogVerdict::Simplify,
+                ),
+                (
+                    Verdict::SelfRun { note: "mine".to_string() },
+                    "will run this themselves",
+                    LogVerdict::SelfRun,
+                ),
+            ] {
+                let harness = Harness::new(vec![Reply::verdict(verdict.clone())]);
+                let result = within(harness.daemon.run_command(run_of("true"), Caller::quiet()))
+                    .await;
+
+                // A recoverable tool error, never a protocol error: the flow's
+                // return type is a `CallToolResult` and not a `Result`, so
+                // `Err(ErrorData)` is unreachable by construction. What has to
+                // be asserted is that it is marked as an error and carries the
+                // note.
+                assert_eq!(result.is_error, Some(true), "{verdict:?}");
+                let text = result_text(&result);
+                assert!(text.contains(needle), "{verdict:?} produced {text}");
+                assert_eq!(harness.verdict(), logged.as_str(), "{verdict:?}");
+                assert_eq!(
+                    harness.only_record()["note"].as_str(),
+                    Some(match &verdict {
+                        Verdict::Deny { note }
+                        | Verdict::Revise { note, .. }
+                        | Verdict::SelfRun { note } => note.as_str(),
+                        Verdict::Approve { .. } => unreachable!(),
+                    }),
+                    "the user's own words belong on the line"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn timeout_is_distinguishable_from_denial() {
+            // A window nobody answers. The agent has to be able to tell an
+            // absent user from a refusing one, or it reports a decision that
+            // was never made.
+            let harness = Harness::new(vec![Reply::silent()]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = result_text(&result);
+            assert!(text.contains("timed out awaiting the user"), "{text}");
+            assert!(!text.contains("denied"), "a timeout must not read as a denial: {text}");
+            assert_eq!(harness.verdict(), "timeout");
+            assert!(harness.prompter.seen().len() == 1, "the window was shown, just unanswered");
+        }
+
+        #[tokio::test]
+        async fn a_decision_in_the_same_instant_as_the_deadline_is_still_a_decision() {
+            // The select is biased with the verdict first, so a verdict that
+            // is ready in the same poll as the timer wins it.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Deny {
+                note: "just in time".to_string(),
+            })
+            .after(Duration::from_secs(1))]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            let text = result_text(&result);
+            assert!(
+                text.contains("denied by user") || text.contains("timed out"),
+                "one or the other, never something else: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_dead_prompt_before_a_verdict_denies() {
+            let harness = Harness::new(vec![Reply::dies()]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(harness.verdict(), LogVerdict::PromptDied.as_str());
+        }
+
+        #[tokio::test]
+        async fn a_window_that_never_opens_denies_too() {
+            let harness = Harness::new(vec![Reply::fails("no display")]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(result_text(&result).contains("no display"));
+            assert_eq!(harness.verdict(), LogVerdict::PromptDied.as_str());
+        }
+
+        // --- the deny rule stops at Approve -------------------------------
+
+        #[tokio::test]
+        async fn a_dead_prompt_after_approve_still_runs_the_command() {
+            // Invariant 3. Killing an authorised command could leave a
+            // half-finished state the user never asked for.
+            let harness = Harness::new(vec![approve().then_dies()]);
+            let marker = harness.dir.path().join("marker");
+            let command = format!("sleep 0.3; echo done > {}", marker.display());
+
+            let result =
+                within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await;
+
+            assert_ne!(result.is_error, Some(true), "an approved command is not an error");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "done");
+
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(
+                record["prompt_died_after_approve"],
+                serde_json::Value::Bool(true),
+                "the lost live view is recorded: {record}"
+            );
+            assert_eq!(record["exit_code"], 0);
+        }
+
+        #[tokio::test]
+        async fn a_window_that_lives_records_that_it_did() {
+            let harness = Harness::new(vec![approve()]);
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            assert_eq!(
+                harness.only_record()["prompt_died_after_approve"],
+                serde_json::Value::Bool(false)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_approved_command_returns_what_actually_happened() {
+            let harness = Harness::new(vec![approve()]);
+            let result = within(
+                harness
+                    .daemon
+                    .run_command(run_of("echo out; echo err 1>&2; exit 3"), Caller::quiet()),
+            )
+            .await;
+
+            assert_ne!(result.is_error, Some(true));
+            let text = result_text(&result);
+            assert!(text.contains("exit code: 3"), "{text}");
+            assert!(text.contains("out"), "{text}");
+            assert!(text.contains("err"), "{text}");
+            let record = harness.only_record();
+            assert_eq!(record["exit_code"], 3);
+            assert_eq!(record["timed_out"], serde_json::Value::Bool(false));
+            assert_eq!(record["killed_by_user"], serde_json::Value::Bool(false));
+        }
+
+        #[tokio::test]
+        async fn the_approval_lock_is_released_at_the_verdict_not_at_completion() {
+            // A five-minute upgrade must not hold every other agent behind it.
+            let harness = Harness::new(vec![approve(), approve()]);
+            let daemon = Arc::clone(&harness.daemon);
+            let slow = tokio::spawn(async move {
+                daemon.run_command(run_of("sleep 2"), Caller::quiet()).await
+            });
+
+            // Wait until the slow command is past its verdict and running.
+            let started = tokio::time::Instant::now();
+            while harness.prompter.seen().is_empty() && started.elapsed() < CEILING {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let quick = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            assert_ne!(quick.is_error, Some(true), "the second request must not wait for the first");
+            assert!(started.elapsed() < Duration::from_secs(2), "it waited for the sleep");
+            within(slow).await.unwrap();
+        }
+
+        // --- abandonment ---------------------------------------------------
+
+        /// Whether any process on this machine has `marker` in its command
+        /// line. The prompt is a child process of the daemon's, so this is how
+        /// a test asks whether one is still on screen.
+        fn any_process_named(marker: &str) -> bool {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return false;
+            };
+            entries.filter_map(Result::ok).any(|entry| {
+                std::fs::read(entry.path().join("cmdline"))
+                    .is_ok_and(|line| String::from_utf8_lossy(&line).contains(marker))
+            })
+        }
+
+        /// A daemon whose windows are real processes: a shell that swallows
+        /// the request and then sits there, exactly as an unanswered window
+        /// does, with a marker in its command line so a test can find it.
+        fn harness_with_real_windows(marker: &str) -> Harness {
+            let dir = tempfile::tempdir().unwrap();
+            let config = quick(dir.path());
+            let prompter =
+                ProcessPrompter::with_argv(["sh", "-c", "cat >/dev/null", marker]);
+            let daemon = Arc::new(Daemon::new(dir.path(), config, Arc::new(prompter)));
+            // The stub is unused on this path; the script is empty because
+            // nothing consults it.
+            Harness { dir, daemon, prompter: Arc::new(StubPrompter::new(Vec::<Reply>::new())) }
+        }
+
+        #[tokio::test]
+        async fn client_cancellation_kills_the_pending_prompt() {
+            let marker = format!("hatch-cancel-{}", uuid::Uuid::new_v4());
+            let harness = harness_with_real_windows(&marker);
+            // Long enough that the deadline cannot be what ends this.
+            let mut config = quick(harness.dir.path());
+            config.timeout_secs = 600;
+            let daemon = Arc::new(Daemon::new(
+                harness.dir.path(),
+                config,
+                Arc::new(ProcessPrompter::with_argv(["sh", "-c", "cat >/dev/null", &marker])),
+            ));
+
+            let cancelled = CancellationToken::new();
+            let caller = Caller {
+                cancelled: cancelled.clone(),
+                hangup: None,
+                progress: None,
+            };
+            let call = {
+                let daemon = Arc::clone(&daemon);
+                tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await })
+            };
+
+            let waited = tokio::time::Instant::now();
+            while !any_process_named(&marker) && waited.elapsed() < CEILING {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(any_process_named(&marker), "the window must be on screen to be killed");
+
+            cancelled.cancel();
+            let result = within(call).await.unwrap();
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(!any_process_named(&marker), "the window outlived the call that opened it");
+
+            let path = AuditLog::new(&harness.dir.path().join("log")).current_path();
+            let text = std::fs::read_to_string(path).unwrap();
+            let record: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(record["verdict"], LogVerdict::Cancelled.as_str());
+        }
+
+        #[tokio::test]
+        async fn cancellation_while_queued_never_opens_a_window() {
+            // A request waiting its turn has no window yet, so abandoning it
+            // must cost nobody anything and must still leave a record.
+            let harness = Harness::new(vec![Reply::silent(), Reply::silent()]);
+            let holder = {
+                let daemon = Arc::clone(&harness.daemon);
+                tokio::spawn(async move {
+                    daemon.run_command(run_of("first"), Caller::quiet()).await
+                })
+            };
+            while harness.prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let cancelled = CancellationToken::new();
+            let caller =
+                Caller { cancelled: cancelled.clone(), hangup: None, progress: None };
+            let queued = {
+                let daemon = Arc::clone(&harness.daemon);
+                tokio::spawn(async move { daemon.run_command(run_of("second"), caller).await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancelled.cancel();
+
+            let result = within(queued).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(harness.prompter.seen().len(), 1, "the queued request never got a window");
+            within(holder).await.unwrap();
+
+            let verdicts: Vec<String> = harness
+                .logged()
+                .iter()
+                .map(|r| r["verdict"].as_str().unwrap().to_string())
+                .collect();
+            assert!(verdicts.contains(&"cancelled".to_string()), "{verdicts:?}");
+        }
+
+        #[tokio::test]
+        async fn a_lost_connection_denies_and_is_not_a_cancellation() {
+            // The unit half of the disconnect story; the wire half is
+            // `transport_disconnect_is_logged_separately_from_cancellation`.
+            let harness = Harness::new(vec![Reply::silent()]);
+            let hangup = Hangup::new();
+            let caller = Caller {
+                cancelled: CancellationToken::new(),
+                hangup: Some(hangup.clone()),
+                progress: None,
+            };
+            let call = {
+                let daemon = Arc::clone(&harness.daemon);
+                tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await })
+            };
+            while harness.prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            hangup.0.gone.cancel();
+
+            let result = within(call).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(harness.verdict(), LogVerdict::Disconnected.as_str());
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_call_whose_stream_dies_first_is_still_a_cancellation() {
+            // A cancellation closes the response stream *before* rmcp's own
+            // token fires, so the flag and not the timing is what decides.
+            let harness = Harness::new(vec![Reply::silent()]);
+            let hangup = Hangup::new();
+            let caller = Caller {
+                cancelled: CancellationToken::new(),
+                hangup: Some(hangup.clone()),
+                progress: None,
+            };
+            let call = {
+                let daemon = Arc::clone(&harness.daemon);
+                tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await })
+            };
+            while harness.prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            hangup.note_cancelled();
+            hangup.0.gone.cancel();
+
+            within(call).await.unwrap();
+            assert_eq!(harness.verdict(), LogVerdict::Cancelled.as_str());
+        }
+
+        // --- refusals -------------------------------------------------------
+
+        #[tokio::test]
+        async fn refusals_happen_before_any_prompt_is_shown() {
+            let harness = Harness::new(Vec::new());
+            let protected = harness.dir.path().join("config.toml");
+            let result = within(harness.daemon.swap_file(
+                SwapFileParams {
+                    title: "take hatch over".to_string(),
+                    path: protected.display().to_string(),
+                    content: "x".to_string(),
+                    reason: "because a test asked".to_string(),
+                    root: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(harness.prompter.seen().is_empty(), "a refused request reached the user");
+            assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+        }
+
+        #[tokio::test]
+        async fn a_working_directory_that_is_not_one_is_refused_before_prompting() {
+            for cwd in ["/no/such/directory/anywhere", "not-absolute"] {
+                let harness = Harness::new(Vec::new());
+                let mut params = run_of("true");
+                params.cwd = Some(cwd.to_string());
+                let result =
+                    within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+                assert_eq!(result.is_error, Some(true), "{cwd}");
+                assert!(harness.prompter.seen().is_empty(), "{cwd} cost the user attention");
+                assert_eq!(harness.verdict(), LogVerdict::Refused.as_str(), "{cwd}");
+            }
+            // A directory that exists but is a file is the third shape of the
+            // same refusal.
+            let harness = Harness::new(Vec::new());
+            let file = harness.dir.path().join("a-file");
+            std::fs::write(&file, b"not a directory").unwrap();
+            let mut params = run_of("true");
+            params.cwd = Some(file.display().to_string());
+            within(harness.daemon.run_command(params, Caller::quiet())).await;
+            assert!(harness.prompter.seen().is_empty());
+            assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+        }
+
+        #[tokio::test]
+        async fn root_is_refused_without_asking_anyone() {
+            let harness = Harness::new(Vec::new());
+            let mut params = run_of("true");
+            params.root = true;
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = result_text(&result);
+            assert!(text.contains("not a decision by the user"), "{text}");
+            assert!(harness.prompter.seen().is_empty());
+            assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+        }
+
+        // --- the file path ---------------------------------------------------
+
+        #[tokio::test]
+        async fn an_approved_swap_writes_the_file_and_records_it() {
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            let result = within(harness.daemon.swap_file(
+                SwapFileParams {
+                    title: "change it".to_string(),
+                    path: target.display().to_string(),
+                    content: "after\n".to_string(),
+                    reason: "because a test asked".to_string(),
+                    root: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["bytes"], 6);
+            assert_eq!(
+                record["hash_before"],
+                "9160d4be34c8695bd172a76c7c7966587ea5a4d991ad22c87b2b91af54aa9ebb",
+                "the hash of what was there: {record}"
+            );
+            assert_eq!(
+                record["hash_after"],
+                "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919",
+                "the hash of what was written: {record}"
+            );
+            assert!(
+                harness.prompter.recorded()[0].sent.contains(
+                    &crate::protocol::DaemonMsg::Finished(protocol::Outcome::Exit { code: 0 })
+                ),
+                "the window must be told it landed: {:?}",
+                harness.prompter.recorded()[0].sent
+            );
+        }
+
+        #[tokio::test]
+        async fn a_denied_swap_leaves_the_file_alone() {
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Deny {
+                note: "not that".to_string(),
+            })]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            within(harness.daemon.swap_file(
+                SwapFileParams {
+                    title: "change it".to_string(),
+                    path: target.display().to_string(),
+                    content: "after\n".to_string(),
+                    reason: "because a test asked".to_string(),
+                    root: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+        }
+
+        // --- the live view ----------------------------------------------------
+
+        #[tokio::test]
+        async fn transport_disconnect_is_logged_separately_from_cancellation() {
+            // Two distinct forms of client abandonment. Both deny; the log
+            // must still tell them apart, or `LogVerdict::Disconnected` is a
+            // variant nothing can reach.
+            //
+            // This one has to go over a real socket. A dropped connection is
+            // not something the handler can be told about in process: rmcp
+            // spawns handlers detached, so the future is not dropped, the
+            // injected token does not fire, and even a progress notification
+            // into the dead stream reports success. What the daemon watches
+            // instead is the response stream itself — see `Hangup`.
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = quick(dir.path());
+            config.token = "test-token".to_string();
+            // Long, so that nothing but the disconnect can end this request.
+            config.timeout_secs = 600;
+            let prompter = Arc::new(StubPrompter::new(vec![Reply::silent()]));
+            let daemon =
+                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+
+            let listener = bind(0).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = app(Arc::clone(&daemon));
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, served).await;
+            });
+
+            let (headers, _) = rpc(
+                addr,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "0" },
+                    },
+                }),
+            )
+            .await;
+            let session = headers
+                .get("mcp-session-id")
+                .expect("a session")
+                .to_str()
+                .unwrap()
+                .to_string();
+            rpc(
+                addr,
+                Some(&session),
+                serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            )
+            .await;
+
+            // A raw socket, so that dropping it is unambiguously a dropped
+            // connection rather than a client library returning it to a pool.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "run_command", "arguments": {
+                    "title": "a test", "command": "true", "reason": "because a test asked"
+                }},
+            })
+            .to_string();
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \
+                         test-token\r\nMcp-Session-Id: {session}\r\nContent-Type: \
+                         application/json\r\nAccept: application/json, \
+                         text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = tokio::time::timeout(CEILING, socket.read(&mut buffer)).await;
+
+            // The window is on screen and nobody has answered it.
+            let waited = tokio::time::Instant::now();
+            while prompter.seen().is_empty() && waited.elapsed() < CEILING {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(prompter.seen().len(), 1, "the request must reach a window first");
+
+            drop(socket);
+
+            let log = AuditLog::new(&dir.path().join("log")).current_path();
+            let waited = tokio::time::Instant::now();
+            let record = loop {
+                assert!(waited.elapsed() < CEILING, "no record was written for the lost client");
+                if let Ok(text) = std::fs::read_to_string(&log)
+                    && let Some(line) = text.lines().next()
+                {
+                    break serde_json::from_str::<serde_json::Value>(line).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                record["verdict"], "disconnected",
+                "a dropped connection is not a cancellation: {record}"
+            );
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_denial_arrives_over_the_wire_as_a_tool_error_not_a_protocol_error() {
+            // The whole point of the verdict mapping, checked where the agent
+            // actually reads it: `result.isError`, never a JSON-RPC `error`.
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = quick(dir.path());
+            config.token = "test-token".to_string();
+            let prompter = Arc::new(StubPrompter::new(vec![Reply::verdict(Verdict::Deny {
+                note: "wrong host".to_string(),
+            })]));
+            let daemon =
+                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+
+            let listener = bind(0).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = app(daemon);
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, served).await;
+            });
+
+            let (headers, _) = rpc(
+                addr,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "0" },
+                    },
+                }),
+            )
+            .await;
+            let session =
+                headers.get("mcp-session-id").unwrap().to_str().unwrap().to_string();
+            rpc(
+                addr,
+                Some(&session),
+                serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            )
+            .await;
+
+            let (_, answered) = rpc(
+                addr,
+                Some(&session),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "run_command", "arguments": {
+                        "title": "a test", "command": "true",
+                        "reason": "because a test asked"
+                    }},
+                }),
+            )
+            .await;
+            let answered = answered.expect("the call must answer");
+            assert!(
+                answered.get("error").is_none(),
+                "a denial must not look like a broken server: {answered}"
+            );
+            assert_eq!(answered["result"]["isError"], true, "{answered}");
+            assert!(
+                answered["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("denied by user: wrong host"),
+                "{answered}"
+            );
+            task.abort();
+        }
+
+        #[tokio::test]
+        async fn progress_covers_the_approval_wait_and_not_only_the_queue() {
+            // The longest silence in a request is the ninety seconds a person
+            // spends reading, so a client that hears nothing during it gives
+            // up on a window somebody is still looking at.
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = quick(dir.path());
+            config.token = "test-token".to_string();
+            config.timeout_secs = 600;
+            let prompter = Arc::new(StubPrompter::new(vec![Reply::silent()]));
+            let daemon =
+                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+
+            let listener = bind(0).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = app(daemon);
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, served).await;
+            });
+
+            let (headers, _) = rpc(
+                addr,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "0" },
+                    },
+                }),
+            )
+            .await;
+            let session =
+                headers.get("mcp-session-id").unwrap().to_str().unwrap().to_string();
+            rpc(
+                addr,
+                Some(&session),
+                serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            )
+            .await;
+
+            // The stream stays open while the window waits, so the body is
+            // read incrementally rather than to completion.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "run_command",
+                    "arguments": {
+                        "title": "a test", "command": "true",
+                        "reason": "because a test asked"
+                    },
+                    "_meta": { "progressToken": 7 },
+                },
+            })
+            .to_string();
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \
+                         test-token\r\nMcp-Session-Id: {session}\r\nContent-Type: \
+                         application/json\r\nAccept: application/json, \
+                         text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let mut seen = String::new();
+            let waited = tokio::time::Instant::now();
+            while !seen.contains("notifications/progress") && waited.elapsed() < CEILING {
+                let mut buffer = [0u8; 4096];
+                let read = tokio::time::timeout(CEILING, socket.read(&mut buffer)).await;
+                match read {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(n)) => seen.push_str(&String::from_utf8_lossy(&buffer[..n])),
+                    Ok(Err(_)) => break,
+                }
+            }
+            assert!(
+                seen.contains("notifications/progress"),
+                "the client heard nothing while the window was open: {seen}"
+            );
+            assert!(
+                seen.contains("awaiting the user") || seen.contains("queued"),
+                "the progress frame must say which wait this is: {seen}"
+            );
+            drop(socket);
+            task.abort();
+        }
+
+        #[test]
+        fn every_phase_has_its_own_message() {
+            let messages: Vec<&str> = [Phase::Queued, Phase::AwaitingApproval, Phase::Executing]
+                .into_iter()
+                .map(Phase::message)
+                .collect();
+            let mut unique = messages.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), messages.len(), "a phase that reads as another one: {messages:?}");
+            for (index, message) in messages.iter().enumerate() {
+                assert_eq!(
+                    Phase::of(u8::try_from(index).unwrap()).message(),
+                    *message,
+                    "the phase a ticker reads back is not the one that was stored"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_ticker_stops_when_the_request_ends() {
+            // Its `Drop` is the whole reason it is a value: "stopped at the
+            // end" then holds on every path out, including the early ones.
+            let progress = Progress::start(&Caller::quiet());
+            let stop = progress.stop.clone();
+            assert!(!stop.is_cancelled());
+            progress.enter(Phase::Executing);
+            assert_eq!(Phase::of(progress.phase.load(Ordering::Relaxed)), Phase::Executing);
+            drop(progress);
+            assert!(stop.is_cancelled(), "a ticker outlived the request it was ticking for");
+        }
+
+        /// The daemon, served on a loopback port, with the session already
+        /// handshaken. Everything the over-the-wire tests need and nothing
+        /// they have to repeat.
+        struct Served {
+            addr: std::net::SocketAddr,
+            session: String,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        async fn serve(daemon: Arc<Daemon>) -> Served {
+            let listener = bind(0).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let served = app(daemon);
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, served).await;
+            });
+
+            let (headers, initialized) = rpc(
+                addr,
+                None,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "test", "version": "0" },
+                    },
+                }),
+            )
+            .await;
+            initialized.expect("initialize must answer");
+            let session =
+                headers.get("mcp-session-id").expect("a session").to_str().unwrap().to_string();
+            rpc(
+                addr,
+                Some(&session),
+                serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            )
+            .await;
+            Served { addr, session, task }
+        }
+
+        /// A daemon whose token is the one `rpc` presents, over a temporary
+        /// hatch directory, answering with `script`.
+        fn wired(timeout_secs: u64, script: Vec<Reply>) -> (Harness, Arc<StubPrompter>) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = quick(dir.path());
+            config.token = "test-token".to_string();
+            config.timeout_secs = timeout_secs;
+            let prompter = Arc::new(StubPrompter::new(script));
+            let daemon =
+                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+            (Harness { dir, daemon, prompter: Arc::clone(&prompter) }, prompter)
+        }
+
+        /// One raw HTTP POST whose connection the caller keeps, so the request
+        /// can be left in flight or dropped mid-call.
+        async fn raw_call(
+            served: &Served,
+            body: &serde_json::Value,
+        ) -> tokio::net::TcpStream {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = body.to_string();
+            let mut socket = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \
+                         test-token\r\nMcp-Session-Id: {}\r\nContent-Type: \
+                         application/json\r\nAccept: application/json, \
+                         text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                        served.session,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = tokio::time::timeout(CEILING, socket.read(&mut buffer)).await;
+            socket
+        }
+
+        fn call_of(id: u32, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            })
+        }
+
+        /// Wait for the first audit record, or say that none was written.
+        async fn first_record(dir: &std::path::Path) -> serde_json::Value {
+            let log = AuditLog::new(&dir.join("log")).current_path();
+            let waited = tokio::time::Instant::now();
+            loop {
+                assert!(waited.elapsed() < CEILING, "no audit record was ever written");
+                if let Ok(text) = std::fs::read_to_string(&log)
+                    && let Some(line) = text.lines().next()
+                {
+                    return serde_json::from_str(line).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cancellation_notification_over_the_wire_cancels_the_call() {
+            // The other half of the abandonment story, end to end: a client
+            // that hits its own tool timeout usually cancels and keeps the
+            // session open, which is not the same event as its process dying.
+            let (harness, prompter) = wired(600, vec![Reply::silent()]);
+            let served = serve(Arc::clone(&harness.daemon)).await;
+
+            let socket = raw_call(
+                &served,
+                &call_of(
+                    2,
+                    "run_command",
+                    serde_json::json!({
+                        "title": "a test", "command": "true",
+                        "reason": "because a test asked"
+                    }),
+                ),
+            )
+            .await;
+
+            let waited = tokio::time::Instant::now();
+            while prompter.seen().is_empty() && waited.elapsed() < CEILING {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(prompter.seen().len(), 1, "the window must be open to be cancelled");
+
+            rpc(
+                served.addr,
+                Some(&served.session),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": { "requestId": 2, "reason": "the client gave up" },
+                }),
+            )
+            .await;
+
+            let record = first_record(harness.dir.path()).await;
+            assert_eq!(
+                record["verdict"], "cancelled",
+                "a cancellation the client sent is not a lost connection: {record}"
+            );
+            drop(socket);
+            served.task.abort();
+        }
+
+        #[tokio::test]
+        async fn both_tools_are_reachable_over_the_wire() {
+            // `swap_file` has its own body, and a body that answers with
+            // nothing at all would still leave every unit test green.
+            let (harness, _) = wired(60, vec![approve()]);
+            let served = serve(Arc::clone(&harness.daemon)).await;
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("written.conf");
+
+            let (_, answered) = rpc(
+                served.addr,
+                Some(&served.session),
+                call_of(
+                    2,
+                    "swap_file",
+                    serde_json::json!({
+                        "title": "write it", "path": target.display().to_string(),
+                        "content": "hello\n", "reason": "because a test asked"
+                    }),
+                ),
+            )
+            .await;
+            let answered = answered.expect("the call must answer");
+            assert!(answered.get("error").is_none(), "{answered}");
+            assert_ne!(answered["result"]["isError"], true, "{answered}");
+            assert!(
+                answered["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("written.conf"),
+                "{answered}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello\n");
+            served.task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_session_that_was_never_opened_is_not_served() {
+            // The session id is what ties a call to its connection, so a
+            // server that answered for one it never issued would be answering
+            // for a call it cannot watch.
+            let (harness, _) = wired(60, Vec::new());
+            let served = serve(Arc::clone(&harness.daemon)).await;
+
+            let response = reqwest::Client::new()
+                .post(format!("http://{}/mcp", served.addr))
+                .header("Authorization", "Bearer test-token")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", "not-a-session-anyone-issued")
+                .body(serde_json::json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" })
+                    .to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404);
+            served.task.abort();
+        }
+
+        #[tokio::test]
+        async fn a_deleted_session_stops_being_served() {
+            let (harness, _) = wired(60, Vec::new());
+            let served = serve(Arc::clone(&harness.daemon)).await;
+            let client = reqwest::Client::new();
+            let url = format!("http://{}/mcp", served.addr);
+
+            let deleted = client
+                .delete(&url)
+                .header("Authorization", "Bearer test-token")
+                .header("Mcp-Session-Id", &served.session)
+                .send()
+                .await
+                .unwrap();
+            assert!(deleted.status().is_success(), "{:?}", deleted.status());
+
+            let after = client
+                .post(&url)
+                .header("Authorization", "Bearer test-token")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", &served.session)
+                .body(serde_json::json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" })
+                    .to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(after.status(), 404, "a closed session must stop answering");
+            served.task.abort();
+        }
+
+        #[tokio::test]
+        async fn the_deadline_starts_at_the_window_and_not_at_the_queue() {
+            // A request that waited its turn still gets a whole window. The
+            // discriminator is the queue wait: measured from when the second
+            // request arrived, its deadline has to be a full timeout *plus*
+            // however long it spent waiting.
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = quick(dir.path());
+            config.timeout_secs = 90;
+            let prompter = Arc::new(StubPrompter::new(vec![
+                approve().after(Duration::from_secs(1)),
+                Reply::silent(),
+            ]));
+            let daemon =
+                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+
+            let holder = {
+                let daemon = Arc::clone(&daemon);
+                tokio::spawn(async move {
+                    daemon.run_command(run_of("true"), Caller::quiet()).await
+                })
+            };
+            while prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let arrived = Utc::now();
+            let cancelled = CancellationToken::new();
+            let caller =
+                Caller { cancelled: cancelled.clone(), hangup: None, progress: None };
+            let queued = {
+                let daemon = Arc::clone(&daemon);
+                tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await })
+            };
+
+            let waited = tokio::time::Instant::now();
+            while prompter.seen().len() < 2 && waited.elapsed() < CEILING {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(prompter.seen().len(), 2, "the second window never opened");
+
+            let from_arrival =
+                (prompter.seen()[1].deadline - arrived).num_milliseconds();
+            assert!(
+                from_arrival > 90_500,
+                "the second window's clock started while it was queued: {from_arrival}ms"
+            );
+            assert!(
+                from_arrival < 95_000,
+                "the deadline is not a full timeout from the window: {from_arrival}ms"
+            );
+
+            cancelled.cancel();
+            within(queued).await.unwrap();
+            within(holder).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn the_window_and_the_log_carry_the_agents_own_words_defanged() {
+            // The title frames the whole decision, and a bidi override in it
+            // would reorder everything the reader sees — including the command
+            // underneath it.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Deny {
+                note: "no".to_string(),
+            })]);
+            let mut params = run_of("true");
+            params.title = "Install \u{202E}gnp.exe".to_string();
+            params.reason = "the build needs it".to_string();
+            within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let shown = &harness.prompter.seen()[0];
+            assert!(shown.title.starts_with("Install "), "{:?}", shown.title);
+            assert!(
+                shown.title.contains("[RLO]"),
+                "the override must be drawn, not obeyed: {:?}",
+                shown.title
+            );
+            assert!(!shown.title.contains('\u{202E}'), "{:?}", shown.title);
+            assert_eq!(shown.reason, "the build needs it");
+
+            let record = harness.only_record();
+            assert_eq!(record["title"], shown.title, "the log and the window agree: {record}");
+            assert_eq!(record["reason"], "the build needs it", "{record}");
+        }
+
+        #[tokio::test]
+        async fn a_write_that_did_not_happen_says_so_and_leaves_the_file_alone() {
+            // Drift: the file moved between the diff the user read and the
+            // write. Every `ApplyError` guarantees the file is untouched, so
+            // the answer has to say that reading and asking again is safe.
+            let harness = Harness::new(vec![approve().after(Duration::from_millis(300))]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            let call = {
+                let daemon = Arc::clone(&harness.daemon);
+                let path = target.display().to_string();
+                tokio::spawn(async move {
+                    daemon
+                        .swap_file(
+                            SwapFileParams {
+                                title: "change it".to_string(),
+                                path,
+                                content: "after\n".to_string(),
+                                reason: "because a test asked".to_string(),
+                                root: false,
+                            },
+                            Caller::quiet(),
+                        )
+                        .await
+                })
+            };
+            while harness.prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            std::fs::write(&target, b"somebody else got there first\n").unwrap();
+
+            let result = within(call).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let text = result_text(&result);
+            assert!(text.contains("changed after the request was approved"), "{text}");
+            assert!(text.contains("asking again is safe"), "{text}");
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "somebody else got there first\n",
+                "a refused write must not touch the file"
+            );
+            assert!(
+                harness.prompter.recorded()[0].sent.contains(
+                    &crate::protocol::DaemonMsg::Finished(protocol::Outcome::Exit { code: 1 })
+                ),
+                "the window must be told it did not land: {:?}",
+                harness.prompter.recorded()[0].sent
+            );
+            // Still one record, and still an approval: the user did approve.
+            assert_eq!(harness.verdict(), "approve");
+        }
+
+        #[tokio::test]
+        async fn approved_output_reaches_the_window_when_streaming_was_ticked() {
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
+
+            let sent = &harness.prompter.recorded()[0].sent;
+            let of = |want: exec::Stream| -> String {
+                sent.iter()
+                    .filter_map(|msg| match msg {
+                        crate::protocol::DaemonMsg::Output { stream, text } if *stream == want => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert_eq!(of(exec::Stream::Stdout), "hello\n", "{sent:?}");
+            assert_eq!(of(exec::Stream::Stderr), "", "{sent:?}");
+            assert!(
+                !sent.iter().any(|msg| matches!(
+                    msg,
+                    crate::protocol::DaemonMsg::Output { text, .. } if text.is_empty()
+                )),
+                "a stream with nothing left over must not send an empty frame: {sent:?}"
+            );
+            assert!(
+                sent.iter().any(|msg| matches!(
+                    msg,
+                    crate::protocol::DaemonMsg::Finished(protocol::Outcome::Exit { code: 0 })
+                )),
+                "the window is told how it ended: {sent:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_character_left_unfinished_is_flushed_to_the_stream_it_came_from() {
+            // Two bytes of a three-byte character on stdout and nothing after
+            // them: the pump holds them waiting for a third byte that never
+            // arrives, and the final flush has to draw them as what they are —
+            // on the stream they were written to, not the other one.
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            within(harness.daemon.run_command(
+                run_of("printf '\\342\\202' ; printf 'e' 1>&2"),
+                Caller::quiet(),
+            ))
+            .await;
+
+            let outputs: Vec<(exec::Stream, String)> = harness.prompter.recorded()[0]
+                .sent
+                .iter()
+                .filter_map(|msg| match msg {
+                    crate::protocol::DaemonMsg::Output { stream, text } => {
+                        Some((*stream, text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                outputs.contains(&(exec::Stream::Stdout, "\u{fffd}".to_string())),
+                "the unfinished character belongs to stdout: {outputs:?}"
+            );
+            assert!(
+                outputs.contains(&(exec::Stream::Stderr, "e".to_string())),
+                "and stderr keeps its own byte: {outputs:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn output_is_not_streamed_when_the_box_was_not_ticked() {
+            let harness = Harness::new(vec![approve()]);
+            within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
+
+            let sent = &harness.prompter.recorded()[0].sent;
+            assert!(
+                !sent
+                    .iter()
+                    .any(|msg| matches!(msg, crate::protocol::DaemonMsg::Output { .. })),
+                "streaming is a display preference, and it was off: {sent:?}"
+            );
+        }
+    }
+
+    // --- the calls the transport is watching ---------------------------------
+
+    #[test]
+    fn a_call_is_watched_until_its_stream_ends_and_then_forgotten() {
+        // The registry exists only so a cancellation arriving on another
+        // connection can find the call it names. An entry that outlived its
+        // stream would be a slow leak in a daemon that runs for weeks.
+        let calls = Arc::new(Calls::default());
+        let id = RequestId::Number(7);
+        let hangup = calls.begin(id.clone());
+        assert_eq!(calls.open(), 1);
+        assert!(!hangup.gone().is_cancelled());
+        assert!(!hangup.was_cancelled());
+
+        calls.note_cancelled(&id);
+        assert!(hangup.was_cancelled(), "the flag must reach the handle the flow holds");
+
+        let end = StreamEnd { id: id.clone(), hangup: hangup.clone(), calls: Arc::clone(&calls) };
+        drop(end);
+        assert!(hangup.gone().is_cancelled(), "the end of the stream is the end of the call");
+        assert_eq!(calls.open(), 0, "the entry outlived the stream it belonged to");
+
+        // A notification for a call nobody is watching is not a panic.
+        calls.note_cancelled(&id);
+    }
+
+    #[test]
+    fn a_call_that_was_never_cancelled_reads_as_a_disconnect() {
+        let caller = Caller {
+            cancelled: CancellationToken::new(),
+            hangup: Some(Hangup::new()),
+            progress: None,
+        };
+        assert_eq!(caller.abandonment(), LogVerdict::Disconnected);
+
+        let hangup = Hangup::new();
+        hangup.note_cancelled();
+        let flagged = Caller {
+            cancelled: CancellationToken::new(),
+            hangup: Some(hangup),
+            progress: None,
+        };
+        assert_eq!(flagged.abandonment(), LogVerdict::Cancelled);
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let told = Caller { cancelled: token, hangup: None, progress: None };
+        assert_eq!(told.abandonment(), LogVerdict::Cancelled);
+    }
+
+    // --- what each outcome says ---------------------------------------------
+
+    fn a_run_detail() -> LogDetail {
+        LogDetail::RunCommand(RunDetail {
+            command: "true".to_string(),
+            root: false,
+            cwd: "/".to_string(),
+            exit_code: None,
+            duration_ms: None,
+            killed_by_user: None,
+            timed_out: None,
+            prompt_died_after_approve: None,
+        })
+    }
+
+    #[test]
+    fn each_verdict_maps_to_its_own_sentence_and_its_own_log_line() {
+        use crate::audit::LogVerdict;
+        use crate::protocol::{ReviseKind, Verdict};
+
+        let cases = [
+            (
+                Verdict::Deny { note: "no".to_string() },
+                LogVerdict::Deny,
+                "denied by user: no",
+            ),
+            (
+                Verdict::Revise { kind: ReviseKind::Explain, note: "why?".to_string() },
+                LogVerdict::Explain,
+                "explain: why?",
+            ),
+            (
+                Verdict::Revise { kind: ReviseKind::Simplify, note: "shorter".to_string() },
+                LogVerdict::Simplify,
+                "more legible form: shorter",
+            ),
+            (
+                Verdict::SelfRun { note: "mine".to_string() },
+                LogVerdict::SelfRun,
+                "will run this themselves",
+            ),
+        ];
+        let mut sentences = Vec::new();
+        for (verdict, logged, needle) in cases {
+            let outcome = declined(verdict.clone(), a_run_detail());
+            assert_eq!(outcome.verdict, logged, "{verdict:?}");
+            assert_eq!(outcome.result.is_error, Some(true), "{verdict:?}");
+            let text = result_text(&outcome.result);
+            assert!(text.contains(needle), "{verdict:?} said {text}");
+            sentences.push(text);
+        }
+        sentences.sort();
+        sentences.dedup();
+        assert_eq!(sentences.len(), 4, "two verdicts that read the same are one verdict");
+
+        // An approval must never be reported as a refusal. It cannot arrive
+        // here, and if it ever did the answer says so rather than inventing a
+        // denial nobody made.
+        let stray = declined(Verdict::Approve { stream: false }, a_run_detail());
+        assert_eq!(stray.result.is_error, Some(true));
+        assert!(result_text(&stray.result).contains("mishandled"));
+    }
+
+    #[test]
+    fn a_lost_client_and_a_cancelled_call_read_differently() {
+        use crate::audit::LogVerdict;
+        let cancelled = abandoned(LogVerdict::Cancelled, a_run_detail());
+        let dropped = abandoned(LogVerdict::Disconnected, a_run_detail());
+        assert_eq!(cancelled.verdict, LogVerdict::Cancelled);
+        assert_eq!(dropped.verdict, LogVerdict::Disconnected);
+        assert_eq!(cancelled.result.is_error, Some(true));
+        assert_eq!(dropped.result.is_error, Some(true));
+        assert!(result_text(&cancelled.result).contains("cancelled"));
+        assert!(result_text(&dropped.result).contains("connection"));
+        for outcome in [&cancelled, &dropped] {
+            assert!(
+                result_text(&outcome.result).contains("Nobody refused this"),
+                "an abandonment is not a decision anybody made"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_that_was_cut_short_never_reads_as_a_complete_one() {
+        let full = Output {
+            stdout: "hello\n".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            killed_by_user: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let text = describe_run(&full, Duration::from_millis(12));
+        assert!(text.contains("exit code: 0"), "{text}");
+        assert!(text.contains("12ms"), "{text}");
+        assert!(
+            text.contains("stdout:\nhello\n\nstderr:"),
+            "a stream that already ends in a newline must not gain another: {text}"
+        );
+        assert!(!text.contains("timed out"), "{text}");
+        assert!(!text.contains("killed"), "{text}");
+        assert!(text.contains("stderr:\n(empty)"), "an empty stream says so: {text}");
+
+        let cut = Output {
+            stdout: "part".to_string(),
+            stderr: "noise".to_string(),
+            exit_code: None,
+            signal: Some(9),
+            timed_out: true,
+            killed_by_user: true,
+            stdout_truncated: true,
+            stderr_truncated: true,
+        };
+        let text = describe_run(&cut, Duration::from_secs(1));
+        assert!(text.contains("signal 9"), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+        assert!(text.contains("killed"), "{text}");
+        assert_eq!(text.matches("truncated").count(), 2, "each stream reports for itself: {text}");
+    }
+
+    #[test]
+    fn the_window_is_only_told_something_that_is_true() {
+        let exited = Output {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(7),
+            signal: None,
+            timed_out: false,
+            killed_by_user: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        assert_eq!(finished_frame(&exited), Some(protocol::Outcome::Exit { code: 7 }));
+
+        let signalled = Output { exit_code: None, signal: Some(9), ..exited.clone() };
+        assert_eq!(finished_frame(&signalled), Some(protocol::Outcome::Signal { signal: 9 }));
+
+        // Neither: nothing true can be said about how it ended, so nothing is
+        // said. An invented exit code is exactly the plausible-looking lie
+        // this project refuses everywhere else.
+        let neither = Output { exit_code: None, signal: None, ..exited };
+        assert_eq!(finished_frame(&neither), None);
+    }
+
+    #[test]
+    fn a_write_that_did_not_happen_says_the_file_is_untouched() {
+        // Every `ApplyError` guarantees it, so saying so is the difference
+        // between an agent that re-reads and asks again and one that gives up.
+        let text = describe_apply(&ApplyError::Collision);
+        assert!(text.contains("the write did not happen"), "{text}");
+        assert!(text.contains("exactly as it was"), "{text}");
+        assert!(text.contains("asking again is safe"), "{text}");
+        assert!(
+            text.contains(&ApplyError::Collision.to_string()),
+            "the reason itself must survive: {text}"
+        );
+    }
+
+    #[test]
+    fn the_recorded_hash_is_the_hash_of_the_bytes() {
+        // `sha256sum` prints this form, so a user can check the log line
+        // against the file by eye.
+        assert_eq!(
+            sha256_hex(b"hello\n"),
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+        );
+        assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    #[test]
+    fn an_unsupported_request_is_worded_as_a_limit_and_not_as_a_decision() {
+        for text in [
+            not_yet("do the thing", "Try the other thing."),
+            refusal_text("this path is protected"),
+        ] {
+            assert!(text.contains("nothing ran"), "{text}");
+            assert!(text.contains("not a decision by the user"), "{text}");
+            assert!(text.contains("nobody was asked"), "{text}");
+        }
+    }
+
+    // --- decoding across chunk boundaries -----------------------------------
+
+    #[test]
+    fn a_character_split_across_chunks_is_held_until_it_is_whole() {
+        let mut buffer = Vec::new();
+        // The first two bytes of a three-byte character.
+        buffer.extend_from_slice("ok\u{20ac}".as_bytes()[..4].as_ref());
+        assert_eq!(take_decodable(&mut buffer).as_deref(), Some("ok"));
+        assert_eq!(buffer.len(), 2, "the unfinished character stays");
+
+        buffer.extend_from_slice(&"\u{20ac}".as_bytes()[2..]);
+        assert_eq!(take_decodable(&mut buffer).as_deref(), Some("\u{20ac}"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_sequence_that_can_never_be_valid_is_not_held_forever() {
+        let mut buffer = vec![b'a', 0xff, b'b'];
+        let taken = take_decodable(&mut buffer).unwrap();
+        assert!(taken.starts_with('a'), "{taken:?}");
+        assert!(taken.contains('\u{fffd}'), "the bad byte is drawn as what it is: {taken:?}");
+        assert!(buffer.is_empty() || buffer == b"b");
+    }
+
+    #[test]
+    fn nothing_decodable_yet_sends_nothing() {
+        let mut buffer = vec![0xe2];
+        assert_eq!(take_decodable(&mut buffer), None);
+        assert_eq!(buffer, vec![0xe2]);
+        assert_eq!(take_decodable(&mut Vec::new()), None);
     }
 }

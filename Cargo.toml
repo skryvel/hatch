@@ -16,6 +16,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dirs = "7.0.0"
 eframe = "0.36.1"
+futures-core = "0.3.34"
 nix = { version = "0.31.3", features = ["signal", "process", "user"] }
 rand = "0.10.2"
 regex = "1.13.1"

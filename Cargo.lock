@@ -1876,6 +1876,7 @@ dependencies = [
  "clap",
  "dirs",
  "eframe",
+ "futures-core",
  "nix",
  "proptest",
  "rand 0.10.2",
