@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -77,21 +77,23 @@ impl Config {
         create_private_dir(&dir.join("stage"))?;
 
         let path = dir.join("config.toml");
-        let mut config = if path.exists() {
-            let text =
-                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            // This file holds the bearer token, and an editor that saves by
-            // rename recreates it at the umask default. Tighten every load,
-            // the same way the directories above are tightened.
-            set_mode(&path, 0o600)?;
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-        } else {
-            Config::default()
-        };
+        let existed = path.exists();
+        let mut config = if existed { read_private(&path)? } else { Config::default() };
 
         if config.token.is_empty() {
             config.token = generate_token();
-            write_private(&path, &config)?;
+            if existed {
+                // The file is there but carries no token — someone wrote a
+                // config by hand, or upgraded from a build that had no such
+                // key. Ours replaces it.
+                write_private(&path, &config)?;
+            } else if !create_private(&path, &config)? {
+                // First run, and another process got there first. Its token
+                // is the one on disk and the one `hatch token` will print;
+                // ours never landed. Adopt theirs rather than authenticating
+                // against a token nobody was ever shown.
+                config = read_private(&path)?;
+            }
         }
         Ok(config)
     }
@@ -117,12 +119,58 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     set_mode(path, 0o700)
 }
 
-/// Write the config to `path` at mode 0600.
+/// Read the config at `path`, tightening the file's mode first.
+///
+/// This file holds the bearer token, and an editor that saves by rename
+/// recreates it at the umask default. Tighten every load, the same way the
+/// directories are tightened.
+fn read_private(path: &Path) -> anyhow::Result<Config> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    set_mode(path, 0o600)?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Write the config to `path` at mode 0600, replacing whatever was there.
 ///
 /// The file is built alongside the target and renamed over it, so a concurrent
 /// reader sees either the old file or the complete new one — never a truncated
 /// file, and never the token sitting at a laxer mode mid-write.
 fn write_private(path: &Path, config: &Config) -> anyhow::Result<()> {
+    staged(path, config)?
+        .persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// Write the config to `path` only if `path` does not exist. Returns whether
+/// this call is the one that created it.
+///
+/// A rename is atomic, which is why `write_private` is safe against a torn
+/// read — but atomic is not the same as exclusive, and a plain rename would
+/// leave the first-run token race open. Two processes starting at once
+/// against a config with no token both generate one and both rename; the
+/// second overwrites the first, and the first still returns *its* token. The
+/// daemon would then authenticate against a token `hatch token` never
+/// printed, and no amount of re-reading afterwards fixes it: the loser can
+/// read the file back before the winner's rename lands.
+///
+/// `RENAME_NOREPLACE` closes it. Exactly one process creates the file; every
+/// other one is told so and reads the winner's token instead. This is only
+/// reachable on a true first run — which is exactly the moment the user is
+/// copying the registration line and would notice nothing wrong.
+fn create_private(path: &Path, config: &Config) -> anyhow::Result<bool> {
+    match staged(path, config)?.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => {
+            Err(anyhow::Error::new(e.error).context(format!("creating {}", path.display())))
+        }
+    }
+}
+
+/// The config, serialized into a 0600 temporary file beside `path`.
+fn staged(path: &Path, config: &Config) -> anyhow::Result<tempfile::NamedTempFile> {
     let text = toml::to_string(config)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -132,10 +180,7 @@ fn write_private(path: &Path, config: &Config) -> anyhow::Result<()> {
         .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
     tmp.write_all(text.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    tmp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    Ok(tmp)
 }
 
 /// Set `path` to exactly `mode`, whatever it was before.
@@ -152,7 +197,14 @@ pub fn default_dir() -> anyhow::Result<PathBuf> {
 
 /// Print the client registration line for `hatch token`.
 pub fn print_client_line() -> anyhow::Result<()> {
-    let config = Config::load_or_create(&default_dir()?)?;
+    print_client_line_for(&Config::load_or_create(&default_dir()?)?)
+}
+
+/// Print the client registration line for a config already in hand.
+///
+/// The daemon prints the line for the config it is actually serving, so the
+/// port and the token in it cannot drift from the ones in use.
+pub fn print_client_line_for(config: &Config) -> anyhow::Result<()> {
     println!(
         "claude mcp add --transport http hatch http://127.0.0.1:{}/mcp \\\n  --header \"Authorization: Bearer {}\"\n",
         config.port, config.token
@@ -284,8 +336,65 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_first_runs_all_return_the_token_that_reached_disk() {
+        // Two `hatch serve` starts against a brand new config used to be able
+        // to each keep their own token, leaving the daemon authenticating
+        // against one `hatch token` never printed.
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(8);
+        let tokens: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        Config::load_or_create(dir.path()).unwrap().token
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let on_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        for token in &tokens {
+            assert_eq!(token, &tokens[0], "the starts disagreed on the token");
+            let reached_disk = on_disk.contains(token.as_str());
+            assert!(reached_disk, "a token that never reached disk was returned");
+        }
+    }
+
+    #[test]
+    fn create_private_reports_who_created_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config::default();
+        assert!(create_private(&path, &config).unwrap(), "the first call creates it");
+        assert!(!create_private(&path, &config).unwrap(), "the second must not clobber it");
+    }
+
+    #[test]
+    fn a_write_that_failed_for_another_reason_is_not_mistaken_for_a_lost_race() {
+        // Treating every failed create as "someone else won" would send the
+        // caller off to read a file that is not there, and report the wrong
+        // thing when the write really did fail.
+        let dir = tempfile::tempdir().unwrap();
+        let unwritable = dir.path().join("n".repeat(300)); // longer than NAME_MAX
+        let error = create_private(&unwritable, &Config::default())
+            .expect_err("a name that long cannot be created");
+        assert!(format!("{error:#}").contains("creating"), "{error:#}");
+        assert!(!unwritable.exists());
+    }
+
+    #[test]
     fn each_token_is_different() {
         assert_ne!(generate_token(), generate_token());
+    }
+
+    #[test]
+    fn the_child_home_is_an_absolute_path() {
+        // It is handed to approved commands as `HOME`. A relative or empty
+        // one would send every tool that expands `~` somewhere unexpected.
+        let home = Config::default().exec_env.get("HOME").unwrap().clone();
+        assert!(home.starts_with('/'), "HOME must be absolute, got {home:?}");
     }
 
     #[test]
