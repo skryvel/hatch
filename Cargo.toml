@@ -3,6 +3,10 @@ name = "hatch"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test-stub-prompter = []
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
