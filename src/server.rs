@@ -119,6 +119,7 @@ use crate::config::{self, Config};
 use crate::denylist::Denylist;
 use crate::exec::env::build_child_env;
 use crate::exec::{Chunk, Env, Output, RunOpts};
+use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
 use crate::protocol::{Payload, Request as PromptRequest, ReviseKind, Verdict};
 use crate::render::diff::{FileDiff, diff_files};
@@ -706,15 +707,21 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// A daemon over the hatch directory `dir`, asking `prompter` for
+    /// A daemon over the directories `paths` names, asking `prompter` for
     /// decisions.
-    pub fn new(dir: &Path, config: Config, prompter: Arc<dyn Prompter>) -> Daemon {
-        let denylist = Denylist::new(dir, &config.denylist_extra);
+    ///
+    /// The denylist is built from [`Paths::protected`] and [`Paths::home`]
+    /// together, so the set of directories it protects cannot fall out of step
+    /// with the set the daemon writes to, and the home it anchors the
+    /// `~/.claude*` entries on is the real one rather than one inferred from a
+    /// directory that no longer sits inside it.
+    pub fn new(paths: &Paths, config: Config, prompter: Arc<dyn Prompter>) -> Daemon {
+        let denylist = Denylist::new(&paths.protected(), paths.home(), &config.denylist_extra);
         Daemon {
             config: Arc::new(config),
             prompter,
             queue: ApprovalQueue::new(),
-            audit: AuditLog::new(&dir.join("log")),
+            audit: AuditLog::new(&paths.log_dir()),
             denylist,
         }
     }
@@ -1891,21 +1898,25 @@ async fn bind(port: u16) -> anyhow::Result<TcpListener> {
     TcpListener::bind(addr).await.with_context(|| {
         format!(
             "binding {addr}. Another hatch may already be running, or something else holds the \
-             port; stop it, or set a different `port` in config.toml"
+             port; stop it, or set a different `port` in config.toml, which lives under \
+             $XDG_CONFIG_HOME/hatch — by default ~/.config/hatch"
         )
     })
 }
 
-/// Delete whatever the last run left in `<dir>/stage`.
+/// Delete whatever the last run left in `stage`.
 ///
 /// Staged bytes are approved-but-unwritten file contents. A run that died
 /// between approval and the write leaves them there, and nothing that comes
 /// later has any way to tell them apart from its own. They are not a cache to
 /// reuse: an operation the user approved yesterday is not one they approved
 /// now.
-fn sweep_stage(dir: &Path) -> anyhow::Result<()> {
-    let stage = dir.join("stage");
-    let entries = std::fs::read_dir(&stage)
+///
+/// A `$XDG_RUNTIME_DIR` stage is already empty here, because the login session
+/// that held the crashed run took it away. This is what stands in for that on
+/// the machines and the fallbacks where it is not.
+fn sweep_stage(stage: &Path) -> anyhow::Result<()> {
+    let entries = std::fs::read_dir(stage)
         .with_context(|| format!("reading {} to sweep it", stage.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("listing {}", stage.display()))?;
@@ -1934,16 +1945,17 @@ fn sweep_stage(dir: &Path) -> anyhow::Result<()> {
 /// failure surfaces as one error naming the address and what to do about it,
 /// and no registration line is printed at all.
 pub fn run_serve() -> anyhow::Result<()> {
-    let dir = config::default_dir()?;
-    let config = Config::load_or_create(&dir)?;
-    sweep_stage(&dir)?;
+    let paths = Paths::from_env()?;
+    paths.report();
+    let config = Config::load_or_create(&paths)?;
+    sweep_stage(&paths.stage_dir())?;
 
     // Located before the listener is bound, so a build that cannot find its
     // own executable fails at startup rather than on the first request, when
     // the failure would be a window that never opens.
     let prompter = Arc::new(ProcessPrompter::new()?);
     let port = config.port;
-    let daemon = Arc::new(Daemon::new(&dir, config, prompter));
+    let daemon = Arc::new(Daemon::new(&paths, config, prompter));
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
@@ -1991,7 +2003,7 @@ mod tests {
     /// window is a program that exits at once.
     fn bare_daemon(config: Config) -> Arc<Daemon> {
         Arc::new(Daemon::new(
-            Path::new("/nonexistent-hatch-directory"),
+            &Paths::scratch(Path::new("/nonexistent-hatch-directory")),
             config,
             Arc::new(crate::prompter::ProcessPrompter::with_argv(["false"])),
         ))
@@ -2016,9 +2028,10 @@ mod tests {
     /// reach a tool but are not about the verdict.
     fn scratch_daemon() -> (tempfile::TempDir, Arc<Daemon>) {
         let dir = tempfile::tempdir().unwrap();
-        Config::load_or_create(dir.path()).unwrap();
+        let paths = Paths::scratch(dir.path());
+        Config::load_or_create(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(
-            dir.path(),
+            &paths,
             test_config(),
             Arc::new(crate::prompter::ProcessPrompter::with_argv(["false"])),
         ));
@@ -2593,13 +2606,14 @@ mod tests {
     #[test]
     fn the_sweep_clears_what_a_crashed_run_left_staged() {
         let dir = tempfile::tempdir().unwrap();
-        Config::load_or_create(dir.path()).unwrap();
-        let stage = dir.path().join("stage");
+        let paths = Paths::scratch(dir.path());
+        Config::load_or_create(&paths).unwrap();
+        let stage = paths.stage_dir();
         std::fs::write(stage.join("leftover"), b"approved yesterday, never written").unwrap();
         std::fs::create_dir(stage.join("nested")).unwrap();
         std::fs::write(stage.join("nested").join("deeper"), b"more of it").unwrap();
 
-        sweep_stage(dir.path()).unwrap();
+        sweep_stage(&stage).unwrap();
 
         assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0, "the stage must be empty");
         assert!(stage.is_dir(), "the sweep must leave the directory itself");
@@ -2637,36 +2651,41 @@ mod tests {
         /// One daemon over a temporary hatch directory, with a scripted
         /// window in front of it.
         struct Harness {
+            /// The temporary root the three directories sit under, held so
+            /// that they outlive the harness.
             dir: tempfile::TempDir,
+            paths: Paths,
             daemon: Arc<Daemon>,
             prompter: Arc<StubPrompter>,
         }
 
         /// A config whose two clocks are short enough for a test to wait out
         /// and long enough that a working path never hits them.
-        fn quick(dir: &std::path::Path) -> Config {
-            let mut config = Config::load_or_create(dir).unwrap();
+        fn quick(paths: &Paths) -> Config {
+            let mut config = Config::load_or_create(paths).unwrap();
             config.timeout_secs = 1;
             config.exec_timeout_secs = 8;
             // The default `cwd`. A directory that exists, and one this test
             // owns, so nothing depends on the machine's real home.
-            config.exec_env.insert("HOME".to_string(), dir.display().to_string());
+            std::fs::create_dir_all(paths.home()).unwrap();
+            config.exec_env.insert("HOME".to_string(), paths.home().display().to_string());
             config
         }
 
         impl Harness {
             fn new(script: Vec<Reply>) -> Harness {
                 let dir = tempfile::tempdir().unwrap();
-                let config = quick(dir.path());
+                let paths = Paths::scratch(dir.path());
+                let config = quick(&paths);
                 let prompter = Arc::new(StubPrompter::new(script));
                 let daemon =
-                    Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
-                Harness { dir, daemon, prompter }
+                    Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
+                Harness { dir, paths, daemon, prompter }
             }
 
             /// Every audit record written so far, decoded.
             fn logged(&self) -> Vec<serde_json::Value> {
-                let path = AuditLog::new(&self.dir.path().join("log")).current_path();
+                let path = AuditLog::new(&self.paths.log_dir()).current_path();
                 let text = std::fs::read_to_string(path).unwrap_or_default();
                 text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
             }
@@ -2905,13 +2924,19 @@ mod tests {
         /// does, with a marker in its command line so a test can find it.
         fn harness_with_real_windows(marker: &str) -> Harness {
             let dir = tempfile::tempdir().unwrap();
-            let config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let config = quick(&paths);
             let prompter =
                 ProcessPrompter::with_argv(["sh", "-c", "cat >/dev/null", marker]);
-            let daemon = Arc::new(Daemon::new(dir.path(), config, Arc::new(prompter)));
+            let daemon = Arc::new(Daemon::new(&paths, config, Arc::new(prompter)));
             // The stub is unused on this path; the script is empty because
             // nothing consults it.
-            Harness { dir, daemon, prompter: Arc::new(StubPrompter::new(Vec::<Reply>::new())) }
+            Harness {
+                dir,
+                paths,
+                daemon,
+                prompter: Arc::new(StubPrompter::new(Vec::<Reply>::new())),
+            }
         }
 
         #[tokio::test]
@@ -2919,10 +2944,10 @@ mod tests {
             let marker = format!("hatch-cancel-{}", uuid::Uuid::new_v4());
             let harness = harness_with_real_windows(&marker);
             // Long enough that the deadline cannot be what ends this.
-            let mut config = quick(harness.dir.path());
+            let mut config = quick(&harness.paths);
             config.timeout_secs = 600;
             let daemon = Arc::new(Daemon::new(
-                harness.dir.path(),
+                &harness.paths,
                 config,
                 Arc::new(ProcessPrompter::with_argv(["sh", "-c", "cat >/dev/null", &marker])),
             ));
@@ -2950,7 +2975,7 @@ mod tests {
             assert_eq!(result.is_error, Some(true));
             assert!(!any_process_named(&marker), "the window outlived the call that opened it");
 
-            let path = AuditLog::new(&harness.dir.path().join("log")).current_path();
+            let path = AuditLog::new(&harness.paths.log_dir()).current_path();
             let text = std::fs::read_to_string(path).unwrap();
             let record: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
             assert_eq!(record["verdict"], LogVerdict::Cancelled.as_str());
@@ -3049,7 +3074,7 @@ mod tests {
         #[tokio::test]
         async fn refusals_happen_before_any_prompt_is_shown() {
             let harness = Harness::new(Vec::new());
-            let protected = harness.dir.path().join("config.toml");
+            let protected = harness.paths.config_file();
             let result = within(harness.daemon.swap_file(
                 SwapFileParams {
                     title: "take hatch over".to_string(),
@@ -3190,13 +3215,14 @@ mod tests {
             // into the dead stream reports success. What the daemon watches
             // instead is the response stream itself — see `Hangup`.
             let dir = tempfile::tempdir().unwrap();
-            let mut config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
             config.token = "test-token".to_string();
             // Long, so that nothing but the disconnect can end this request.
             config.timeout_secs = 600;
             let prompter = Arc::new(StubPrompter::new(vec![Reply::silent()]));
             let daemon =
-                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
 
             let listener = bind(0).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3267,7 +3293,7 @@ mod tests {
 
             drop(socket);
 
-            let log = AuditLog::new(&dir.path().join("log")).current_path();
+            let log = AuditLog::new(&paths.log_dir()).current_path();
             let waited = tokio::time::Instant::now();
             let record = loop {
                 assert!(waited.elapsed() < CEILING, "no record was written for the lost client");
@@ -3290,13 +3316,14 @@ mod tests {
             // The whole point of the verdict mapping, checked where the agent
             // actually reads it: `result.isError`, never a JSON-RPC `error`.
             let dir = tempfile::tempdir().unwrap();
-            let mut config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
             config.token = "test-token".to_string();
             let prompter = Arc::new(StubPrompter::new(vec![Reply::verdict(Verdict::Deny {
                 note: "wrong host".to_string(),
             })]));
             let daemon =
-                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
 
             let listener = bind(0).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3361,12 +3388,13 @@ mod tests {
             // spends reading, so a client that hears nothing during it gives
             // up on a window somebody is still looking at.
             let dir = tempfile::tempdir().unwrap();
-            let mut config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
             config.token = "test-token".to_string();
             config.timeout_secs = 600;
             let prompter = Arc::new(StubPrompter::new(vec![Reply::silent()]));
             let daemon =
-                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
 
             let listener = bind(0).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3528,13 +3556,14 @@ mod tests {
         /// hatch directory, answering with `script`.
         fn wired(timeout_secs: u64, script: Vec<Reply>) -> (Harness, Arc<StubPrompter>) {
             let dir = tempfile::tempdir().unwrap();
-            let mut config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
             config.token = "test-token".to_string();
             config.timeout_secs = timeout_secs;
             let prompter = Arc::new(StubPrompter::new(script));
             let daemon =
-                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
-            (Harness { dir, daemon, prompter: Arc::clone(&prompter) }, prompter)
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
+            (Harness { dir, paths, daemon, prompter: Arc::clone(&prompter) }, prompter)
         }
 
         /// One raw HTTP POST whose connection the caller keeps, so the request
@@ -3573,8 +3602,8 @@ mod tests {
         }
 
         /// Wait for the first audit record, or say that none was written.
-        async fn first_record(dir: &std::path::Path) -> serde_json::Value {
-            let log = AuditLog::new(&dir.join("log")).current_path();
+        async fn first_record(paths: &Paths) -> serde_json::Value {
+            let log = AuditLog::new(&paths.log_dir()).current_path();
             let waited = tokio::time::Instant::now();
             loop {
                 assert!(waited.elapsed() < CEILING, "no audit record was ever written");
@@ -3624,7 +3653,7 @@ mod tests {
             )
             .await;
 
-            let record = first_record(harness.dir.path()).await;
+            let record = first_record(&harness.paths).await;
             assert_eq!(
                 record["verdict"], "cancelled",
                 "a cancellation the client sent is not a lost connection: {record}"
@@ -3730,14 +3759,15 @@ mod tests {
             // request arrived, its deadline has to be a full timeout *plus*
             // however long it spent waiting.
             let dir = tempfile::tempdir().unwrap();
-            let mut config = quick(dir.path());
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
             config.timeout_secs = 90;
             let prompter = Arc::new(StubPrompter::new(vec![
                 approve().after(Duration::from_secs(1)),
                 Reply::silent(),
             ]));
             let daemon =
-                Arc::new(Daemon::new(dir.path(), config, Arc::clone(&prompter) as Arc<_>));
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
 
             let holder = {
                 let daemon = Arc::clone(&daemon);

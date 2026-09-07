@@ -58,7 +58,8 @@
 //!
 //! What is not accepted is that oracle reaching the protected set. If the stat
 //! ran first, the two refusals would differ — "protected" for
-//! `~/.hatch/config.toml`, "no such directory" for `~/.hatch/nope/x` — and
+//! `~/.config/hatch/config.toml`, "no such directory" for
+//! `~/.config/hatch/nope/x` — and
 //! `swap_file` would become a way to map hatch's own state, the user's
 //! sandbox profiles and every `denylist_extra` entry without a single prompt.
 //! Consulting the denylist first collapses all of that to one answer that
@@ -83,7 +84,8 @@
 //! into and refusing it would break honest requests for no gain. That is what
 //! step 6 is for. The lexical denylist judges the spelling the agent supplied,
 //! and a symlinked ancestor makes that spelling and the file two different
-//! things — `/tmp/x/config.toml` where `/tmp/x` points at `~/.hatch` is not
+//! things — `/tmp/x/config.toml` where `/tmp/x` points at `~/.config/hatch` is
+//! not
 //! lexically protected, but it is the same file. Once the parent is known to
 //! exist it can be canonicalised, and the protected set is asked again about
 //! the resolved spelling. Step 3 alone would leave the denylist bypassable by
@@ -109,7 +111,8 @@
 //!
 //! 1. **[`validate`] in full**, not the hash alone. This is what re-closes the
 //!    symlinked-ancestor bypass: `/tmp/x/config.toml` where `/tmp/x` became a
-//!    link to `~/.hatch` while the prompt was up is a *different file* under
+//!    link to `~/.config/hatch` while the prompt was up is a *different file*
+//!    under
 //!    the same name, and a content hash cannot see that, because the hash only
 //!    ever describes whichever file the name currently means — which for a
 //!    create is quite legitimately no file at all. It also re-closes the
@@ -1103,12 +1106,16 @@ mod tests {
     /// A denylist over a fictional home directory, for the cases that never
     /// touch the disk.
     fn deny() -> Denylist {
-        Denylist::new(Path::new("/home/user/.hatch"), &[])
+        Denylist::new(&["/home/user/.config/hatch"], Path::new("/home/user"), &[])
     }
 
     /// A denylist that protects a real directory, for the cases that do.
     fn deny_dir(dir: &Path) -> Denylist {
-        Denylist::new(Path::new("/home/user/.hatch"), &[dir.to_string_lossy().into_owned()])
+        Denylist::new(
+            &["/home/user/.config/hatch"],
+            Path::new("/home/user"),
+            &[dir.to_string_lossy().into_owned()],
+        )
     }
 
     fn set_mode(path: &Path, mode: u32) {
@@ -1131,7 +1138,7 @@ mod tests {
         // simply false. `..` gets its own refusal so the message is true.
         assert_eq!(validate(Path::new("/etc/../etc/hosts"), &deny()), Err(Refusal::DotDot));
         assert_eq!(
-            validate(Path::new("/home/user/.hatch/../.hatch/config.toml"), &deny()),
+            validate(Path::new("/home/user/.config/hatch/../hatch/config.toml"), &deny()),
             Err(Refusal::DotDot)
         );
     }
@@ -1323,7 +1330,8 @@ mod tests {
         let secret = fs::canonicalize(protected.path()).unwrap().join("secret");
         fs::write(&secret, "x").unwrap();
         let deny = Denylist::new(
-            Path::new("/home/user/.hatch"),
+            &["/home/user/.config/hatch"],
+            Path::new("/home/user"),
             &[secret.to_string_lossy().into_owned()],
         );
 

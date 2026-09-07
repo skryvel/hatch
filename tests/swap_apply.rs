@@ -20,10 +20,10 @@ use hatch::swap::{ApplyError, PlanKind, Refusal, apply, plan, validate};
 ///
 /// Fictional on purpose: the protected set is judged lexically and before the
 /// filesystem is consulted, so these paths never have to exist, and a test
-/// that pointed at the developer's real `~/.hatch` would pass or fail
+/// that pointed at the developer's real `~/.config/hatch` would pass or fail
 /// depending on whose machine it ran on.
 fn deny() -> Denylist {
-    Denylist::new(Path::new("/home/user/.hatch"), &[])
+    Denylist::new(&["/home/user/.config/hatch"], Path::new("/home/user"), &[])
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn missing_parent_is_refused() {
 #[test]
 fn denylisted_target_is_refused() {
     assert!(matches!(
-        validate(Path::new("/home/user/.hatch/config.toml"), &deny()),
+        validate(Path::new("/home/user/.config/hatch/config.toml"), &deny()),
         Err(Refusal::Denied)
     ));
 }

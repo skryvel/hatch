@@ -11,12 +11,19 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
+use crate::paths::Paths;
+
 /// Bytes of entropy behind the bearer token.
 const TOKEN_BYTES: usize = 32;
 
-/// On-disk settings. Every field has a default and the struct carries
-/// `#[serde(default)]`, so a config file written by an older build keeps
-/// loading unchanged after new fields are added.
+/// On-disk settings, read from and written to
+/// `$XDG_CONFIG_HOME/hatch/config.toml` — `~/.config/hatch/config.toml` unless
+/// the variable says otherwise. See [`crate::paths`] for the other two
+/// directories, which are not here and not next to this one.
+///
+/// Every field has a default and the struct carries `#[serde(default)]`, so a
+/// config file written by an older build keeps loading unchanged after new
+/// fields are added.
 ///
 /// `exec_env` is declared last only so the written file reads scalars first;
 /// the serializer emits tables after plain values whatever the field order.
@@ -26,7 +33,8 @@ pub struct Config {
     /// Loopback port the MCP server listens on.
     pub port: u16,
     /// Bearer token the client must present. Empty in `Config::default()`;
-    /// `load_or_create` generates one and writes it back.
+    /// `load_or_create` generates one and writes it back. It is the reason
+    /// this file is 0600 and re-tightened on every load.
     pub token: String,
     /// How long a request waits for a human decision.
     pub timeout_secs: u64,
@@ -67,16 +75,23 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load `<dir>/config.toml`, creating `dir` (with its `log/` and `stage/`
-    /// subdirectories) if absent. A config with no token — a brand new one, or
-    /// an existing file that never had the key — gets a fresh token written
-    /// back, so `hatch serve` and `hatch token` agree across restarts.
-    pub fn load_or_create(dir: &Path) -> anyhow::Result<Config> {
-        create_private_dir(dir)?;
-        create_private_dir(&dir.join("log"))?;
-        create_private_dir(&dir.join("stage"))?;
+    /// Load the config file, creating every directory hatch needs if absent:
+    /// the config, state and runtime ones and the `log/` and `stage/` inside
+    /// the last two. A config with no token — a brand new one, or an existing
+    /// file that never had the key — gets a fresh token written back, so
+    /// `hatch serve` and `hatch token` agree across restarts.
+    ///
+    /// Each directory is created at 0700 and, if it was already there at a
+    /// laxer mode, brought back to 0700. The XDG spec asks for exactly this of
+    /// anything an application creates under the base directories, and here it
+    /// is load-bearing rather than tidy: `log/` records full command text and
+    /// `stage/` holds file content that has been approved but not yet written.
+    pub fn load_or_create(paths: &Paths) -> anyhow::Result<Config> {
+        create_private_dir(paths.config_dir())?;
+        create_private_dir(&paths.log_dir())?;
+        create_private_dir(&paths.stage_dir())?;
 
-        let path = dir.join("config.toml");
+        let path = paths.config_file();
         let existed = path.exists();
         let mut config = if existed { read_private(&path)? } else { Config::default() };
 
@@ -108,6 +123,10 @@ impl Config {
 /// Create `path` and its parents, and hold it at 0700. `stage/` holds the
 /// approved bytes of files about to be written as root and `log/` records full
 /// command text, so neither may be readable by other local users.
+///
+/// The parents matter now that the three directories are in three places:
+/// creating `~/.local/state/hatch/log` creates `~/.local/state/hatch` on the
+/// way, and it is created at 0700 too.
 fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -189,15 +208,15 @@ fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
         .with_context(|| format!("securing {}", path.display()))
 }
 
-/// The real config directory, `~/.hatch`.
-pub fn default_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("no home directory to place ~/.hatch in")?;
-    Ok(home.join(".hatch"))
-}
-
 /// Print the client registration line for `hatch token`.
+///
+/// Also reports anything unusual about where the directories ended up, which
+/// on this path is the point as much as the line is: a user with a leftover
+/// `~/.hatch` is a user who may be holding a token nothing accepts any more.
 pub fn print_client_line() -> anyhow::Result<()> {
-    print_client_line_for(&Config::load_or_create(&default_dir()?)?)
+    let paths = Paths::from_env()?;
+    paths.report();
+    print_client_line_for(&Config::load_or_create(&paths)?)
 }
 
 /// Print the client registration line for a config already in hand.
@@ -238,31 +257,57 @@ fn default_home() -> String {
 mod tests {
     use super::*;
 
+    /// A temporary root, and the three directories under it. Distinct
+    /// directories rather than one: everything below would still pass if
+    /// `log/` were created inside the config directory, and that is exactly
+    /// the mistake the move to XDG makes possible.
+    fn scratch() -> (tempfile::TempDir, Paths) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::scratch(root.path());
+        (root, paths)
+    }
+
     #[test]
     fn generates_a_token_on_first_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = Config::load_or_create(dir.path()).unwrap();
+        let (_root, paths) = scratch();
+        let c = Config::load_or_create(&paths).unwrap();
         assert_eq!(c.token.len(), 43); // 32 bytes base64url, unpadded
     }
 
     #[test]
     fn second_load_returns_the_same_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = Config::load_or_create(dir.path()).unwrap();
-        let b = Config::load_or_create(dir.path()).unwrap();
+        let (_root, paths) = scratch();
+        let a = Config::load_or_create(&paths).unwrap();
+        let b = Config::load_or_create(&paths).unwrap();
         assert_eq!(a.token, b.token);
     }
 
     #[test]
     fn config_file_is_not_group_or_world_readable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        Config::load_or_create(dir.path()).unwrap();
-        let mode = std::fs::metadata(dir.path().join("config.toml"))
-            .unwrap()
-            .permissions()
-            .mode();
+        let (_root, paths) = scratch();
+        Config::load_or_create(&paths).unwrap();
+        let mode = std::fs::metadata(paths.config_file()).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "config.toml must be 0600");
+    }
+
+    #[test]
+    fn the_three_directories_are_created_where_they_were_asked_for() {
+        // The config file goes in one, the log in the second, the stage in the
+        // third, and none of them is created next to another.
+        let (_root, paths) = scratch();
+        Config::load_or_create(&paths).unwrap();
+        assert!(paths.config_file().is_file(), "no config.toml");
+        assert!(paths.log_dir().is_dir(), "no log directory");
+        assert!(paths.stage_dir().is_dir(), "no stage directory");
+        assert!(
+            !paths.config_dir().join("log").exists(),
+            "the log must not be created beside the config"
+        );
+        assert!(
+            !paths.config_dir().join("stage").exists(),
+            "nor the stage"
+        );
     }
 
     #[test]
@@ -274,25 +319,32 @@ mod tests {
     #[test]
     fn state_directories_are_not_group_or_world_readable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        Config::load_or_create(dir.path()).unwrap();
-        for sub in ["log", "stage"] {
-            let mode = std::fs::metadata(dir.path().join(sub))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o077, 0, "{sub}/ must be 0700");
+        let (_root, paths) = scratch();
+        Config::load_or_create(&paths).unwrap();
+        // Every directory hatch made, including the two it created on the way
+        // to `log/` and `stage/`.
+        let made = [
+            paths.config_dir().to_path_buf(),
+            paths.log_dir(),
+            paths.log_dir().parent().unwrap().to_path_buf(),
+            paths.stage_dir(),
+            paths.stage_dir().parent().unwrap().to_path_buf(),
+        ];
+        for dir in made {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} must be 0700", dir.display());
         }
     }
 
     #[test]
     fn a_config_missing_its_token_gets_one_written_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
+        let (_root, paths) = scratch();
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let path = paths.config_file();
         std::fs::write(&path, "port = 9000\nterminal = [\"foot\", \"-e\"]\n").unwrap();
 
-        let a = Config::load_or_create(dir.path()).unwrap();
-        let b = Config::load_or_create(dir.path()).unwrap();
+        let a = Config::load_or_create(&paths).unwrap();
+        let b = Config::load_or_create(&paths).unwrap();
 
         assert_eq!(a.token.len(), 43);
         assert_eq!(a.token, b.token, "token must survive a restart");
@@ -308,31 +360,39 @@ mod tests {
     #[test]
     fn a_lax_config_file_is_tightened_on_load() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let (_root, paths) = scratch();
         // The first load writes a token, so the second takes the steady-state
         // path that does not rewrite the file.
-        Config::load_or_create(dir.path()).unwrap();
-        let path = dir.path().join("config.toml");
+        Config::load_or_create(&paths).unwrap();
+        let path = paths.config_file();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        Config::load_or_create(dir.path()).unwrap();
+        Config::load_or_create(&paths).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "config.toml must be tightened back to 0600");
     }
 
     #[test]
-    fn a_lax_config_dir_is_tightened_on_load() {
+    fn a_lax_directory_of_any_of_the_three_is_tightened_on_load() {
+        // A directory that already exists — from an older hatch, from a
+        // restore, or from a user who made it by hand at the umask default —
+        // is brought back to 0700 rather than left as found. All three, not
+        // just the config one: the log and the stage are the two that hold
+        // command text and approved bytes.
         use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("hatch");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_root, paths) = scratch();
+        for dir in [paths.config_dir().to_path_buf(), paths.log_dir(), paths.stage_dir()] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
-        Config::load_or_create(&root).unwrap();
+        Config::load_or_create(&paths).unwrap();
 
-        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "the config directory must be 0700");
+        for dir in [paths.config_dir().to_path_buf(), paths.log_dir(), paths.stage_dir()] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{} must be tightened to 0700", dir.display());
+        }
     }
 
     #[test]
@@ -340,21 +400,21 @@ mod tests {
         // Two `hatch serve` starts against a brand new config used to be able
         // to each keep their own token, leaving the daemon authenticating
         // against one `hatch token` never printed.
-        let dir = tempfile::tempdir().unwrap();
+        let (_root, paths) = scratch();
         let start = std::sync::Barrier::new(8);
         let tokens: Vec<String> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
                         start.wait();
-                        Config::load_or_create(dir.path()).unwrap().token
+                        Config::load_or_create(&paths).unwrap().token
                     })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        let on_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let on_disk = std::fs::read_to_string(paths.config_file()).unwrap();
         for token in &tokens {
             assert_eq!(token, &tokens[0], "the starts disagreed on the token");
             let reached_disk = on_disk.contains(token.as_str());

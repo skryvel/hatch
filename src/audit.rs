@@ -192,7 +192,8 @@ pub struct SwapDetail {
 
 /// The append-only writer over a log directory.
 ///
-/// The directory is `~/.hatch/log`, created at 0700 by
+/// The directory is `$XDG_STATE_HOME/hatch/log` — `~/.local/state/hatch/log`
+/// unless the variable says otherwise — created at 0700 by
 /// [`crate::config::Config::load_or_create`]; this type only writes into it.
 pub struct AuditLog {
     dir: PathBuf,
@@ -371,7 +372,9 @@ mod rfc3339_secs {
 
 /// Tail the audit log for `hatch log`.
 pub fn tail() -> anyhow::Result<()> {
-    AuditLog::new(&crate::config::default_dir()?.join("log")).print_current()
+    let paths = crate::paths::Paths::from_env()?;
+    paths.report();
+    AuditLog::new(&paths.log_dir()).print_current()
 }
 
 #[cfg(test)]
