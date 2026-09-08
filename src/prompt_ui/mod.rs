@@ -44,6 +44,7 @@
 //! is not worth a window.
 
 pub mod guard;
+pub mod panes;
 pub mod visibility;
 
 use std::collections::VecDeque;
@@ -57,6 +58,7 @@ use eframe::egui;
 
 use crate::exec::Stream;
 use crate::prompt_ui::guard::{Action, Guard, intercept};
+use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
 
 /// The window's application id.
@@ -96,6 +98,24 @@ const EXIT_BACKSTOP: Duration = Duration::from_millis(250);
 /// command.
 const OUTPUT_CAP: usize = 1 << 20;
 
+/// The size of the two buttons that settle the request.
+///
+/// Wide and tall enough that they are aimed at rather than clipped, and the
+/// same size as each other: Approve is the one that runs something, and
+/// making it the larger of the two would be an invitation dressed as an
+/// affordance.
+const PRIMARY_BUTTON: egui::Vec2 = egui::vec2(150.0, 34.0);
+
+/// The gap between Approve and Deny.
+///
+/// A slipped pointer has to cross it, and it lands on the panel rather than
+/// on the other verdict. Deliberately larger than egui's own spacing, which
+/// is tuned for buttons whose worst outcome is being pressed by accident.
+const PRIMARY_GAP: f32 = 28.0;
+
+/// The most of the window the live output takes while a command runs.
+const RUNNING_OUTPUT_HEIGHT: f32 = 180.0;
+
 // ---- the state machine -----------------------------------------------------
 
 /// Where this window is between opening and leaving.
@@ -125,6 +145,7 @@ pub enum Incoming {
 pub struct PromptState {
     phase: Phase,
     request: Option<Request>,
+    shown: Option<Shown>,
     queue_depth: u32,
     outcome: Option<Outcome>,
     output: VecDeque<(Stream, String)>,
@@ -145,6 +166,7 @@ impl PromptState {
         PromptState {
             phase: Phase::WaitingForRequest,
             request: None,
+            shown: None,
             queue_depth: 0,
             outcome: None,
             output: VecDeque::new(),
@@ -162,6 +184,15 @@ impl PromptState {
     /// The request being decided, once it has arrived.
     pub fn request(&self) -> Option<&Request> {
         self.request.as_ref()
+    }
+
+    /// The payload as something drawable, checked when it arrived.
+    ///
+    /// There is never a request without one: a payload that could not be
+    /// rebuilt through the real builder closed the window instead of
+    /// becoming one. See [`PromptState::handle`].
+    pub fn shown(&self) -> Option<&Shown> {
+        self.shown.as_ref()
     }
 
     /// The last depth the daemon published, whether or not it is drawn.
@@ -249,8 +280,25 @@ impl PromptState {
                     self.channel_broken("hatch sent a second request to a window that has one");
                     return;
                 }
+                // The rendering is checked here, once, and before the window
+                // has anything to show — not per frame while drawing, where
+                // the only thing left to do about a bad one is to draw part
+                // of it. A payload whose spans do not tile their source, or
+                // whose one-line form disagrees with them, is a frame this
+                // window cannot show the truth of, so it closes: the daemon
+                // reads that as a denial, which is the safe direction.
+                let shown = match Shown::of(&req.payload) {
+                    Ok(shown) => shown,
+                    Err(e) => {
+                        self.channel_broken(format!(
+                            "hatch sent a request this window cannot draw: {e}"
+                        ));
+                        return;
+                    }
+                };
                 self.queue_depth = req.queue_depth;
                 self.request = Some(req);
+                self.shown = Some(shown);
                 self.phase = Phase::AwaitingVerdict;
             }
             DaemonMsg::QueueDepth { depth } => self.queue_depth = depth,
@@ -509,46 +557,51 @@ impl eframe::App for PromptApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            // Agent-controlled text, defanged by the daemon. Drawn as text
-            // and not interpreted; nothing here undoes the defanging. Copied
-            // out so the buttons below can still borrow the state machine.
-            let shown = self.state.request().map(|r| (r.title.clone(), r.reason.clone()));
-            let Some((title, reason)) = shown else {
-                ui.label("Waiting for hatch to send the request…");
-                return;
-            };
-
-            ui.heading(title);
-            ui.label(reason);
-            ui.separator();
-
-            if let Some(left) = self.state.seconds_remaining(Utc::now()) {
-                ui.label(format!("{left}s left"));
-            }
-            if let Some(waiting) = self.state.queue_badge() {
-                ui.label(format!("{waiting} more waiting"));
-            }
-            ui.label(format!("{:?}", self.state.phase()));
-
-            match self.state.phase() {
-                Phase::AwaitingVerdict => {
-                    let open = self.guard_open;
-                    self.verdict_area(ui, open);
-                }
-                Phase::Running => {
-                    if ui.button("Kill").clicked() {
-                        let kill = self.state.request_kill();
-                        answer(&mut self.out, &mut self.state, kill);
-                    }
-                }
-                Phase::WaitingForRequest | Phase::Closed => {}
-            }
-        });
+        self.window(ui, self.guard_open);
     }
 }
 
 impl PromptApp {
+    /// The whole window, for one frame.
+    ///
+    /// Split out of [`eframe::App::ui`] so the tests below can draw the real
+    /// layout — panes, panels and buttons — through egui's own `run_ui`,
+    /// without a display and without an `eframe::Frame` to hand it. The
+    /// guard's answer is a parameter for the same reason it is a field: the
+    /// half of the frame that judges input and the half that draws it must
+    /// agree.
+    fn window(&mut self, ui: &mut egui::Ui, guard_open: bool) {
+        // Agent-controlled text, defanged by the daemon. Drawn as text and
+        // not interpreted; nothing here undoes the defanging. Copied out so
+        // the panels below can still borrow the state machine.
+        let headline = self.state.request().map(|r| (r.title.clone(), r.reason.clone()));
+        let Some((title, reason)) = headline else {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("Waiting for hatch to send the request…");
+            });
+            return;
+        };
+
+        // The controls are a panel and not the bottom of the scrolling
+        // region, and that is the whole answer to "two scroll areas plus the
+        // buttons". A bottom panel takes its height out of the window before
+        // anything above it is laid out, so a command of any length reaches
+        // the end of its pane rather than the end of the window: Approve
+        // cannot be pushed off the screen, and there is no scroll position
+        // from which the buttons are missing.
+        egui::Panel::bottom("hatch-controls").show(ui, |ui| self.controls(ui, guard_open));
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            panes::draw_headline(ui, &title, &reason);
+            ui.separator();
+            // There is always one once a request has arrived: a payload that
+            // could not be rebuilt closed the window instead of becoming one.
+            if let Some(shown) = self.state.shown() {
+                panes::draw_payload(ui, shown);
+            }
+        });
+    }
+
     /// Carry out one decision the guard made.
     ///
     /// A decision, not a suggestion: it is applied where it is received. The
@@ -563,6 +616,88 @@ impl PromptApp {
         };
         let frame = self.state.decide(verdict);
         answer(&mut self.out, &mut self.state, frame);
+    }
+
+    /// Everything below the panes: what the clock says, and what can be
+    /// pressed.
+    ///
+    /// One method rather than a panel closure per phase, because the phase is
+    /// what decides between them and the two must never both be drawn.
+    fn controls(&mut self, ui: &mut egui::Ui, guard_open: bool) {
+        ui.add_space(4.0);
+        self.status_row(ui);
+        match self.state.phase() {
+            Phase::AwaitingVerdict => {
+                self.verdict_area(ui, guard_open);
+            }
+            Phase::Running => self.running_row(ui),
+            Phase::WaitingForRequest | Phase::Closed => {}
+        }
+        ui.add_space(4.0);
+    }
+
+    /// The clock and the badge.
+    ///
+    /// The countdown changes colour *and* weight on the way down rather than
+    /// only shrinking as a number: plain text is legible at 255 s and useless
+    /// at 8 s, when the reader is no longer reading anything. Two thresholds,
+    /// not a fade — see [`panes::urgency`] — and never colour alone, which
+    /// would say nothing at all to a reader who cannot tell red from grey.
+    fn status_row(&self, ui: &mut egui::Ui) {
+        let (calm, soon, imminent) = {
+            let visuals = ui.visuals();
+            (visuals.weak_text_color(), visuals.warn_fg_color, visuals.error_fg_color)
+        };
+        ui.horizontal(|ui| {
+            if let Some(left) = self.state.seconds_remaining(Utc::now()) {
+                let text = egui::RichText::new(countdown_text(left));
+                ui.label(match urgency(left) {
+                    Urgency::Calm => text.color(calm),
+                    Urgency::Soon => text.color(soon).strong(),
+                    Urgency::Imminent => text.color(imminent).strong().size(17.0),
+                });
+            }
+            if let Some(waiting) = self.state.queue_badge() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{waiting} more waiting"))
+                            .small()
+                            .color(calm),
+                    );
+                });
+            }
+        });
+    }
+
+    /// What an approved command's window offers while it runs.
+    ///
+    /// The output is here, in the same panel as Kill, and capped: the reason
+    /// to watch it is to decide whether to press that button, and a decision
+    /// is made from the last screenful.
+    fn running_row(&mut self, ui: &mut egui::Ui) {
+        ui.label("Approved. It is running now.");
+        if self.stream {
+            let text: String =
+                self.state.output().iter().map(|(_, chunk)| chunk.as_str()).collect();
+            egui::ScrollArea::vertical()
+                .id_salt("hatch-output")
+                .max_height(RUNNING_OUTPUT_HEIGHT)
+                .auto_shrink([false, true])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    // Already decoded by the daemon; drawn, never decoded
+                    // again. See `crate::protocol`.
+                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
+                });
+        } else {
+            ui.label(
+                egui::RichText::new("Its output is not being streamed to this window.").small(),
+            );
+        }
+        if unfocusable(ui, egui::Button::new("Kill")).clicked() {
+            let kill = self.state.request_kill();
+            answer(&mut self.out, &mut self.state, kill);
+        }
     }
 
     /// The verdict area, shut while the guard is.
@@ -587,10 +722,18 @@ impl PromptApp {
         approve
     }
 
-    /// The buttons, and nothing more than the buttons.
+    /// The buttons, the note and the checkbox, weighted so that the two that
+    /// decide do not look like the three that ask.
     ///
-    /// The layout and the diff view are other work; this is here to prove
-    /// that a press becomes a frame on the wire.
+    /// Five buttons stacked in one column at one size is the layout that
+    /// produces a misclick, and a misclick here is an approval. So Approve
+    /// and Deny are one row of large buttons with a real gap between them —
+    /// the gap is not decoration, it is the distance a slipped pointer has to
+    /// cross to turn a refusal into a root command — and Explain, Simplify
+    /// and "I'll run it myself" are a smaller row underneath. They are escape
+    /// hatches: they send the agent away with something to do and nothing
+    /// runs, which is the same class of outcome as Deny and does not deserve
+    /// the same size as it.
     ///
     /// Every one of them is built with [`egui::Sense::CLICK`] rather than
     /// [`egui::Sense::click`], which is the same thing without `FOCUSABLE`.
@@ -598,31 +741,73 @@ impl PromptApp {
     /// is pressed, so a button that can never hold focus can never be
     /// activated by a key at all — which is the hole that taking Enter out of
     /// the frame leaves open on its own, because Space is ordinary typing and
-    /// has to reach the note field. Do not swap these back to `ui.button`.
+    /// has to reach the note field. [`unfocusable`] is the one door: do not
+    /// swap these back to `ui.button`.
     ///
     /// Returns the Approve button.
     fn verdict_buttons(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        ui.checkbox(&mut self.stream, "Stream output");
-        ui.text_edit_singleline(&mut self.note);
+        // Read before the fields below are borrowed to draw.
+        let (streamable, interactive) = match self.state.shown() {
+            Some(shown) => (shown.streamable(), shown.interactive()),
+            None => (false, false),
+        };
 
+        ui.horizontal(|ui| {
+            ui.label("Note to the agent");
+            ui.text_edit_singleline(&mut self.note);
+        });
+        // One name for it, used by the checkbox and by the line that says why
+        // it is dead: a control that cannot be ticked and does not say why is
+        // a window asking the reader to guess.
+        let can_stream = !interactive;
+        if streamable {
+            ui.add_enabled(
+                can_stream,
+                egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
+            );
+            if !can_stream {
+                ui.label(
+                    egui::RichText::new("It runs in a terminal of its own.")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
         let note = self.note.clone();
         let mut decided = None;
-        let approve = unfocusable(ui, "Approve");
+
+        let approve = ui
+            .horizontal(|ui| {
+                let approve =
+                    unfocusable(ui, egui::Button::new(strong("Approve")).min_size(PRIMARY_BUTTON));
+                // A pointer that slips off Deny must land on nothing.
+                ui.add_space(PRIMARY_GAP);
+                if unfocusable(ui, egui::Button::new(strong("Deny")).min_size(PRIMARY_BUTTON))
+                    .clicked()
+                {
+                    decided = Some(Verdict::Deny { note: note.clone() });
+                }
+                approve
+            })
+            .inner;
         if approve.clicked() {
             decided = Some(Verdict::Approve { stream: self.stream });
         }
-        if unfocusable(ui, "Deny").clicked() {
-            decided = Some(Verdict::Deny { note: note.clone() });
-        }
-        if unfocusable(ui, "Explain").clicked() {
-            decided = Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
-        }
-        if unfocusable(ui, "Simplify").clicked() {
-            decided = Some(Verdict::Revise { kind: ReviseKind::Simplify, note: note.clone() });
-        }
-        if unfocusable(ui, "I'll run it myself").clicked() {
-            decided = Some(Verdict::SelfRun { note });
-        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if secondary(ui, "Explain first").clicked() {
+                decided = Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
+            }
+            if secondary(ui, "Ask for something simpler").clicked() {
+                decided = Some(Verdict::Revise { kind: ReviseKind::Simplify, note: note.clone() });
+            }
+            if secondary(ui, "I'll run it myself").clicked() {
+                decided = Some(Verdict::SelfRun { note });
+            }
+        });
 
         if let Some(verdict) = decided {
             let frame = self.state.decide(verdict);
@@ -634,10 +819,21 @@ impl PromptApp {
 
 /// A button a mouse can press and a keyboard cannot reach.
 ///
-/// See [`PromptApp::verdict_buttons`] for why every button that decides
-/// something is built this way.
-fn unfocusable(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(label).sense(egui::Sense::CLICK))
+/// The single place [`egui::Sense::CLICK`] is applied, so a new button cannot
+/// be added with the focusable sense by forgetting rather than by deciding.
+/// See [`PromptApp::verdict_buttons`] for why that matters.
+fn unfocusable(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
+    ui.add(button.sense(egui::Sense::CLICK))
+}
+
+/// One of the three ways to send the agent away without running anything.
+fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    unfocusable(ui, egui::Button::new(egui::RichText::new(label).small()))
+}
+
+/// A primary button's label.
+fn strong(label: &str) -> egui::RichText {
+    egui::RichText::new(label).strong().size(16.0)
 }
 
 #[cfg(test)]
@@ -1294,6 +1490,342 @@ mod tests {
         approve.request_focus();
         let approve = draw(&mut app, &ctx, Vec::new(), true);
         assert!(!approve.has_focus(), "egui gave a verdict button the keyboard focus");
+    }
+
+    // ---- what the window actually draws -----------------------------------
+    //
+    // The bug this layout exists to fix is a window that showed the title and
+    // the reason and not the command, so it is not enough to know that the
+    // drawing code runs. These tests read the text egui laid out and assert
+    // the command is in it. No display is needed: `run_ui` produces the same
+    // shapes it would send to a GPU.
+
+    /// Every string egui laid out this frame, joined.
+    fn text_on_screen(output: &egui::FullOutput) -> String {
+        fn walk(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Draw the whole window and hand back what it says.
+    ///
+    /// Three frames, not one: a panel learns its height from the frame
+    /// before, so a pane measured against the first frame's guess is not the
+    /// pane a reader sees.
+    fn window_text(app: &mut PromptApp, open: bool) -> String {
+        let ctx = egui::Context::default();
+        // Twice: the first frame is what teaches the panels their size, and
+        // a pane sized against a zero-height guess is not the pane a user
+        // sees.
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(raw(Vec::new()), |ui| app.window(ui, open));
+            out.textures_delta.clear();
+        }
+        let mut out = ctx.run_ui(raw(Vec::new()), |ui| app.window(ui, open));
+        let text = text_on_screen(&out);
+        out.textures_delta.clear();
+        text
+    }
+
+    /// A window awaiting a verdict on `command`.
+    fn a_window_showing(command: &str) -> PromptApp {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command(command, &BTreeMap::from([("HOME".into(), "/home/u".into())])),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        );
+        app.state.handle(DaemonMsg::Request(request));
+        app
+    }
+
+    #[test]
+    fn the_window_draws_the_command_and_not_only_the_agents_summary() {
+        let drawn = window_text(&mut a_window_showing("rm -rf /var/tmp/build"), true);
+
+        assert!(drawn.contains("delete the build directory"), "the title is missing: {drawn}");
+        assert!(
+            drawn.contains("rm -rf /var/tmp/build"),
+            "the window is asking about a command it does not show: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_separator_is_on_screen_rather_than_faded_out_of_it() {
+        let drawn = window_text(&mut a_window_showing("ls; rm -rf target"), true);
+
+        assert!(drawn.contains(';'), "the separator was not drawn at all: {drawn}");
+    }
+
+    #[test]
+    fn a_disguised_character_is_chipped_in_both_panes() {
+        // Cyrillic a and a right-to-left override. Each chips once per pane,
+        // so each label appears twice: the raw pane is not the pane that gets
+        // to be honest second.
+        let drawn = window_text(&mut a_window_showing("echo us\u{0430}r\u{202e}"), true);
+
+        assert_eq!(drawn.matches("[U+0430]").count(), 2, "chipped in one pane only: {drawn}");
+        assert_eq!(drawn.matches("[RLO]").count(), 2, "chipped in one pane only: {drawn}");
+    }
+
+    #[test]
+    fn a_variable_is_shown_with_its_value_beside_it_and_never_instead_of_it() {
+        let drawn = window_text(&mut a_window_showing("echo $HOME"), true);
+
+        assert!(drawn.contains("$HOME"), "the reference was replaced by its value: {drawn}");
+        assert!(drawn.contains("/home/u"), "the value was not shown at all: {drawn}");
+    }
+
+    #[test]
+    fn the_window_draws_the_clock_and_the_queue_behind_it() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(45);
+        request.queue_depth = 2;
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("s left to decide"), "there is no countdown at all: {drawn}");
+        assert!(drawn.contains("2 more waiting"), "the queue badge is missing: {drawn}");
+    }
+
+    #[test]
+    fn an_approved_command_gets_a_window_that_says_so_and_offers_kill() {
+        let mut app = a_window_showing("sleep 5");
+        app.stream = true;
+        let frame = app.state.decide(Verdict::Approve { stream: true });
+        answer(&mut app.out, &mut app.state, frame);
+        app.state.handle(DaemonMsg::Output {
+            stream: Stream::Stdout,
+            text: "half way through".to_string(),
+        });
+
+        let drawn = window_text(&mut app, true);
+
+        assert_eq!(app.state.phase(), Phase::Running);
+        assert!(drawn.contains("running"), "the window does not say what it is doing: {drawn}");
+        assert!(drawn.contains("Kill"), "there is no way to stop it: {drawn}");
+        assert!(drawn.contains("half way through"), "the output is not shown: {drawn}");
+        // "Approved." contains "Approve", so the verdict row is checked by
+        // the button that has no other reason to be on screen.
+        assert!(!drawn.contains("Deny"), "it still offers a verdict on what is running: {drawn}");
+    }
+
+    #[test]
+    fn the_window_says_who_it_runs_as_and_where() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command("id", &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/srv/app"),
+            true,
+            false,
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("ROOT"), "a root command did not say so: {drawn}");
+        assert!(drawn.contains("/srv/app"), "the working directory is missing: {drawn}");
+    }
+
+    #[test]
+    fn no_debug_formatted_rust_name_reaches_the_window() {
+        // The skeleton drew the phase as `AwaitingVerdict`. Developer text in
+        // a window whose job is to be believed reads as unfinished.
+        let drawn = window_text(&mut a_window_showing("ls"), true);
+
+        for name in ["AwaitingVerdict", "WaitingForRequest", "Phase::", "SpanKind", "Payload"] {
+            assert!(!drawn.contains(name), "{name} is on screen: {drawn}");
+        }
+    }
+
+    #[test]
+    fn a_command_too_long_for_the_window_cannot_push_the_buttons_off_it() {
+        // Fifty segments, each asking for its own line: far more than fits.
+        let long = vec!["echo hello"; 50].join("; ");
+        let drawn = window_text(&mut a_window_showing(&long), true);
+
+        assert!(drawn.contains("Approve"), "Approve was pushed off the window: {drawn}");
+        assert!(drawn.contains("Deny"), "Deny was pushed off the window: {drawn}");
+    }
+
+    #[test]
+    fn a_long_title_cannot_push_the_command_off_the_window() {
+        // `title` is agent-written and capped only at four kilobytes, which
+        // is enough prose to fill the window twice over. An agent that could
+        // do that could hide the command behind its own summary.
+        let mut app = a_window_showing("rm -rf /var/tmp/build");
+        let long = "a very long story about why this is necessary. ".repeat(90);
+        let mut request = a_request(90);
+        request.title = long;
+        request.payload = app.state.request().expect("a request").payload.clone();
+        app.state = PromptState::new();
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(
+            drawn.contains("rm -rf /var/tmp/build"),
+            "a long title crowded the command off the window: {drawn}"
+        );
+        assert!(drawn.contains("Approve"), "and it took the buttons with it: {drawn}");
+    }
+
+    #[test]
+    fn a_danger_marker_is_drawn_where_the_reader_will_see_it() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command("rm -rf /", &BTreeMap::new()),
+            vec!["deletes a directory tree".to_string()],
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(
+            drawn.contains("deletes a directory tree"),
+            "a marker the daemon found never reached the window: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_swap_never_draws_an_empty_pane_that_reads_as_nothing_changing() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::swap(
+            PathBuf::from("/tmp/conf.toml"),
+            crate::swap::SwapPlan {
+                kind: crate::swap::PlanKind::Replace,
+                landing_mode: 0o644,
+                landing_owner: crate::swap::Principal { id: 1000, name: Some("u".into()) },
+                landing_group: crate::swap::Principal { id: 1000, name: Some("u".into()) },
+                hash_before: Some("aa".into()),
+                size_delta: 4,
+            },
+            &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("/tmp/conf.toml"), "the file is not named: {drawn}");
+        assert!(drawn.contains("0644"), "the landing mode is missing: {drawn}");
+        assert!(drawn.contains("port = 8080"), "the proposed line was never drawn: {drawn}");
+        assert!(drawn.contains("port = 80"), "the current line was never drawn: {drawn}");
+    }
+
+    #[test]
+    fn a_command_in_its_own_terminal_says_why_it_cannot_be_streamed_here() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command("vim /etc/hosts", &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            true,
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(
+            drawn.contains("terminal of its own"),
+            "a checkbox that cannot be ticked was left unexplained: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_swap_offers_no_checkbox_for_output_it_will_never_produce() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::swap(
+            PathBuf::from("/tmp/f"),
+            crate::swap::SwapPlan {
+                kind: crate::swap::PlanKind::Create,
+                landing_mode: 0o600,
+                landing_owner: crate::swap::Principal { id: 1, name: None },
+                landing_group: crate::swap::Principal { id: 1, name: None },
+                hash_before: None,
+                size_delta: 2,
+            },
+            &crate::render::diff::side_by_side("", "hi\n"),
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(!drawn.contains("Stream output"), "a swap offered to stream output: {drawn}");
+    }
+
+    #[test]
+    fn a_request_this_window_cannot_draw_closes_it_rather_than_being_guessed_at() {
+        let mut state = PromptState::new();
+        let mut request = a_request(90);
+        let Payload::Command { spans, raw, danger, cwd, root, interactive, .. } = request.payload
+        else {
+            panic!("not a command")
+        };
+        // A one-line form that does not match the spans it claims to
+        // summarise: the two halves of the window would describe different
+        // commands.
+        request.payload = Payload::Command {
+            display_line: "something else entirely".to_string(),
+            spans,
+            raw,
+            danger,
+            cwd,
+            root,
+            interactive,
+        };
+
+        state.handle(DaemonMsg::Request(request));
+
+        assert!(state.should_close(), "the window drew a frame it could not check");
+        assert!(state.broken().is_some(), "and it did not say why");
+        assert_eq!(state.phase(), Phase::Closed);
+        assert!(state.shown().is_none(), "it kept something to draw anyway");
+    }
+
+    #[test]
+    fn a_request_that_can_be_drawn_is_kept_in_its_checked_form() {
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+
+        assert!(state.shown().is_some(), "the window has nothing to draw");
+        assert_eq!(state.phase(), Phase::AwaitingVerdict);
     }
 
     #[test]
