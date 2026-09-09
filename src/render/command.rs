@@ -193,9 +193,16 @@ enum Boundary {
     /// by definition.
     ///
     /// So the newline is left to `unicode::classify_into`, which chips it as
-    /// `[LF]` at the end of its segment, and this boundary contributes the
-    /// break alone. The character is visible, the layout is metadata, and the
-    /// two readings stay apart.
+    /// `[LF]` at the end of its segment and asks the span after it to start a
+    /// line. The character is visible, the layout is metadata, and the two
+    /// readings stay apart.
+    ///
+    /// This boundary is therefore no longer the only thing asking for that
+    /// break, and is kept anyway: segmentation's own reason for it is that a
+    /// newline *ends a segment*, which is a claim about command structure and
+    /// not about text layout. The two coincide today. Dropping this arm
+    /// because the classifier happens to agree would make the segmenter's
+    /// notion of a segment depend on how the classifier draws a character.
     Newline(usize),
 }
 
@@ -793,16 +800,26 @@ mod tests {
 
     #[test]
     fn a_newline_inside_quotes_is_not_a_boundary() {
-        // A literal newline in an argument is content, not structure.
+        // A literal newline in an argument is content, not structure. Asked
+        // of the scanner rather than of the finished rendering, because the
+        // classifier gives *every* newline a line break of its own — see
+        // `unicode::classify_into` — so a break in the result no longer tells
+        // these two apart. What segmentation claims is that this newline ends
+        // no segment, and this is that claim.
+        assert!(boundaries("echo 'a\nb'").is_empty());
+
         let spans = render_command("echo 'a\nb'");
-        assert!(breaks(&spans).is_empty());
+        assert!(separators(&spans).is_empty(), "a quoted newline was tagged as structure");
         assert_eq!(chips(&spans), vec!['\n'], "but it is still shown for what it is");
+        assert_eq!(unrender(&spans), "echo 'a\nb'");
     }
 
     #[test]
     fn an_escaped_newline_is_a_line_continuation_and_not_a_boundary() {
+        assert!(boundaries("echo a\\\nb").is_empty());
+
         let spans = render_command("echo a\\\nb");
-        assert!(breaks(&spans).is_empty());
+        assert!(separators(&spans).is_empty());
         assert_eq!(unrender(&spans), "echo a\\\nb");
     }
 

@@ -69,7 +69,14 @@ use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, 
 const APP_ID: &str = "hatch-prompt";
 
 /// The size the window opens at.
-const WINDOW_SIZE: [f32; 2] = [900.0, 700.0];
+///
+/// Wide enough for the side-by-side diff to be the view a `swap_file` request
+/// actually gets: the two columns and their gutters are measured in
+/// characters of the monospace font, and at 900 points a column held few
+/// enough of them that ordinary source lines sent the whole diff to the
+/// unified fallback. Height is unchanged -- the panes scroll, and a taller
+/// window would only take more of the screen for the same reading.
+const WINDOW_SIZE: [f32; 2] = [1280.0, 700.0];
 
 /// How often the window redraws when nothing arrives.
 ///

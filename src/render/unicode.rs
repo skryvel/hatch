@@ -195,6 +195,10 @@ pub fn defang(text: &str) -> String {
 /// combining acute renders as `e` followed by `[U+0301]`, which is exactly the
 /// point — the reader is told the accent is a separate character and not part
 /// of the letter.
+///
+/// A newline is chipped like everything else outside the safe set *and* asks
+/// the span after it to start a line, so the shape of a multi-line string
+/// survives into every pane that draws one. See [`classify_into`].
 pub fn classify(source: &str) -> Spans {
     let mut builder = SpanBuilder::new(source);
     classify_into(&mut builder, source.len());
@@ -240,6 +244,28 @@ pub fn classify_into(builder: &mut SpanBuilder<'_>, end: usize) {
         let at = start + offset;
         builder.push_to(at, SpanKind::Plain);
         builder.push_to(at + c.len_utf8(), SpanKind::Chip { name: chip_label(c) });
+        // A newline gets the chip *and* the break. The two are independent
+        // axes and always were — a chip decides what a character is drawn as,
+        // `break_before` decides where the next character is drawn — so
+        // asking for both is not a weakening of either. `[LF]` still stands
+        // at the end of the line it ends, which is what keeps a real newline
+        // distinguishable from a backslash and an `n` typed as two
+        // characters; the break is what stops a pasted script from being one
+        // line that scrolls sideways forever.
+        //
+        // Here rather than in a view, because "a newline ends a line" is true
+        // of every pane and of every string this function classifies. A view
+        // that broke on `[LF]` itself would be reading a label, and a label
+        // is the one thing on screen that a command may contain literally.
+        //
+        // Only U+000A. A lone `\r` returns to the start of the line it is
+        // already on rather than opening a new one, and it is still visible
+        // as `[CR]`; `\r\n` breaks on its `\n`, so the pair reads as
+        // `[CR][LF]` at the end of the line, which is exactly the sequence
+        // that is in the file.
+        if c == '\n' {
+            builder.break_next();
+        }
     }
     builder.push_to(end, SpanKind::Plain);
 }
@@ -425,6 +451,43 @@ mod tests {
         let spans = classify("a\tb\nc");
         assert_eq!(chips(&spans), vec!['\t', '\n']);
         assert_eq!(labels(&spans), vec!["[TAB]", "[LF]"]);
+    }
+
+    #[test]
+    fn a_newline_is_labelled_and_also_ends_the_line() {
+        // Both, not either. A pane that only got the label draws a pasted
+        // script as one line that scrolls sideways; a pane that only got the
+        // break cannot tell a real newline from a typed backslash-n.
+        let spans = classify("a\nb");
+
+        assert_eq!(labels(&spans), vec!["[LF]"], "the character stopped being visible");
+        let breaks: Vec<bool> = spans.iter().map(Span::break_before).collect();
+        assert_eq!(breaks, vec![false, false, true], "the break is not on the span after the [LF]");
+    }
+
+    #[test]
+    fn only_a_newline_ends_a_line() {
+        // A lone `\r` returns to the start of the line it is on. It is still
+        // chipped; it just does not open a new one.
+        let spans = classify("a\rb");
+        assert_eq!(labels(&spans), vec!["[CR]"]);
+        assert!(spans.iter().all(|span| !span.break_before()), "a carriage return broke the line");
+
+        // And `\r\n` breaks once, after the pair, so both characters stay on
+        // the line they end.
+        let crlf = classify("a\r\nb");
+        assert_eq!(labels(&crlf), vec!["[CR]", "[LF]"]);
+        let breaks: Vec<bool> = crlf.iter().map(Span::break_before).collect();
+        assert_eq!(breaks, vec![false, false, false, true]);
+    }
+
+    #[test]
+    fn a_trailing_newline_does_not_ask_for_a_line_that_is_not_there() {
+        // The break is pending when the source runs out, and a pending break
+        // that never lands is dropped. This is what keeps a diff line -- which
+        // always ends in its own terminator -- from carrying a break at all.
+        let spans = classify("a\n");
+        assert!(spans.iter().all(|span| !span.break_before()));
     }
 
     // --- what a chip may and may not do ----------------------------------

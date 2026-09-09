@@ -62,6 +62,26 @@ const SOON: i64 = 30;
 /// the panes' share of the window.
 const HEADLINE_SHARE: f32 = 0.30;
 
+/// The most of the space below the header the raw pane may take.
+///
+/// A newline now ends a line in every pane, so a pasted script is as many
+/// lines in the raw pane as it has, and without a ceiling a fifty-line
+/// heredoc would push the annotated pane off the bottom. The raw pane is the
+/// one a reader falls back to, not the one they read first, so it yields the
+/// space and scrolls.
+const RAW_SHARE: f32 = 0.40;
+
+/// Characters of gutter in front of each diff column: the `-`/`+` mark and
+/// the space after it.
+const GUTTER_CHARS: usize = 2;
+
+/// Characters of empty space between the two diff columns.
+///
+/// Two and not one, so that a line ending in a space and a line starting with
+/// one are still two lines to the eye. It doubles as the slack that keeps the
+/// character-count fit from depending on sub-pixel rounding.
+const GAP_CHARS: usize = 2;
+
 // ---- the checked rendering -------------------------------------------------
 
 /// One request's payload, rebuilt through the real builder and ready to draw.
@@ -90,8 +110,8 @@ pub enum Shown {
         /// Whether it runs in a terminal of its own.
         interactive: bool,
     },
-    /// A file swap. The side-by-side view is not built yet; see
-    /// [`draw_swap`] for what stands in its place and why it is not nothing.
+    /// A file swap, drawn in whichever of the two views fits — see
+    /// [`draw_swap`].
     Swap {
         /// The file, defanged for drawing.
         path: String,
@@ -99,6 +119,15 @@ pub enum Shown {
         plan: SwapPlan,
         /// The diff, rebuilt through the real builder.
         rows: Vec<Row>,
+        /// The widest line either column would have to draw, in characters.
+        ///
+        /// Measured here rather than per frame because it decides which view
+        /// the diff gets, and a 256 KB replacement is a quarter of a million
+        /// rows: a decision procedure that walked all of them sixty times a
+        /// second would cost more than the view it is choosing. It depends
+        /// only on `rows`, so measuring it once is not a cache that can go
+        /// stale.
+        longest: usize,
     },
 }
 
@@ -130,11 +159,15 @@ impl Shown {
                     annotated,
                 })
             }
-            Payload::Swap { path, plan, .. } => Ok(Shown::Swap {
-                path: defang(&path.display().to_string()),
-                plan: plan.clone(),
-                rows: payload.rows()?,
-            }),
+            Payload::Swap { path, plan, .. } => {
+                let rows = payload.rows()?;
+                Ok(Shown::Swap {
+                    path: defang(&path.display().to_string()),
+                    plan: plan.clone(),
+                    longest: longest_drawn_line(&rows),
+                    rows,
+                })
+            }
         }
     }
 
@@ -272,6 +305,106 @@ pub fn changed_rows(rows: &[Row]) -> usize {
     rows.iter().filter(|row| row.changed()).count()
 }
 
+// ---- which of the two diff views ------------------------------------------
+
+/// How a diff is being drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffView {
+    /// Two columns: the file on the left, what replaces it on the right.
+    SideBySide,
+    /// One column, `-`/`+` marked, the current file's form first. What a diff
+    /// falls back to when two columns cannot hold it.
+    Unified,
+}
+
+/// The width of the widest line either column would have to draw, in
+/// characters.
+///
+/// Characters and not pixels, and the count is exact rather than an estimate.
+/// Everything that reaches the screen from a diff line does so as
+/// [`Span::display_text`]: a plain span is U+0020..=U+007E because
+/// [`classify`] chips everything else, and every chip label is ASCII too. So
+/// a drawn diff line is ASCII in a monospace font, where one character is one
+/// advance and the sum of the counts is the width.
+///
+/// A row's terminator counts only where it would be drawn, because that is
+/// the question — how wide is this line *on screen* — and not how many bytes
+/// it has.
+pub fn longest_drawn_line(rows: &[Row]) -> usize {
+    rows.iter()
+        .map(|row| {
+            let terminator = terminator_changed(row);
+            [row.left(), row.right()]
+                .into_iter()
+                .flatten()
+                .map(|side| drawn_width(side, terminator))
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// One side's drawn width in characters, terminator included only when the
+/// view would draw it.
+fn drawn_width(side: &Side, terminator: bool) -> usize {
+    let spans = if terminator { side.spans() } else { side.content_spans() };
+    spans.iter().map(|span| span.display_text().chars().count()).sum()
+}
+
+/// How many characters one of the two columns holds, in a pane that holds
+/// `pane` of them.
+///
+/// Saturating rather than signed: a pane too narrow for its own furniture
+/// holds no column at all, and that is a reason to fall back rather than a
+/// negative number to propagate.
+fn column_chars(pane: usize) -> usize {
+    pane.saturating_sub(2 * GUTTER_CHARS + GAP_CHARS) / 2
+}
+
+/// Two columns only when *every* line fits one of them whole.
+///
+/// # Why the longest line and not a percentile
+///
+/// A threshold that let some proportion of lines overflow is a per-row
+/// decision wearing a statistic: the rows past it would still have to be
+/// truncated, wrapped or allowed to run into the neighbouring column, and all
+/// three are worse than one column. Truncation hides bytes the reader is
+/// approving. Wrapping makes a row a different height on each side, so the
+/// two columns stop lining up and the pairing the view is entirely *for*
+/// stops being visible. Overflow draws one line on top of another.
+///
+/// All-or-nothing is what makes "side by side is showing" mean something: it
+/// is a promise that every line on screen is complete and that nothing needs
+/// to be scrolled to horizontally. The cost is that one long line sends the
+/// whole file to the unified view, and the caption says so with the number in
+/// it, so the reader can widen the window and watch it flip back.
+pub fn diff_view(longest: usize, column: usize) -> DiffView {
+    if column > 0 && longest <= column { DiffView::SideBySide } else { DiffView::Unified }
+}
+
+/// The line above the diff: how much changes, which view this is, and — when
+/// it is the fallback — the measurement that chose it.
+///
+/// The reader is told which view they are looking at either way. A view that
+/// silently swapped itself for another as the window was dragged wider would
+/// be the same class of thing as a diff that silently normalises line
+/// endings: a rendering that changed without saying so.
+pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize) -> String {
+    let counted = format!("{} of {} lines change.", changed_rows(rows), rows.len());
+    match view {
+        DiffView::SideBySide => format!(
+            "{counted} Side by side: on the left the file as it is, on the right what replaces \
+             it. A tinted empty cell is a row that side has no line for — not a blank line."
+        ),
+        DiffView::Unified => format!(
+            "{counted} One column, not two: the longest line is {longest} characters and a column \
+             here holds {column}, so two of them could not show it whole. Every line is below, \
+             the current file's form first. Widen the window for the side-by-side view."
+        ),
+    }
+}
+
 // ---- drawing ---------------------------------------------------------------
 
 /// The colours the panes use, resolved against whatever theme is in force.
@@ -283,6 +416,14 @@ struct Palette {
     chip_bg: Color32,
     separator_bg: Color32,
     value_bg: Color32,
+    /// Behind a side-by-side cell for a row that side has no line on.
+    ///
+    /// Deliberately not the faint background the chips and notes sit on: a
+    /// gap has to be distinguishable from a line whose content happens to be
+    /// empty, and if the two tints matched, the only difference on screen
+    /// would be a missing `-` or `+` in a gutter. It is a tint and not a
+    /// colour with meaning — nothing is wrong with a gap.
+    gap_bg: Color32,
 }
 
 impl Palette {
@@ -296,6 +437,7 @@ impl Palette {
             chip_bg: visuals.code_bg_color,
             separator_bg: visuals.faint_bg_color,
             value_bg: visuals.faint_bg_color,
+            gap_bg: visuals.extreme_bg_color,
         }
     }
 }
@@ -328,7 +470,7 @@ pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
             ui.separator();
             draw_command(ui, annotated, raw);
         }
-        Shown::Swap { path, plan, rows } => draw_swap(ui, path, plan, rows),
+        Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
     }
 }
 
@@ -363,11 +505,11 @@ fn draw_command_header(
 
 /// The two panes, in the order a suspicious reader wants them.
 ///
-/// The space is not split between them. The raw pane is exactly one line
-/// high whatever the command is — nothing in it can start a new line, since
-/// a newline is a chip like any other character that is not drawn as itself
-/// — so it takes that line and scrolls sideways, and everything left over
-/// goes to the annotated pane, which is the one that grows.
+/// The space is not split evenly. The raw pane grows to as many lines as the
+/// command has — a newline is drawn as `[LF]` *and* ends the line, so a
+/// heredoc is a block and not one line scrolling sideways forever — and then
+/// stops at [`RAW_SHARE`] and scrolls. Everything left over goes to the
+/// annotated pane, which is the one a reader spends their time in.
 fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans) {
     let palette = Palette::of(ui);
 
@@ -376,9 +518,11 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans) {
             .small()
             .color(palette.quiet),
     );
+    let raw_ceiling = ui.available_height() * RAW_SHARE;
     egui::Frame::group(ui.style()).show(ui, |ui| {
         egui::ScrollArea::both()
             .id_salt("hatch-raw")
+            .max_height(raw_ceiling)
             .auto_shrink([false, true])
             .show(ui, |ui| draw_spans(ui, raw, Weight::Mono));
     });
@@ -398,26 +542,65 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans) {
     });
 }
 
-/// What a `swap_file` request looks like until the side-by-side view exists.
+/// What a `swap_file` request looks like.
 ///
 /// Not an empty pane, and not a summary either. An empty pane in this window
 /// reads as "nothing changes", which is the one thing it must never say by
 /// accident; a summary — "12 lines change" — reads as a fact the reader has
-/// checked when they have checked nothing. So every line is drawn, one under
-/// the other, through exactly the same span machinery the command panes use:
-/// chips and all, with the current file's form of a changed line marked `-`
-/// and the proposed one `+`. It is a worse view than the side-by-side one
-/// will be, and it is a view: approving from it is approving something that
-/// was drawn.
+/// checked when they have checked nothing. So every line is drawn, through
+/// exactly the same span machinery the command panes use, chips and all.
 ///
-/// A line terminator is drawn only where the two sides' terminators differ —
-/// a `\n` that became a `\r\n`, or a last line that lost its newline. Hiding
-/// that always would show two identical-looking lines for a change that is
-/// only a change of line ending, which is a rendering that lies about the
-/// bytes; drawing it always puts an orange `[LF]` on every line of the file,
-/// and a reader who has learned to skip chips is a reader who will skip the
-/// one that is a bidi override.
-fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row]) {
+/// # Two views, and which one a diff gets
+///
+/// Side by side is the view this is for: the file as it is on the left, what
+/// replaces it on the right, one row per row of the model. It is only offered
+/// when every line fits its column whole — see [`diff_view`] — and when one
+/// does not, the whole diff falls back to the unified view, `-` and `+` in
+/// one column, where a long line can run off the side and be scrolled to.
+/// The caption says which view this is and, in the fallback, the two numbers
+/// that chose it. Degrading in the open beats a second column that quietly
+/// holds part of a line.
+///
+/// Side by side never scrolls horizontally, and that is the point of the
+/// all-or-nothing rule rather than an accident of it: everything in view is
+/// whole, so a row that looks identical on both sides *is* identical, except
+/// for the one thing the terminator rule below covers.
+///
+/// # What a row that only exists on one side looks like
+///
+/// A gap — a row where the model has no line for one column — is drawn as a
+/// tinted empty cell with nothing in its gutter, never as a blank line. The
+/// difference matters and is exactly the difference between "this file has no
+/// line here" and "this file has an empty line here", which is a real line
+/// that a reader is approving. Two channels say it, so neither has to be
+/// colour alone: the tint, and the absence of the `-`/`+` mark that every
+/// present line of a changed row carries.
+///
+/// # What the pairing does and does not claim
+///
+/// `similar` pairs a delete with an insert positionally inside a replace
+/// block, and the surplus follows one-sided. That pairing is a display
+/// decision the model is explicit about making with no claim behind it, and
+/// two columns are where it starts to *look* like a claim. So the view adds
+/// nothing to it: no intra-line highlighting of the "changed part", which
+/// would be an assertion that the two lines are versions of each other, and
+/// no reordering to make pairs look better. Each cell carries its own `-` or
+/// `+`, which says this line goes or this line arrives — a statement about
+/// one line, not about a correspondence between two.
+///
+/// # Line terminators
+///
+/// Drawn only where the two sides' terminators differ, as in the unified
+/// view, and two columns make the argument for that rule stronger rather than
+/// weaker. The case it exists for — content identical, ending rewritten — is
+/// precisely the case where two columns would otherwise be drawn pixel for
+/// pixel the same over a change to every byte at the end of every line. When
+/// it fires, both cells draw their terminator, because a `[LF]` shown against
+/// a cell that hides its own is not a comparison. Drawing them always instead
+/// would put an orange `[LF]` on every line of the file, and a reader who has
+/// learned to skip chips is a reader who will skip the one that is a bidi
+/// override.
+fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: usize) {
     let palette = Palette::of(ui);
     ui.horizontal_wrapped(|ui| {
         ui.label("Writes");
@@ -431,39 +614,215 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row]) {
     }
     ui.separator();
 
-    let lines = diff_lines(rows);
+    let font = font(Weight::Mono, ui.style());
+    let advance = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, '0')).max(1.0);
+    let column = column_chars((text_width(ui) / advance).floor().max(0.0) as usize);
+    let view = diff_view(longest, column);
     ui.label(
-        RichText::new(format!(
-            "{} of {} lines change. Side-by-side is not built yet; every line is below, the \
-             current file's form first.",
-            changed_rows(rows),
-            rows.len()
-        ))
-        .small()
-        .color(palette.quiet),
+        RichText::new(diff_caption(view, rows, longest, column)).small().color(palette.quiet),
     );
+
+    if rows.is_empty() {
+        // Said in words, because an empty pane here would read as "nothing
+        // changes" over a request that does change something: creating an
+        // empty file, or emptying one, is a write with no lines in it.
+        ui.label(
+            RichText::new("Neither side has any lines at all.").italics().color(palette.quiet),
+        );
+        return;
+    }
+
     // `show_rows` and not a loop: a 256 KB replacement is a quarter of a
     // million rows, and a pane that laid all of them out per frame would be
     // a window nobody can answer in time — which the daemon resolves as a
     // denial, but by making the machine unusable rather than by anyone
-    // deciding anything. Every drawn line is one line of monospace, so the
-    // uniform height the API wants is a fact rather than an assumption.
+    // deciding anything. Every drawn row is one line of monospace, so the
+    // uniform height the API wants is a fact rather than an assumption, and
+    // it is a fact in both views: side by side never wraps a cell, because a
+    // diff that would have to wrap one is drawn unified instead.
     let row_height =
         ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        egui::ScrollArea::both()
-            .id_salt("hatch-diff")
-            .max_height(ui.available_height())
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, lines.len(), |ui, range| {
-                for line in &lines[range] {
-                    draw_diff_line(ui, line, palette.danger, palette.warn);
-                }
-            });
+    egui::Frame::group(ui.style()).show(ui, |ui| match view {
+        DiffView::SideBySide => {
+            let size = Cells {
+                gutter: advance * GUTTER_CHARS as f32,
+                cell: advance * column as f32,
+                gap: advance * GAP_CHARS as f32,
+                height: row_height,
+            };
+            // Vertical only. Every line fits, so there is nothing to the
+            // side to scroll to, and a horizontal bar that moved one column
+            // out from under the other would break the alignment the view is
+            // for.
+            egui::ScrollArea::vertical()
+                .id_salt("hatch-diff-columns")
+                .max_height(ui.available_height())
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows.len(), |ui, range| {
+                    for row in &rows[range] {
+                        draw_row(ui, row, &palette, size);
+                    }
+                });
+        }
+        DiffView::Unified => {
+            let lines = diff_lines(rows);
+            egui::ScrollArea::both()
+                .id_salt("hatch-diff")
+                .max_height(ui.available_height())
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, lines.len(), |ui, range| {
+                    for line in &lines[range] {
+                        draw_diff_line(ui, line, palette.danger, palette.warn);
+                    }
+                });
+        }
     });
 }
 
-/// One line of the stand-in diff: which side it came from, and how it is
+/// The width a diff pane really has for text.
+///
+/// Subtracting the furniture rather than measuring inside the pane, because
+/// the view has to be chosen before the pane that would report its own width
+/// exists. Every term is something that is definitely there: the group
+/// frame's border and padding on both sides, and the vertical scroll bar,
+/// which a diff of any length grows.
+fn text_width(ui: &Ui) -> f32 {
+    let frame = egui::Frame::group(ui.style());
+    let border = (frame.inner_margin.sum() + frame.outer_margin.sum()).x + 2.0 * frame.stroke.width;
+    let scroll = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+    (ui.available_width() - border - scroll).max(0.0)
+}
+
+/// The pixel geometry of one side-by-side row.
+#[derive(Debug, Clone, Copy)]
+struct Cells {
+    /// Width of one column's `-`/`+` mark and the space after it.
+    gutter: f32,
+    /// Width of one column's text.
+    cell: f32,
+    /// Width of the empty space between the two columns.
+    gap: f32,
+    /// Height of the whole row, which every cell fills whether or not it has
+    /// a line — a shorter gap cell would make the tint stop short of the row
+    /// it belongs to.
+    height: f32,
+}
+
+/// What one column of one row has to show.
+#[derive(Debug, Clone, Copy)]
+enum Cell<'a> {
+    /// A line of that side's file.
+    Line {
+        side: &'a Side,
+        /// `-` for the file as it is, `+` for what replaces it, a space for a
+        /// line both sides agree on.
+        marker: &'static str,
+        changed: bool,
+        /// Whether this row's terminator is part of what changed, and so has
+        /// to be on screen. See [`draw_swap`].
+        terminator: bool,
+    },
+    /// That side has no line on this row. **Not** an empty line: see
+    /// [`draw_swap`].
+    Gap,
+}
+
+/// The two cells of one row.
+///
+/// The only place the gap is decided, so "the model had no line here" and
+/// "the line here is empty" cannot be confused by a drawing function reading
+/// an empty span slice and guessing.
+fn cells(row: &Row) -> [Cell<'_>; 2] {
+    let terminator = terminator_changed(row);
+    let changed = row.changed();
+    [
+        cell(row.left(), "-", changed, terminator),
+        cell(row.right(), "+", changed, terminator),
+    ]
+}
+
+/// One column of one row. A `None` side is a gap and never a blank line --
+/// the model says the column has nothing here, and a `Side` with no content
+/// spans would say the opposite.
+fn cell<'a>(
+    side: Option<&'a Side>,
+    marked: &'static str,
+    changed: bool,
+    terminator: bool,
+) -> Cell<'a> {
+    match side {
+        Some(side) => Cell::Line {
+            side,
+            marker: if changed { marked } else { " " },
+            changed,
+            terminator,
+        },
+        None => Cell::Gap,
+    }
+}
+
+/// One row of the side-by-side view.
+fn draw_row(ui: &mut Ui, row: &Row, palette: &Palette, size: Cells) {
+    let [left, right] = cells(row);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        draw_cell(ui, left, palette, size);
+        ui.add_space(size.gap);
+        draw_cell(ui, right, palette, size);
+    });
+}
+
+/// One column of one row: a mark, and a line or a tinted absence.
+fn draw_cell(ui: &mut Ui, cell: Cell<'_>, palette: &Palette, size: Cells) {
+    match cell {
+        Cell::Line { side, marker, changed, terminator } => {
+            let colour = match (changed, marker) {
+                (false, _) => palette.quiet,
+                (true, "-") => palette.danger,
+                (true, _) => palette.warn,
+            };
+            slot(ui, size.gutter, size.height, |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(marker).monospace().color(colour))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
+            let spans = if terminator { side.spans() } else { side.content_spans() };
+            slot(ui, size.cell, size.height, |ui| draw_line(ui, spans, Weight::Mono));
+        }
+        Cell::Gap => {
+            // No mark and no text: the gutter is left empty on purpose, so
+            // that the reader has a second, colourless way to tell a gap from
+            // a line that happens to be blank.
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(size.gutter + size.cell, size.height),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(rect, 2.0, palette.gap_bg);
+        }
+    }
+}
+
+/// Reserve exactly `width` by `height` and draw into it.
+///
+/// The reservation is the whole point and is why this is not
+/// `allocate_ui_with_layout`, which shrinks to what its contents used: the
+/// two columns line up only if a short line still costs its column's full
+/// width, and a row whose left cell shrank would put its right cell
+/// somewhere no other row's is. The contents are not clipped to the slot —
+/// a clip would silently cut a line off, and the whole reason this view is
+/// only offered when every line fits is so that it never has to.
+fn slot(ui: &mut Ui, width: f32, height: f32, draw: impl FnOnce(&mut Ui)) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Min)),
+    );
+    draw(&mut inner);
+}
+
+/// One line of the unified view: which side it came from, and how it is
 /// marked.
 struct DiffLine<'a> {
     side: &'a Side,
@@ -476,7 +835,7 @@ struct DiffLine<'a> {
     terminator: bool,
 }
 
-/// Flatten the rows into the lines that are drawn, in order.
+/// Flatten the rows into the lines the unified view draws, in order.
 ///
 /// A changed row contributes both of its sides, and either may be missing —
 /// that is what an insertion and a deletion are. An unchanged row contributes
@@ -517,14 +876,14 @@ fn terminator_of(side: &Side) -> String {
     side.terminator_spans().iter().map(Span::text).collect()
 }
 
-/// One drawn line of the stand-in diff.
+/// One drawn line of the unified view.
 fn draw_diff_line(ui: &mut Ui, line: &DiffLine<'_>, removed: Color32, added: Color32) {
     let quiet = ui.visuals().weak_text_color();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let gutter = RichText::new(format!("{} ", line.marker)).monospace();
         ui.label(if line.changed {
-            gutter.color(if line.marker == "-" { removed } else { added }).strong()
+            gutter.color(if line.marker == "-" { removed } else { added })
         } else {
             gutter.color(quiet)
         });
@@ -551,13 +910,22 @@ impl Weight {
     fn wraps(self) -> bool {
         self != Weight::Mono
     }
+}
 
-    /// The base text this weight draws a span's own text as.
-    fn text(self, text: &str) -> RichText {
-        match self {
-            Weight::Mono | Weight::Wrapped => RichText::new(text).monospace(),
-            Weight::Body => RichText::new(text),
-            Weight::Heading => RichText::new(text).size(20.0),
+/// The font a weight draws in, resolved against the style in force.
+///
+/// Heading is body at a larger size rather than egui's own `Heading` style,
+/// which is what the per-span form did and is worth keeping: the headline is
+/// two paragraphs of agent-written prose, and it should read as prose set
+/// large.
+fn font(weight: Weight, style: &egui::Style) -> egui::FontId {
+    match weight {
+        Weight::Mono | Weight::Wrapped => egui::TextStyle::Monospace.resolve(style),
+        Weight::Body => egui::TextStyle::Body.resolve(style),
+        Weight::Heading => {
+            let mut font = egui::TextStyle::Body.resolve(style);
+            font.size = 20.0;
+            font
         }
     }
 }
@@ -593,30 +961,34 @@ fn lines(spans: &[Span]) -> Vec<&[Span]> {
     out
 }
 
-/// One drawn line of spans.
+/// One drawn line of spans, as a single laid-out run of text.
 ///
-/// Item spacing goes to zero for the whole line, and that is not cosmetic:
-/// egui's default gap between widgets would appear between two adjacent
-/// spans as a space that is not in the command. Every gap on screen inside a
-/// pane is a gap that is in the text, except the padding a chip or a note
-/// carries with it, and those are coloured so they cannot be read as
-/// whitespace.
+/// # One job, not one label per span
+///
+/// The obvious shape — an `egui::Label` per span, laid out side by side —
+/// costs a widget per span, and the number of spans is chosen by the agent:
+/// a kilobyte of combining marks is a thousand chips, and every one of them
+/// would be allocated, sensed and painted on every frame. It resolves to a
+/// window nobody can read in time, which the daemon settles as a denial, so
+/// it is a quality problem rather than a safety one — but a diff draws two
+/// columns of it per row, which is where a slow pane becomes an unusable one.
+///
+/// A [`LayoutJob`] is one widget per *line* with a format per span, and it is
+/// the honest shape for a second reason. Adjacent labels are separated by
+/// egui's item spacing, so the per-span form had to zero that out or put a
+/// gap on screen that is not in the text; here there is nothing between two
+/// spans to zero, because they are two ranges of one string. And that string
+/// is [`line_text`] — testable, unlike a sequence of widgets — so what the
+/// reader is shown can be asserted against what the spans say.
 fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) {
-    let draw = |ui: &mut Ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let palette = Palette::of(ui);
-        for span in line {
-            draw_span(ui, span, weight, &palette);
-        }
-    };
-    if weight.wraps() {
-        ui.horizontal_wrapped(draw);
-    } else {
-        ui.horizontal(draw);
-    }
+    let palette = Palette::of(ui);
+    let font = font(weight, ui.style());
+    let job = line_job(line, &palette, &font);
+    ui.add(egui::Label::new(job).wrap_mode(wrap_mode(weight)));
 }
 
-/// One span, as itself or as the chip that stands for it.
+/// One line of spans as an [`egui::text::LayoutJob`]: the text every span
+/// draws, in order, each in the format its kind asks for.
 ///
 /// # Why a separator is not faded
 ///
@@ -630,40 +1002,58 @@ fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) {
 /// for is what actually stops it hiding between two commands. Emphasis is
 /// taken off it by giving the eye somewhere else to land, never by making it
 /// harder to see.
-fn draw_span(ui: &mut Ui, span: &Span, weight: Weight, palette: &Palette) {
-    let text = weight.text(&span.display_text());
-    let label = match span.kind() {
-        // Chips are hatch's word, not the agent's: a background is what says
-        // "this box is a substitution", and the label inside it is the only
-        // text in either pane that is not the source's own bytes.
-        SpanKind::Chip { .. } => text.color(palette.warn).background_color(palette.chip_bg),
-        SpanKind::Separator => text.color(palette.text).background_color(palette.separator_bg),
-        SpanKind::Command => text.color(palette.text).strong(),
-        SpanKind::Danger => text.color(palette.danger).strong(),
-        SpanKind::Variable { .. } | SpanKind::Plain => text.color(palette.text),
+fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text::LayoutJob {
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        color: palette.text,
+        ..Default::default()
     };
-    ui.add(egui::Label::new(label).wrap_mode(wrap_mode(weight)));
-
-    // The value goes beside the reference and never in place of it: the
-    // reference is what was approved, and a window that showed `/home/user`
-    // where the command says `$HOME` would have quietly replaced the text it
-    // is asking about. Italic, coloured and boxed, so nothing about it reads
-    // as part of the command.
-    if let Some((_, resolved)) = span.variable() {
-        let note = match resolved {
-            Some(value) => format!(" → {} ", defang(value)),
-            None => " → unset ".to_string(),
+    let mut job = egui::text::LayoutJob::default();
+    for span in line {
+        let format = match span.kind() {
+            // Chips are hatch's word, not the agent's: a background is what
+            // says "this box is a substitution", and the label inside it is
+            // the only text in either pane that is not the source's own
+            // bytes.
+            SpanKind::Chip { .. } => egui::TextFormat {
+                color: palette.warn,
+                background: palette.chip_bg,
+                ..plain.clone()
+            },
+            SpanKind::Separator => {
+                egui::TextFormat { background: palette.separator_bg, ..plain.clone() }
+            }
+            SpanKind::Danger => egui::TextFormat { color: palette.danger, ..plain.clone() },
+            SpanKind::Command | SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
-        ui.add(
-            egui::Label::new(
-                weight
-                    .text(&note)
-                    .italics()
-                    .color(palette.quiet)
-                    .background_color(palette.value_bg),
-            )
-            .wrap_mode(wrap_mode(weight)),
-        );
+        job.append(&span.display_text(), 0.0, format);
+
+        // The value goes beside the reference and never in place of it: the
+        // reference is what was approved, and a window that showed
+        // `/home/user` where the command says `$HOME` would have quietly
+        // replaced the text it is asking about. Italic, coloured and boxed,
+        // so nothing about it reads as part of the command.
+        if let Some((_, resolved)) = span.variable() {
+            job.append(
+                &variable_note(resolved),
+                0.0,
+                egui::TextFormat {
+                    color: palette.quiet,
+                    background: palette.value_bg,
+                    italics: true,
+                    ..plain.clone()
+                },
+            );
+        }
+    }
+    job
+}
+
+/// What a resolved variable reads as beside its reference.
+fn variable_note(resolved: Option<&str>) -> String {
+    match resolved {
+        Some(value) => format!(" \u{2192} {} ", defang(value)),
+        None => " \u{2192} unset ".to_string(),
     }
 }
 
@@ -981,6 +1371,107 @@ mod tests {
         assert_eq!(size_delta(0), "the same number of bytes");
     }
 
+    // ---- which of the two diff views ---------------------------------------
+
+    #[test]
+    fn the_widest_line_is_measured_as_it_is_drawn_and_not_as_it_is_stored() {
+        // A chip is one character in the file and five on screen, and it is
+        // the five that decide whether a column can hold the line.
+        let rows = crate::render::diff::side_by_side("ab\n", "a\u{202e}b\n");
+        assert_eq!(longest_drawn_line(&rows), 7, "[RLO] was counted as one character");
+
+        // The terminator counts only where it is drawn. These two rows differ
+        // only in their line ending, so both sides show `[LF]` or `[CR][LF]`.
+        let endings = crate::render::diff::side_by_side("ab\n", "ab\r\n");
+        assert_eq!(longest_drawn_line(&endings), 2 + "[CR][LF]".len());
+    }
+
+    #[test]
+    fn an_empty_diff_has_no_widest_line_rather_than_a_wrong_one() {
+        assert_eq!(longest_drawn_line(&[]), 0);
+        assert_eq!(longest_drawn_line(&crate::render::diff::side_by_side("\n", "\n")), 0);
+    }
+
+    #[test]
+    fn a_column_is_what_is_left_after_the_gutters_and_the_gap() {
+        // 2 + 2 gutter, 2 gap, and the rest halved.
+        assert_eq!(column_chars(86), 40);
+        assert_eq!(column_chars(87), 40, "an odd character cannot be split between columns");
+        // Narrower than its own furniture is no column at all, not a panic
+        // and not a negative width.
+        assert_eq!(column_chars(6), 0);
+        assert_eq!(column_chars(0), 0);
+    }
+
+    #[test]
+    fn two_columns_only_when_every_line_fits_one() {
+        assert_eq!(diff_view(40, 40), DiffView::SideBySide, "a line that exactly fits does");
+        assert_eq!(diff_view(41, 40), DiffView::Unified, "one character over sends it back");
+        assert_eq!(diff_view(0, 40), DiffView::SideBySide, "a file of empty lines fits");
+        // A pane with no room for a column falls back however short the
+        // lines are, including when there are none.
+        assert_eq!(diff_view(0, 0), DiffView::Unified);
+    }
+
+    #[test]
+    fn the_caption_says_which_view_this_is_and_the_fallback_says_why() {
+        let rows = crate::render::diff::side_by_side("keep\nold\n", "keep\nnew\n");
+
+        let side = diff_caption(DiffView::SideBySide, &rows, 4, 40);
+        assert!(side.starts_with("1 of 2 lines change."), "got: {side}");
+        assert!(side.contains("Side by side"), "the reader is not told which view this is");
+        assert!(side.contains("not a blank line"), "the tinted cell is unexplained");
+
+        let unified = diff_caption(DiffView::Unified, &rows, 214, 40);
+        assert!(unified.contains("214"), "the fallback does not say what was too long");
+        assert!(unified.contains("40"), "nor what it was too long for");
+        assert!(!unified.contains("not built"), "the caption still promises a missing view");
+    }
+
+    #[test]
+    fn a_side_with_no_line_is_a_gap_and_an_empty_line_is_a_line() {
+        // The distinction the two-column view turns on. A gap is a row this
+        // column's file has nothing on; an empty line is a line, and drawing
+        // the two the same would put a byte in a column that is not in the
+        // file -- or hide one that is.
+        let inserted = crate::render::diff::side_by_side("", "added\n");
+        let [left, right] = cells(&inserted[0]);
+        assert!(matches!(left, Cell::Gap), "an insertion drew a blank line into the old file");
+        assert!(matches!(right, Cell::Line { marker: "+", .. }));
+
+        let blank = crate::render::diff::side_by_side("a\n\n", "a\n\n");
+        let [left, right] = cells(&blank[1]);
+        let Cell::Line { side, .. } = left else { panic!("an empty line was drawn as a gap") };
+        assert!(side.content_spans().is_empty(), "this is the empty line, not a filled one");
+        assert!(matches!(right, Cell::Line { .. }));
+    }
+
+    #[test]
+    fn only_a_changed_row_marks_its_cells() {
+        let rows = crate::render::diff::side_by_side("keep\nold\n", "keep\nnew\n");
+
+        let [left, right] = cells(&rows[0]);
+        assert!(matches!(left, Cell::Line { marker: " ", changed: false, .. }));
+        assert!(matches!(right, Cell::Line { marker: " ", changed: false, .. }));
+
+        let [left, right] = cells(&rows[1]);
+        assert!(matches!(left, Cell::Line { marker: "-", changed: true, .. }));
+        assert!(matches!(right, Cell::Line { marker: "+", changed: true, .. }));
+    }
+
+    #[test]
+    fn a_row_that_changed_only_its_line_ending_shows_the_ending_in_both_columns() {
+        // The case two columns would otherwise draw pixel for pixel the same
+        // over a change to every line in the file.
+        let rows = crate::render::diff::side_by_side("a\n", "a\r\n");
+        let [left, right] = cells(&rows[0]);
+
+        for cell in [left, right] {
+            let Cell::Line { terminator, .. } = cell else { panic!("both sides are present") };
+            assert!(terminator, "a column hid the only thing that changed");
+        }
+    }
+
     // ---- layout ------------------------------------------------------------
 
     #[test]
@@ -1024,6 +1515,143 @@ mod tests {
         assert!(Weight::Heading.wraps());
         assert_eq!(wrap_mode(Weight::Mono), egui::TextWrapMode::Extend);
         assert_eq!(wrap_mode(Weight::Wrapped), egui::TextWrapMode::Wrap);
+    }
+
+
+    // ---- what a laid-out line actually says --------------------------------
+
+    /// A palette of distinguishable colours, so a test can tell which format
+    /// a stretch of the job was given. The real one comes from the theme.
+    fn a_palette() -> Palette {
+        Palette {
+            text: Color32::from_rgb(1, 0, 0),
+            quiet: Color32::from_rgb(2, 0, 0),
+            danger: Color32::from_rgb(3, 0, 0),
+            warn: Color32::from_rgb(4, 0, 0),
+            chip_bg: Color32::from_rgb(5, 0, 0),
+            separator_bg: Color32::from_rgb(6, 0, 0),
+            value_bg: Color32::from_rgb(7, 0, 0),
+            gap_bg: Color32::from_rgb(8, 0, 0),
+        }
+    }
+
+    fn job_of(spans: &Spans) -> egui::text::LayoutJob {
+        line_job(spans, &a_palette(), &egui::FontId::monospace(12.0))
+    }
+
+    /// The format covering the byte at `at` in the job's text.
+    fn format_at(job: &egui::text::LayoutJob, at: usize) -> &egui::TextFormat {
+        &job
+            .sections
+            .iter()
+            .find(|section| (section.byte_range.start.0..section.byte_range.end.0).contains(&at))
+            .expect("the sections cover the whole text")
+            .format
+    }
+
+    #[test]
+    fn a_laid_out_line_says_exactly_what_the_spans_say() {
+        // The assertion the per-span form could not make: one string, and it
+        // is the concatenation of every span's drawn text with nothing
+        // between them. A gap here would be a character on screen that is
+        // not in the command.
+        let job = job_of(&classify("ls a\u{202e}b"));
+
+        assert_eq!(job.text, "ls a[RLO]b");
+    }
+
+    #[test]
+    fn a_resolved_value_is_in_the_line_beside_its_reference_and_not_in_place_of_it() {
+        let spans =
+            render_command("echo $HOME", &BTreeMap::from([("HOME".into(), "/home/u".into())]));
+
+        assert_eq!(job_of(&spans).text, "echo $HOME → /home/u ");
+    }
+
+    #[test]
+    fn an_unset_reference_says_so_rather_than_reading_as_an_empty_value() {
+        let spans = render_command("echo $NOPE", &BTreeMap::new());
+
+        assert_eq!(job_of(&spans).text, "echo $NOPE → unset ");
+    }
+
+    #[test]
+    fn a_chip_is_the_only_stretch_of_a_line_drawn_in_hatch_s_own_colours() {
+        let palette = a_palette();
+        let job = job_of(&classify("a\u{202e}b"));
+
+        // `a` and `b` are the command's own text; `[RLO]` is hatch's label
+        // for one character of it, and it is boxed and coloured so that it
+        // cannot be read as text that was really there.
+        assert_eq!(format_at(&job, 0).color, palette.text);
+        assert_eq!(format_at(&job, 0).background, Color32::TRANSPARENT);
+        assert_eq!(format_at(&job, 1).color, palette.warn);
+        assert_eq!(format_at(&job, 1).background, palette.chip_bg);
+        assert_eq!(format_at(&job, "a[RLO]".len()).color, palette.text);
+    }
+
+    #[test]
+    fn every_stretch_of_a_line_is_laid_out_in_the_font_the_pane_asked_for() {
+        // A format that lost its font falls back to egui's default, which is
+        // proportional: a monospace pane would stop being one, and the
+        // character-count fit that chooses the side-by-side view would be
+        // measuring a font nothing is drawn in.
+        let job = job_of(&classify("ls"));
+
+        assert_eq!(format_at(&job, 0).font_id, egui::FontId::monospace(12.0));
+    }
+
+    #[test]
+    fn a_span_the_daemon_marked_dangerous_is_drawn_in_the_danger_colour() {
+        let palette = a_palette();
+        let mut spans = classify("mkfs");
+        spans.set_kind(0, SpanKind::Danger);
+
+        assert_eq!(format_at(&job_of(&spans), 0).color, palette.danger);
+    }
+
+    #[test]
+    fn a_resolved_value_is_marked_as_hatch_s_note_and_not_as_command_text() {
+        // Italic, quiet and boxed, all three: the note sits inside the same
+        // line as the command it annotates, so nothing but its formatting
+        // separates "what will run" from "what hatch worked out".
+        let palette = a_palette();
+        let spans =
+            render_command("echo $HOME", &BTreeMap::from([("HOME".into(), "/home/u".into())]));
+        let job = job_of(&spans);
+        let note = job.text.find('\u{2192}').expect("the note is on screen");
+
+        assert_eq!(format_at(&job, note).color, palette.quiet);
+        assert_eq!(format_at(&job, note).background, palette.value_bg);
+        assert!(format_at(&job, note).italics, "the note reads as part of the command");
+
+        // And the reference it belongs to does not take the note's styling.
+        let reference = job.text.find('$').expect("the reference is on screen");
+        assert_eq!(format_at(&job, reference).color, palette.text);
+        assert!(!format_at(&job, reference).italics);
+    }
+
+    #[test]
+    fn a_separator_is_boxed_and_never_faded() {
+        // A `;` nobody notices is how a second command gets approved along
+        // with the first, so the de-emphasis is a block behind it and never
+        // a reduction of its contrast.
+        let palette = a_palette();
+        let spans = render_command("ls; rm", &BTreeMap::new());
+        let job = job_of(&spans);
+        let semicolon = job.text.find(';').expect("the separator is on screen");
+
+        assert_eq!(format_at(&job, semicolon).color, palette.text, "a separator was faded");
+        assert_eq!(format_at(&job, semicolon).background, palette.separator_bg);
+    }
+
+    #[test]
+    fn every_weight_draws_in_a_font_and_only_the_unreflowed_one_refuses_to_wrap() {
+        let style = egui::Style::default();
+        assert_eq!(font(Weight::Mono, &style), font(Weight::Wrapped, &style));
+        assert_ne!(font(Weight::Body, &style).family, font(Weight::Mono, &style).family);
+        assert_eq!(font(Weight::Heading, &style).size, 20.0);
+        assert_eq!(font(Weight::Heading, &style).family, font(Weight::Body, &style).family);
     }
 
     #[test]
