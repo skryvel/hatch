@@ -26,6 +26,36 @@
 //!
 //! The safe set is ASCII printable, U+0020 through U+007E. Everything outside
 //! it chips, named where the name helps and `[U+XXXX]` otherwise.
+//!
+//! # Two tiers of chip, because uniform alarm is no alarm
+//!
+//! Chipping everything outside the safe set is the right rule and it has one
+//! cost: a heredoc puts ten identical orange `[LF]`s down the right edge of
+//! the pane, and a reader who learns to skip those is a reader who will skip
+//! the one that is a bidi override. A display where everything shouts says
+//! nothing.
+//!
+//! So a chip's *label* is tiered even though its *presence* is not — see
+//! [`ChipTier`]. A newline, a carriage return and a tab are ordinary structure
+//! in a shell command: they are not disguises, and what a reader needs from
+//! them is to see where they are, not to be warned. They get a compact glyph
+//! the window draws quietly. Everything else — the bidi controls, the
+//! zero-width set, NBSP, homoglyphs, unnamed codepoints — keeps the loud
+//! bracketed label, so the alarm is spent only where there is something to be
+//! alarmed about.
+//!
+//! NBSP is deliberately in the loud tier and not with the tab. It is invisible
+//! and passes for a space, which makes it a way to fake an argument boundary;
+//! that is a hazard rather than structure, and the fact that it is
+//! whitespace-shaped is exactly why it must not be drawn like whitespace.
+//!
+//! Nothing about the tier weakens invariant 1b. A structural chip still stands
+//! for exactly one codepoint and still keeps that codepoint as its text; only
+//! the string on screen is shorter. And the glyphs are chosen from outside
+//! ASCII on purpose, so a command containing a literal `↵` chips it as
+//! `[U+21B5]` rather than drawing it: every character either pane draws as
+//! itself is ASCII printable, so any of these glyphs on screen is
+//! unambiguously hatch's word and never the command's own byte.
 
 use std::borrow::Cow;
 
@@ -47,14 +77,77 @@ use super::{SpanBuilder, SpanKind, Spans};
 /// 2. hatch draws layout breaks as metadata — `break_before` on the following
 ///    span — precisely so that no character is ever consumed by the layout. If
 ///    a literal U+000A were drawn as itself, a break on screen would no longer
-///    tell the reader whether it is layout or content. `[LF]` keeps those two
+///    tell the reader whether it is layout or content. A chip keeps those two
 ///    readings apart, and a newline inside a command is exactly the structure a
 ///    reader most needs to see.
 ///
-/// The cost is that a multi-line command is noisier to read. That is the right
-/// trade for a window whose entire job is to be believed.
+/// The cost is that a multi-line command is noisier to read, and
+/// [`ChipTier`] is how much of that cost is paid back: these three are the
+/// structural tier, so a heredoc shows a column of quiet `↵` rather than a
+/// column of orange `[LF]`. They are still chips, and still one per
+/// character.
 fn is_plain(c: char) -> bool {
     c == ' ' || c.is_ascii_graphic()
+}
+
+/// How loudly a chip asks to be drawn.
+///
+/// A property of the character, computed by [`chip_tier`] and never stored
+/// beside the text — [`super::Span::chip_tier`] reads it back out of the
+/// codepoint the chip covers, for the same reason
+/// [`super::Span::chip_codepoint`] does: a stored copy is a thing that can
+/// come to disagree with the character the user approved.
+///
+/// The window is where this turns into pixels, and the window is told the
+/// tier rather than being left to recognise a label. A view that looked for
+/// `[LF]` would be reading a label, and a label is the one thing on screen a
+/// command may contain literally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipTier {
+    /// A newline, a carriage return or a tab: ordinary structure in a shell
+    /// command. Drawn as a compact glyph, quietly.
+    Structural,
+    /// Everything else that must not be drawn as itself. Drawn as its
+    /// bracketed label, loudly.
+    Loud,
+}
+
+/// The characters that are structure rather than disguise, and the compact
+/// glyph each is drawn as.
+///
+/// Three entries and no more, and each one earns its place by being something
+/// a reader needs *located* rather than *flagged*. A CRLF then reads `⇤↵`,
+/// which is quieter than `[CR][LF]` and also more distinguishable: two glyphs
+/// of different shapes rather than two bracketed words of the same shape.
+///
+/// The glyphs are all outside ASCII, which is what keeps them from ever being
+/// confused with the command's own text — see the module docs — and all three
+/// are one advance wide in the window's monospace font, which the diff's
+/// character-count fit depends on and
+/// `every_glyph_the_panes_draw_is_one_monospace_advance` pins.
+///
+/// `⇤` for the carriage return rather than the Unicode control picture `␍`:
+/// the control pictures are in none of the fonts the window ships, so `␍`
+/// would draw as nothing at all — a character that is on screen in name only
+/// is exactly the failure a chip exists to prevent. `⇤` says what a carriage
+/// return does, which is to go back to the start of the line rather than to
+/// open a new one, and it pairs with `↵` for the CRLF case.
+const STRUCTURAL: &[(char, &str)] = &[
+    ('\u{0009}', "\u{2192}"),  // TAB, drawn as →
+    ('\u{000A}', "\u{21B5}"),  // LF, drawn as ↵
+    ('\u{000D}', "\u{21E4}"),  // CR, drawn as ⇤
+];
+
+/// Which tier a character's chip is in.
+///
+/// Total, and defined for every character including the ones that never chip:
+/// the question "how loud is this?" has an answer for `a` too, and it is
+/// [`ChipTier::Loud`], which costs nothing because `a` is drawn as itself.
+pub fn chip_tier(c: char) -> ChipTier {
+    match STRUCTURAL.iter().any(|(structural, _)| *structural == c) {
+        true => ChipTier::Structural,
+        false => ChipTier::Loud,
+    }
 }
 
 /// Labels for the characters worth naming.
@@ -131,14 +224,34 @@ const INVISIBLE: &[(char, char)] = &[
     ('\u{E0100}', '\u{E01EF}'), // variation selectors supplement
 ];
 
-/// What a chip for `c` shows in its place.
+/// What a chip for `c` shows in its place: the compact glyph for a
+/// [`ChipTier::Structural`] character, and the loud label for everything else.
 ///
-/// Every label is bracketed, including the fallback, so that a chip cannot be
-/// mistaken for text that was really there. The brackets are not proof — a
-/// command may contain a literal `[LF]` — but they put the two readings in the
-/// same shape, which is the most a plain string can do; telling them apart for
-/// certain is the UI's job, through styling the chip spans differently.
+/// This is where the tier is decided, beside the label it decides, and not in
+/// a view. A view that recognised `[LF]` would be reading a label, and a label
+/// is the one thing on screen that a command may contain literally.
 fn chip_label(c: char) -> Cow<'static, str> {
+    match STRUCTURAL.iter().find(|(structural, _)| *structural == c) {
+        Some((_, glyph)) => Cow::Borrowed(*glyph),
+        None => loud_label(c),
+    }
+}
+
+/// The loud form of a chip's label: named where the name helps, `[U+XXXX]`
+/// otherwise.
+///
+/// Every label here is bracketed, including the fallback, so that a chip
+/// cannot be mistaken for text that was really there. The brackets are not
+/// proof — a command may contain a literal `[LF]` — but they put the two
+/// readings in the same shape, which is the most a plain string can do;
+/// telling them apart for certain is the UI's job, through styling the chip
+/// spans differently.
+///
+/// Split out from [`chip_label`] because [`defang`] needs this form and only
+/// this form: a defanged string is drawn as ordinary text with no chip
+/// machinery around it, so every character in it has to be one the window can
+/// draw as itself, and the compact glyphs are not.
+fn loud_label(c: char) -> Cow<'static, str> {
     match NAMED.iter().find(|(named, _)| *named == c) {
         Some((_, name)) => Cow::Borrowed(*name),
         None => Cow::Owned(format!("[U+{:04X}]", c as u32)),
@@ -174,13 +287,24 @@ fn is_invisible(c: char) -> bool {
 /// and a value carrying a bidi override or a newline would reorder or split
 /// the line the command is being read on. Selection is enough — the agent
 /// never has to author the string to weaponise it.
+///
+/// # Always the loud label, even for a newline
+///
+/// The result is drawn as ordinary text, with none of the chip machinery
+/// around it, so every character in it has to be one the window draws as
+/// itself — and the compact structural glyphs are not, by design. That is the
+/// mechanical reason, and there is a second one that points the same way: a
+/// newline in a *resolved variable value* is not the ordinary structure a
+/// newline in a command is. It is a line break the agent chose to have drawn
+/// beside the command by picking which variable to write, and splitting the
+/// line a command is read on is precisely the hazard the loud tier is for.
 pub fn defang(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if is_plain(c) {
             out.push(c);
         } else {
-            out.push_str(&chip_label(c));
+            out.push_str(&loud_label(c));
         }
     }
     out
@@ -247,7 +371,7 @@ pub fn classify_into(builder: &mut SpanBuilder<'_>, end: usize) {
         // A newline gets the chip *and* the break. The two are independent
         // axes and always were — a chip decides what a character is drawn as,
         // `break_before` decides where the next character is drawn — so
-        // asking for both is not a weakening of either. `[LF]` still stands
+        // asking for both is not a weakening of either. The `↵` still stands
         // at the end of the line it ends, which is what keeps a real newline
         // distinguishable from a backslash and an `n` typed as two
         // characters; the break is what stops a pasted script from being one
@@ -260,9 +384,8 @@ pub fn classify_into(builder: &mut SpanBuilder<'_>, end: usize) {
         //
         // Only U+000A. A lone `\r` returns to the start of the line it is
         // already on rather than opening a new one, and it is still visible
-        // as `[CR]`; `\r\n` breaks on its `\n`, so the pair reads as
-        // `[CR][LF]` at the end of the line, which is exactly the sequence
-        // that is in the file.
+        // as `⇤`; `\r\n` breaks on its `\n`, so the pair reads as `⇤↵` at the
+        // end of the line, which is exactly the sequence that is in the file.
         if c == '\n' {
             builder.break_next();
         }
@@ -329,7 +452,15 @@ mod tests {
         spans.iter().filter_map(Span::chip_codepoint).collect()
     }
 
-    /// Every label this module promises, written out by hand.
+    /// Every compact glyph this module promises, written out by hand, for
+    /// the same reason `EXPECTED_LABELS` is.
+    const EXPECTED_GLYPHS: &[(char, &str)] = &[
+        ('\u{0009}', "\u{2192}"),
+        ('\u{000A}', "\u{21B5}"),
+        ('\u{000D}', "\u{21E4}"),
+    ];
+
+    /// Every loud label this module promises, written out by hand.
     ///
     /// Deliberately a second copy rather than a walk of `NAMED`: a test that
     /// reads its expectations out of the table it is testing agrees with any
@@ -450,7 +581,7 @@ mod tests {
         // would stop a reader telling layout from content.
         let spans = classify("a\tb\nc");
         assert_eq!(chips(&spans), vec!['\t', '\n']);
-        assert_eq!(labels(&spans), vec!["[TAB]", "[LF]"]);
+        assert_eq!(labels(&spans), vec!["\u{2192}", "\u{21B5}"]);
     }
 
     #[test]
@@ -460,9 +591,9 @@ mod tests {
         // break cannot tell a real newline from a typed backslash-n.
         let spans = classify("a\nb");
 
-        assert_eq!(labels(&spans), vec!["[LF]"], "the character stopped being visible");
+        assert_eq!(labels(&spans), vec!["\u{21B5}"], "the character stopped being visible");
         let breaks: Vec<bool> = spans.iter().map(Span::break_before).collect();
-        assert_eq!(breaks, vec![false, false, true], "the break is not on the span after the [LF]");
+        assert_eq!(breaks, vec![false, false, true], "the break is not on the span after the ↵");
     }
 
     #[test]
@@ -470,13 +601,13 @@ mod tests {
         // A lone `\r` returns to the start of the line it is on. It is still
         // chipped; it just does not open a new one.
         let spans = classify("a\rb");
-        assert_eq!(labels(&spans), vec!["[CR]"]);
+        assert_eq!(labels(&spans), vec!["\u{21E4}"]);
         assert!(spans.iter().all(|span| !span.break_before()), "a carriage return broke the line");
 
         // And `\r\n` breaks once, after the pair, so both characters stay on
         // the line they end.
         let crlf = classify("a\r\nb");
-        assert_eq!(labels(&crlf), vec!["[CR]", "[LF]"]);
+        assert_eq!(labels(&crlf), vec!["\u{21E4}", "\u{21B5}"]);
         let breaks: Vec<bool> = crlf.iter().map(Span::break_before).collect();
         assert_eq!(breaks, vec![false, false, false, true]);
     }
@@ -553,15 +684,91 @@ mod tests {
     #[test]
     fn named_characters_get_their_names() {
         for (c, expected) in EXPECTED_LABELS {
-            assert_eq!(chip_label(*c), *expected, "U+{:04X}", *c as u32);
-            let spans = classify(&c.to_string());
-            assert_eq!(labels(&spans), vec![expected.to_string()], "U+{:04X}", *c as u32);
+            assert_eq!(loud_label(*c), *expected, "U+{:04X}", *c as u32);
         }
         assert_eq!(
             NAMED.len(),
             EXPECTED_LABELS.len(),
             "a label was added to or removed from NAMED without saying so here"
         );
+    }
+
+    #[test]
+    fn a_loud_chip_is_drawn_as_its_bracketed_name() {
+        // What reaches the screen, for everything outside the structural
+        // three: the loud label and nothing shorter.
+        for (c, expected) in EXPECTED_LABELS.iter().filter(|(c, _)| chip_tier(*c) == ChipTier::Loud)
+        {
+            let spans = classify(&c.to_string());
+            assert_eq!(labels(&spans), vec![expected.to_string()], "U+{:04X}", *c as u32);
+            assert_eq!(spans[0].chip_tier(), Some(ChipTier::Loud), "U+{:04X}", *c as u32);
+        }
+    }
+
+    // --- the two tiers ----------------------------------------------------
+
+    #[test]
+    fn ordinary_structure_is_drawn_as_a_compact_glyph() {
+        // The whole point of the tier: a heredoc's line endings stop being a
+        // column of the same alarm the bidi override wears.
+        for (c, glyph) in EXPECTED_GLYPHS {
+            assert_eq!(chip_tier(*c), ChipTier::Structural, "U+{:04X}", *c as u32);
+            assert_eq!(chip_label(*c), *glyph, "U+{:04X}", *c as u32);
+            let spans = classify(&c.to_string());
+            assert_eq!(labels(&spans), vec![glyph.to_string()], "U+{:04X}", *c as u32);
+            assert_eq!(spans[0].chip_tier(), Some(ChipTier::Structural));
+        }
+        assert_eq!(
+            STRUCTURAL.len(),
+            EXPECTED_GLYPHS.len(),
+            "a glyph was added to or removed from STRUCTURAL without saying so here"
+        );
+    }
+
+    #[test]
+    fn a_crlf_reads_as_two_distinguishable_glyphs() {
+        let spans = classify("a\r\nb");
+        let shown: String = spans.iter().map(|s| s.display_text()).collect();
+        assert_eq!(shown, "a\u{21E4}\u{21B5}b");
+    }
+
+    #[test]
+    fn everything_that_is_a_disguise_rather_than_structure_stays_loud() {
+        // The list that decides whether the quiet tier bought anything. NBSP
+        // is the one worth naming: it is whitespace-shaped, which is exactly
+        // why it must not be drawn like whitespace.
+        for c in [
+            '\u{00A0}', '\u{00AD}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{202E}', '\u{2066}',
+            '\u{2028}', '\u{2029}', '\u{FEFF}', '\u{0430}', '\u{0301}', '\u{001B}', '\u{0000}',
+            '\u{1D7CE}',
+        ] {
+            assert_eq!(chip_tier(c), ChipTier::Loud, "U+{:04X} went quiet", c as u32);
+            let label = chip_label(c);
+            assert!(label.starts_with('['), "U+{:04X} lost its brackets", c as u32);
+        }
+    }
+
+    #[test]
+    fn a_compact_glyph_is_outside_the_set_that_is_drawn_as_itself() {
+        // What keeps a glyph from ever being confused with the command's own
+        // byte: a literal `↵` in a command is non-ASCII and so chips, as
+        // `[U+21B5]`, which is not `↵`.
+        for (_, glyph) in STRUCTURAL {
+            for c in glyph.chars() {
+                assert!(!is_plain(c), "U+{:04X} would draw as itself", c as u32);
+                assert_eq!(chip_tier(c), ChipTier::Loud, "the glyph is not itself structure");
+                assert_ne!(chip_label(c), *glyph, "a literal glyph draws as the glyph");
+            }
+        }
+    }
+
+    #[test]
+    fn a_character_that_is_drawn_as_itself_still_has_a_tier() {
+        // Total by construction, so a caller never has to ask whether asking
+        // is allowed. Loud is the answer, and it costs nothing: `a` is never
+        // chipped.
+        assert_eq!(chip_tier('a'), ChipTier::Loud);
+        assert_eq!(chip_tier(' '), ChipTier::Loud);
     }
 
     #[test]
@@ -573,6 +780,9 @@ mod tests {
         for (c, name) in EXPECTED_LABELS.iter().chain(NAMED) {
             assert!(!is_plain(*c), "{name} names U+{:04X}, which is drawn as itself", *c as u32);
         }
+        for (c, glyph) in EXPECTED_GLYPHS.iter().chain(STRUCTURAL) {
+            assert!(!is_plain(*c), "{glyph} stands for U+{:04X}, drawn as itself", *c as u32);
+        }
     }
 
     #[test]
@@ -580,6 +790,22 @@ mod tests {
         assert_eq!(chip_label('\u{0430}'), "[U+0430]");
         assert_eq!(chip_label('\u{0007}'), "[U+0007]", "short codepoints stay four digits");
         assert_eq!(chip_label('\u{1D7CE}'), "[U+1D7CE]", "long ones are not truncated");
+        assert_eq!(loud_label('\u{0430}'), "[U+0430]");
+    }
+
+    #[test]
+    fn every_structural_character_is_also_named_for_the_places_that_need_words() {
+        // `defang` has no chip machinery to hang a glyph on, so each of these
+        // still needs a bracketed name. A structural character missing from
+        // `NAMED` would defang to `[U+000A]`, which is a worse thing to read
+        // in a variable's value than `[LF]`.
+        for (c, _) in STRUCTURAL {
+            assert!(
+                NAMED.iter().any(|(named, _)| named == c),
+                "U+{:04X} is structural but unnamed",
+                *c as u32
+            );
+        }
     }
 
     #[test]
@@ -741,5 +967,20 @@ mod tests {
         // text that ambiguity would be unacceptable, which is exactly why
         // approved text gets chips instead.
         assert_eq!(defang("[LF]"), defang("\n"));
+    }
+
+    #[test]
+    fn defang_keeps_the_loud_label_even_for_structure() {
+        // Two reasons, and either alone would decide it. The mechanical one:
+        // a defanged string is drawn as ordinary text, so every character in
+        // it has to be drawable as itself, and the compact glyphs are not.
+        // The other: a newline in a variable's value is a line break the
+        // agent arranged to have drawn beside the command, which is a hazard
+        // and not structure.
+        assert_eq!(defang("a\nb"), "a[LF]b");
+        assert!(
+            defang("\n\r\t").chars().all(is_plain),
+            "a compact glyph reached a string with no chip around it"
+        );
     }
 }

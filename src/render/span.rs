@@ -146,8 +146,31 @@ pub enum SpanKind {
     /// agent-chosen text and a raw bidi override in a config value would
     /// reorder the command around it.
     Variable { resolved: Option<String> },
-    /// The first word of a segment.
+    /// The first word of a segment: the word that names what will run.
+    ///
+    /// Produced by [`super::command::highlight`], which claims it only for a
+    /// word that contains no quote character, so a `Command` never overlaps a
+    /// [`SpanKind::Quoted`].
+    ///
+    /// Decoration, and this kind carries no claim the reader may lean on:
+    /// hatch's model of shell grammar is five separators plus quoting, so
+    /// "the first word of a segment" is what the *scanner* thinks the first
+    /// word is. It is drawn as its own text at full contrast either way, so
+    /// a reader who ignores the emphasis reads exactly the same characters.
     Command,
+    /// A quoted string, delimiters included: `'…'` or `"…"`.
+    ///
+    /// The delimiters are inside the span on purpose. The quotes are what
+    /// make the string one word to the shell, so a highlight that covered the
+    /// interior and left the quotes outside would draw the boundary in the
+    /// wrong place — and the boundary is the whole thing a reader is trying
+    /// to see.
+    ///
+    /// Decoration, on the same terms as [`SpanKind::Command`]. Where the
+    /// scanner's model stops — `$'…'`, a heredoc body, a comment — this is
+    /// wrong in the same direction and at the same bounded cost: the text is
+    /// still on screen, drawn as itself.
+    Quoted,
     Danger,
     /// A character that must not be drawn as itself. `text` is still the
     /// original character, and stays exactly one codepoint long; `name` is
@@ -233,6 +256,17 @@ impl Span {
             SpanKind::Chip { .. } => self.text.chars().next(),
             _ => None,
         }
+    }
+
+    /// How loudly this chip asks to be drawn, or `None` for every other kind.
+    ///
+    /// Read out of the character, exactly like [`Span::chip_codepoint`] and
+    /// for the same reason: a tier stored beside the text is a second thing
+    /// that can come to describe a character it does not cover. The rule
+    /// itself belongs to [`super::unicode`], beside the label it decides, so
+    /// that a window never has to recognise a label to know how loud it is.
+    pub fn chip_tier(&self) -> Option<super::unicode::ChipTier> {
+        self.chip_codepoint().map(super::unicode::chip_tier)
     }
 
     /// For a `Variable` span, its name and what that name resolves to in the
@@ -778,6 +812,33 @@ mod tests {
         assert_eq!(spans[2].text().len(), 3);
         assert_eq!(spans[2].chip_codepoint(), Some('\u{202E}'));
         assert_eq!(spans[0].chip_codepoint(), None, "only chips have one");
+    }
+
+    #[test]
+    fn a_chips_tier_is_read_back_out_of_the_character_it_covers() {
+        use crate::render::unicode::ChipTier;
+
+        let (_, spans) = sample();
+        assert_eq!(spans[2].chip_tier(), Some(ChipTier::Loud), "a bidi override is not structure");
+        assert_eq!(spans[0].chip_tier(), None, "only a chip has a tier");
+
+        let mut builder = SpanBuilder::new("\n");
+        builder.push_rest(SpanKind::Chip { name: "\u{21B5}".into() });
+        assert_eq!(builder.finish()[0].chip_tier(), Some(ChipTier::Structural));
+    }
+
+    #[test]
+    fn a_tier_comes_from_the_character_and_not_from_the_label() {
+        // A label is free-form and a kind can be deserialised from anywhere,
+        // so the two could be made to disagree. The character is what was
+        // approved, so the character is what decides.
+        use crate::render::unicode::ChipTier;
+
+        let mut builder = SpanBuilder::new("\u{202E}");
+        builder.push_rest(SpanKind::Chip { name: "\u{21B5}".into() });
+        let spans = builder.finish();
+        assert_eq!(spans[0].display_text(), "\u{21B5}", "the label is whatever it says");
+        assert_eq!(spans[0].chip_tier(), Some(ChipTier::Loud), "the tier is the character's");
     }
 
     #[test]

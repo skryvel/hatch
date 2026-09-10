@@ -41,7 +41,7 @@
 //! to see it.
 //!
 //! So the terminator is part of the line, is classified with everything else,
-//! and comes out as chips — `[CR]`, `[LF]` — because [`super::unicode`] draws
+//! and comes out as chips — `⇤`, `↵` — because [`super::unicode`] draws
 //! only U+0020..=U+007E as itself. That is honest but noisy, so [`Side`]
 //! splits its own spans for the view's benefit: [`Side::content_spans`] is
 //! the line without its terminator and [`Side::terminator_spans`] is the

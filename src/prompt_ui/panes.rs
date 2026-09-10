@@ -44,7 +44,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Payload, ProtocolError};
 use crate::render::diff::{Row, Side};
-use crate::render::unicode::{ScanReport, classify, defang, scan};
+use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::render::{Span, SpanKind, Spans};
 use crate::swap::{PlanKind, SwapPlan};
 
@@ -73,9 +73,12 @@ const RAW_SHARE: f32 = 0.40;
 
 /// Characters of gutter in front of each diff column: the `-`/`+` mark and
 /// the space after it.
+///
+/// Diff furniture only. The two command panes have no gutter, which is why
+/// [`column_chars`] takes the figure rather than knowing it.
 const GUTTER_CHARS: usize = 2;
 
-/// Characters of empty space between the two diff columns.
+/// Characters of empty space between two columns, in either view.
 ///
 /// Two and not one, so that a line ending in a space and a line starting with
 /// one are still two lines to the eye. It doubles as the slack that keeps the
@@ -99,6 +102,12 @@ pub enum Shown {
         /// The same source, classified and nothing else. Its `source()` is
         /// `annotated.source()` — the text this window's approval covers.
         raw: Spans,
+        /// The widest line either pane would have to draw, in characters.
+        ///
+        /// Measured here for the reason the diff's is: it decides whether the
+        /// two panes are drawn side by side, and it depends only on the two
+        /// renderings, so measuring it once is not a cache that can go stale.
+        longest: usize,
         /// How odd that source is, for the header line.
         scan: ScanReport,
         /// The danger labels the daemon found, defanged for drawing.
@@ -149,13 +158,15 @@ impl Shown {
                 // from here means every character in either pane came out of
                 // something the builder checked.
                 let source = annotated.source();
+                let raw = classify(source);
                 Ok(Shown::Command {
-                    raw: classify(source),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
                     cwd: defang(&cwd.display().to_string()),
                     root: *root,
                     interactive: *interactive,
+                    longest: widest_line(&annotated).max(widest_line(&raw)),
+                    raw,
                     annotated,
                 })
             }
@@ -305,7 +316,7 @@ pub fn changed_rows(rows: &[Row]) -> usize {
     rows.iter().filter(|row| row.changed()).count()
 }
 
-// ---- which of the two diff views ------------------------------------------
+// ---- does it fit in two columns? -------------------------------------------
 
 /// How a diff is being drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,15 +328,51 @@ pub enum DiffView {
     Unified,
 }
 
-/// The width of the widest line either column would have to draw, in
-/// characters.
+/// How the two command panes are being drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandView {
+    /// Two columns: the exact text on the left, hatch's annotated form on the
+    /// right, each with the whole height of the window.
+    SideBySide,
+    /// The annotated pane under the raw one. What the panes fall back to when
+    /// two columns cannot hold them.
+    Stacked,
+}
+
+/// One drawn line's width in characters, notes included.
 ///
 /// Characters and not pixels, and the count is exact rather than an estimate.
-/// Everything that reaches the screen from a diff line does so as
+/// Almost everything that reaches the screen does so as
 /// [`Span::display_text`]: a plain span is U+0020..=U+007E because
-/// [`classify`] chips everything else, and every chip label is ASCII too. So
-/// a drawn diff line is ASCII in a monospace font, where one character is one
-/// advance and the sum of the counts is the width.
+/// [`classify`] chips everything else, and a loud chip's label is ASCII too.
+/// The exceptions are the three compact glyphs a structural chip draws and
+/// the `\u{2192}` in a variable's note, each of which is one advance of the
+/// same monospace font — `every_glyph_the_panes_draw_is_one_monospace_advance`
+/// is what holds that true. So a drawn line is monospace throughout, one
+/// character is one advance, and the sum of the counts is the width.
+///
+/// A variable's note is counted because it is drawn: it sits inside the line,
+/// after the reference, and a fit that ignored it would put the annotated
+/// pane's longest line off the side of its column.
+fn line_chars(line: &[Span]) -> usize {
+    line.iter()
+        .map(|span| {
+            let note = span.variable().map_or(0, |(_, resolved)| {
+                variable_note(resolved).chars().count()
+            });
+            span.display_text().chars().count() + note
+        })
+        .sum()
+}
+
+/// The widest line of one rendering, in characters, split where the rendering
+/// asked to be split.
+pub fn widest_line(spans: &Spans) -> usize {
+    lines(spans).into_iter().map(line_chars).max().unwrap_or(0)
+}
+
+/// The width of the widest line either column would have to draw, in
+/// characters.
 ///
 /// A row's terminator counts only where it would be drawn, because that is
 /// the question — how wide is this line *on screen* — and not how many bytes
@@ -348,21 +395,30 @@ pub fn longest_drawn_line(rows: &[Row]) -> usize {
 /// One side's drawn width in characters, terminator included only when the
 /// view would draw it.
 fn drawn_width(side: &Side, terminator: bool) -> usize {
-    let spans = if terminator { side.spans() } else { side.content_spans() };
-    spans.iter().map(|span| span.display_text().chars().count()).sum()
+    line_chars(if terminator { side.spans() } else { side.content_spans() })
 }
 
-/// How many characters one of the two columns holds, in a pane that holds
-/// `pane` of them.
+/// How many characters one of two columns holds, in a region that holds
+/// `region` of them and spends `furniture` on each column before any text.
 ///
-/// Saturating rather than signed: a pane too narrow for its own furniture
+/// The furniture is a parameter because the two views that ask this have
+/// different amounts of it: a diff column carries a `-`/`+` gutter, and a
+/// command pane carries none. The gap between the columns is the same in
+/// both, so it is not.
+///
+/// Saturating rather than signed: a region too narrow for its own furniture
 /// holds no column at all, and that is a reason to fall back rather than a
 /// negative number to propagate.
-fn column_chars(pane: usize) -> usize {
-    pane.saturating_sub(2 * GUTTER_CHARS + GAP_CHARS) / 2
+fn column_chars(region: usize, furniture: usize) -> usize {
+    region.saturating_sub(2 * furniture + GAP_CHARS) / 2
 }
 
 /// Two columns only when *every* line fits one of them whole.
+///
+/// One rule, asked by both views, because it is one question: can a column
+/// this wide hold the widest thing that would go in it? What each view does
+/// when the answer is no differs — a diff has a unified form to fall back to,
+/// the command panes stack — but the measurement and the threshold do not.
 ///
 /// # Why the longest line and not a percentile
 ///
@@ -377,10 +433,45 @@ fn column_chars(pane: usize) -> usize {
 /// All-or-nothing is what makes "side by side is showing" mean something: it
 /// is a promise that every line on screen is complete and that nothing needs
 /// to be scrolled to horizontally. The cost is that one long line sends the
-/// whole file to the unified view, and the caption says so with the number in
+/// whole thing back to one column, and the caption says so with the number in
 /// it, so the reader can widen the window and watch it flip back.
+pub fn fits_two_columns(longest: usize, column: usize) -> bool {
+    column > 0 && longest <= column
+}
+
+/// Which view a diff gets.
 pub fn diff_view(longest: usize, column: usize) -> DiffView {
-    if column > 0 && longest <= column { DiffView::SideBySide } else { DiffView::Unified }
+    if fits_two_columns(longest, column) { DiffView::SideBySide } else { DiffView::Unified }
+}
+
+/// Which arrangement the two command panes get.
+pub fn command_view(longest: usize, column: usize) -> CommandView {
+    if fits_two_columns(longest, column) { CommandView::SideBySide } else { CommandView::Stacked }
+}
+
+/// What to say above the command panes, or `None` when there is nothing worth
+/// a line.
+///
+/// Side by side says nothing, and that is deliberate. The diff announces both
+/// of its views because they draw *different lines* — unified interleaves the
+/// two sides and side by side pairs them — so a reader has to be told which
+/// they are reading. The command panes draw the same two renderings either
+/// way, each still carrying its own label, and only their arrangement
+/// changes; a permanent "Side by side" would be another line a reader learns
+/// to skip, on the same argument that keeps [`scan_summary`] quiet about an
+/// ordinary command.
+///
+/// The fallback does say so, with both numbers, because that is the case
+/// where the reader might be looking for a view they are not getting.
+pub fn command_caption(view: CommandView, longest: usize, column: usize) -> Option<String> {
+    match view {
+        CommandView::SideBySide => None,
+        CommandView::Stacked => Some(format!(
+            "One pane above the other, not side by side: the longest line is {longest} \
+             characters and a column here holds {column}, so two of them could not show it \
+             whole. Widen the window to put them beside each other."
+        )),
+    }
 }
 
 /// The line above the diff: how much changes, which view this is, and — when
@@ -408,11 +499,50 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
 // ---- drawing ---------------------------------------------------------------
 
 /// The colours the panes use, resolved against whatever theme is in force.
+///
+/// # What each one already means, and how the highlight stays out of the way
+///
+/// The window had four things to say before it said anything about syntax,
+/// and each has a channel of its own:
+///
+/// * `danger` — red — is the one colour that means *be careful*: `ROOT`, a
+///   danger marker, and the `-` side of a diff.
+/// * `warn` — orange — is hatch substituting for a character it will not draw
+///   as itself: the loud chip, and the unusual-character count above the
+///   panes.
+/// * `quiet` — grey — is hatch talking rather than the command: captions, the
+///   resolved value of a variable (italic and boxed as well), and now the
+///   structural chip glyphs.
+/// * `text` is the command's own bytes.
+///
+/// Highlighting gets what is left, and it deliberately does not get a colour
+/// that means anything else:
+///
+/// * `command`, the word that names what runs, is not a hue at all. It is the
+///   theme's *strong* text: the same characters as their neighbours, drawn
+///   with more contrast rather than less. That keeps it legible to a reader
+///   who cannot separate hues, and it cannot be confused with red or orange
+///   because it is neither. Bold is not available to it — the window's
+///   bundled monospace face has no bold cut, and a synthetic one would change
+///   the advance width that the side-by-side fit is measured in — so contrast
+///   is the whole of the emphasis.
+/// * `quoted` is the theme's link colour, which is the one hue in this window
+///   with no other job, and it is the coolest thing on screen — as far from
+///   red and orange as the palette goes.
+///
+/// The rule underneath both: **highlighting only ever adds contrast.**
+/// Nothing here fades a span, boxes one, or replaces its text, so a reader
+/// who ignores colour entirely reads the same characters in the same order.
+/// The raw pane beside it carries no highlighting at all.
 struct Palette {
     text: Color32,
     quiet: Color32,
     danger: Color32,
     warn: Color32,
+    /// The word that names what runs. Contrast, never a hue.
+    command: Color32,
+    /// A quoted string, delimiters included.
+    quoted: Color32,
     chip_bg: Color32,
     separator_bg: Color32,
     value_bg: Color32,
@@ -434,6 +564,8 @@ impl Palette {
             quiet: visuals.weak_text_color(),
             danger: visuals.error_fg_color,
             warn: visuals.warn_fg_color,
+            command: visuals.strong_text_color(),
+            quoted: visuals.hyperlink_color,
             chip_bg: visuals.code_bg_color,
             separator_bg: visuals.faint_bg_color,
             value_bg: visuals.faint_bg_color,
@@ -465,10 +597,10 @@ pub fn draw_headline(ui: &mut Ui, title: &str, reason: &str) {
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, cwd, root, .. } => {
+        Shown::Command { annotated, raw, scan, danger, cwd, root, longest, .. } => {
             draw_command_header(ui, scan, danger, cwd, *root);
             ui.separator();
-            draw_command(ui, annotated, raw);
+            draw_command(ui, annotated, raw, *longest);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
     }
@@ -503,43 +635,330 @@ fn draw_command_header(
     }
 }
 
-/// The two panes, in the order a suspicious reader wants them.
+// ---- keeping the two stacked panes together --------------------------------
+
+/// How far two offsets may differ and still count as the same one.
+///
+/// Half a logical pixel: smaller than anything a reader can produce and
+/// larger than the rounding a scroll area does to itself, so a pane that was
+/// given an offset and handed it straight back is never mistaken for a pane
+/// the reader scrolled.
+const SCROLL_EPSILON: f32 = 0.5;
+
+/// Where the two stacked panes' shared scroll position is kept.
+fn scroll_link_id() -> egui::Id {
+    egui::Id::new("hatch-command-scroll")
+}
+
+/// Which of the two command panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Raw,
+    Annotated,
+}
+
+/// Which pane the reader last scrolled, and where they left it.
+///
+/// Kept in egui's own per-frame-persistent store rather than threaded through
+/// the state machine: it is a scroll position, which is not part of what the
+/// window is deciding, and [`crate::prompt_ui::PromptState`] deliberately
+/// knows nothing about how anything is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollLink {
+    /// The pane the reader is driving. It is given back exactly the offset it
+    /// last reported, so it can never be pulled away from where they put it.
+    driver: Pane,
+    offset: f32,
+}
+
+impl Default for ScrollLink {
+    fn default() -> ScrollLink {
+        ScrollLink { driver: Pane::Raw, offset: 0.0 }
+    }
+}
+
+/// Where one drawn line of a pane begins: in the source, and on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneLine {
+    /// The byte offset in the source this line starts at.
+    at: usize,
+    /// The row it starts on, counting the extra rows any wrapped line above
+    /// it took.
+    row: usize,
+}
+
+/// One pane's lines, and how many rows they take altogether.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneRows {
+    lines: Vec<PaneLine>,
+    rows: usize,
+}
+
+/// Where every drawn line of a rendering begins, in both coordinates.
+///
+/// The source offset is what the two panes share. They are two renderings of
+/// one string and both tile it exactly — that is invariant 1 — so a byte
+/// offset means the same thing in both. A *line number* does not: the
+/// annotated pane opens a line at every separator as well as at every
+/// newline, so its line twelve and the raw pane's line twelve are routinely
+/// different text. Nor do pixels, once the line counts differ.
+///
+/// `wrap` is the pane's width in characters, or `None` for a pane that does
+/// not reflow. A wrapped line takes more than one row, and a link that
+/// assumed one row per line would put the follower steadily too high down a
+/// pane with wrapping above the target — the silent kind of drift.
+///
+/// The count is an estimate in one direction only. egui breaks at word
+/// boundaries where it can, so it wraps at or before the character count
+/// says, which means this can under-count rows and never over-count them.
+/// The follower therefore lands at the linked line or a little above it,
+/// showing context before it — never past it, which is the answer that would
+/// hide the line the reader was looking for.
+fn pane_lines(spans: &Spans, wrap: Option<usize>) -> PaneRows {
+    let mut lines_out = Vec::new();
+    let mut rows = 0;
+    for line in lines(spans) {
+        let Some(first) = line.first() else { continue };
+        lines_out.push(PaneLine { at: first.range().start, row: rows });
+        rows += match wrap {
+            Some(width) if width > 0 => line_chars(line).div_ceil(width).max(1),
+            _ => 1,
+        };
+    }
+    PaneRows { lines: lines_out, rows }
+}
+
+/// Which line a pane is showing at its top, from its offset in pixels.
+fn line_at(offset: f32, row: f32, lines: &[PaneLine]) -> usize {
+    let at = (offset / row).floor().max(0.0) as usize;
+    lines.partition_point(|line| line.row <= at).saturating_sub(1)
+}
+
+/// The line of `to` that holds the place line `line` of `from` begins at.
+///
+/// The last line that starts at or before it, which is the line that place is
+/// *on* — never the line after, so scrolling to the top of a segment in one
+/// pane cannot scroll past it in the other.
+fn linked_line(from: &[PaneLine], to: &[PaneLine], line: usize) -> usize {
+    let Some(from) = from.get(line) else {
+        return 0;
+    };
+    to.partition_point(|line| line.at <= from.at).saturating_sub(1)
+}
+
+/// The furthest a pane of `rows` rows can be scrolled inside `viewport`.
+///
+/// Deliberately an under-estimate: the scroll area sits inside a group frame,
+/// so its real viewport is a little shorter than `viewport` and its real
+/// maximum a little larger. Asking for less than a pane can give is safe —
+/// the pane hands back exactly what it was asked for — while asking for more
+/// would be clamped, and a clamped offset is indistinguishable from a reader
+/// scrolling.
+fn max_offset(rows: usize, row: f32, viewport: f32) -> f32 {
+    (rows as f32 * row - viewport).max(0.0)
+}
+
+/// What to ask one pane for this frame.
+///
+/// The driver gets exactly what it last reported, so the reader's own pane
+/// never moves under them. The follower gets the place the driver is looking
+/// at, translated through the source offset the two renderings share.
+fn requested_offset(
+    link: ScrollLink,
+    pane: Pane,
+    of: &PaneRows,
+    driver: &PaneRows,
+    row: f32,
+    viewport: f32,
+) -> f32 {
+    if link.driver == pane {
+        return link.offset;
+    }
+    let line = linked_line(&driver.lines, &of.lines, line_at(link.offset, row, &driver.lines));
+    let at = of.lines.get(line).map_or(0, |line| line.row) as f32 * row;
+    at.min(max_offset(of.rows, row, viewport))
+}
+
+/// Who drove, after a frame in which both panes were asked for an offset.
+///
+/// A pane that hands back what it was given did not move; a pane that hands
+/// back something else was scrolled, and becomes the one the other follows.
+/// The follower is asked first, because it is the pane whose answer is news:
+/// the driver is being handed its own offset and agreeing with it says
+/// nothing.
+fn drove(
+    link: ScrollLink,
+    raw: f32,
+    want_raw: f32,
+    annotated: f32,
+    want_annotated: f32,
+) -> ScrollLink {
+    if (annotated - want_annotated).abs() > SCROLL_EPSILON {
+        ScrollLink { driver: Pane::Annotated, offset: annotated }
+    } else if (raw - want_raw).abs() > SCROLL_EPSILON {
+        ScrollLink { driver: Pane::Raw, offset: raw }
+    } else {
+        link
+    }
+}
+
+/// What the raw pane is called on screen.
+const RAW_LABEL: &str = "Exactly the text being approved — no reflow, no grouping, no colour";
+
+/// What the annotated pane is called on screen.
+const ANNOTATED_LABEL: &str = "The same command, annotated — the colour and the italics are \
+                               hatch's notes, not the command";
+
+/// The two panes.
+///
+/// # Side by side, when they fit
+///
+/// Reading a command is a top-to-bottom act, so each pane wants the window's
+/// whole height rather than half of it. Two columns also put the raw and the
+/// annotated form of the same text at the same height, so a discrepancy
+/// between them is something the eye catches rather than something the reader
+/// has to scroll between and hold in memory — which is the entire reason the
+/// raw pane is there.
+///
+/// That second benefit is exactly what a column too narrow to hold a line
+/// destroys: one pane wrapping or scrolling sideways while the other does not
+/// puts the two forms of a line at different heights, which is worse than
+/// stacking them. So the panes go side by side only when every line of both
+/// fits a column whole, by [`fits_two_columns`] — the same rule, and the same
+/// function, the diff uses — and stack when it does not. Nothing is ever
+/// truncated to make them fit, and [`command_caption`] says which case this
+/// is when the answer is the fallback.
+///
+/// # Stacked, when they do not
 ///
 /// The space is not split evenly. The raw pane grows to as many lines as the
-/// command has — a newline is drawn as `[LF]` *and* ends the line, so a
-/// heredoc is a block and not one line scrolling sideways forever — and then
-/// stops at [`RAW_SHARE`] and scrolls. Everything left over goes to the
-/// annotated pane, which is the one a reader spends their time in.
-fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans) {
+/// command has — a newline is drawn as `↵` *and* ends the line, so a heredoc
+/// is a block and not one line scrolling sideways forever — and then stops at
+/// [`RAW_SHARE`] and scrolls. Everything left over goes to the annotated
+/// pane, which is the one a reader spends their time in.
+///
+/// Stacked, and only stacked, the two panes scroll together. Side by side
+/// needs no help: corresponding text is already level, which is the whole
+/// reason to prefer it. Stacked puts line N and its annotated form half a
+/// window apart, and scrolling them independently turns comparing the two
+/// forms of one line into a memory exercise — in the arrangement the reader
+/// did not choose. So the panes are linked, by *position in the command*
+/// rather than by pixels or by line number: see [`pane_lines`] for why those
+/// two would drift and a source offset cannot.
+fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
     let palette = Palette::of(ui);
+    let column = column_chars(pane_chars(ui, 2), 0);
+    let view = command_view(longest, column);
+    if let Some(caption) = command_caption(view, longest, column) {
+        ui.label(RichText::new(caption).small().color(palette.quiet));
+    }
 
-    ui.label(
-        RichText::new("Exactly the text being approved — no reflow, no grouping")
-            .small()
-            .color(palette.quiet),
-    );
-    let raw_ceiling = ui.available_height() * RAW_SHARE;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        egui::ScrollArea::both()
-            .id_salt("hatch-raw")
-            .max_height(raw_ceiling)
-            .auto_shrink([false, true])
-            .show(ui, |ui| draw_spans(ui, raw, Weight::Mono));
-    });
+    match view {
+        CommandView::SideBySide => {
+            let height = ui.available_height();
+            ui.columns(2, |columns| {
+                draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None));
+                draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None));
+            });
+        }
+        CommandView::Stacked => {
+            let row = row_height(ui);
+            // The raw pane does not reflow, so one line is one row there; the
+            // annotated pane wraps at the width of one full-width box.
+            let raw_rows = pane_lines(raw, None);
+            let annotated_rows = pane_lines(annotated, Some(pane_chars(ui, 1)));
+            let link =
+                ui.data(|data| data.get_temp::<ScrollLink>(scroll_link_id())).unwrap_or_default();
+            let driver = match link.driver {
+                Pane::Raw => &raw_rows,
+                Pane::Annotated => &annotated_rows,
+            };
 
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new("The same command, annotated — italics are hatch's notes, not the command")
-            .small()
-            .color(palette.quiet),
-    );
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("hatch-annotated")
-            .max_height(ui.available_height())
-            .auto_shrink([false, false])
-            .show(ui, |ui| draw_spans(ui, annotated, Weight::Wrapped));
-    });
+            let ceiling = raw_ceiling(ui.available_height());
+            let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, ceiling);
+            let at_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
+
+            ui.add_space(4.0);
+            let rest = ui.available_height();
+            let want_annotated =
+                requested_offset(link, Pane::Annotated, &annotated_rows, driver, row, rest);
+            let at_annotated =
+                draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)));
+
+            let link = drove(link, at_raw, want_raw, at_annotated, want_annotated);
+            ui.data_mut(|data| data.insert_temp(scroll_link_id(), link));
+        }
+    }
+}
+
+/// One command pane: its label, then the rendering in a framed, scrolling
+/// box.
+///
+/// Each pane keeps the weight it has always had, in both arrangements. The
+/// raw pane never reflows, so a line too wide for it is scrolled to; the
+/// annotated pane wraps, so a stacked window shows a long command without
+/// anyone having to drag sideways. Side by side is only offered when neither
+/// behaviour can fire, which is what [`fits_two_columns`] is measuring.
+///
+/// `at` is where the pane is asked to be scrolled to, and `None` is "wherever
+/// the reader left it". The returned offset is where it actually ended up,
+/// which is how the caller tells a pane that agreed with what it was asked
+/// from a pane the reader scrolled.
+fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
+    let palette = Palette::of(ui);
+    ui.label(RichText::new(pane.label).small().color(palette.quiet));
+    // A pane that cannot wrap needs somewhere to scroll a long line to; one
+    // that wraps has nothing to the side and a horizontal bar would only be
+    // furniture.
+    let mut scroll = match pane.weight.wraps() {
+        true => egui::ScrollArea::vertical(),
+        false => egui::ScrollArea::both(),
+    }
+    .id_salt(pane.id)
+    .max_height(pane.height)
+    .auto_shrink([false, pane.shrink]);
+    if let Some(at) = pane.at {
+        scroll = scroll.vertical_scroll_offset(at);
+    }
+    egui::Frame::group(ui.style())
+        .show(ui, |ui| scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight)).state.offset.y)
+        .inner
+}
+
+/// One command pane's box: everything about it except what is in it.
+#[derive(Debug, Clone, Copy)]
+struct PaneBox {
+    /// What the pane is called on screen.
+    label: &'static str,
+    /// Its scroll area's identity, so a pane keeps its position across
+    /// frames.
+    id: &'static str,
+    weight: Weight,
+    /// The most of the window it may take.
+    height: f32,
+    /// Whether it shrinks to its content rather than filling `height`.
+    shrink: bool,
+    /// Where to scroll it, or `None` for wherever the reader left it.
+    at: Option<f32>,
+}
+
+impl PaneBox {
+    /// The raw pane, which never reflows.
+    fn raw(height: f32, shrink: bool, at: Option<f32>) -> PaneBox {
+        PaneBox { label: RAW_LABEL, id: "hatch-raw", weight: Weight::Mono, height, shrink, at }
+    }
+
+    /// The annotated pane, which wraps.
+    fn annotated(height: f32, at: Option<f32>) -> PaneBox {
+        PaneBox {
+            label: ANNOTATED_LABEL,
+            id: "hatch-annotated",
+            weight: Weight::Wrapped,
+            height,
+            shrink: false,
+            at,
+        }
+    }
 }
 
 /// What a `swap_file` request looks like.
@@ -595,11 +1014,15 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans) {
 /// weaker. The case it exists for — content identical, ending rewritten — is
 /// precisely the case where two columns would otherwise be drawn pixel for
 /// pixel the same over a change to every byte at the end of every line. When
-/// it fires, both cells draw their terminator, because a `[LF]` shown against
-/// a cell that hides its own is not a comparison. Drawing them always instead
-/// would put an orange `[LF]` on every line of the file, and a reader who has
-/// learned to skip chips is a reader who will skip the one that is a bidi
-/// override.
+/// it fires, both cells draw their terminator, because a `↵` shown against a
+/// cell that hides its own is not a comparison. Drawing them always would put
+/// a chip on every line of the file, and a reader who has learned to skip
+/// chips is a reader who will skip the one that is a bidi override. That
+/// argument is weaker than it was — a terminator is in the structural tier
+/// now, so it is a quiet glyph rather than an orange box, and a whole column
+/// of them is much less of an imposition. It is not gone: a chip on every
+/// line is still a mark on every line, and the rule costs a reader nothing,
+/// because the case it hides is exactly the case where both sides agree.
 fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: usize) {
     let palette = Palette::of(ui);
     ui.horizontal_wrapped(|ui| {
@@ -614,9 +1037,8 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     }
     ui.separator();
 
-    let font = font(Weight::Mono, ui.style());
-    let advance = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, '0')).max(1.0);
-    let column = column_chars((text_width(ui) / advance).floor().max(0.0) as usize);
+    let advance = advance(ui);
+    let column = column_chars(pane_chars(ui, 1), GUTTER_CHARS);
     let view = diff_view(longest, column);
     ui.label(
         RichText::new(diff_caption(view, rows, longest, column)).small().color(palette.quiet),
@@ -640,8 +1062,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     // uniform height the API wants is a fact rather than an assumption, and
     // it is a fact in both views: side by side never wraps a cell, because a
     // diff that would have to wrap one is drawn unified instead.
-    let row_height =
-        ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
+    let row_height = row_height(ui);
     egui::Frame::group(ui.style()).show(ui, |ui| match view {
         DiffView::SideBySide => {
             let size = Cells {
@@ -679,18 +1100,57 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     });
 }
 
-/// The width a diff pane really has for text.
+/// The width `boxes` framed, scrolling boxes really leave for text.
 ///
-/// Subtracting the furniture rather than measuring inside the pane, because
-/// the view has to be chosen before the pane that would report its own width
-/// exists. Every term is something that is definitely there: the group
-/// frame's border and padding on both sides, and the vertical scroll bar,
-/// which a diff of any length grows.
-fn text_width(ui: &Ui) -> f32 {
+/// Subtracting the furniture rather than measuring inside the box, because
+/// the view has to be chosen before the box that would report its own width
+/// exists. Every term is something that is definitely there: each box's group
+/// frame, border and padding on both sides, and each box's vertical scroll
+/// bar, which anything long enough to matter grows.
+///
+/// `boxes` is one for a diff, which is drawn in a single frame, and two for
+/// the command panes side by side.
+fn text_width(ui: &Ui, boxes: usize) -> f32 {
     let frame = egui::Frame::group(ui.style());
     let border = (frame.inner_margin.sum() + frame.outer_margin.sum()).x + 2.0 * frame.stroke.width;
     let scroll = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
-    (ui.available_width() - border - scroll).max(0.0)
+    (ui.available_width() - boxes as f32 * (border + scroll)).max(0.0)
+}
+
+/// The height of one drawn line, from the font in force and the space the
+/// layout puts between two of them.
+///
+/// Both terms are needed and neither is the other: a row is a line of text
+/// *plus* the gap to the next one, and the scroll link turns a line index
+/// into an offset by multiplying by exactly this.
+fn row_height(ui: &Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y
+}
+
+/// The most of `available` the raw pane may take when the panes are stacked.
+///
+/// A share and not a line count, because the thing being protected is the
+/// annotated pane's part of the window: the raw pane is the one a reader
+/// falls back to, not the one they read first, so it yields the space and
+/// scrolls.
+fn raw_ceiling(available: f32) -> f32 {
+    available * RAW_SHARE
+}
+
+/// The width of one character of the font both panes and both diff views draw
+/// in.
+///
+/// `'0'` because every glyph of a monospace font is the same width and a
+/// digit is the one that is certainly present. Floored at one so that a font
+/// that reports nothing cannot make a column infinitely wide.
+fn advance(ui: &Ui) -> f32 {
+    let font = font(Weight::Mono, ui.style());
+    ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, '0')).max(1.0)
+}
+
+/// How many characters of that font fit across `boxes` framed boxes.
+fn pane_chars(ui: &Ui, boxes: usize) -> usize {
+    (text_width(ui, boxes) / advance(ui)).floor().max(0.0) as usize
 }
 
 /// The pixel geometry of one side-by-side row.
@@ -917,14 +1377,15 @@ impl Weight {
 /// Heading is body at a larger size rather than egui's own `Heading` style,
 /// which is what the per-span form did and is worth keeping: the headline is
 /// two paragraphs of agent-written prose, and it should read as prose set
-/// large.
+/// large. A multiple of body and not a point count, so that it follows the
+/// size the reader chose — see [`super::apply_font_size`].
 fn font(weight: Weight, style: &egui::Style) -> egui::FontId {
     match weight {
         Weight::Mono | Weight::Wrapped => egui::TextStyle::Monospace.resolve(style),
         Weight::Body => egui::TextStyle::Body.resolve(style),
         Weight::Heading => {
             let mut font = egui::TextStyle::Body.resolve(style);
-            font.size = 20.0;
+            font.size *= super::HEADLINE_SCALE;
             font
         }
     }
@@ -990,6 +1451,19 @@ fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) {
 /// One line of spans as an [`egui::text::LayoutJob`]: the text every span
 /// draws, in order, each in the format its kind asks for.
 ///
+/// # Why a chip has two loudnesses
+///
+/// The tier comes from [`Span::chip_tier`], which reads it out of the
+/// character, and never from the label: a view that recognised `[LF]` would
+/// be reading a label, and a label is the one thing on screen that a command
+/// may contain literally. A loud chip keeps the box and the warning colour; a
+/// structural one — a newline, a carriage return, a tab — is a compact glyph
+/// in the quiet colour with no box at all, because a heredoc's ten line
+/// endings shouting as loudly as a bidi override teaches the reader to skip
+/// both. The glyph is still not the command's own text and cannot be mistaken
+/// for it: every character either pane draws as itself is ASCII printable, and
+/// none of these glyphs is.
+///
 /// # Why a separator is not faded
 ///
 /// The model calls a separator "dimmed, kept on screen", and the obvious
@@ -1014,17 +1488,29 @@ fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text
             // Chips are hatch's word, not the agent's: a background is what
             // says "this box is a substitution", and the label inside it is
             // the only text in either pane that is not the source's own
-            // bytes.
-            SpanKind::Chip { .. } => egui::TextFormat {
-                color: palette.warn,
-                background: palette.chip_bg,
-                ..plain.clone()
+            // bytes. Structure is the exception, and it is quieter rather
+            // than absent -- see above.
+            SpanKind::Chip { .. } => match span.chip_tier() {
+                Some(ChipTier::Structural) => {
+                    egui::TextFormat { color: palette.quiet, ..plain.clone() }
+                }
+                _ => egui::TextFormat {
+                    color: palette.warn,
+                    background: palette.chip_bg,
+                    ..plain.clone()
+                },
             },
             SpanKind::Separator => {
                 egui::TextFormat { background: palette.separator_bg, ..plain.clone() }
             }
             SpanKind::Danger => egui::TextFormat { color: palette.danger, ..plain.clone() },
-            SpanKind::Command | SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
+            // Decoration, and additive only: more contrast and a cooler hue,
+            // never a box, never a fade, never a substitution.
+            SpanKind::Command => {
+                egui::TextFormat { color: palette.command, ..plain.clone() }
+            }
+            SpanKind::Quoted => egui::TextFormat { color: palette.quoted, ..plain.clone() },
+            SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
         job.append(&span.display_text(), 0.0, format);
 
@@ -1380,10 +1866,11 @@ mod tests {
         let rows = crate::render::diff::side_by_side("ab\n", "a\u{202e}b\n");
         assert_eq!(longest_drawn_line(&rows), 7, "[RLO] was counted as one character");
 
-        // The terminator counts only where it is drawn. These two rows differ
-        // only in their line ending, so both sides show `[LF]` or `[CR][LF]`.
+        // The terminator counts only where it is drawn, and it is drawn in
+        // the structural tier: these two rows differ only in their line
+        // ending, so both sides show `↵` or `⇤↵`, one character each.
         let endings = crate::render::diff::side_by_side("ab\n", "ab\r\n");
-        assert_eq!(longest_drawn_line(&endings), 2 + "[CR][LF]".len());
+        assert_eq!(longest_drawn_line(&endings), 2 + "\u{21E4}\u{21B5}".chars().count());
     }
 
     #[test]
@@ -1393,14 +1880,22 @@ mod tests {
     }
 
     #[test]
-    fn a_column_is_what_is_left_after_the_gutters_and_the_gap() {
-        // 2 + 2 gutter, 2 gap, and the rest halved.
-        assert_eq!(column_chars(86), 40);
-        assert_eq!(column_chars(87), 40, "an odd character cannot be split between columns");
+    fn a_column_is_what_is_left_after_the_furniture_and_the_gap() {
+        // A diff column: 2 + 2 gutter, 2 gap, and the rest halved.
+        assert_eq!(column_chars(86, GUTTER_CHARS), 40);
+        assert_eq!(
+            column_chars(87, GUTTER_CHARS),
+            40,
+            "an odd character cannot be split between columns"
+        );
+        // A command pane has no gutter, so the same width holds more.
+        assert_eq!(column_chars(86, 0), 42);
+        assert_eq!(column_chars(6, 0), 2, "the gap is still spent");
         // Narrower than its own furniture is no column at all, not a panic
         // and not a negative width.
-        assert_eq!(column_chars(6), 0);
-        assert_eq!(column_chars(0), 0);
+        assert_eq!(column_chars(6, GUTTER_CHARS), 0);
+        assert_eq!(column_chars(0, GUTTER_CHARS), 0);
+        assert_eq!(column_chars(0, 0), 0);
     }
 
     #[test]
@@ -1472,6 +1967,407 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_glyph_the_panes_draw_is_one_monospace_advance() {
+        // What the whole character-count fit rests on. A drawn line is
+        // measured in characters and laid out in pixels, and the two agree
+        // only while every character is one advance of the pane's own font.
+        // ASCII is by definition; these are not, and one of them -- the
+        // control picture `␍` an earlier draft used for a carriage return --
+        // is in none of the fonts the window ships and measured zero, drawing
+        // as nothing at all. This test is what caught that, and what stops the
+        // next such glyph reaching a reader.
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let font = font(Weight::Mono, ui.style());
+                let width =
+                    |c: char| ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, c));
+                let ascii = width('0');
+                assert!(ascii > 0.0, "the monospace font draws nothing at all");
+                // The three compact chip glyphs, and the arrow a variable's
+                // note is drawn with.
+                for c in ['\u{2192}', '\u{21B5}', '\u{21E4}'] {
+                    assert_eq!(
+                        width(c),
+                        ascii,
+                        "U+{:04X} is not one advance of the pane's font",
+                        c as u32
+                    );
+                }
+                assert_eq!(width('\u{2192}'), ascii, "the note's arrow is measured as one too");
+            },
+        );
+        // epaint refuses to be dropped holding texture deltas nobody applied.
+        out.textures_delta.clear();
+    }
+
+    /// Run one frame at `points` and hand back what a caller measured.
+    fn at_font_size<T>(points: f32, mut measure: impl FnMut(&Ui) -> T) -> T {
+        let ctx = egui::Context::default();
+        crate::prompt_ui::apply_font_size(&ctx, points);
+        let mut measured = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| measured = Some(measure(ui)),
+        );
+        out.textures_delta.clear();
+        measured.expect("the frame ran")
+    }
+
+    #[test]
+    fn a_column_is_measured_in_the_font_the_window_is_actually_drawing_in() {
+        // The fit rule is the reason the font size cannot be a number the
+        // drawing code knows and the measuring code does not. A constant
+        // advance pinned to one size would go on claiming that two columns
+        // fit after the reader chose a larger one, and the reader would get
+        // truncation or overflow instead of the honest fallback.
+        let small = at_font_size(12.0, |ui| (advance(ui), pane_chars(ui, 2)));
+        let large = at_font_size(24.0, |ui| (advance(ui), pane_chars(ui, 2)));
+
+        assert!(large.0 > small.0 * 1.9, "a doubled font did not widen a character");
+        assert!(
+            large.1 * 2 <= small.1 + 4,
+            "a doubled font left a column holding about as much: {} against {}",
+            large.1,
+            small.1
+        );
+        assert!(
+            column_chars(large.1, 0) < column_chars(small.1, 0),
+            "the fit rule did not follow the font"
+        );
+    }
+
+    #[test]
+    fn a_framed_scrolling_box_costs_the_width_of_its_own_furniture() {
+        // The view has to be chosen before the box that would report its own
+        // width exists, so the furniture is subtracted rather than measured.
+        // What has to be true of that subtraction: it takes something, it
+        // takes the same amount per box, and what it takes is a border and a
+        // scroll bar rather than a rounding error or a quarter of the window.
+        at_font_size(16.0, |ui| {
+            let (none, one, two) = (ui.available_width(), text_width(ui, 1), text_width(ui, 2));
+            assert!(one < none, "a framed, scrolling box cost nothing at all");
+            assert!(two < one, "the second box cost nothing");
+            let furniture = none - one;
+            assert!(
+                (furniture - (one - two)).abs() < 0.01,
+                "two boxes cost {} and one costs {furniture}",
+                none - two
+            );
+            assert!(furniture > 8.0, "the furniture is {furniture}, which is not a border");
+            assert!(furniture < none / 4.0, "the furniture is {furniture} of {none}");
+        });
+    }
+
+    #[test]
+    fn a_row_is_a_line_of_text_and_the_gap_to_the_next_one() {
+        // The scroll link turns a line index into an offset by multiplying by
+        // this, so it has to be the whole of a row: a bare text height would
+        // put the follower steadily above the line it is meant to be on.
+        at_font_size(16.0, |ui| {
+            let text = ui.text_style_height(&egui::TextStyle::Monospace);
+            let row = row_height(ui);
+            assert!(row > text, "the gap between two lines was dropped: {row} against {text}");
+            assert!(row < 2.0 * text, "the gap is a gap, not a second line: {row}");
+        });
+    }
+
+    #[test]
+    fn the_raw_pane_yields_most_of_a_stacked_window_to_the_annotated_one() {
+        assert_eq!(raw_ceiling(100.0), 100.0 * RAW_SHARE);
+        assert!(raw_ceiling(100.0) < 50.0, "the pane a reader falls back to took half the window");
+        assert!(raw_ceiling(100.0) > 0.0, "and it took none of it");
+        assert_eq!(raw_ceiling(0.0), 0.0, "no window is no ceiling, not a panic");
+    }
+
+    #[test]
+    fn a_font_the_window_cannot_measure_still_leaves_a_column_of_some_width() {
+        // `advance` floors at one point, so a font that reported nothing
+        // gives a very narrow column rather than an infinitely wide one --
+        // and an infinitely wide column is the value that would claim every
+        // line fits.
+        let chars = at_font_size(12.0, |ui| pane_chars(ui, 2));
+        assert!(chars > 0, "a pane held no characters at all");
+        assert!(chars < 100_000, "a pane held an impossible number of them");
+    }
+
+    // ---- which arrangement the command panes get ---------------------------
+
+    #[test]
+    fn the_widest_command_line_is_measured_as_it_is_drawn() {
+        // The lines are the rendering's own, so a segment break shortens the
+        // longest line rather than being ignored.
+        assert_eq!(widest_line(&classify("ls -l")), 5);
+        assert_eq!(
+            widest_line(&render_command("ls -l; rm -rf target", &BTreeMap::new())),
+            " rm -rf target".chars().count(),
+            "the two segments are two lines and the longer one wins"
+        );
+        // A chip is one character in the command and one or five on screen.
+        assert_eq!(widest_line(&classify("a\u{202e}b")), 7, "[RLO] counted as one character");
+        // `a` and the `↵` that ends its line; `b` alone on the next.
+        assert_eq!(widest_line(&classify("a\nb")), 2, "the glyph ends the line it ends");
+        assert_eq!(widest_line(&classify("")), 0, "no lines, not one empty one");
+    }
+
+    #[test]
+    fn a_variables_note_is_part_of_the_line_it_has_to_fit_on() {
+        // The note is drawn inside the line, after the reference, so a fit
+        // that ignored it would put the annotated pane's longest line off the
+        // side of its column.
+        let env = BTreeMap::from([("HOME".to_string(), "/home/u".to_string())]);
+        let spans = render_command("echo $HOME", &env);
+
+        assert_eq!(widest_line(&spans), "echo $HOME \u{2192} /home/u ".chars().count());
+        assert!(widest_line(&spans) > widest_line(&classify("echo $HOME")), "the note is free");
+    }
+
+    #[test]
+    fn the_two_panes_share_the_rule_the_diff_uses() {
+        // One question -- can a column this wide hold the widest thing that
+        // would go in it? -- and one answer, so the two views cannot drift
+        // apart about what "fits" means.
+        assert!(fits_two_columns(40, 40), "a line that exactly fits does");
+        assert!(!fits_two_columns(41, 40), "one character over does not");
+        assert!(fits_two_columns(0, 40), "nothing to draw fits");
+        assert!(!fits_two_columns(0, 0), "a column with no room falls back however short");
+
+        assert_eq!(command_view(40, 40), CommandView::SideBySide);
+        assert_eq!(command_view(41, 40), CommandView::Stacked);
+        assert_eq!(diff_view(40, 40), DiffView::SideBySide);
+        assert_eq!(diff_view(41, 40), DiffView::Unified);
+    }
+
+    #[test]
+    fn the_command_panes_say_so_when_they_could_not_be_put_side_by_side() {
+        // Only in the fallback. Side by side draws the same two labelled
+        // panes as stacking does and only moves them, so a permanent caption
+        // would be another line a reader learns to skip.
+        assert_eq!(command_caption(CommandView::SideBySide, 4, 40), None);
+
+        let stacked = command_caption(CommandView::Stacked, 214, 40).expect("a caption");
+        assert!(stacked.contains("214"), "the fallback does not say what was too long");
+        assert!(stacked.contains("40"), "nor what it was too long for");
+        assert!(stacked.contains("Widen"), "nor what the reader can do about it");
+    }
+
+    // ---- keeping the two stacked panes together ----------------------------
+
+    /// A pane's lines as `(source offset, row)` pairs, for readable
+    /// expectations.
+    fn rows_of(pane: &PaneRows) -> Vec<(usize, usize)> {
+        pane.lines.iter().map(|line| (line.at, line.row)).collect()
+    }
+
+    #[test]
+    fn a_lines_place_in_the_command_is_what_the_two_panes_share() {
+        // The annotated pane opens a line at every separator as well as at
+        // every newline, so the two panes have different line counts over the
+        // same string -- which is exactly why a line number is not a shared
+        // coordinate and a byte offset is.
+        let source = "ls; rm\ncat";
+        let raw = pane_lines(&classify(source), None);
+        let annotated = pane_lines(&render_command(source, &BTreeMap::new()), None);
+
+        assert_eq!(rows_of(&raw), vec![(0, 0), (7, 1)], "the raw pane breaks only at the newline");
+        assert_eq!(
+            rows_of(&annotated),
+            vec![(0, 0), (3, 1), (7, 2)],
+            "the annotated pane breaks at the `;` too"
+        );
+        assert_eq!((raw.rows, annotated.rows), (2, 3));
+    }
+
+    #[test]
+    fn a_wrapped_line_takes_the_rows_it_takes() {
+        // The link's other half. A pane that assumed one row per line would
+        // put the follower steadily too high down a pane with wrapping above
+        // the target, which is the silent kind of drift.
+        let spans = classify("aaaaaaaaaa\nbb\ncc");
+
+        assert_eq!(
+            rows_of(&pane_lines(&spans, None)),
+            vec![(0, 0), (11, 1), (14, 2)],
+            "a pane that does not reflow gives every line one row"
+        );
+        // Eleven characters -- ten and the `↵` -- across a four-character
+        // pane is three rows, so the lines below start three rows down.
+        let wrapped = pane_lines(&spans, Some(4));
+        assert_eq!(rows_of(&wrapped), vec![(0, 0), (11, 3), (14, 4)]);
+        assert_eq!(wrapped.rows, 5);
+
+        // A width of nothing is not a division by zero and not an infinite
+        // number of rows: it is a pane that cannot be measured, and one row
+        // per line is the answer that never scrolls past anything.
+        assert_eq!(rows_of(&pane_lines(&spans, Some(0))), vec![(0, 0), (11, 1), (14, 2)]);
+        // An empty rendering has no lines and no rows, not one blank row.
+        assert_eq!(pane_lines(&classify(""), None), PaneRows { lines: Vec::new(), rows: 0 });
+    }
+
+    /// The two panes of `ls; rm\ncat`, which is the shape the link is for:
+    /// two lines against three, over the same string.
+    fn linked_panes() -> (PaneRows, PaneRows) {
+        let source = "ls; rm\ncat";
+        (
+            pane_lines(&classify(source), None),
+            pane_lines(&render_command(source, &BTreeMap::new()), None),
+        )
+    }
+
+    #[test]
+    fn a_line_in_one_pane_finds_the_line_it_is_on_in_the_other() {
+        let (raw, annotated) = linked_panes();
+
+        // Down: the annotated pane's extra line is on the raw pane's first.
+        assert_eq!(linked_line(&annotated.lines, &raw.lines, 0), 0);
+        assert_eq!(linked_line(&annotated.lines, &raw.lines, 1), 0, "`; rm` is still line one");
+        assert_eq!(linked_line(&annotated.lines, &raw.lines, 2), 1);
+        // Up: the raw pane's line two is the annotated pane's line three.
+        assert_eq!(linked_line(&raw.lines, &annotated.lines, 0), 0);
+        assert_eq!(linked_line(&raw.lines, &annotated.lines, 1), 2);
+        // Never past the place asked about, and never out of bounds.
+        assert_eq!(linked_line(&raw.lines, &annotated.lines, 9), 0, "a line that is not there");
+        assert_eq!(linked_line(&[], &annotated.lines, 0), 0);
+        assert_eq!(linked_line(&raw.lines, &[], 1), 0);
+    }
+
+    #[test]
+    fn a_panes_offset_reads_as_the_line_it_is_showing() {
+        let lines = pane_lines(&classify("aaaaaaaaaa\nbb\ncc"), Some(4)).lines;
+
+        assert_eq!(line_at(0.0, 10.0, &lines), 0);
+        assert_eq!(line_at(9.9, 10.0, &lines), 0, "part of a row is still that row");
+        assert_eq!(line_at(20.0, 10.0, &lines), 0, "and so is a wrapped row of the same line");
+        assert_eq!(line_at(30.0, 10.0, &lines), 1, "the line whose first row this is");
+        assert_eq!(line_at(1e9, 10.0, &lines), 2, "past the end is the last line, not a panic");
+        assert_eq!(line_at(-5.0, 10.0, &lines), 0, "and above the top is the first");
+        assert_eq!(line_at(50.0, 10.0, &[]), 0, "a pane with no lines is on line zero");
+    }
+
+    #[test]
+    fn the_follower_is_never_asked_for_more_than_it_can_give() {
+        // A clamped offset is indistinguishable from a reader scrolling, so
+        // the estimate is deliberately short of the pane's real maximum.
+        assert_eq!(max_offset(10, 10.0, 40.0), 60.0);
+        assert_eq!(max_offset(3, 10.0, 40.0), 0.0, "a pane that fits does not scroll");
+        assert_eq!(max_offset(0, 10.0, 40.0), 0.0);
+    }
+
+    #[test]
+    fn the_pane_the_reader_is_scrolling_is_handed_back_its_own_offset() {
+        // The driver must never be pulled away from where the reader put it,
+        // which is also what stops the two panes fighting: it is asked for
+        // exactly what it reported, so it never disagrees.
+        let (raw, annotated) = linked_panes();
+        let link = ScrollLink { driver: Pane::Raw, offset: 13.0 };
+
+        assert_eq!(requested_offset(link, Pane::Raw, &raw, &raw, 10.0, 100.0), 13.0);
+        // Raw line one is annotated line two, and there is room for it.
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 10.0), 20.0);
+        // In a viewport that leaves nowhere to scroll, the follower stays put
+        // rather than being asked for an offset it would have to clamp.
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn whichever_pane_moved_is_the_one_the_other_follows() {
+        let link = ScrollLink { driver: Pane::Raw, offset: 10.0 };
+
+        // Nobody moved: both handed back what they were given.
+        assert_eq!(drove(link, 10.0, 10.0, 20.0, 20.0), link);
+        // The follower moved, so it takes over.
+        assert_eq!(
+            drove(link, 10.0, 10.0, 55.0, 20.0),
+            ScrollLink { driver: Pane::Annotated, offset: 55.0 }
+        );
+        // The driver moved, and stays the driver at its new place.
+        assert_eq!(
+            drove(link, 44.0, 10.0, 20.0, 20.0),
+            ScrollLink { driver: Pane::Raw, offset: 44.0 }
+        );
+        // Rounding inside a scroll area is not a reader, and half a logical
+        // pixel exactly is the line: smaller than anything a hand produces
+        // and larger than anything a scroll area rounds by.
+        assert_eq!(drove(link, 10.2, 10.0, 20.0, 20.1), link);
+        assert_eq!(
+            drove(link, 10.0 + SCROLL_EPSILON, 10.0, 20.0 + SCROLL_EPSILON, 20.0),
+            link,
+            "a pane that moved by exactly the epsilon was read as a reader"
+        );
+        assert_eq!(
+            drove(link, 10.0, 10.0, 20.0 + SCROLL_EPSILON * 1.01, 20.0),
+            ScrollLink { driver: Pane::Annotated, offset: 20.0 + SCROLL_EPSILON * 1.01 },
+            "a pane that moved by more than the epsilon was read as rounding"
+        );
+        assert_eq!(
+            drove(link, 10.0 + SCROLL_EPSILON * 1.01, 10.0, 20.0, 20.0),
+            ScrollLink { driver: Pane::Raw, offset: 10.0 + SCROLL_EPSILON * 1.01 }
+        );
+    }
+
+    #[test]
+    fn a_linked_pane_settles_rather_than_oscillating() {
+        // The failure this shape exists to avoid: an offset fed back into the
+        // pane that produced it, with the two dragging each other a little
+        // further apart every frame. Two frames of the real arithmetic, with
+        // the reader scrolling once and then stopping.
+        let (raw, annotated) = linked_panes();
+        let (row, viewport) = (10.0, 10.0);
+        let mut link = ScrollLink::default();
+
+        // Frame one: the reader drags the raw pane to its second line.
+        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, viewport);
+        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, viewport);
+        link = drove(link, 10.0, want_raw, want_annotated, want_annotated);
+        assert_eq!(link, ScrollLink { driver: Pane::Raw, offset: 10.0 });
+
+        // Frame two: nobody touches anything, and both panes hand back what
+        // they were asked for.
+        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, viewport);
+        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, viewport);
+        assert_eq!(want_raw, 10.0, "the driver was pulled off its own line");
+        assert_eq!(want_annotated, 20.0, "the follower is on the line the driver is on");
+        assert_eq!(
+            drove(link, want_raw, want_raw, want_annotated, want_annotated),
+            link,
+            "a frame nobody scrolled changed the shared position"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_follower_lands_on_the_linked_line_and_never_past_it() {
+        // The bound on the estimate: egui wraps at or before the character
+        // count says, so this can put the follower a row or two above the
+        // line the driver is on -- showing context before it -- and never
+        // below it, which is the direction that would hide the line the
+        // reader was looking for.
+        let source = "aaaaaaaaaa; bb";
+        let raw = pane_lines(&classify(source), None);
+        let annotated = pane_lines(&render_command(source, &BTreeMap::new()), Some(4));
+        let link = ScrollLink { driver: Pane::Raw, offset: 0.0 };
+
+        // One raw line, so the follower is asked for the top whatever the
+        // wrapping below it.
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 10.0), 0.0);
+        // And the wrapping really is counted: the second segment does not
+        // start on row one.
+        assert!(annotated.lines[1].row > 1, "the wrapped first line took one row");
+    }
+
     // ---- layout ------------------------------------------------------------
 
     #[test]
@@ -1528,10 +2424,12 @@ mod tests {
             quiet: Color32::from_rgb(2, 0, 0),
             danger: Color32::from_rgb(3, 0, 0),
             warn: Color32::from_rgb(4, 0, 0),
-            chip_bg: Color32::from_rgb(5, 0, 0),
-            separator_bg: Color32::from_rgb(6, 0, 0),
-            value_bg: Color32::from_rgb(7, 0, 0),
-            gap_bg: Color32::from_rgb(8, 0, 0),
+            command: Color32::from_rgb(5, 0, 0),
+            quoted: Color32::from_rgb(6, 0, 0),
+            chip_bg: Color32::from_rgb(7, 0, 0),
+            separator_bg: Color32::from_rgb(8, 0, 0),
+            value_bg: Color32::from_rgb(9, 0, 0),
+            gap_bg: Color32::from_rgb(10, 0, 0),
         }
     }
 
@@ -1632,6 +2530,103 @@ mod tests {
     }
 
     #[test]
+    fn a_structural_chip_is_quiet_and_a_loud_one_is_boxed() {
+        // The whole of the tier, where it turns into pixels. A newline that
+        // shouted as loudly as a bidi override is what teaches a reader to
+        // skip both.
+        let palette = a_palette();
+        let job = job_of(&classify("a\nb\u{202e}"));
+
+        let newline = job.text.find('\u{21B5}').expect("the glyph is on screen");
+        assert_eq!(format_at(&job, newline).color, palette.quiet, "a newline shouted");
+        assert_eq!(
+            format_at(&job, newline).background,
+            Color32::TRANSPARENT,
+            "a newline was boxed like a substitution the reader has to look at"
+        );
+
+        let override_at = job.text.find("[RLO]").expect("the label is on screen");
+        assert_eq!(format_at(&job, override_at).color, palette.warn);
+        assert_eq!(format_at(&job, override_at).background, palette.chip_bg);
+    }
+
+    #[test]
+    fn the_tier_is_read_from_the_character_and_not_from_the_label() {
+        // A view that recognised `[LF]` would be reading a label, and a label
+        // is the one thing on screen a command may contain literally. Here
+        // the command contains that literal, and it must draw loudly like the
+        // ordinary text it is -- not quietly like a newline.
+        let palette = a_palette();
+        let job = job_of(&classify("[LF]"));
+
+        assert_eq!(job.text, "[LF]", "four characters of the command, drawn as themselves");
+        assert_eq!(format_at(&job, 0).color, palette.text, "text was drawn as hatch's own word");
+        assert_eq!(format_at(&job, 0).background, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn the_word_that_runs_and_the_strings_are_drawn_apart_from_the_rest() {
+        let palette = a_palette();
+        let spans = render_command("ls 'a b' -l", &BTreeMap::new());
+        let job = job_of(&spans);
+
+        assert_eq!(job.text, "ls 'a b' -l", "highlighting changed the text");
+        assert_eq!(format_at(&job, 0).color, palette.command, "the command name is not marked");
+        assert_eq!(format_at(&job, 3).color, palette.quoted, "the string is not marked");
+        assert_eq!(format_at(&job, 9).color, palette.text, "an argument took a highlight");
+    }
+
+    #[test]
+    fn highlighting_only_ever_adds_contrast() {
+        // The rule that keeps decoration from becoming load-bearing: a
+        // highlighted span is drawn as its own text, in the pane's own font,
+        // with nothing behind it and nothing done to it that a reader who
+        // ignores colour would notice.
+        let spans = render_command("ls 'a b'", &BTreeMap::new());
+        let job = job_of(&spans);
+
+        for section in &job.sections {
+            assert_eq!(section.format.background, Color32::TRANSPARENT, "a highlight was boxed");
+            assert!(!section.format.italics, "a highlight leaned");
+            assert_eq!(section.format.font_id, egui::FontId::monospace(12.0));
+        }
+    }
+
+    #[test]
+    fn the_highlight_colours_are_not_the_colours_that_already_mean_something() {
+        // Red is danger, orange is hatch substituting for a character, grey
+        // is hatch talking. A palette that spent one of those on a keyword
+        // would make the meaningful ones ordinary, so the two the highlight
+        // uses have to be distinct from all of them -- and from each other.
+        let visuals = egui::Visuals::dark();
+        let palette = Palette {
+            text: visuals.text_color(),
+            quiet: visuals.weak_text_color(),
+            danger: visuals.error_fg_color,
+            warn: visuals.warn_fg_color,
+            command: visuals.strong_text_color(),
+            quoted: visuals.hyperlink_color,
+            chip_bg: visuals.code_bg_color,
+            separator_bg: visuals.faint_bg_color,
+            value_bg: visuals.faint_bg_color,
+            gap_bg: visuals.extreme_bg_color,
+        };
+        let named = [
+            ("text", palette.text),
+            ("quiet", palette.quiet),
+            ("danger", palette.danger),
+            ("warn", palette.warn),
+            ("command", palette.command),
+            ("quoted", palette.quoted),
+        ];
+        for (i, (a, colour)) in named.iter().enumerate() {
+            for (b, other) in &named[i + 1..] {
+                assert_ne!(colour, other, "{a} and {b} are the same colour");
+            }
+        }
+    }
+
+    #[test]
     fn a_separator_is_boxed_and_never_faded() {
         // A `;` nobody notices is how a second command gets approved along
         // with the first, so the de-emphasis is a block behind it and never
@@ -1650,7 +2645,11 @@ mod tests {
         let style = egui::Style::default();
         assert_eq!(font(Weight::Mono, &style), font(Weight::Wrapped, &style));
         assert_ne!(font(Weight::Body, &style).family, font(Weight::Mono, &style).family);
-        assert_eq!(font(Weight::Heading, &style).size, 20.0);
+        assert_eq!(
+            font(Weight::Heading, &style).size,
+            font(Weight::Body, &style).size * crate::prompt_ui::HEADLINE_SCALE,
+            "the headline stopped following the size the reader chose"
+        );
         assert_eq!(font(Weight::Heading, &style).family, font(Weight::Body, &style).family);
     }
 

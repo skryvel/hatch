@@ -153,6 +153,48 @@
 //! distrusts the annotation can read straight through it. `over_annotation_
 //! where_the_model_stops` pins the list, so a change here has to be a
 //! deliberate one.
+//!
+//! # Highlighting: the same scanner again, and why not `syntect`
+//!
+//! [`highlight`] is the last pass. It marks the word that names what runs and
+//! the quoted strings, so the annotated pane shows *structure* rather than
+//! being the raw pane with line breaks in it.
+//!
+//! The spec called for `syntect` with the bash grammar and this does not use
+//! it, for three reasons in descending order of weight:
+//!
+//! 1. **Two models of quoting can disagree about the same byte.** [`Scan`]
+//!    already decides where a string starts and ends, and both other passes
+//!    ask it: that is why `echo 'a; b'` is one segment and `'$HOME'` is not
+//!    annotated. A second grammar answering the same question is exactly the
+//!    "second hand-rolled quote tracker" [`Scan`]'s own docs warn about, and
+//!    the disagreement would be visible — a string drawn as quoted across a
+//!    `;` that the segmenter split on.
+//! 2. **The unit is wrong.** `syntect` highlights a line into styled ranges;
+//!    this crate needs kinds attached to spans that already exist and that
+//!    were cut by other passes. Every chip, separator and `$NAME` is already
+//!    a span boundary, so its output would have to be intersected with them
+//!    anyway — which is the whole of the work below.
+//! 3. **It brings a palette.** A `syntect` theme assigns colours, and the
+//!    colours in this window already mean things: red is danger, the chip's
+//!    orange is hatch substituting for a character, italic grey is hatch's
+//!    own note. A theme that spent red on a keyword would make the meaningful
+//!    ones ordinary.
+//!
+//! What it costs is scope, and the scope is deliberately small: the first
+//! word and the quoted strings, and nothing else. There is no keyword list,
+//! no builtin table and no flag rule, because each one is another colour, and
+//! a pane where six things are coloured is a pane where the two that matter
+//! are not.
+//!
+//! **Highlighting is decoration and is never load-bearing.** Every span it
+//! marks is still drawn as its own text at full contrast — nothing is faded,
+//! nothing is replaced, nothing is hidden — so a reader who ignores colour
+//! entirely reads the same characters in the same order. The raw pane beside
+//! it carries no highlighting at all and remains the thing the approval
+//! covers. And the model gaps above are inherited unchanged: where the
+//! scanner is wrong about a quote, the highlight is wrong in the same
+//! direction, and `highlighting_where_the_model_stops` pins those cases.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -562,6 +604,233 @@ pub fn annotate_variables(spans: Spans, env: &BTreeMap<String, String>) -> Spans
     builder.finish()
 }
 
+// ---- highlighting ----------------------------------------------------------
+
+/// The byte ranges of the segments `command` is drawn as, excluding the
+/// separator tokens between them.
+///
+/// A newline's boundary is reported one past the newline, and the newline is
+/// whitespace, so it ends the word before it without needing to be excluded
+/// here. A separator token is not whitespace and does have to be: `ls;rm`
+/// would otherwise be one word called `ls;rm`.
+fn segments(command: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for boundary in boundaries(command) {
+        let (stop, next) = match boundary {
+            Boundary::Separator(token) => (token.start, token.end),
+            Boundary::Newline(end) => (end, end),
+        };
+        out.push(start..stop);
+        start = next;
+    }
+    out.push(start..command.len());
+    out
+}
+
+/// True where a word ends: unescaped whitespace outside quotes.
+///
+/// Quoting is the whole of it, and it is the scanner's answer rather than a
+/// second one. `echo "a b"` is two words to the shell, so it has to be two
+/// words here — a highlight that called `"a` a word would draw a boundary the
+/// shell does not have.
+fn is_word_break(c: &Scanned) -> bool {
+    !c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace()
+}
+
+/// True for `NAME=…`, the form a leading word takes when it is an assignment
+/// rather than the command.
+///
+/// `FOO=1 ls` runs `ls`, so drawing `FOO=1` as the word that names what runs
+/// would be a highlight contradicting the text — the one thing decoration in
+/// this window may never do. The grammar is the shell's: a name, then `=`.
+/// `env FOO=1 ls` is unaffected, because `env` is not an assignment and is
+/// genuinely what runs.
+fn is_assignment(word: &str) -> bool {
+    let Some(at) = word.find('=') else {
+        return false;
+    };
+    // `=1` has no name in front of the `=`, and an empty name fails the
+    // first-character test on its own -- no separate guard for it, which
+    // would be a second way to say the same thing and a second way to get it
+    // wrong.
+    let name = &word[..at];
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(is_name_char)
+}
+
+/// The word of `segment` that names what will run, or `None` when the segment
+/// has none — it is empty, it is nothing but assignments, or the word it
+/// would be carries a quote character.
+///
+/// `at` is a cursor into `scanned` that this advances past `segment`, so a
+/// command of ten thousand segments costs one walk of the command rather than
+/// one walk per segment. The input is agent-controlled, so that is the
+/// difference between linear and quadratic in something the agent chooses.
+///
+/// # Why a quoted word is declined
+///
+/// `"ls" -l` really does run `ls`, so the refusal costs a highlight on a real
+/// command name. What it buys is that a [`SpanKind::Command`] region can
+/// never overlap a [`SpanKind::Quoted`] one — a word that is inside quotes
+/// extends to include them, since a quoted space is not a word break — and
+/// two overlapping regions have no honest drawing.
+fn command_word(
+    command: &str,
+    scanned: &[Scanned],
+    at: &mut usize,
+    segment: &Range<usize>,
+) -> Option<Range<usize>> {
+    // Two binary searches rather than two hand-rolled cursor loops. The
+    // offsets ascend, so the run belonging to this segment is a slice, and
+    // taking it as one is what makes `at` impossible to fail to advance --
+    // the input is agent-controlled, and a cursor loop that does not move is
+    // a window that never opens.
+    *at += scanned[*at..].partition_point(|c| c.offset < segment.start);
+    let run = &scanned[*at..];
+    let run = &run[..run.partition_point(|c| c.offset < segment.end)];
+    *at += run.len();
+
+    let mut word: Option<usize> = None;
+    for c in run {
+        match (is_word_break(c), word) {
+            // A word closed by whitespace. An assignment is not the command,
+            // so it falls through to the arm below and the next word is
+            // tried; anything else is the answer.
+            (true, Some(start)) if !is_assignment(&command[start..c.offset]) => {
+                return claimable(command, start..c.offset);
+            }
+            (true, _) => word = None,
+            (false, None) => word = Some(c.offset),
+            (false, Some(_)) => {}
+        }
+    }
+    // A word that runs to the end of the segment is never closed by a break.
+    claimable(command, word?..segment.end)
+}
+
+/// `word`, unless this pass declines to call it the command: an assignment,
+/// or a word carrying a quote character.
+fn claimable(command: &str, word: Range<usize>) -> Option<Range<usize>> {
+    let text = &command[word.clone()];
+    (!is_assignment(text) && !text.contains(['\'', '"'])).then_some(word)
+}
+
+/// The byte range of every quoted string in `command`, delimiters included,
+/// in source order.
+///
+/// An unterminated string runs to the end of the command, which is what the
+/// scanner already believes about it — see
+/// `an_unterminated_quote_protects_the_rest_of_the_command` — so the
+/// highlight and the segmentation agree about how far the string reaches
+/// rather than each having a view.
+fn quoted_strings(command: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut open: Option<usize> = None;
+    for c in scan(command) {
+        if c.escaped {
+            continue;
+        }
+        match (open, c.quoting, c.ch) {
+            (None, Quoting::Normal, '\'' | '"') => open = Some(c.offset),
+            (Some(start), Quoting::Single, '\'') | (Some(start), Quoting::Double, '"') => {
+                out.push(start..c.offset + c.ch.len_utf8());
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        out.push(start..command.len());
+    }
+    out
+}
+
+/// Every region [`highlight`] wants to mark, in source order and never
+/// overlapping.
+fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
+    let scanned: Vec<Scanned> = scan(command).collect();
+    let mut at = 0;
+    let mut out: Vec<(Range<usize>, SpanKind)> = segments(command)
+        .iter()
+        .filter_map(|segment| command_word(command, &scanned, &mut at, segment))
+        .map(|word| (word, SpanKind::Command))
+        .collect();
+    out.extend(quoted_strings(command).into_iter().map(|range| (range, SpanKind::Quoted)));
+    out.sort_by_key(|(range, _)| range.start);
+    out
+}
+
+/// Mark the word that names what runs, and the quoted strings, so the
+/// annotated pane shows structure rather than the raw pane with line breaks
+/// in it.
+///
+/// The last pass in [`super::render_command`], and it has to be last: it
+/// claims spans, and [`annotate_variables`] leaves a claimed span alone, so
+/// running it earlier would cost every `$NAME` inside a command word or a
+/// double-quoted string its resolved value. A value is information; a colour
+/// is decoration, and the pass that produces decoration yields.
+///
+/// # A refinement, and only of what nobody else has claimed
+///
+/// It subdivides `Plain` spans and re-emits every other kind exactly as it
+/// found it, so a chip stays a chip, a separator stays a separator and a
+/// `$HOME` inside `"…"` keeps its value. A region that straddles such a span
+/// — a quoted string with a chip in it — is drawn on the plain parts either
+/// side and simply does not cover the chip, which is the right answer: the
+/// chip is louder than the highlight and has more to say.
+///
+/// Walking into a fresh [`SpanBuilder`] rather than calling [`Spans::split`]
+/// per region, for the reason [`annotate_variables`] gives at length: split
+/// copies both halves' text, and the number of regions is chosen by the
+/// agent.
+///
+/// # Panics
+///
+/// If the spans do not tile the source, which would be a bug here or in the
+/// scanner. A panicking prompt window is a dead prompt window, and hatch
+/// treats that as a denial, so failing this way fails closed.
+pub fn highlight(spans: Spans) -> Spans {
+    let source = spans.source();
+    let regions = regions(source);
+    let mut builder = SpanBuilder::new(source);
+    let mut next = 0;
+
+    for span in spans.iter() {
+        if span.break_before() {
+            builder.break_next();
+        }
+        let range = span.range();
+        // Regions that ended before this span began are finished with. This
+        // is the only place `next` moves, so a region cannot be skipped by
+        // one path and re-drawn by another.
+        next += regions[next..].partition_point(|(region, _)| region.end <= range.start);
+
+        let rest = match span.kind() {
+            // Every region reaching into this span, clipped to it. At most
+            // one of them runs past the end, because the region after that
+            // one would have to start past the end too, so `take_while` ends
+            // the walk exactly there and the next span picks that region up
+            // where this one left off.
+            SpanKind::Plain => {
+                let reaching =
+                    regions[next..].iter().take_while(|(region, _)| region.start < range.end);
+                for (region, kind) in reaching {
+                    builder.push_to(region.start.max(range.start), SpanKind::Plain);
+                    builder.push_to(region.end.min(range.end), kind.clone());
+                }
+                SpanKind::Plain
+            }
+            // A span another pass has claimed keeps its kind, and any region
+            // inside it is simply not drawn.
+            kind => kind.clone(),
+        };
+        builder.push_to(range.end, rest);
+    }
+
+    builder.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -663,18 +932,23 @@ mod tests {
     #[test]
     fn a_break_is_requested_after_each_separator() {
         let spans = render_command("a; b");
-        assert_eq!(spans.len(), 3, "a, the separator, and the rest");
+        assert_eq!(spans.len(), 4, "a, the separator, the space, and b");
         assert_eq!(spans[1].text(), ";");
         assert!(!spans[1].break_before(), "layout never lands on the separator itself");
         assert!(spans[2].break_before(), "it lands on the span after it");
-        assert_eq!(spans[2].text(), " b", "and no whitespace is trimmed to tidy the line");
+        assert_eq!(spans[2].text(), " ", "and no whitespace is trimmed to tidy the line");
+        assert_eq!(spans[3].text(), "b");
     }
 
     #[test]
     fn every_separator_gets_a_break_after_it() {
         // The trailing space belongs to the run, not to the separator that
         // comes after it: nothing is trimmed on either side of a boundary.
-        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec![" b ", " c ", " d ", " e"]);
+        // The break lands on the space that follows each separator, which is
+        // where the segment's own text begins: the highlight pass cuts the
+        // command word out of the run after it, and the space is what is left
+        // starting where the run did.
+        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec![" "; 4]);
     }
 
     #[test]
@@ -792,7 +1066,7 @@ mod tests {
         let spans = render_command("a\nb");
         assert!(separators(&spans).is_empty(), "the newline is not tagged Separator");
         assert_eq!(chips(&spans), vec!['\n'], "it is chipped, like every other control");
-        assert_eq!(spans[1].display_text(), "[LF]");
+        assert_eq!(spans[1].display_text(), "\u{21B5}");
         assert!(!spans[1].break_before(), "the chip closes its segment");
         assert!(spans[2].break_before(), "and the break lands after it");
         assert_eq!(unrender(&spans), "a\nb");
@@ -1129,6 +1403,234 @@ mod tests {
         assert!(variables(&spans).iter().all(|v| *v == ("$A", Some("/home/user"))));
         assert_eq!(unrender(&spans), command);
         assert!(spans.covers_source());
+    }
+
+    // --- highlighting: the word that runs, and the quoted strings ---------
+
+    /// Every span of one kind, as the window would draw it.
+    fn of_kind<'a>(spans: &'a Spans, kind: &SpanKind) -> Vec<&'a str> {
+        spans.iter().filter(|s| s.kind() == kind).map(Span::text).collect()
+    }
+
+    fn commands(spans: &Spans) -> Vec<&str> {
+        of_kind(spans, &SpanKind::Command)
+    }
+
+    fn quotes(spans: &Spans) -> Vec<&str> {
+        of_kind(spans, &SpanKind::Quoted)
+    }
+
+    #[test]
+    fn the_first_word_of_a_segment_is_the_one_that_names_what_runs() {
+        assert_eq!(commands(&render_command("ls -la /etc")), vec!["ls"]);
+        assert_eq!(commands(&render_command("  ls -la")), vec!["ls"], "leading space is skipped");
+        assert_eq!(commands(&render_command("ls")), vec!["ls"], "a command with no arguments");
+        assert_eq!(commands(&render_command("sudo rm -rf x")), vec!["sudo"], "sudo is what runs");
+    }
+
+    #[test]
+    fn every_segment_gets_its_own_command_word() {
+        assert_eq!(commands(&render_command("ls; rm -rf x")), vec!["ls", "rm"]);
+        assert_eq!(commands(&render_command("a && b || c | d")), vec!["a", "b", "c", "d"]);
+        assert_eq!(commands(&render_command("ls\ncat f")), vec!["ls", "cat"], "a newline too");
+        assert_eq!(commands(&render_command("ls;rm")), vec!["ls", "rm"], "with no space at all");
+    }
+
+    #[test]
+    fn a_segment_with_nothing_in_it_names_nothing() {
+        assert!(commands(&render_command("")).is_empty());
+        assert!(commands(&render_command(";")).is_empty());
+        assert!(commands(&render_command("   ")).is_empty());
+        assert_eq!(commands(&render_command("a;;b")), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_leading_assignment_is_not_the_command() {
+        // `FOO=1 ls` runs `ls`. Marking `FOO=1` as the word that names what
+        // runs would be decoration contradicting the text, which is the one
+        // thing highlighting in this window may never do.
+        assert_eq!(commands(&render_command("FOO=1 ls -l")), vec!["ls"]);
+        assert_eq!(commands(&render_command("A=1 B=2 make")), vec!["make"], "and any number");
+        assert_eq!(commands(&render_command("env FOO=1 ls")), vec!["env"], "env really runs");
+        assert!(commands(&render_command("FOO=1")).is_empty(), "an assignment alone runs nothing");
+        // A word that merely contains `=` is not an assignment.
+        assert_eq!(commands(&render_command("./x=y arg")), vec!["./x=y"]);
+        assert_eq!(commands(&render_command("=1 ls")), vec!["=1"], "no name before the `=`");
+    }
+
+    #[test]
+    fn a_quoted_string_is_marked_with_its_delimiters() {
+        // The quotes are what make the string one word to the shell, so a
+        // highlight that covered the interior and left them outside would
+        // draw the boundary in the wrong place.
+        assert_eq!(quotes(&render_command("echo 'hi there'")), vec!["'hi there'"]);
+        assert_eq!(quotes(&render_command("echo \"hi there\"")), vec!["\"hi there\""]);
+        assert_eq!(quotes(&render_command("a 'x' 'y'")), vec!["'x'", "'y'"], "one region each");
+        assert_eq!(
+            quotes(&render_command("echo \"it's here\"")),
+            vec!["\"it's here\""],
+            "the other kind of quote is ordinary text inside a string"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_string_runs_to_the_end_of_the_command() {
+        // The same answer the scanner already gives segmentation, so the two
+        // agree about how far the string reaches instead of each having a
+        // view.
+        assert_eq!(quotes(&render_command("echo 'a; b")), vec!["'a; b"]);
+    }
+
+    #[test]
+    fn an_escaped_quote_opens_no_string() {
+        assert!(quotes(&render_command(r#"echo \"a\""#)).is_empty());
+        assert_eq!(
+            quotes(&render_command(r#"echo "a\"b""#)),
+            vec![r#""a\"b""#],
+            "an escaped quote inside a string does not close it"
+        );
+    }
+
+    #[test]
+    fn a_command_word_carrying_a_quote_is_declined_rather_than_overlapped() {
+        // `"ls" -l` does run `ls`, so this costs a highlight on a real
+        // command name. What it buys is that no `Command` region can ever
+        // overlap a `Quoted` one, and two overlapping regions have no honest
+        // drawing.
+        let spans = render_command("\"ls\" -l");
+        assert!(commands(&spans).is_empty());
+        assert_eq!(quotes(&spans), vec!["\"ls\""]);
+        assert_eq!(unrender(&spans), "\"ls\" -l");
+    }
+
+    #[test]
+    fn highlighting_never_overrules_a_pass_that_has_more_to_say() {
+        // A chip is louder than a highlight and a resolved value is
+        // information; both survive being inside a highlighted region.
+        let env = env(&[("HOME", "/home/user")]);
+
+        let spans = rendered("ls\u{202E}x -l", &env);
+        assert_eq!(chips(&spans), vec!['\u{202E}'], "the override is still a chip");
+        assert_eq!(commands(&spans), vec!["ls", "x"], "and the word either side of it is marked");
+
+        let spans = rendered("echo \"$HOME/x\"", &env);
+        assert_eq!(variables(&spans), vec![("$HOME", Some("/home/user"))]);
+        assert_eq!(quotes(&spans), vec!["\"", "/x\""], "the string is drawn either side of it");
+        assert_eq!(unrender(&spans), "echo \"$HOME/x\"");
+    }
+
+    #[test]
+    fn a_reference_that_is_the_command_word_keeps_its_value_and_not_the_highlight() {
+        // Annotation runs first and highlighting yields to it: a value is
+        // information the reader cannot get anywhere else, and a colour is
+        // decoration they can do without.
+        let spans = rendered("$EDITOR f", &env(&[("EDITOR", "vi")]));
+        assert_eq!(variables(&spans), vec![("$EDITOR", Some("vi"))]);
+        assert!(commands(&spans).is_empty(), "the highlight overruled the value");
+    }
+
+    #[test]
+    fn a_separator_is_never_swallowed_by_a_command_word() {
+        let spans = render_command("ls;rm");
+        assert_eq!(separators(&spans), vec![";"]);
+        assert_eq!(commands(&spans), vec!["ls", "rm"]);
+        assert_eq!(unrender(&spans), "ls;rm");
+    }
+
+    #[test]
+    fn highlighting_where_the_model_stops() {
+        // The mirror of the two lists above, for the same reason: the
+        // highlight asks the same scanner the same question, so it inherits
+        // the same gaps, and the cost is bounded the same way -- the text is
+        // still on screen, drawn as itself.
+        //
+        // A comment's `#` is just a word, so the word after `;` inside one is
+        // marked as a command that will never run; an ANSI-C string's `$` is
+        // outside the region the ordinary single-quote rule finds.
+        assert_eq!(commands(&render_command("echo a # b; c")), vec!["echo", "c"], "comment");
+        assert_eq!(quotes(&render_command("echo $'a b'")), vec!["'a b'"], "ANSI-C quoting");
+        assert_eq!(
+            commands(&render_command("cat <<EOF\nls\nEOF")),
+            vec!["cat", "ls", "EOF"],
+            "a heredoc body is data, and is drawn as though it were commands"
+        );
+
+        // And in every one of them the text is untouched. The two without a
+        // newline in them are checked character for character as well: what
+        // the highlight got wrong is a colour, and nothing else moved.
+        for command in ["echo a # b; c", "echo $'a b'"] {
+            let spans = render_command(command);
+            assert_eq!(unrender(&spans), command);
+            let shown: String = spans.iter().map(|s| s.display_text()).collect();
+            assert_eq!(shown, command, "{command:?} is not drawn as itself throughout");
+        }
+        assert_eq!(unrender(&render_command("cat <<EOF\nls\nEOF")), "cat <<EOF\nls\nEOF");
+    }
+
+    #[test]
+    fn highlighting_adds_and_removes_nothing() {
+        let env = env(&[("HOME", "/home/user"), ("A", "; rm -rf /")]);
+        for command in [
+            "",
+            " ",
+            ";",
+            "'",
+            "\"",
+            "''",
+            "ls",
+            "ls; rm 'a b' && echo \"$A\"",
+            "FOO=1 BAR=2 env",
+            "a\u{202E}b 'c\u{200B}d'",
+            "ünïcödé 'ünïcödé'",
+            "echo 'a; b",
+            "cat <<EOF\na; b\nEOF",
+            r"echo \'a\' $A",
+        ] {
+            let spans = rendered(command, &env);
+            assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
+            assert!(spans.covers_source(), "{command:?} is not tiled by its spans");
+        }
+    }
+
+    #[test]
+    fn a_command_of_many_segments_is_highlighted_in_one_walk() {
+        // The command word of each segment is found with a cursor that only
+        // ever moves forwards, so this is linear rather than one walk of the
+        // command per segment -- and the number of segments is the agent's to
+        // choose. The count is asserted so a walk that stopped early would
+        // not pass.
+        let count = 5_000;
+        let command = "ls;".repeat(count);
+        let spans = render_command(&command);
+        assert_eq!(commands(&spans).len(), count);
+        assert_eq!(unrender(&spans), command);
+        assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn the_scanner_finds_quoted_strings_in_source_order() {
+        assert_eq!(quoted_strings("a 'b' \"c\""), vec![2..5, 6..9]);
+        assert_eq!(quoted_strings("no quotes"), Vec::<Range<usize>>::new());
+        assert_eq!(quoted_strings("'"), vec![0..1], "an unterminated string is still one");
+    }
+
+    #[test]
+    fn a_segment_stops_at_its_separator_and_not_after_it() {
+        assert_eq!(segments("a; b"), vec![0..1, 2..4]);
+        assert_eq!(segments("a\nb"), vec![0..2, 2..3], "a newline ends the word by being space");
+        assert_eq!(segments("a"), vec![0..1]);
+        assert_eq!(segments(""), vec![0..0]);
+    }
+
+    #[test]
+    fn an_assignment_is_a_name_then_an_equals_and_nothing_looser() {
+        assert!(is_assignment("A=1"));
+        assert!(is_assignment("_a9="), "an empty value is still an assignment");
+        assert!(!is_assignment("=1"), "no name at all");
+        assert!(!is_assignment("9A=1"), "a name may not start with a digit");
+        assert!(!is_assignment("a-b=1"), "nor carry a hyphen");
+        assert!(!is_assignment("ls"), "and a word with no `=` is not one");
+        assert!(!is_assignment(""));
     }
 
     // --- the boundary of what `$` is claimed to mean ----------------------

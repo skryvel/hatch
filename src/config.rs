@@ -16,6 +16,22 @@ use crate::paths::Paths;
 /// Bytes of entropy behind the bearer token.
 const TOKEN_BYTES: usize = 32;
 
+/// Point size the approval window draws at unless the config says otherwise.
+///
+/// Larger than egui's own default, which is tuned for dense tool windows. This
+/// one is a window a person is asked to *read* — a command they are about to
+/// let run unsandboxed on their machine — on a 1280-point window on a desktop
+/// display, and at egui's default it reads as cramped.
+const DEFAULT_FONT_SIZE: u32 = 16;
+
+/// The range a font size is held to.
+///
+/// Not a safety boundary; a legibility one. Below the floor the window has
+/// text nobody can read and above the ceiling it has two words in it, and
+/// both are ways for a config typo to produce a window that cannot be used
+/// rather than an error anyone would see.
+const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 8..=48;
+
 /// On-disk settings, read from and written to
 /// `$XDG_CONFIG_HOME/hatch/config.toml` — `~/.config/hatch/config.toml` unless
 /// the variable says otherwise. See [`crate::paths`] for the other two
@@ -50,6 +66,24 @@ pub struct Config {
     /// be an **absolute, literal path prefix**: `~` is not expanded and a
     /// relative entry can never match, so either one silently protects nothing.
     pub denylist_extra: Vec<String>,
+    /// Point size the approval window draws body and monospace text at.
+    ///
+    /// A genuine per-user preference — display DPI, eyesight, viewing
+    /// distance — and nothing about it is a safety property, which is what
+    /// separates it from the typing guard's 750 ms. That interval is
+    /// deliberately not a key here, because a setting inviting it to be
+    /// lowered to zero is a liability; a font size cannot be set to a value
+    /// that approves anything.
+    ///
+    /// Whole points rather than a float, so that the natural thing to write
+    /// in the file — `font_size = 16` — parses. TOML does not widen an
+    /// integer into a float, so an `f32` field would reject exactly what a
+    /// reader would type, and a config that fails to parse is a daemon that
+    /// does not start.
+    ///
+    /// Read through [`Config::font_size_points`], never directly: it is the
+    /// clamp, and an unclamped 0 is a window with no text in it.
+    pub font_size: u32,
     /// The complete child environment, on top of `exec_path` as `PATH`.
     pub exec_env: BTreeMap<String, String>,
 }
@@ -69,6 +103,7 @@ impl Default for Config {
             exec_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
             terminal: vec!["konsole".to_string(), "-e".to_string()],
             denylist_extra: Vec::new(),
+            font_size: DEFAULT_FONT_SIZE,
             exec_env,
         }
     }
@@ -111,6 +146,15 @@ impl Config {
             }
         }
         Ok(config)
+    }
+
+    /// The point size the window draws at, clamped to something legible.
+    ///
+    /// Clamped rather than rejected: a font size is a preference and a typo in
+    /// one is not worth refusing to open a window over, which on this path
+    /// would resolve as a denial of the request the user was about to read.
+    pub fn font_size_points(&self) -> f32 {
+        self.font_size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()) as f32
     }
 
     /// The longest a client call can block: the approval wait followed by a
@@ -208,6 +252,32 @@ fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
         .with_context(|| format!("securing {}", path.display()))
 }
 
+/// The point size the approval window should draw at, read without creating
+/// or writing anything.
+///
+/// Read-only and infallible on purpose. The prompt process draws a window and
+/// owns nothing — not the config file, not the directories — and a missing,
+/// unreadable or unparseable config here must cost a font size and nothing
+/// else: refusing to open the window would resolve as a denial of the request
+/// the user was about to be shown, which is a far worse answer to a typo in a
+/// preference than drawing it at the default.
+pub fn display_font_size() -> f32 {
+    match Paths::from_env() {
+        Ok(paths) => font_size_at(&paths),
+        Err(_) => Config::default().font_size_points(),
+    }
+}
+
+/// The whole of [`display_font_size`] except for reading the environment, so
+/// every case is testable without one.
+pub fn font_size_at(paths: &Paths) -> f32 {
+    fs::read_to_string(paths.config_file())
+        .ok()
+        .and_then(|text| toml::from_str::<Config>(&text).ok())
+        .unwrap_or_default()
+        .font_size_points()
+}
+
 /// Print the client registration line for `hatch token`.
 ///
 /// Also reports anything unusual about where the directories ended up, which
@@ -265,6 +335,56 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::scratch(root.path());
         (root, paths)
+    }
+
+    // ---- the font size ---------------------------------------------------
+
+    #[test]
+    fn the_default_font_size_is_the_one_this_window_is_read_at() {
+        assert_eq!(Config::default().font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(Config::default().font_size_points(), DEFAULT_FONT_SIZE as f32);
+    }
+
+    #[test]
+    fn a_font_size_is_clamped_rather_than_refused() {
+        // A typo in a preference must not close the window: on this path
+        // that resolves as a denial of the request the reader was about to
+        // see, which is a very expensive answer to a stray zero.
+        let sized = |font_size| Config { font_size, ..Config::default() }.font_size_points();
+        assert_eq!(sized(0), *FONT_SIZE_RANGE.start() as f32);
+        assert_eq!(sized(1), *FONT_SIZE_RANGE.start() as f32);
+        assert_eq!(sized(10_000), *FONT_SIZE_RANGE.end() as f32);
+        assert_eq!(sized(20), 20.0, "an ordinary size is left alone");
+        assert_eq!(sized(8), 8.0, "and so are the ends of the range");
+        assert_eq!(sized(48), 48.0);
+    }
+
+    #[test]
+    fn a_font_size_is_written_and_read_back_as_a_whole_number() {
+        // TOML does not widen an integer into a float, so `font_size = 16` --
+        // the only thing a reader would type -- has to be what the field
+        // accepts.
+        let parsed: Config = toml::from_str("font_size = 22").unwrap();
+        assert_eq!(parsed.font_size, 22);
+        assert!(toml::to_string(&Config::default()).unwrap().contains("font_size = 16"));
+    }
+
+    #[test]
+    fn the_window_reads_the_size_without_creating_or_writing_anything() {
+        let (_root, paths) = scratch();
+
+        // No config at all: the default, and nothing appears on disk.
+        assert_eq!(font_size_at(&paths), DEFAULT_FONT_SIZE as f32);
+        assert!(!paths.config_file().exists(), "reading a font size created a config file");
+
+        fs::create_dir_all(paths.config_dir()).unwrap();
+        fs::write(paths.config_file(), "font_size = 24
+").unwrap();
+        assert_eq!(font_size_at(&paths), 24.0);
+
+        // A file that does not parse costs a font size and nothing else.
+        fs::write(paths.config_file(), "font_size = 'large'\n").unwrap();
+        assert_eq!(font_size_at(&paths), DEFAULT_FONT_SIZE as f32);
     }
 
     #[test]

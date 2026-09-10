@@ -105,23 +105,121 @@ const EXIT_BACKSTOP: Duration = Duration::from_millis(250);
 /// command.
 const OUTPUT_CAP: usize = 1 << 20;
 
-/// The size of the two buttons that settle the request.
+/// The size of the two buttons that settle the request, in multiples of one
+/// line of button text: width, then height.
 ///
 /// Wide and tall enough that they are aimed at rather than clipped, and the
 /// same size as each other: Approve is the one that runs something, and
 /// making it the larger of the two would be an invitation dressed as an
 /// affordance.
-const PRIMARY_BUTTON: egui::Vec2 = egui::vec2(150.0, 34.0);
+///
+/// Multiples and not points, because the font size is the reader's to choose
+/// — see [`crate::config::Config::font_size`] — and a button pinned to 34
+/// points is a button the text grows out of.
+const PRIMARY_BUTTON_ROWS: egui::Vec2 = egui::vec2(10.0, 2.3);
 
 /// The gap between Approve and Deny.
 ///
 /// A slipped pointer has to cross it, and it lands on the panel rather than
 /// on the other verdict. Deliberately larger than egui's own spacing, which
 /// is tuned for buttons whose worst outcome is being pressed by accident.
+///
+/// Points, and deliberately not a multiple of the text like its neighbours:
+/// what this measures is how far a slipped pointer has to travel, which is a
+/// distance on the screen and not a quantity of text.
 const PRIMARY_GAP: f32 = 28.0;
 
-/// The most of the window the live output takes while a command runs.
-const RUNNING_OUTPUT_HEIGHT: f32 = 180.0;
+/// The most of the window the live output takes while a command runs, in
+/// lines of the monospace font it is drawn in.
+///
+/// Lines and not points, for the reason [`PRIMARY_BUTTON_ROWS`] gives: the
+/// question is how much of the output a reader can see at once, and that is a
+/// number of lines whatever size they have chosen to read at.
+const RUNNING_OUTPUT_ROWS: f32 = 10.0;
+
+/// How much larger than body text the headline is drawn.
+///
+/// The headline is two paragraphs of agent-written prose and should read as
+/// prose set large, so it scales with whatever size the reader chose rather
+/// than being pinned to a point count of its own.
+pub const HEADLINE_SCALE: f32 = 1.5;
+
+/// How the other text styles are sized against the configured one.
+///
+/// `Small` is the pane labels and the captions, `Heading` is egui's own and
+/// is unused by this window — set anyway, so a widget that reaches for it
+/// does not fall back to a size nothing else here uses.
+const SMALL_SCALE: f32 = 0.8;
+const HEADING_SCALE: f32 = 1.4;
+
+/// Draw every text style at the size the config asks for.
+///
+/// Applied once, to the context's style, rather than at each label: the
+/// side-by-side fit rule measures a column in characters of the monospace
+/// font *as the style resolves it* — see
+/// [`crate::prompt_ui::panes::widest_line`] and the `advance` it is compared
+/// against — so the size has to reach the measurement and the drawing through
+/// the same place, or the two disagree and the window promises a column that
+/// cannot hold its lines.
+pub fn apply_font_size(ctx: &egui::Context, points: f32) {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    ctx.all_styles_mut(|style| {
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(points * SMALL_SCALE, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(points, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(points, FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(points * HEADING_SCALE, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(points, FontFamily::Monospace)),
+        ]
+        .into();
+    });
+}
+
+/// How much larger than body text the countdown is drawn once the window is
+/// about to be taken away.
+///
+/// A multiple rather than a point count, for the reason
+/// [`PRIMARY_BUTTON_ROWS`] gives. Colour *and* size, never colour alone,
+/// which would say nothing to a reader who cannot tell red from grey.
+const IMMINENT_SCALE: f32 = 1.35;
+
+/// The size of one primary button, against the style in force.
+fn primary_button(ui: &egui::Ui) -> egui::Vec2 {
+    ui.text_style_height(&egui::TextStyle::Button) * PRIMARY_BUTTON_ROWS
+}
+
+/// How wide the controls are: exactly the two primary buttons and the gap
+/// between them.
+///
+/// The cluster is centred in the panel rather than left against its edge —
+/// Approve and Deny are the question the window exists to ask, and at 1280
+/// points wide a row of controls in the bottom-left corner reads as an
+/// afterthought. Everything in the cluster is this wide, so the note field
+/// and the buttons line up as one thing rather than three left edges that
+/// happen to agree.
+fn cluster_width(ui: &egui::Ui) -> f32 {
+    2.0 * primary_button(ui).x + PRIMARY_GAP
+}
+
+/// Lay out `add` in a `width`-wide row, centred in whatever it is placed in.
+///
+/// The width is given rather than measured because every row here has one it
+/// knows: a row that shrank to its contents would move as the contents
+/// changed, and the two verdict buttons must not drift under a pointer that
+/// is already on the way to one.
+fn centred_row<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center),
+        add,
+    )
+    .inner
+}
 
 // ---- the state machine -----------------------------------------------------
 
@@ -427,6 +525,11 @@ pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn()
 /// it sees a process that exited without deciding, which is a denial.
 pub fn run_prompt() -> anyhow::Result<()> {
     let fatal: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    // Best effort, and deliberately read-only: this process draws a window
+    // and owns nothing, so a missing or unreadable config is a window at the
+    // default size rather than a request that never opens one -- which the
+    // daemon would resolve as a denial.
+    let font_size = crate::config::display_font_size();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -448,6 +551,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
             // context to wake and so a window that never opens never reads a
             // request it could not have shown. Nothing is lost by waiting:
             // the daemon's first write fits in the pipe.
+            apply_font_size(&cc.egui_ctx, font_size);
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || {
@@ -655,25 +759,34 @@ impl PromptApp {
             let visuals = ui.visuals();
             (visuals.weak_text_color(), visuals.warn_fg_color, visuals.error_fg_color)
         };
-        ui.horizontal(|ui| {
-            if let Some(left) = self.state.seconds_remaining(Utc::now()) {
-                let text = egui::RichText::new(countdown_text(left));
-                ui.label(match urgency(left) {
-                    Urgency::Calm => text.color(calm),
-                    Urgency::Soon => text.color(soon).strong(),
-                    Urgency::Imminent => text.color(imminent).strong().size(17.0),
-                });
-            }
-            if let Some(waiting) = self.state.queue_badge() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{waiting} more waiting"))
-                            .small()
-                            .color(calm),
-                    );
-                });
-            }
-        });
+        // One row, drawn twice over: the clock belongs to the question and is
+        // centred with it, and the badge is an aside about *other* windows
+        // and stays out at the edge. Two children over one rect rather than
+        // one flow, so that a badge appearing cannot shove the clock sideways
+        // -- a countdown that moves when something unrelated arrives is a
+        // countdown the eye has to find again.
+        let body = egui::TextStyle::Body.resolve(ui.style()).size;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), body * IMMINENT_SCALE * 1.4),
+            egui::Sense::hover(),
+        );
+        let child = |ui: &mut egui::Ui, align| {
+            ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(align))
+        };
+
+        if let Some(left) = self.state.seconds_remaining(Utc::now()) {
+            let text = egui::RichText::new(countdown_text(left));
+            child(ui, egui::Layout::top_down(egui::Align::Center)).label(match urgency(left) {
+                Urgency::Calm => text.color(calm),
+                Urgency::Soon => text.color(soon).strong(),
+                Urgency::Imminent => text.color(imminent).strong().size(body * IMMINENT_SCALE),
+            });
+        }
+        if let Some(waiting) = self.state.queue_badge() {
+            child(ui, egui::Layout::right_to_left(egui::Align::Center)).label(
+                egui::RichText::new(format!("{waiting} more waiting")).small().color(calm),
+            );
+        }
     }
 
     /// What an approved command's window offers while it runs.
@@ -682,13 +795,13 @@ impl PromptApp {
     /// to watch it is to decide whether to press that button, and a decision
     /// is made from the last screenful.
     fn running_row(&mut self, ui: &mut egui::Ui) {
-        ui.label("Approved. It is running now.");
+        ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
         if self.stream {
             let text: String =
                 self.state.output().iter().map(|(_, chunk)| chunk.as_str()).collect();
             egui::ScrollArea::vertical()
                 .id_salt("hatch-output")
-                .max_height(RUNNING_OUTPUT_HEIGHT)
+                .max_height(ui.text_style_height(&egui::TextStyle::Monospace) * RUNNING_OUTPUT_ROWS)
                 .auto_shrink([false, true])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
@@ -701,7 +814,14 @@ impl PromptApp {
                 egui::RichText::new("Its output is not being streamed to this window.").small(),
             );
         }
-        if unfocusable(ui, egui::Button::new("Kill")).clicked() {
+        // Centred with the verdict buttons it replaces. The output above it
+        // is not: it is monospace text being read, and a column of it down
+        // the middle of a 1280-point window is harder to follow than one that
+        // starts where every other line of text in this window starts.
+        let killed = ui
+            .vertical_centered(|ui| unfocusable(ui, egui::Button::new("Kill")).clicked())
+            .inner;
+        if killed {
             let kill = self.state.request_kill();
             answer(&mut self.out, &mut self.state, kill);
         }
@@ -759,62 +879,83 @@ impl PromptApp {
             None => (false, false),
         };
 
-        ui.horizontal(|ui| {
-            ui.label("Note to the agent");
-            ui.text_edit_singleline(&mut self.note);
-        });
         // One name for it, used by the checkbox and by the line that says why
         // it is dead: a control that cannot be ticked and does not say why is
         // a window asking the reader to guess.
         let can_stream = !interactive;
-        if streamable {
-            ui.add_enabled(
-                can_stream,
-                egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
-            );
-            if !can_stream {
-                ui.label(
-                    egui::RichText::new("It runs in a terminal of its own.")
-                        .small()
-                        .weak(),
-                );
-            }
-        }
-
-        ui.add_space(8.0);
         let note = self.note.clone();
         let mut decided = None;
+        let width = cluster_width(ui);
 
         let approve = ui
-            .horizontal(|ui| {
-                let approve =
-                    unfocusable(ui, egui::Button::new(strong("Approve")).min_size(PRIMARY_BUTTON));
-                // A pointer that slips off Deny must land on nothing.
-                ui.add_space(PRIMARY_GAP);
-                if unfocusable(ui, egui::Button::new(strong("Deny")).min_size(PRIMARY_BUTTON))
-                    .clicked()
-                {
-                    decided = Some(Verdict::Deny { note: note.clone() });
+            .vertical_centered(|ui| {
+                // The label above the field rather than beside it, so that
+                // the field itself is centred on the buttons below and not
+                // pushed off-centre by the width of a word.
+                ui.label(egui::RichText::new("Note to the agent").small().weak());
+                ui.add_sized(
+                    egui::vec2(width, ui.spacing().interact_size.y),
+                    egui::TextEdit::singleline(&mut self.note),
+                );
+                if streamable {
+                    ui.add_enabled(
+                        can_stream,
+                        egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
+                    );
+                    if !can_stream {
+                        ui.label(
+                            egui::RichText::new("It runs in a terminal of its own.")
+                                .small()
+                                .weak(),
+                        );
+                    }
                 }
+
+                ui.add_space(8.0);
+                let approve = centred_row(ui, width, |ui| {
+                    let approve = unfocusable(
+                        ui,
+                        egui::Button::new(strong("Approve")).min_size(primary_button(ui)),
+                    );
+                    // A pointer that slips off Deny must land on nothing.
+                    ui.add_space(PRIMARY_GAP);
+                    if unfocusable(
+                        ui,
+                        egui::Button::new(strong("Deny")).min_size(primary_button(ui)),
+                    )
+                    .clicked()
+                    {
+                        decided = Some(Verdict::Deny { note: note.clone() });
+                    }
+                    approve
+                });
+
+                ui.add_space(4.0);
+                // Centred under the two that decide, and small: these send
+                // the agent away with something to do and nothing runs, which
+                // is the same class of outcome as Deny and does not deserve
+                // the same size as it.
+                centred_row(ui, width, |ui| {
+                    if secondary(ui, "Explain first").clicked() {
+                        decided =
+                            Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
+                    }
+                    if secondary(ui, "Ask for something simpler").clicked() {
+                        decided = Some(Verdict::Revise {
+                            kind: ReviseKind::Simplify,
+                            note: note.clone(),
+                        });
+                    }
+                    if secondary(ui, "I'll run it myself").clicked() {
+                        decided = Some(Verdict::SelfRun { note });
+                    }
+                });
                 approve
             })
             .inner;
         if approve.clicked() {
             decided = Some(Verdict::Approve { stream: self.stream });
         }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if secondary(ui, "Explain first").clicked() {
-                decided = Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
-            }
-            if secondary(ui, "Ask for something simpler").clicked() {
-                decided = Some(Verdict::Revise { kind: ReviseKind::Simplify, note: note.clone() });
-            }
-            if secondary(ui, "I'll run it myself").clicked() {
-                decided = Some(Verdict::SelfRun { note });
-            }
-        });
 
         if let Some(verdict) = decided {
             let frame = self.state.decide(verdict);
@@ -854,6 +995,60 @@ mod tests {
 
     use crate::protocol::{DaemonMsg, Outcome, Payload, Request, ReviseKind, Verdict};
     use crate::render::render_command;
+
+    #[test]
+    fn every_text_style_is_drawn_at_the_size_the_config_asked_for() {
+        // One application, to the style, so that the fit rule and the drawing
+        // resolve the same font. A style left at egui's own size would be a
+        // column measured in a font nothing is drawn in.
+        use egui::{FontFamily, TextStyle};
+
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 20.0);
+        let style = ctx.style_of(egui::Theme::Dark);
+        let size = |text_style: TextStyle| text_style.resolve(&style);
+
+        assert_eq!(size(TextStyle::Body).size, 20.0);
+        assert_eq!(size(TextStyle::Button).size, 20.0);
+        assert_eq!(size(TextStyle::Monospace).size, 20.0);
+        assert_eq!(size(TextStyle::Small).size, 20.0 * SMALL_SCALE);
+        assert_eq!(size(TextStyle::Heading).size, 20.0 * HEADING_SCALE);
+        assert_eq!(
+            size(TextStyle::Monospace).family,
+            FontFamily::Monospace,
+            "the pane the fit rule measures stopped being monospace"
+        );
+        assert_eq!(size(TextStyle::Body).family, FontFamily::Proportional);
+        assert_eq!(
+            TextStyle::Monospace.resolve(&ctx.style_of(egui::Theme::Light)).size,
+            20.0,
+            "a reader on a light theme got a different size"
+        );
+
+        // And a second size really moves it, so this is not agreeing with
+        // whatever egui happened to have.
+        apply_font_size(&ctx, 11.0);
+        let restyled = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(TextStyle::Monospace.resolve(&restyled).size, 11.0);
+    }
+
+    #[test]
+    fn the_buttons_grow_with_the_text_in_them() {
+        // A button pinned to a point count is a button the text grows out of.
+        let measure = |points: f32| {
+            let ctx = egui::Context::default();
+            apply_font_size(&ctx, points);
+            let mut size = None;
+            let mut out = ctx.run_ui(raw(Vec::new()), |ui| size = Some(primary_button(ui)));
+            out.textures_delta.clear();
+            size.expect("the frame ran")
+        };
+
+        let small = measure(10.0);
+        let large = measure(20.0);
+        assert!(large.x > small.x, "a larger font left the button the same width");
+        assert!(large.y > small.y, "and the same height");
+    }
 
     fn a_request(seconds_left: i64) -> Request {
         Request {

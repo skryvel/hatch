@@ -19,7 +19,7 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, var
 /// Render a command for the approval window, against the environment it will
 /// actually run in.
 ///
-/// Three passes. The first two compose through a single `SpanBuilder` rather
+/// Four passes. The first two compose through a single `SpanBuilder` rather
 /// than by splicing their results: [`command::segment`] walks the command,
 /// tags the separators it finds outside quotes and asks for a line break on
 /// each span that follows one, and hands every run in between to
@@ -27,7 +27,15 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, var
 /// unambiguously safe to draw and chips the rest. The third,
 /// [`command::annotate_variables`], refines that result in place: it splits
 /// existing spans down to each `$NAME` and tags them with the value the child
-/// will see.
+/// will see. The fourth, [`command::highlight`], marks the word that names
+/// what runs and the quoted strings.
+///
+/// The order of the last two is not free. Both refine `Plain` spans and both
+/// leave a span another pass has claimed alone, so whichever runs first wins
+/// the overlap — and a resolved value is information the reader cannot get
+/// anywhere else, while a highlight is decoration they can do without.
+/// Annotation therefore goes first, and `"$HOME/x"` keeps its value while the
+/// quotes around it are still drawn as a string.
 ///
 /// Every pass is additive. None removes a character to make room for layout,
 /// for a label or for a value, which is what keeps `tests/fidelity.rs` green.
@@ -50,7 +58,7 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, var
 /// written without it, and wiring each pass in here is what puts it under
 /// those properties.
 pub fn render_command(command: &str, env: &BTreeMap<String, String>) -> Spans {
-    command::annotate_variables(command::segment(command), env)
+    command::highlight(command::annotate_variables(command::segment(command), env))
 }
 
 #[cfg(test)]
@@ -65,12 +73,33 @@ mod tests {
     }
 
     #[test]
-    fn whole_command_is_one_plain_span() {
+    fn an_ordinary_command_is_its_name_and_the_rest() {
+        // Two spans, and no chip, no separator and no note between them: the
+        // highlight pass marks the word that names what runs, and everything
+        // else in an ordinary command is left alone.
         let spans = render_command("ls -la /etc");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text(), "ls -la /etc");
-        assert_eq!(spans[0].kind(), &SpanKind::Plain);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text(), "ls");
+        assert_eq!(spans[0].kind(), &SpanKind::Command);
+        assert_eq!(spans[1].text(), " -la /etc");
+        assert_eq!(spans[1].kind(), &SpanKind::Plain);
         assert!(!spans[0].break_before());
+        assert_eq!(unrender(&spans), "ls -la /etc");
+    }
+
+    #[test]
+    fn rendering_marks_the_word_that_names_what_runs() {
+        // The fourth wiring guard, and it is here for the reason the other
+        // three are: every invariant in `tests/fidelity.rs` holds trivially
+        // for one Plain span over the whole command, so nothing there would
+        // notice the highlight pass being dropped out of this function.
+        let spans = render_command("echo 'hi there'");
+        let kinds: Vec<&SpanKind> = spans.iter().map(Span::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![&SpanKind::Command, &SpanKind::Plain, &SpanKind::Quoted],
+        );
+        assert_eq!(unrender(&spans), "echo 'hi there'");
     }
 
     #[test]
