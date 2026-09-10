@@ -12,6 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::Paths;
+use crate::prompt_ui::theme::Theme;
 
 /// Bytes of entropy behind the bearer token.
 const TOKEN_BYTES: usize = 32;
@@ -84,6 +85,17 @@ pub struct Config {
     /// Read through [`Config::font_size_points`], never directly: it is the
     /// clamp, and an unclamped 0 is a window with no text in it.
     pub font_size: u32,
+    /// Which palette the approval window draws in: `dark` or `light`.
+    ///
+    /// A preference on exactly the same terms as `font_size`, and here for
+    /// the same reason: how well a person reads off a screen is about the
+    /// screen and the room it is in, and nothing in either palette decides
+    /// anything. Both carry every meaning the window has — see
+    /// [`crate::prompt_ui::theme`], where the claim that they do is a test.
+    ///
+    /// A word rather than a boolean, so the file says what it means and so a
+    /// third palette would be a value rather than a schema change.
+    pub theme: Theme,
     /// The complete child environment, on top of `exec_path` as `PATH`.
     pub exec_env: BTreeMap<String, String>,
 }
@@ -104,6 +116,7 @@ impl Default for Config {
             terminal: vec!["konsole".to_string(), "-e".to_string()],
             denylist_extra: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
+            theme: Theme::default(),
             exec_env,
         }
     }
@@ -262,20 +275,35 @@ fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 /// the user was about to be shown, which is a far worse answer to a typo in a
 /// preference than drawing it at the default.
 pub fn display_font_size() -> f32 {
+    display_style().0
+}
+
+/// The point size and the palette the approval window should draw in, read
+/// without creating or writing anything.
+///
+/// Both from one read of one file: two reads could see two files, and a
+/// window drawn at one config's size in another config's colours would be a
+/// window nobody configured.
+pub fn display_style() -> (f32, Theme) {
     match Paths::from_env() {
-        Ok(paths) => font_size_at(&paths),
-        Err(_) => Config::default().font_size_points(),
+        Ok(paths) => display_style_at(&paths),
+        Err(_) => (Config::default().font_size_points(), Config::default().theme),
     }
 }
 
-/// The whole of [`display_font_size`] except for reading the environment, so
+/// The whole of [`display_style`] except for reading the environment, so
 /// every case is testable without one.
-pub fn font_size_at(paths: &Paths) -> f32 {
-    fs::read_to_string(paths.config_file())
+pub fn display_style_at(paths: &Paths) -> (f32, Theme) {
+    let config = fs::read_to_string(paths.config_file())
         .ok()
         .and_then(|text| toml::from_str::<Config>(&text).ok())
-        .unwrap_or_default()
-        .font_size_points()
+        .unwrap_or_default();
+    (config.font_size_points(), config.theme)
+}
+
+/// The point size alone, for callers that want nothing else.
+pub fn font_size_at(paths: &Paths) -> f32 {
+    display_style_at(paths).0
 }
 
 /// Print the client registration line for `hatch token`.
@@ -385,6 +413,38 @@ mod tests {
         // A file that does not parse costs a font size and nothing else.
         fs::write(paths.config_file(), "font_size = 'large'\n").unwrap();
         assert_eq!(font_size_at(&paths), DEFAULT_FONT_SIZE as f32);
+    }
+
+    #[test]
+    fn the_window_reads_its_size_and_its_palette_from_one_look_at_one_file() {
+        // One read, because two reads could see two files and a window drawn
+        // at one config's size in another config's colours is a window nobody
+        // configured.
+        let (_root, paths) = scratch();
+
+        assert_eq!(display_style_at(&paths), (DEFAULT_FONT_SIZE as f32, Theme::Dark));
+        assert!(!paths.config_file().exists(), "reading a preference created a config file");
+
+        fs::create_dir_all(paths.config_dir()).unwrap();
+        fs::write(paths.config_file(), "font_size = 20\ntheme = 'light'\n").unwrap();
+        assert_eq!(display_style_at(&paths), (20.0, Theme::Light));
+
+        // A config written before the key existed keeps working and keeps the
+        // palette the window has always had.
+        fs::write(paths.config_file(), "font_size = 20\n").unwrap();
+        assert_eq!(display_style_at(&paths), (20.0, Theme::Dark));
+
+        // And a palette nobody has heard of costs both preferences rather
+        // than the window: the file does not parse, so the defaults stand.
+        fs::write(paths.config_file(), "theme = 'chartreuse'\n").unwrap();
+        assert_eq!(display_style_at(&paths), (DEFAULT_FONT_SIZE as f32, Theme::Dark));
+    }
+
+    #[test]
+    fn a_written_config_names_its_palette_in_a_word() {
+        let written = toml::to_string(&Config::default()).unwrap();
+        assert!(written.contains("theme = \"dark\""), "{written}");
+        assert_eq!(toml::from_str::<Config>("theme = 'light'").unwrap().theme, Theme::Light);
     }
 
     #[test]

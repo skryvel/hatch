@@ -45,6 +45,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use crate::protocol::{Outcome, Payload, ProtocolError};
 use crate::render::diff::{Row, Side};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
+use crate::prompt_ui::theme::{self, Palette};
 use crate::render::{Span, SpanKind, Spans};
 use crate::swap::{PlanKind, SwapPlan};
 
@@ -62,14 +63,21 @@ const SOON: i64 = 30;
 /// the panes' share of the window.
 const HEADLINE_SHARE: f32 = 0.30;
 
-/// The most of the space below the header the raw pane may take.
+/// The most of the space below the header the raw pane may take, whatever
+/// [`RAW_STRIP_ROWS`] works out to.
 ///
-/// A newline now ends a line in every pane, so a pasted script is as many
-/// lines in the raw pane as it has, and without a ceiling a fifty-line
-/// heredoc would push the annotated pane off the bottom. The raw pane is the
-/// one a reader falls back to, not the one they read first, so it yields the
-/// space and scrolls.
+/// A backstop for a short window rather than the ordinary rule: at a window
+/// height where six rows would be most of the space, the annotated pane still
+/// gets the larger half.
 const RAW_SHARE: f32 = 0.40;
+
+/// How many lines of the raw command the stacked strip shows at once.
+///
+/// Enough to see the line you are checking with its neighbours around it,
+/// which is what makes a discrepancy between the two panes visible at all,
+/// and few enough that the pane a reader actually reads keeps the window.
+/// See [`raw_ceiling`] for why this is a strip and not a share.
+const RAW_STRIP_ROWS: f32 = 6.0;
 
 /// Characters of gutter in front of each diff column: the `-`/`+` mark and
 /// the space after it.
@@ -488,28 +496,40 @@ pub fn command_view(longest: usize, column: usize) -> CommandView {
     if fits_two_columns(longest, column) { CommandView::SideBySide } else { CommandView::Stacked }
 }
 
-/// What to say above the command panes, or `None` when there is nothing worth
-/// a line.
+/// The one line above the command panes: which pane is which, what each of
+/// them promises, and — in the fallback — why the reader is not getting the
+/// other arrangement.
 ///
-/// Side by side says nothing, and that is deliberate. The diff announces both
-/// of its views because they draw *different lines* — unified interleaves the
-/// two sides and side by side pairs them — so a reader has to be told which
-/// they are reading. The command panes draw the same two renderings either
-/// way, each still carrying its own label, and only their arrangement
-/// changes; a permanent "Side by side" would be another line a reader learns
-/// to skip, on the same argument that keeps [`scan_summary`] quiet about an
-/// ordinary command.
+/// # Why one caption and not one per pane
 ///
-/// The fallback does say so, with both numbers, because that is the case
-/// where the reader might be looking for a view they are not getting.
-pub fn command_caption(view: CommandView, longest: usize, column: usize) -> Option<String> {
+/// Each pane used to carry a label of its own. Two labels are two rows when
+/// the panes are stacked, and the window has no rows to spare: the thing
+/// being read is a command somebody is about to let run, and every row of
+/// furniture is a row of it they cannot see.
+///
+/// What the labels said, though, is not furniture. "No colour" and "the
+/// colour is hatch's notes, not the command" is the *claim that makes the raw
+/// pane worth having* — without it the reader has no reason to believe the
+/// two panes differ in anything but prettiness — so it survives whole, in one
+/// sentence per pane, said once.
+///
+/// The arrangement is named because the caption now has to say which pane it
+/// is talking about. That is a change from before, when side by side said
+/// nothing at all: naming a view a reader can see is worth a word when the
+/// same word is what points at the promise.
+pub fn command_caption(view: CommandView, longest: usize, column: usize) -> String {
     match view {
-        CommandView::SideBySide => None,
-        CommandView::Stacked => Some(format!(
-            "One pane above the other, not side by side: the longest line is {longest} \
-             characters and a column here holds {column}, so two of them could not show it \
-             whole. Widen the window to put them beside each other."
-        )),
+        CommandView::SideBySide => "Left: exactly the text being approved — no reflow, no \
+             grouping, no colour. Right: the same command, annotated — the colour, the underline \
+             and the italics are hatch's notes, not the command."
+            .to_string(),
+        CommandView::Stacked => format!(
+            "Above, a strip that scrolls with the pane below: exactly the text being approved — \
+             no reflow, no grouping, no colour. Below: the same command, annotated — the colour, \
+             the underline and the italics are hatch's notes, not the command. Side by side \
+             would need a column of {longest} characters and this window holds {column}; widen \
+             it for that view."
+        ),
     }
 }
 
@@ -539,10 +559,11 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
 
 /// The colours the panes use, resolved against whatever theme is in force.
 ///
-/// # What each one already means, and how the highlight stays out of the way
-///
-/// The window had four things to say before it said anything about syntax,
-/// and each has a channel of its own:
+/// The values live in [`crate::prompt_ui::theme`], which is also what builds
+/// the `Visuals` the rest of the window draws with, so a pane and the panel
+/// behind it cannot be told two different things. What is written here is
+/// what each colour *means*, which is a fact about this window rather than
+/// about a theme:
 ///
 /// * `danger` — red — is the one colour that means *be careful*: `ROOT`, a
 ///   danger marker, and the `-` side of a diff.
@@ -550,7 +571,7 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
 ///   as itself: the loud chip, and the unusual-character count above the
 ///   panes.
 /// * `quiet` — grey — is hatch talking rather than the command: captions, the
-///   resolved value of a variable (italic and boxed as well), and now the
+///   resolved value of a variable (italic and boxed as well), and the
 ///   structural chip glyphs.
 /// * `text` is the command's own bytes.
 ///
@@ -558,62 +579,81 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
 /// that means anything else:
 ///
 /// * `command`, the word that names what runs, is not a hue at all. It is the
-///   theme's *strong* text: the same characters as their neighbours, drawn
-///   with more contrast rather than less. That keeps it legible to a reader
-///   who cannot separate hues, and it cannot be confused with red or orange
-///   because it is neither. Bold is not available to it — the window's
+///   theme's *strong* text — white on dark, black on light — plus an
+///   underline. Two channels rather than one: contrast alone reads as
+///   slightly brighter text at a glance, and bold is not available (the
 ///   bundled monospace face has no bold cut, and a synthetic one would change
-///   the advance width that the side-by-side fit is measured in — so contrast
-///   is the whole of the emphasis.
+///   the advance width the side-by-side fit is measured in). The underline is
+///   drawn under the row by the text layout and adds nothing to any glyph's
+///   advance, so the measurement and the drawing still agree — see
+///   `an_underlined_command_word_is_exactly_as_wide_as_a_plain_one`.
 /// * `quoted` is the theme's link colour, which is the one hue in this window
 ///   with no other job, and it is the coolest thing on screen — as far from
-///   red and orange as the palette goes.
+///   red and orange as the palette goes. It is never underlined, and the
+///   command word is never that hue, so the two marks cannot combine into
+///   something that reads as a hyperlink — which is a thing this window does
+///   not have.
 ///
-/// The rule underneath both: **highlighting only ever adds contrast.**
-/// Nothing here fades a span, boxes one, or replaces its text, so a reader
-/// who ignores colour entirely reads the same characters in the same order.
-/// The raw pane beside it carries no highlighting at all.
-struct Palette {
-    text: Color32,
-    quiet: Color32,
-    danger: Color32,
-    warn: Color32,
-    /// The word that names what runs. Contrast, never a hue.
-    command: Color32,
-    /// A quoted string, delimiters included.
-    quoted: Color32,
-    chip_bg: Color32,
-    separator_bg: Color32,
-    value_bg: Color32,
-    /// Behind a side-by-side cell for a row that side has no line on.
-    ///
-    /// Deliberately not the faint background the chips and notes sit on: a
-    /// gap has to be distinguishable from a line whose content happens to be
-    /// empty, and if the two tints matched, the only difference on screen
-    /// would be a missing `-` or `+` in a gutter. It is a tint and not a
-    /// colour with meaning — nothing is wrong with a gap.
-    gap_bg: Color32,
+/// The rule underneath all of it: **highlighting only ever adds.** Nothing
+/// here fades a span, boxes one, or replaces its text, so a reader who
+/// ignores colour entirely reads the same characters in the same order. The
+/// raw pane beside it carries no highlighting at all.
+fn palette(ui: &Ui) -> Palette {
+    theme::of(ui)
 }
 
-impl Palette {
-    fn of(ui: &Ui) -> Palette {
-        let visuals = ui.visuals();
-        Palette {
-            text: visuals.text_color(),
-            quiet: visuals.weak_text_color(),
-            danger: visuals.error_fg_color,
-            warn: visuals.warn_fg_color,
-            command: visuals.strong_text_color(),
-            quoted: visuals.hyperlink_color,
-            chip_bg: visuals.code_bg_color,
-            separator_bg: visuals.faint_bg_color,
-            value_bg: visuals.faint_bg_color,
-            gap_bg: visuals.extreme_bg_color,
+/// Who and where an operation runs, for the corner of the title row.
+///
+/// A copy rather than a borrow of the payload, because the row that draws it
+/// has to measure it before it decides where to put it, and measuring twice
+/// from two places is how the measurement and the drawing come to disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunContext {
+    /// The working directory, already defanged.
+    pub cwd: String,
+    /// Whether it was asked for as root.
+    pub root: bool,
+}
+
+impl RunContext {
+    /// The run context of whatever this window is showing, if it has one.
+    ///
+    /// A `swap_file` request has none: it names an absolute path in its own
+    /// header and runs as whoever the plan says, which is a different claim
+    /// drawn in a different place.
+    pub fn of(shown: &Shown) -> Option<RunContext> {
+        match shown {
+            Shown::Command { cwd, root, .. } => {
+                Some(RunContext { cwd: cwd.clone(), root: *root })
+            }
+            Shown::Swap { .. } => None,
         }
     }
 }
 
-/// The agent's two lines, above everything.
+/// The most of the title's row the run context may take before it gives up
+/// and takes a row of its own.
+///
+/// The title is the agent's sentence and the run context is a path of
+/// unbounded length, so on a narrow window or a deep directory the two cannot
+/// share a line. Rather than truncating either — a truncated path is a
+/// security-relevant fact removed from the screen — the row splits back into
+/// two, which is what it always was.
+const ASIDE_SHARE: f32 = 0.45;
+
+/// Whether a run context `width` points wide may share a `room`-wide title
+/// row.
+///
+/// A separate answer from the drawing, so the rule is a thing a test can ask
+/// rather than a thing a screenshot has to be read for. Nothing is truncated
+/// either way: `false` means the run context takes a row of its own, which is
+/// what it always had.
+fn aside_fits(width: f32, room: f32) -> bool {
+    width > 0.0 && width <= room * ASIDE_SHARE
+}
+
+/// The agent's two lines, above everything, with the run context in the
+/// corner of the first one.
 ///
 /// Drawn through [`classify`], which is more than the protocol requires: they
 /// arrive defanged, so nothing dangerous is left in them, but a chip is a
@@ -621,48 +661,132 @@ impl Palette {
 /// difference between a label the agent wrote and one hatch substituted.
 /// Classifying what arrives puts every remaining oddity in a box that reads
 /// as hatch's own voice.
-pub fn draw_headline(ui: &mut Ui, title: &str, reason: &str) {
+///
+/// # Why "Runs as … in …" is up here
+///
+/// It used to be a row of its own below the separator, and a row of its own
+/// is a row of the window that the command being read does not get. It is
+/// also, read plainly, part of the same sentence as the title: *this* is what
+/// the agent wants, and *this* is who and where it happens. So the title
+/// takes the left of the row and the run context the right, and they cost one
+/// row between them instead of two.
+pub fn draw_headline(ui: &mut Ui, title: &str, reason: &str, aside: Option<&RunContext>) {
     egui::ScrollArea::vertical()
         .id_salt("hatch-headline")
         .max_height(ui.available_height() * HEADLINE_SHARE)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            draw_spans(ui, &classify(title), Weight::Heading);
+            let width = aside.map_or(0.0, |aside| run_context_width(ui, aside));
+            match aside_fits(width, ui.available_width()) {
+                true => draw_title_row(ui, title, aside.expect("a width came from one"), width),
+                false => {
+                    draw_spans(ui, &classify(title), Weight::Heading);
+                    if let Some(aside) = aside {
+                        ui.horizontal_wrapped(|ui| draw_run_context(ui, aside));
+                    }
+                }
+            }
             ui.add_space(4.0);
             draw_spans(ui, &classify(reason), Weight::Body);
         });
 }
 
+/// The title, with the run context right-aligned against the end of its first
+/// line.
+///
+/// Two children over one rect rather than one flow: the title wraps, and a
+/// title that grew to two lines must push the reason down without dragging
+/// the run context into the middle of the paragraph.
+fn draw_title_row(ui: &mut Ui, title: &str, aside: &RunContext, width: f32) {
+    let row = ui.available_rect_before_wrap();
+    let gap = ui.spacing().item_spacing.x;
+    let line = ui.text_style_height(&egui::TextStyle::Body);
+
+    let left = egui::Rect::from_min_max(
+        row.min,
+        egui::pos2(row.right() - width - gap, row.bottom()),
+    );
+    let mut title_ui = ui.new_child(egui::UiBuilder::new().max_rect(left));
+    draw_spans(&mut title_ui, &classify(title), Weight::Heading);
+    let used = title_ui.min_rect().height();
+
+    let right = egui::Rect::from_min_size(
+        egui::pos2(row.right() - width, row.top()),
+        egui::vec2(width, ui.text_style_height(&egui::TextStyle::Heading).max(line)),
+    );
+    let mut aside_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    draw_run_context(&mut aside_ui, aside);
+
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+        row.min,
+        egui::vec2(row.width(), used.max(right.height())),
+    ));
+}
+
+/// "Runs as you in /some/path", as three labels.
+fn draw_run_context(ui: &mut Ui, aside: &RunContext) {
+    let palette = palette(ui);
+    ui.spacing_mut().item_spacing.x = ui.spacing().item_spacing.x.min(4.0);
+    ui.label(RichText::new("Runs as").small().color(palette.quiet));
+    let who = RichText::new(principal(aside.root)).strong();
+    ui.label(if aside.root { who.color(palette.danger) } else { who });
+    ui.label(RichText::new("in").small().color(palette.quiet));
+    ui.label(RichText::new(&aside.cwd).monospace());
+}
+
+/// How wide that row of labels is, measured in the fonts actually in force.
+///
+/// Measured and not guessed: the row is placed by subtracting this from the
+/// right edge, and a guess that came out short would put the path off the
+/// side of the window.
+fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
+    let gap = ui.spacing().item_spacing.x.min(4.0);
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let mono = egui::TextStyle::Monospace.resolve(ui.style());
+    let text = |font: &egui::FontId, s: &str| {
+        ui.ctx().fonts_mut(|fonts| {
+            fonts.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x
+        })
+    };
+    text(&small, "Runs as")
+        + text(&body, principal(aside.root))
+        + text(&small, "in")
+        + text(&mono, &aside.cwd)
+        + 3.0 * gap
+}
+
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, cwd, root, longest, .. } => {
-            draw_command_header(ui, scan, danger, cwd, *root);
-            ui.separator();
+        Shown::Command { annotated, raw, scan, danger, longest, .. } => {
+            draw_command_header(ui, scan, danger);
             draw_command(ui, annotated, raw, *longest);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
     }
 }
 
-/// Who it runs as, where, and how odd the text is.
-fn draw_command_header(
-    ui: &mut Ui,
-    report: &ScanReport,
-    danger: &[String],
-    cwd: &str,
-    root: bool,
-) {
-    let palette = Palette::of(ui);
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Runs as");
-        let who = RichText::new(principal(root)).strong();
-        ui.label(if root { who.color(palette.danger) } else { who });
-        ui.label("in");
-        ui.label(RichText::new(cwd).monospace());
-    });
+/// How odd the text is, and what it was marked for.
+///
+/// Only what is there: an ordinary command in an ordinary directory draws
+/// neither of these lines, so the two rows this can cost are rows a request
+/// that needs them pays for and no other request does. Who it runs as and
+/// where is up in the title row — see [`draw_headline`].
+fn draw_command_header(ui: &mut Ui, report: &ScanReport, danger: &[String]) {
+    let palette = palette(ui);
     if let Some(summary) = scan_summary(report) {
-        ui.label(RichText::new(format!("Unusual characters: {summary}")).color(palette.warn));
+        // Bold, like the marked list: this is one of the two colours the
+        // chrome draws at large-text contrast rather than body contrast, and
+        // bold is the half of "large" it can actually have. See
+        // `crate::prompt_ui::theme`.
+        ui.label(
+            RichText::new(format!("Unusual characters: {summary}")).color(palette.warn).strong(),
+        );
     }
     if !danger.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -841,13 +965,6 @@ fn drove(
     }
 }
 
-/// What the raw pane is called on screen.
-const RAW_LABEL: &str = "Exactly the text being approved — no reflow, no grouping, no colour";
-
-/// What the annotated pane is called on screen.
-const ANNOTATED_LABEL: &str = "The same command, annotated — the colour and the italics are \
-                               hatch's notes, not the command";
-
 /// The two panes.
 ///
 /// # Side by side, when they fit
@@ -870,11 +987,11 @@ const ANNOTATED_LABEL: &str = "The same command, annotated — the colour and th
 ///
 /// # Stacked, when they do not
 ///
-/// The space is not split evenly. The raw pane grows to as many lines as the
-/// command has — a newline is drawn as `↵` *and* ends the line, so a heredoc
-/// is a block and not one line scrolling sideways forever — and then stops at
-/// [`RAW_SHARE`] and scrolls. Everything left over goes to the annotated
-/// pane, which is the one a reader spends their time in.
+/// The space is not split, and deliberately not: the raw pane becomes a strip
+/// of [`RAW_STRIP_ROWS`] lines and everything else goes to the annotated
+/// pane. Stacking is chosen *because the command is long*, so an even split
+/// would take the most reading room away in the case that needs the most —
+/// and spend it drawing the same command twice. See [`raw_ceiling`].
 ///
 /// Stacked, and only stacked, the two panes scroll together. Side by side
 /// needs no help: corresponding text is already level, which is the whole
@@ -885,12 +1002,12 @@ const ANNOTATED_LABEL: &str = "The same command, annotated — the colour and th
 /// rather than by pixels or by line number: see [`pane_lines`] for why those
 /// two would drift and a source offset cannot.
 fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
-    let palette = Palette::of(ui);
+    let palette = palette(ui);
     let column = column_chars(pane_chars(ui, 2), 0);
     let view = command_view(longest, column);
-    if let Some(caption) = command_caption(view, longest, column) {
-        ui.label(RichText::new(caption).small().color(palette.quiet));
-    }
+    // One line for both panes: which is which, and what each promises. See
+    // `command_caption` for why the promise is not furniture.
+    ui.label(RichText::new(command_caption(view, longest, column)).small().color(palette.quiet));
 
     match view {
         CommandView::SideBySide => {
@@ -913,7 +1030,7 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
                 Pane::Annotated => &annotated_rows,
             };
 
-            let ceiling = raw_ceiling(ui.available_height());
+            let ceiling = raw_ceiling(ui.available_height(), row);
             let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, ceiling);
             let at_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
 
@@ -930,8 +1047,10 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
     }
 }
 
-/// One command pane: its label, then the rendering in a framed, scrolling
-/// box.
+/// One command pane: the rendering in a framed, scrolling box.
+///
+/// No label of its own — the one caption above both panes says which is which
+/// and what each promises, in the rows two labels would have cost.
 ///
 /// Each pane keeps the weight it has always had, in both arrangements. The
 /// raw pane never reflows, so a line too wide for it is scrolled to; the
@@ -944,8 +1063,6 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
 /// which is how the caller tells a pane that agreed with what it was asked
 /// from a pane the reader scrolled.
 fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
-    let palette = Palette::of(ui);
-    ui.label(RichText::new(pane.label).small().color(palette.quiet));
     // A pane that cannot wrap needs somewhere to scroll a long line to; one
     // that wraps has nothing to the side and a horizontal bar would only be
     // furniture.
@@ -959,7 +1076,7 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
     if let Some(at) = pane.at {
         scroll = scroll.vertical_scroll_offset(at);
     }
-    egui::Frame::group(ui.style())
+    pane_frame(ui)
         .show(ui, |ui| scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight)).state.offset.y)
         .inner
 }
@@ -967,8 +1084,6 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
 /// One command pane's box: everything about it except what is in it.
 #[derive(Debug, Clone, Copy)]
 struct PaneBox {
-    /// What the pane is called on screen.
-    label: &'static str,
     /// Its scroll area's identity, so a pane keeps its position across
     /// frames.
     id: &'static str,
@@ -984,13 +1099,12 @@ struct PaneBox {
 impl PaneBox {
     /// The raw pane, which never reflows.
     fn raw(height: f32, shrink: bool, at: Option<f32>) -> PaneBox {
-        PaneBox { label: RAW_LABEL, id: "hatch-raw", weight: Weight::Mono, height, shrink, at }
+        PaneBox { id: "hatch-raw", weight: Weight::Mono, height, shrink, at }
     }
 
     /// The annotated pane, which wraps.
     fn annotated(height: f32, at: Option<f32>) -> PaneBox {
         PaneBox {
-            label: ANNOTATED_LABEL,
             id: "hatch-annotated",
             weight: Weight::Wrapped,
             height,
@@ -1063,7 +1177,7 @@ impl PaneBox {
 /// line is still a mark on every line, and the rule costs a reader nothing,
 /// because the case it hides is exactly the case where both sides agree.
 fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: usize) {
-    let palette = Palette::of(ui);
+    let palette = palette(ui);
     ui.horizontal_wrapped(|ui| {
         ui.label("Writes");
         ui.label(RichText::new(path).monospace().strong());
@@ -1102,7 +1216,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     // it is a fact in both views: side by side never wraps a cell, because a
     // diff that would have to wrap one is drawn unified instead.
     let row_height = row_height(ui);
-    egui::Frame::group(ui.style()).show(ui, |ui| match view {
+    pane_frame(ui).show(ui, |ui| match view {
         DiffView::SideBySide => {
             let size = Cells {
                 gutter: advance * GUTTER_CHARS as f32,
@@ -1139,6 +1253,23 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     });
 }
 
+/// The box a pane is drawn in: a fill that is not the chrome, and an edge
+/// that says so.
+///
+/// egui's own group frame is a hairline and no fill at all, which on a dark
+/// theme is a pane that reads as part of the window behind it — see
+/// [`crate::prompt_ui::theme`] for the measurement. The fill is the anchor
+/// for the eye and the border is the boundary claim; the two together are
+/// what make a pane an object.
+///
+/// One function, used by every reading box and by the width arithmetic that
+/// has to know how much of a column the furniture takes: a frame measured
+/// through one constructor and drawn through another is how a column comes to
+/// promise room it does not have.
+fn pane_frame(ui: &Ui) -> egui::Frame {
+    egui::Frame::group(ui.style()).fill(palette(ui).surface)
+}
+
 /// The width `boxes` framed, scrolling boxes really leave for text.
 ///
 /// Subtracting the furniture rather than measuring inside the box, because
@@ -1150,7 +1281,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
 /// `boxes` is one for a diff, which is drawn in a single frame, and two for
 /// the command panes side by side.
 fn text_width(ui: &Ui, boxes: usize) -> f32 {
-    let frame = egui::Frame::group(ui.style());
+    let frame = pane_frame(ui);
     let border = (frame.inner_margin.sum() + frame.outer_margin.sum()).x + 2.0 * frame.stroke.width;
     let scroll = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
     (ui.available_width() - boxes as f32 * (border + scroll)).max(0.0)
@@ -1166,14 +1297,36 @@ fn row_height(ui: &Ui) -> f32 {
     ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y
 }
 
-/// The most of `available` the raw pane may take when the panes are stacked.
+/// How tall the raw pane is when the panes are stacked.
 ///
-/// A share and not a line count, because the thing being protected is the
-/// annotated pane's part of the window: the raw pane is the one a reader
-/// falls back to, not the one they read first, so it yields the space and
-/// scrolls.
-fn raw_ceiling(available: f32) -> f32 {
-    available * RAW_SHARE
+/// # Why a strip
+///
+/// Stacking happens *because the command is long* — that is the whole of the
+/// rule that chose it — and long is exactly when a reader needs vertical
+/// room. Splitting the space between two renderings of the same text was
+/// therefore backwards: it took the most room away in the case where reading
+/// was hardest, and spent it drawing the command a second time.
+///
+/// The two panes do not have the same job. The annotated pane is the one a
+/// reader *reads*. The raw pane is the one they *check* — it is the answer to
+/// "the pretty view might be misleading me" — and checking is done a line at
+/// a time, against the line you are already on. So stacked, the raw pane is a
+/// strip of [`RAW_STRIP_ROWS`] lines and the annotated pane takes everything
+/// else.
+///
+/// # Why it is not behind a toggle
+///
+/// The point of the raw pane is to be there without being asked for: a pane
+/// behind a disclosure triangle is a pane the reader forgets exists, and the
+/// one time it matters is the one time nobody clicks. So the strip is always
+/// drawn, never collapsed, and all of the raw text is reachable in it —
+/// scrolled directly, or by scrolling the annotated pane, which drags the
+/// strip to the same place in the command. See [`ScrollLink`].
+///
+/// The share is still a ceiling on top of the strip, for the short window
+/// where six rows would be most of what there is.
+fn raw_ceiling(available: f32, row: f32) -> f32 {
+    (RAW_STRIP_ROWS * row).min(available * RAW_SHARE)
 }
 
 /// The width of one character of the font both panes and both diff views draw
@@ -1481,7 +1634,7 @@ fn lines(spans: &[Span]) -> Vec<&[Span]> {
 /// is [`line_text`] — testable, unlike a sequence of widgets — so what the
 /// reader is shown can be asserted against what the spans say.
 fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) {
-    let palette = Palette::of(ui);
+    let palette = palette(ui);
     let font = font(weight, ui.style());
     let job = line_job(line, &palette, &font);
     ui.add(egui::Label::new(job).wrap_mode(wrap_mode(weight)));
@@ -1543,11 +1696,26 @@ fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text
                 egui::TextFormat { background: palette.separator_bg, ..plain.clone() }
             }
             SpanKind::Danger => egui::TextFormat { color: palette.danger, ..plain.clone() },
-            // Decoration, and additive only: more contrast and a cooler hue,
-            // never a box, never a fade, never a substitution.
-            SpanKind::Command => {
-                egui::TextFormat { color: palette.command, ..plain.clone() }
-            }
+            // Decoration, and additive only: never a box, never a fade,
+            // never a substitution.
+            //
+            // Two channels, not one. Contrast alone -- the theme's strongest
+            // text -- turned out to read as *slightly brighter text* rather
+            // than as a mark, and bold is not available here: the bundled
+            // monospace face has no bold cut and a synthetic one would change
+            // the advance width the side-by-side fit is measured in. An
+            // underline is drawn beneath the row by the text layout and adds
+            // nothing to any glyph's advance, so the measurement and the
+            // drawing still agree.
+            //
+            // It cannot be mistaken for a link: `quoted` is the only hue with
+            // a link's colour and it is never underlined, and the command
+            // word is never that hue.
+            SpanKind::Command => egui::TextFormat {
+                color: palette.command,
+                underline: egui::Stroke::new(1.0, palette.command),
+                ..plain.clone()
+            },
             SpanKind::Quoted => egui::TextFormat { color: palette.quoted, ..plain.clone() },
             SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
@@ -1796,6 +1964,55 @@ mod tests {
     }
 
     // ---- the header --------------------------------------------------------
+
+    #[test]
+    fn a_run_context_shares_the_title_row_only_while_it_leaves_the_title_a_row() {
+        // The title is the agent's sentence and a path has no length limit,
+        // so the two cannot always share. Rather than truncating either --
+        // a truncated path is a security-relevant fact taken off the screen
+        // -- the row splits back into the two it always was.
+        assert!(aside_fits(100.0, 1000.0), "a short path did not fit a wide window");
+        assert!(aside_fits(450.0, 1000.0), "a path at the share exactly did not fit");
+        assert!(!aside_fits(451.0, 1000.0), "a path over the share still took the row");
+        assert!(!aside_fits(100.0, 100.0), "a narrow window still shared its title row");
+        assert!(!aside_fits(0.0, 1000.0), "a request with no run context reserved room for one");
+    }
+
+    #[test]
+    fn a_run_context_is_measured_in_the_fonts_it_is_drawn_in() {
+        // The row is placed by subtracting this from the right edge, so a
+        // measurement that came out short would put the path off the side.
+        at_font_size(16.0, |ui| {
+            let short = RunContext { cwd: "/tmp".to_string(), root: false };
+            let long = RunContext {
+                cwd: "/home/user/src/service/deploy/staging/registry".to_string(),
+                root: false,
+            };
+            assert!(run_context_width(ui, &short) > 0.0, "it measured as nothing at all");
+            assert!(
+                run_context_width(ui, &long) > run_context_width(ui, &short),
+                "a longer path measured no wider"
+            );
+            // Root is a longer word than the ordinary one and is measured as
+            // one: the header draws it in red, not in a different size.
+            let rooted = RunContext { cwd: short.cwd.clone(), root: true };
+            assert!(run_context_width(ui, &rooted) > run_context_width(ui, &short));
+        });
+    }
+
+    #[test]
+    fn only_a_command_has_a_run_context_to_put_in_the_corner() {
+        // A swap names an absolute path in its own header and runs as
+        // whoever the plan says: a different claim, drawn in a different
+        // place.
+        let command = Shown::of(&a_command("ls")).expect("a command");
+        let context = RunContext::of(&command).expect("a command runs somewhere");
+        assert_eq!(context.cwd, "/tmp");
+        assert!(!context.root);
+
+        let swap = Shown::of(&swap_payload("a\n", "b\n")).expect("a swap");
+        assert_eq!(RunContext::of(&swap), None);
+    }
 
     #[test]
     fn the_header_says_root_in_words() {
@@ -2167,11 +2384,22 @@ mod tests {
     }
 
     #[test]
-    fn the_raw_pane_yields_most_of_a_stacked_window_to_the_annotated_one() {
-        assert_eq!(raw_ceiling(100.0), 100.0 * RAW_SHARE);
-        assert!(raw_ceiling(100.0) < 50.0, "the pane a reader falls back to took half the window");
-        assert!(raw_ceiling(100.0) > 0.0, "and it took none of it");
-        assert_eq!(raw_ceiling(0.0), 0.0, "no window is no ceiling, not a panic");
+    fn the_stacked_raw_pane_is_a_strip_and_not_a_share_of_the_window() {
+        // The bug: stacking is chosen because the command is long, and a
+        // 40% share handed the least reading room to the longest commands.
+        let row = 22.0;
+        let strip = RAW_STRIP_ROWS * row;
+        assert_eq!(raw_ceiling(600.0, row), strip, "a tall window still gets a strip");
+        assert!(
+            raw_ceiling(600.0, row) < 600.0 * RAW_SHARE,
+            "the strip is not an improvement on the share it replaced"
+        );
+        // And the share is still the backstop, for a window too short for
+        // even six rows to be a strip rather than the whole of it.
+        assert_eq!(raw_ceiling(100.0, row), 100.0 * RAW_SHARE);
+        assert!(raw_ceiling(100.0, row) < 50.0, "the pane a reader falls back to took half");
+        assert_eq!(raw_ceiling(0.0, row), 0.0, "no window is no ceiling, not a panic");
+        assert!(raw_ceiling(600.0, row) > 0.0, "the raw text is not on screen at all");
     }
 
     #[test]
@@ -2233,16 +2461,32 @@ mod tests {
     }
 
     #[test]
-    fn the_command_panes_say_so_when_they_could_not_be_put_side_by_side() {
-        // Only in the fallback. Side by side draws the same two labelled
-        // panes as stacking does and only moves them, so a permanent caption
-        // would be another line a reader learns to skip.
-        assert_eq!(command_caption(CommandView::SideBySide, 4, 40), None);
+    fn one_caption_names_both_panes_and_keeps_what_each_of_them_promises() {
+        // The panes carry no labels of their own any more -- two labels are
+        // two rows when the panes are stacked -- so the claim that made the
+        // raw pane worth having has to survive here, in both arrangements.
+        for (view, first, second) in [
+            (CommandView::SideBySide, "Left", "Right"),
+            (CommandView::Stacked, "Above", "Below"),
+        ] {
+            let caption = command_caption(view, 214, 40);
+            assert!(caption.contains(first), "the first pane is not named: {caption}");
+            assert!(caption.contains(second), "the second pane is not named: {caption}");
+            assert!(
+                caption.contains("no colour"),
+                "the raw pane's promise is gone: {caption}"
+            );
+            assert!(
+                caption.contains("hatch's notes, not the command"),
+                "the annotated pane's warning is gone: {caption}"
+            );
+        }
 
-        let stacked = command_caption(CommandView::Stacked, 214, 40).expect("a caption");
+        // And the fallback still says what was too long and what to do.
+        let stacked = command_caption(CommandView::Stacked, 214, 40);
         assert!(stacked.contains("214"), "the fallback does not say what was too long");
         assert!(stacked.contains("40"), "nor what it was too long for");
-        assert!(stacked.contains("Widen"), "nor what the reader can do about it");
+        assert!(stacked.contains("widen"), "nor what the reader can do about it");
     }
 
     // ---- keeping the two stacked panes together ----------------------------
@@ -2500,6 +2744,12 @@ mod tests {
     /// a stretch of the job was given. The real one comes from the theme.
     fn a_palette() -> Palette {
         Palette {
+            chrome: Color32::from_rgb(11, 0, 0),
+            surface: Color32::from_rgb(12, 0, 0),
+            border: Color32::from_rgb(13, 0, 0),
+            button: Color32::from_rgb(14, 0, 0),
+            button_hovered: Color32::from_rgb(15, 0, 0),
+            button_active: Color32::from_rgb(16, 0, 0),
             text: Color32::from_rgb(1, 0, 0),
             quiet: Color32::from_rgb(2, 0, 0),
             danger: Color32::from_rgb(3, 0, 0),
@@ -2678,32 +2928,84 @@ mod tests {
         // is hatch talking. A palette that spent one of those on a keyword
         // would make the meaningful ones ordinary, so the two the highlight
         // uses have to be distinct from all of them -- and from each other.
-        let visuals = egui::Visuals::dark();
-        let palette = Palette {
-            text: visuals.text_color(),
-            quiet: visuals.weak_text_color(),
-            danger: visuals.error_fg_color,
-            warn: visuals.warn_fg_color,
-            command: visuals.strong_text_color(),
-            quoted: visuals.hyperlink_color,
-            chip_bg: visuals.code_bg_color,
-            separator_bg: visuals.faint_bg_color,
-            value_bg: visuals.faint_bg_color,
-            gap_bg: visuals.extreme_bg_color,
-        };
-        let named = [
-            ("text", palette.text),
-            ("quiet", palette.quiet),
-            ("danger", palette.danger),
-            ("warn", palette.warn),
-            ("command", palette.command),
-            ("quoted", palette.quoted),
-        ];
-        for (i, (a, colour)) in named.iter().enumerate() {
-            for (b, other) in &named[i + 1..] {
-                assert_ne!(colour, other, "{a} and {b} are the same colour");
+        // Both palettes, because a theme is a choice and neither of them may
+        // collapse two meanings into one colour.
+        for theme in [crate::prompt_ui::theme::Theme::Dark, crate::prompt_ui::theme::Theme::Light]
+        {
+            let palette = theme.palette();
+            let named = [
+                ("text", palette.text),
+                ("quiet", palette.quiet),
+                ("danger", palette.danger),
+                ("warn", palette.warn),
+                ("command", palette.command),
+                ("quoted", palette.quoted),
+            ];
+            for (i, (a, colour)) in named.iter().enumerate() {
+                for (b, other) in &named[i + 1..] {
+                    assert_ne!(colour, other, "{theme:?}: {a} and {b} are the same colour");
+                }
             }
         }
+    }
+
+    #[test]
+    fn the_command_word_carries_an_underline_as_well_as_its_contrast() {
+        // Contrast alone read as slightly brighter text rather than as a
+        // mark. Two channels, so a glance finds it.
+        let palette = a_palette();
+        let spans = render_command("ls -l", &BTreeMap::new());
+        let job = job_of(&spans);
+        let format = format_at(&job, 0);
+
+        assert_eq!(format.color, palette.command);
+        assert_eq!(format.underline.color, palette.command, "the command word is not underlined");
+        assert!(format.underline.width > 0.0);
+    }
+
+    #[test]
+    fn nothing_reads_as_a_hyperlink_that_this_window_does_not_have() {
+        // The link colour belongs to quoted strings, and it was chosen for
+        // them. Underlining it as well would draw a hyperlink -- a thing this
+        // window has none of -- so the underline goes on the one span kind
+        // that is never that colour.
+        let palette = a_palette();
+        let spans = render_command("echo 'hello'", &BTreeMap::new());
+        let job = job_of(&spans);
+        let quote = job.text.find('\'').expect("the quoted string is on screen");
+        let quoted = format_at(&job, quote);
+
+        assert_eq!(quoted.color, palette.quoted);
+        assert_eq!(quoted.underline, egui::Stroke::NONE, "a quoted string reads as a link");
+        assert_ne!(palette.command, palette.quoted, "the underlined word is the link colour");
+    }
+
+    #[test]
+    fn an_underlined_command_word_is_exactly_as_wide_as_a_plain_one() {
+        // The side-by-side fit is measured in characters against the
+        // monospace advance, so a mark that widened a glyph would make the
+        // measurement and the drawing disagree about what fits a column.
+        // Verified through egui's own layout rather than assumed.
+        at_font_size(16.0, |ui| {
+            let advance = advance(ui);
+            let font = font(Weight::Mono, ui.style());
+            let plain = egui::TextFormat { font_id: font.clone(), ..Default::default() };
+            let marked = egui::TextFormat {
+                underline: egui::Stroke::new(1.0, Color32::WHITE),
+                ..plain.clone()
+            };
+            let width = |format: egui::TextFormat| {
+                let mut job = egui::text::LayoutJob::default();
+                job.append("0000000000", 0.0, format);
+                job.wrap.max_width = f32::INFINITY;
+                ui.ctx().fonts_mut(|fonts| fonts.layout_job(job)).size().x
+            };
+            assert_eq!(width(marked), width(plain.clone()), "the underline moved the glyphs");
+            assert!(
+                (width(plain) - 10.0 * advance).abs() < 0.5,
+                "ten characters are not ten advances wide"
+            );
+        });
     }
 
     #[test]

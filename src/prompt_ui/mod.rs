@@ -75,6 +75,7 @@
 
 pub mod guard;
 pub mod panes;
+pub mod theme;
 pub mod visibility;
 
 use std::collections::VecDeque;
@@ -757,7 +758,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
     // and owns nothing, so a missing or unreadable config is a window at the
     // default size rather than a request that never opens one -- which the
     // daemon would resolve as a denial.
-    let font_size = crate::config::display_font_size();
+    let (font_size, theme) = crate::config::display_style();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -780,6 +781,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
             // request it could not have shown. Nothing is lost by waiting:
             // the daemon's first write fits in the pipe.
             apply_font_size(&cc.egui_ctx, font_size);
+            theme::apply(&cc.egui_ctx, theme);
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
             let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal));
@@ -1015,10 +1017,11 @@ impl PromptApp {
                 self.viewer(ui, &title);
                 return;
             }
-            panes::draw_headline(ui, &title, &reason);
-            ui.separator();
             // There is always one once a request has arrived: a payload that
             // could not be rebuilt closed the window instead of becoming one.
+            let aside = self.state.shown().and_then(panes::RunContext::of);
+            panes::draw_headline(ui, &title, &reason, aside.as_ref());
+            ui.separator();
             if let Some(shown) = self.state.shown() {
                 panes::draw_payload(ui, shown);
             }
@@ -1045,7 +1048,7 @@ impl PromptApp {
                 egui::RichText::new(
                     "Earlier output was dropped: this window keeps the last megabyte.",
                 )
-                .small()
+                .strong()
                 .color(ui.visuals().warn_fg_color),
             );
         }
@@ -1327,10 +1330,27 @@ impl PromptApp {
     /// and Deny are one row of large buttons with a real gap between them —
     /// the gap is not decoration, it is the distance a slipped pointer has to
     /// cross to turn a refusal into a root command — and Explain, Simplify
-    /// and "I'll run it myself" are a smaller row underneath. They are escape
-    /// hatches: they send the agent away with something to do and nothing
-    /// runs, which is the same class of outcome as Deny and does not deserve
-    /// the same size as it.
+    /// and "I'll run it myself" are small buttons out at the right-hand edge
+    /// of the same row. They are escape hatches: they send the agent away
+    /// with something to do and nothing runs, which is the same class of
+    /// outcome as Deny and does not deserve the same size as it.
+    ///
+    /// # Why they share a row
+    ///
+    /// A row of this panel is a row the command above it does not get, and
+    /// this window is read at 700 points high. The escape hatches had a row
+    /// of their own and a 1280-point window has half of that row empty either
+    /// side of the two buttons that matter, so they moved into the empty
+    /// half. Nothing about the weighting moved with them: they are still
+    /// small, still secondary, and they are now *further* from Approve than
+    /// they were, because they sit past Deny with a full [`PRIMARY_GAP`]
+    /// between. Approve and Deny do not move at all — they stay centred in
+    /// the panel, in the same place, at the same size, whether or not the
+    /// hatches fit beside them.
+    ///
+    /// When they do not fit — a narrow window, a large font — they take a row
+    /// of their own again rather than overlapping Deny. That is measured, not
+    /// hoped: see [`row_width`].
     ///
     /// Every one of them is built with [`egui::Sense::CLICK`] rather than
     /// [`egui::Sense::click`], which is the same thing without `FOCUSABLE`.
@@ -1357,72 +1377,10 @@ impl PromptApp {
         let mut decided = None;
         let width = cluster_width(ui);
 
-        let approve = ui
-            .vertical_centered(|ui| {
-                // The label above the field rather than beside it, so that
-                // the field itself is centred on the buttons below and not
-                // pushed off-centre by the width of a word.
-                ui.label(egui::RichText::new("Note to the agent").small().weak());
-                ui.add_sized(
-                    egui::vec2(width, ui.spacing().interact_size.y),
-                    egui::TextEdit::singleline(&mut self.note),
-                );
-                if streamable {
-                    ui.add_enabled(
-                        can_stream,
-                        egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
-                    );
-                    if !can_stream {
-                        ui.label(
-                            egui::RichText::new("It runs in a terminal of its own.")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                }
+        self.note_row(ui, width, streamable, can_stream);
+        ui.add_space(6.0);
+        let approve = self.decision_row(ui, width, &note, &mut decided);
 
-                ui.add_space(8.0);
-                let approve = centred_row(ui, width, |ui| {
-                    let approve = unfocusable(
-                        ui,
-                        egui::Button::new(strong("Approve")).min_size(primary_button(ui)),
-                    );
-                    // A pointer that slips off Deny must land on nothing.
-                    ui.add_space(PRIMARY_GAP);
-                    if unfocusable(
-                        ui,
-                        egui::Button::new(strong("Deny")).min_size(primary_button(ui)),
-                    )
-                    .clicked()
-                    {
-                        decided = Some(Verdict::Deny { note: note.clone() });
-                    }
-                    approve
-                });
-
-                ui.add_space(4.0);
-                // Centred under the two that decide, and small: these send
-                // the agent away with something to do and nothing runs, which
-                // is the same class of outcome as Deny and does not deserve
-                // the same size as it.
-                centred_row(ui, width, |ui| {
-                    if secondary(ui, "Explain first").clicked() {
-                        decided =
-                            Some(Verdict::Revise { kind: ReviseKind::Explain, note: note.clone() });
-                    }
-                    if secondary(ui, "Ask for something simpler").clicked() {
-                        decided = Some(Verdict::Revise {
-                            kind: ReviseKind::Simplify,
-                            note: note.clone(),
-                        });
-                    }
-                    if secondary(ui, "I'll run it myself").clicked() {
-                        decided = Some(Verdict::SelfRun { note });
-                    }
-                });
-                approve
-            })
-            .inner;
         if approve.clicked() {
             decided = Some(Verdict::Approve { stream: self.stream });
         }
@@ -1433,6 +1391,260 @@ impl PromptApp {
         }
         approve
     }
+
+    /// One row: what to tell the agent, and whether to watch the output.
+    ///
+    /// Three rows before — a label, a field, a checkbox — and the label was
+    /// above the field rather than beside it only so that the field stayed
+    /// centred on the buttons below. That is still true and is still the
+    /// constraint: the field is centred at exactly `width`, and the label and
+    /// the checkbox are hung off its two ends. So the cluster still lines up
+    /// as one thing, and it costs one row instead of three.
+    fn note_row(&mut self, ui: &mut egui::Ui, width: f32, streamable: bool, can_stream: bool) {
+        let quiet = ui.visuals().weak_text_color();
+        let label = "Note to the agent";
+        let height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body));
+        let flanks = [
+            // Small, because that is what it is drawn at: a row measured in
+            // one style and drawn in another is a row that reserves the wrong
+            // amount of it.
+            text_width(ui, label, egui::TextStyle::Small),
+            match streamable {
+                true => self.stream_width(ui),
+                false => 0.0,
+            },
+        ];
+        let Some([left, centre, right]) = flanked_row(ui, height, width, flanks) else {
+            // Too narrow to hang anything off the field. Back to the stack,
+            // which is a taller row and a correct one.
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(label).small().color(quiet));
+                ui.add_sized(egui::vec2(width, height), egui::TextEdit::singleline(&mut self.note));
+                if streamable {
+                    self.stream_box(ui, can_stream);
+                }
+            });
+            return;
+        };
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(left)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| ui.label(egui::RichText::new(label).small().color(quiet)),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(centre)
+                .layout(egui::Layout::top_down_justified(egui::Align::Center)),
+            |ui| ui.add(egui::TextEdit::singleline(&mut self.note)),
+        );
+        if streamable {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(right)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| self.stream_box(ui, can_stream),
+            );
+        }
+    }
+
+    /// The stream checkbox, and the reason it is dead when it is.
+    fn stream_box(&mut self, ui: &mut egui::Ui, can_stream: bool) {
+        ui.add_enabled(
+            can_stream,
+            egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
+        );
+        if !can_stream {
+            ui.label(
+                egui::RichText::new("It runs in a terminal of its own.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+    }
+
+    /// How much room the checkbox and its note need beside the field.
+    ///
+    /// Deliberately generous. This is the flank that is drawn *rightwards*
+    /// from the field, so it is the one an under-measurement pushes off the
+    /// side of the window — and egui's own checkbox carries gaps between its
+    /// box and its text that are not worth reproducing here exactly. A slack
+    /// of two ordinary gaps costs a fallback that fires a little early and
+    /// buys a control that is never half off the screen; the claim that it is
+    /// enough is
+    /// `the_stream_box_sits_beside_the_field_and_stays_inside_the_window`.
+    fn stream_width(&self, ui: &egui::Ui) -> f32 {
+        let box_ = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        // `Button` and not `Body`: that is the style a checkbox draws its own
+        // label in.
+        let label = text_width(ui, "Stream output to this window", egui::TextStyle::Button);
+        let dead = match self.state.shown().is_some_and(|shown| shown.interactive()) {
+            true => {
+                ui.spacing().item_spacing.x
+                    + text_width(ui, "It runs in a terminal of its own.", egui::TextStyle::Small)
+            }
+            false => 0.0,
+        };
+        box_ + label + dead + 2.0 * ui.spacing().item_spacing.x
+    }
+
+    /// One row: the two buttons that decide, and the three that do not.
+    fn decision_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        width: f32,
+        note: &str,
+        decided: &mut Option<Verdict>,
+    ) -> egui::Response {
+        let height = primary_button(ui).y;
+        // One list, drawn in one order or the other. Two lists is how a
+        // button ends up in one arrangement and not the other.
+        let hatches = [
+            (Some(ReviseKind::Explain), "Explain first"),
+            (Some(ReviseKind::Simplify), "Ask for something simpler"),
+            (None, "I'll run it myself"),
+        ];
+        let needed = row_width(
+            ui,
+            hatches.iter().map(|(_, label)| *label),
+            egui::TextStyle::Small,
+        );
+        // Past Deny, with the same gap Approve and Deny keep between them: a
+        // pointer sliding off Deny lands on the panel, never on a button.
+        let flanks = [0.0, needed + PRIMARY_GAP];
+        let places = flanked_row(ui, height, width, flanks);
+
+        let mut verdicts = |ui: &mut egui::Ui| {
+            let approve = unfocusable(
+                ui,
+                egui::Button::new(strong("Approve")).min_size(primary_button(ui)),
+            );
+            // A pointer that slips off Deny must land on nothing.
+            ui.add_space(PRIMARY_GAP);
+            if unfocusable(ui, egui::Button::new(strong("Deny")).min_size(primary_button(ui)))
+                .clicked()
+            {
+                *decided = Some(Verdict::Deny { note: note.to_string() });
+            }
+            approve
+        };
+        let approve = match places {
+            Some([_, centre, _]) => ui
+                .scope_builder(
+                    egui::UiBuilder::new().max_rect(centre).layout(
+                        egui::Layout::left_to_right(egui::Align::Center)
+                            .with_main_align(egui::Align::Center),
+                    ),
+                    &mut verdicts,
+                )
+                .inner,
+            None => ui.vertical_centered(|ui| centred_row(ui, width, &mut verdicts)).inner,
+        };
+
+        let mut hatch_row = |ui: &mut egui::Ui, reversed: bool| {
+            let mut order = hatches;
+            if reversed {
+                order.reverse();
+            }
+            for (kind, label) in order {
+                if secondary(ui, label).clicked() {
+                    *decided = Some(match kind {
+                        Some(kind) => Verdict::Revise { kind, note: note.to_string() },
+                        None => Verdict::SelfRun { note: note.to_string() },
+                    });
+                }
+            }
+        };
+        match places {
+            // Right to left, so the row is built from the window's edge
+            // inwards and the three of them end where they started however
+            // wide the labels turn out to be. Reversed, so that reading order
+            // is the same as it is in the fallback below.
+            Some([_, _, right]) => {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(right)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    |ui| hatch_row(ui, true),
+                );
+            }
+            // A row of their own, centred under the two that decide, when
+            // there is no room beside them.
+            None => {
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| centred_row(ui, width, |ui| hatch_row(ui, false)));
+            }
+        }
+        approve
+    }
+}
+
+/// A row with something `width` wide centred in it and a flank on each side.
+///
+/// Returns the three rects — left, centre, right — or `None` when a flank
+/// would reach into the centre. That answer is the whole point: the centre of
+/// this panel is where Approve and Deny are, and a control allowed to overlap
+/// them is a control that can be pressed instead of them. A caller that gets
+/// `None` puts its flanks somewhere else; nothing is ever moved or shrunk to
+/// make room.
+///
+/// The centre is placed from the row's own width rather than from what the
+/// flanks turned out to need, so the two verdict buttons sit in exactly the
+/// same place whether or not anything is beside them.
+fn flanked_row(
+    ui: &mut egui::Ui,
+    height: f32,
+    width: f32,
+    flanks: [f32; 2],
+) -> Option<[egui::Rect; 3]> {
+    let gap = ui.spacing().item_spacing.x;
+    let row = egui::Rect::from_min_size(
+        ui.available_rect_before_wrap().min,
+        egui::vec2(ui.available_width(), height),
+    );
+    let centre = egui::Rect::from_center_size(row.center(), egui::vec2(width, height));
+    // A flank stops a gap short of the centre. Without it a label reads as
+    // part of the field it is naming and a checkbox reads as a button on the
+    // end of it.
+    let left = egui::Rect::from_min_max(row.min, egui::pos2(centre.left() - gap, row.bottom()));
+    let right =
+        egui::Rect::from_min_max(egui::pos2(centre.right() + gap, row.top()), row.max);
+    if flanks[0] > left.width() || flanks[1] > right.width() {
+        // Nothing has been allocated, so the caller's fallback starts where
+        // this row would have: a refusal costs no space.
+        return None;
+    }
+    ui.advance_cursor_after_rect(row);
+    Some([left, centre, right])
+}
+
+/// How wide one string is in the style it will be drawn in.
+fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let font = style.resolve(ui.style());
+    ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_no_wrap(text.to_string(), font, egui::Color32::WHITE).size().x
+    })
+}
+
+/// How wide a row of buttons carrying `labels` is, furniture included.
+///
+/// Measured rather than guessed, because what it decides is whether those
+/// buttons may sit beside the two that settle the request — and a guess that
+/// came out short would put one of them under a pointer aimed at Deny.
+fn row_width<'a>(
+    ui: &egui::Ui,
+    labels: impl IntoIterator<Item = &'a str>,
+    style: egui::TextStyle,
+) -> f32 {
+    let padding = 2.0 * ui.spacing().button_padding.x;
+    let mut total = 0.0;
+    let mut count: f32 = 0.0;
+    for label in labels {
+        total += text_width(ui, label, style.clone()) + padding;
+        count += 1.0;
+    }
+    total + (count - 1.0).max(0.0) * ui.spacing().item_spacing.x
 }
 
 /// A button a mouse can press and a keyboard cannot reach.
@@ -2330,12 +2542,18 @@ mod tests {
     }
 
     fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        raw_sized(events, egui::vec2(800.0, 600.0))
+    }
+
+    /// The same, on a window of a given size.
+    ///
+    /// The size is a parameter because two of the claims below are about
+    /// space: how much of the window the panes get at the size the window
+    /// opens at, and what the controls do when there is not enough of it.
+    fn raw_sized(events: Vec<egui::Event>, size: egui::Vec2) -> egui::RawInput {
         egui::RawInput {
             events,
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(800.0, 600.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             ..Default::default()
         }
     }
@@ -2461,6 +2679,23 @@ mod tests {
         let text = text_on_screen(&out);
         out.textures_delta.clear();
         text
+    }
+
+    /// A window awaiting a verdict on `command`, which runs in a terminal of
+    /// its own and so cannot be streamed to this one.
+    fn an_interactive_window_showing(command: &str) -> PromptApp {
+        let mut app = a_window_showing(command);
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command(command, &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            true,
+        );
+        app.state = PromptState::new();
+        app.state.handle(DaemonMsg::Request(request));
+        app
     }
 
     /// A window awaiting a verdict on `command`.
@@ -2829,5 +3064,454 @@ mod tests {
         let open = draw(&mut app, &ctx, Vec::new(), true);
         assert!(open.enabled(), "the buttons never become live at all");
     }
+    // ---- how much of the window the reader gets ---------------------------
+    //
+    // The window exists to have a command read off it, so the space the panes
+    // get is a claim about the product and not a detail of the layout. These
+    // measure it the way a screenshot would: by finding the pane boxes egui
+    // actually laid out.
+
+    /// The whole window, drawn at `size`, as the shapes egui would send to a
+    /// GPU.
+    fn window_shapes(app: &mut PromptApp, size: egui::Vec2) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        apply_font_size(&ctx, 16.0);
+        // Three frames: a panel learns its height from the frame before, so a
+        // pane measured against the first frame's guess is not the pane a
+        // reader sees.
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+            out.textures_delta.clear();
+        }
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+        out.textures_delta.clear();
+        out.shapes
+    }
+
+    /// Every rectangle filled with the pane surface: the reading boxes, and
+    /// nothing else on screen is that colour.
+    fn pane_boxes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::epaint::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == fill => out.push(rect.rect),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, fill, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let fill = theme::DARK.surface;
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, fill, &mut out);
+        }
+        // The note field is drawn on the same surface, and it is not a pane.
+        out.retain(|rect| rect.height() > 60.0);
+        out
+    }
+
+    /// How many points of the window's height the panes cover.
+    fn pane_height(app: &mut PromptApp, size: egui::Vec2) -> f32 {
+        let shapes = window_shapes(app, size);
+        let boxes = pane_boxes(&shapes);
+        assert!(!boxes.is_empty(), "no pane was drawn at all");
+        let top = boxes.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
+        let bottom = boxes.iter().map(|r| r.bottom()).fold(f32::NEG_INFINITY, f32::max);
+        bottom - top
+    }
+
+    /// The size the window opens at, which is the size these claims are made
+    /// about.
+    fn opening_size() -> egui::Vec2 {
+        egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1])
+    }
+
+    #[test]
+    fn the_panes_get_most_of_the_window_the_reader_opened() {
+        // Measured, not asserted about the code: this is the number the whole
+        // bundling pass exists to move. Before it, a short command at this
+        // size got 360 points of pane out of 700 and the furniture took the
+        // other 340. The floor here is well under what the layout actually
+        // manages, so it fails on a regression rather than on a font metric.
+        let mut app = a_window_showing("rm -rf /var/tmp/build && echo 'cleared'");
+        let height = pane_height(&mut app, opening_size());
+
+        assert!(
+            height >= 0.6 * WINDOW_SIZE[1],
+            "the panes got {height} of {} points; the furniture has grown back",
+            WINDOW_SIZE[1]
+        );
+    }
+
+    #[test]
+    fn a_long_command_gives_the_pane_a_reader_reads_more_than_the_one_they_check() {
+        // The bug: stacking is chosen *because* the command is long, and an
+        // even split handed the least room to the case that needed the most.
+        // The raw pane is a strip; the annotated pane gets the rest.
+        let long = (0..12)
+            .map(|i| format!("docker build --pull --no-cache -t registry.internal/thing:{i} ."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = a_window_showing(&long);
+        let shapes = window_shapes(&mut app, opening_size());
+        let mut boxes = pane_boxes(&shapes);
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+
+        assert_eq!(boxes.len(), 2, "a stacked command did not draw two panes");
+        let (strip, reading) = (boxes[0].height(), boxes[1].height());
+        assert!(
+            reading > 1.5 * strip,
+            "the strip is {strip} and the pane a reader reads is {reading}: still a split"
+        );
+        // And the raw text is on screen without anyone asking for it.
+        assert!(strip > 0.0, "the raw pane is not drawn at all when stacked");
+    }
+
+    // ---- the controls, bundled --------------------------------------------
+
+    #[test]
+    fn the_escape_hatches_share_the_verdict_row_without_reaching_it() {
+        // They are past Deny, at the window's edge, with a full `PRIMARY_GAP`
+        // between: a pointer sliding off Deny lands on the panel. The claim
+        // is about rectangles, so it is asked of the rectangles.
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 16.0);
+        let (mut app, _sink) = an_awaiting_window();
+        let mut approve = None;
+        let mut hatch = None;
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), opening_size()), |ui| {
+            egui::Panel::bottom("t").show(ui, |ui| {
+                let mut note = String::new();
+                approve = Some(ui.scope(|ui| app.decision_row(ui, cluster_width(ui), "", &mut None)).inner);
+                hatch = Some(ui.min_rect());
+                note.clear();
+            });
+        });
+        out.textures_delta.clear();
+        let approve = approve.expect("the row drew");
+        let row = hatch.expect("the row drew");
+
+        assert!(approve.rect.width() > 0.0, "Approve was not laid out");
+        // One row, not two: everything the panel drew is no taller than a
+        // single primary button plus the padding around it.
+        assert!(
+            row.height() < 2.0 * approve.rect.height(),
+            "the hatches took a row of their own on a window that had space: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_them_gives_the_hatches_their_own_row_again() {
+        // Never an overlap. `flanked_row` answers `None` rather than shrinking
+        // anything, because the thing it would be reaching into is Approve.
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 16.0);
+        let (mut app, _sink) = an_awaiting_window();
+        let mut approve = None;
+        let mut row = None;
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), egui::vec2(520.0, 700.0)), |ui| {
+            egui::Panel::bottom("t").show(ui, |ui| {
+                approve = Some(ui.scope(|ui| app.decision_row(ui, cluster_width(ui), "", &mut None)).inner);
+                row = Some(ui.min_rect());
+            });
+        });
+        out.textures_delta.clear();
+        let approve = approve.expect("the row drew");
+        let row = row.expect("the row drew");
+
+        assert!(
+            row.height() > approve.rect.height(),
+            "the hatches stayed on the verdict row at a width that cannot hold them"
+        );
+    }
+
+    #[test]
+    fn a_flank_that_would_reach_the_centre_is_refused_rather_than_squeezed() {
+        // The centre of that row is Approve and Deny. A control allowed to
+        // overlap them is a control that can be pressed instead of them.
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), egui::vec2(1000.0, 200.0)), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let width = 400.0;
+                let room = ui.available_width();
+                let fits = flanked_row(ui, 20.0, width, [10.0, 10.0]).expect("ten points fit");
+                assert!(fits[0].right() < fits[1].left(), "the left flank touched the centre");
+                assert!(fits[2].left() > fits[1].right(), "the right flank touched the centre");
+                assert!(
+                    (fits[1].center().x - ui.min_rect().center().x).abs() < 1.0,
+                    "the centre is not centred"
+                );
+                assert!(flanked_row(ui, 20.0, width, [room, 0.0]).is_none());
+                assert!(flanked_row(ui, 20.0, width, [0.0, room]).is_none());
+                // The boundary is inclusive on the fitting side: a flank that
+                // exactly fills its side is a flank that fits, and the extra
+                // row a refusal costs is not worth a fraction of a point.
+                let exact = fits[0].width();
+                assert!(
+                    flanked_row(ui, 20.0, width, [exact, exact]).is_some(),
+                    "a flank that exactly fits was sent to its own row"
+                );
+                assert!(
+                    flanked_row(ui, 20.0, width, [exact + 1.0, 0.0]).is_none(),
+                    "a point over was allowed to reach the centre"
+                );
+                assert!(
+                    flanked_row(ui, 20.0, width, [0.0, exact + 1.0]).is_none(),
+                    "a point over was allowed to reach the centre from the right"
+                );
+            });
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_note_its_label_and_the_stream_box_are_one_row() {
+        // Three rows before. The field is still centred at exactly the
+        // cluster width, so it still lines up with the buttons under it; the
+        // label and the checkbox hang off its ends.
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 16.0);
+        let mut app = a_window_showing("sleep 1");
+        let mut row = None;
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), opening_size()), |ui| {
+            egui::Panel::bottom("t").show(ui, |ui| {
+                let width = cluster_width(ui);
+                app.note_row(ui, width, true, true);
+                row = Some(ui.min_rect().height());
+            });
+        });
+        out.textures_delta.clear();
+        let row = row.expect("the row drew");
+
+        assert!(
+            row < 2.0 * ctx.style_of(egui::Theme::Dark).spacing.interact_size.y,
+            "the note row is {row} points: it is still a stack"
+        );
+    }
+
+    #[test]
+    fn the_window_still_says_who_it_runs_as_and_where_after_the_merge() {
+        // The run context moved into the corner of the title row. Moved, not
+        // dropped: it is the answer to "on whose machine, in which tree".
+        let drawn = window_text(&mut a_window_showing("ls"), true);
+
+        assert!(drawn.contains("Runs as"), "the run context is gone: {drawn}");
+        assert!(drawn.contains("/tmp"), "the working directory is gone: {drawn}");
+    }
+
+    #[test]
+    fn one_caption_still_carries_what_each_pane_promises() {
+        // The per-pane labels are gone; the claim they made is not.
+        let drawn = window_text(&mut a_window_showing("ls -l"), true);
+
+        assert!(drawn.contains("no colour"), "the raw pane's promise is gone: {drawn}");
+        assert!(
+            drawn.contains("hatch's notes, not the command"),
+            "the annotated pane's warning is gone: {drawn}"
+        );
+    }
+
+    /// Every galley egui laid out this frame, with where it put it.
+    fn text_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => out.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_run_context_sits_in_the_corner_of_the_title_row_and_inside_the_window() {
+        // The row is placed by subtracting a measured width from the right
+        // edge, so the measurement has two ways to be wrong and both are
+        // visible: too small puts the path off the side of the window, too
+        // large sends the whole thing to a row of its own for no reason.
+        let mut app = a_window_showing("ls");
+        let shapes = window_shapes(&mut app, opening_size());
+        let drawn = text_rects(&shapes);
+        let find = |want: &str| {
+            drawn
+                .iter()
+                .find(|(text, _)| text == want)
+                .unwrap_or_else(|| panic!("{want} is not on screen"))
+                .1
+        };
+
+        let title = find("delete the build directory");
+        let runs = find("Runs as");
+        let cwd = find("/tmp");
+        assert!(
+            cwd.right() <= WINDOW_SIZE[0],
+            "the working directory runs {} points off the right of the window",
+            cwd.right() - WINDOW_SIZE[0]
+        );
+        assert!(title.right() < runs.left(), "the title and the run context overlap");
+        assert!(
+            (title.center().y - cwd.center().y).abs() < title.height(),
+            "the run context took a row of its own on a window with room for it"
+        );
+    }
+
+    #[test]
+    fn the_stream_box_sits_beside_the_field_and_stays_inside_the_window() {
+        // The checkbox is the flank drawn rightwards from the note field, so
+        // it is the one a short measurement pushes off the side of the
+        // window. egui lays out its own checkbox; what is asserted here is
+        // where the thing actually landed.
+        let mut app = a_window_showing("sleep 1");
+        let shapes = window_shapes(&mut app, opening_size());
+        let drawn = text_rects(&shapes);
+        let find = |want: &str| {
+            drawn
+                .iter()
+                .find(|(text, _)| text == want)
+                .unwrap_or_else(|| panic!("{want} is not on screen"))
+                .1
+        };
+
+        let note = find("Note to the agent");
+        let stream = find("Stream output to this window");
+        assert!(
+            stream.right() <= WINDOW_SIZE[0],
+            "the stream box runs {} points off the right of the window",
+            stream.right() - WINDOW_SIZE[0]
+        );
+        assert!(note.right() < stream.left(), "the label and the checkbox overlap");
+        assert!(
+            (note.center().y - stream.center().y).abs() < note.height(),
+            "the label and the checkbox are not on one row after all"
+        );
+    }
+
+    /// Every button face egui drew, as rectangles.
+    ///
+    /// Found by fill, because that is what a button *is* on screen: the
+    /// question these ask is about the distance between two things a pointer
+    /// can land on, and a pointer lands on a rectangle.
+    fn button_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::epaint::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == fill => out.push(rect.rect),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, fill, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, theme::DARK.button, &mut out);
+        }
+        out
+    }
+
+    /// The verdict row's buttons at a given window width: the two that decide
+    /// and, if they are sharing the row, the ones that do not.
+    fn verdict_row(app: &mut PromptApp, width: f32) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+        let shapes = window_shapes(app, egui::vec2(width, 700.0));
+        let mut buttons = button_rects(&shapes);
+        buttons.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        // The two verdicts are the tall ones; nothing else in this window is
+        // `PRIMARY_BUTTON_ROWS` high.
+        let tallest = buttons.iter().map(|r| r.height()).fold(0.0_f32, f32::max);
+        let (primary, rest): (Vec<egui::Rect>, Vec<egui::Rect>) =
+            buttons.into_iter().partition(|r| r.height() >= tallest - 0.5);
+        let row = primary.first().map_or(0.0, |r| r.center().y);
+        // On the same row means level with the verdicts, not merely near
+        // them: the fallback draws its row directly underneath.
+        let sharing =
+            rest.into_iter().filter(|r| (r.center().y - row).abs() < 0.5 * tallest).collect();
+        (primary, sharing)
+    }
+
+    #[test]
+    fn a_slipped_pointer_still_has_the_whole_gap_to_cross_before_it_finds_a_hatch() {
+        // The escape hatches moved onto the verdict row. The distance that
+        // makes a misclick harmless is not decoration and did not move with
+        // them, so it is asserted at *every* width where they share the row —
+        // including the narrowest one, which is the only width where the
+        // arithmetic that reserves the gap can be caught getting it wrong.
+        let mut app = a_window_showing("rm -rf /var/tmp/build");
+        let mut ever_shared = false;
+        let mut ever_alone = false;
+        let mut width = 700.0;
+        while width <= 1400.0 {
+            let (primary, sharing) = verdict_row(&mut app, width);
+            assert_eq!(primary.len(), 2, "at {width} points the two verdicts were not drawn");
+            let deny = primary[1];
+            match sharing.is_empty() {
+                true => ever_alone = true,
+                false => {
+                    ever_shared = true;
+                    let nearest =
+                        sharing.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min);
+                    assert!(
+                        nearest - deny.right() >= PRIMARY_GAP,
+                        "at {width} points a hatch is {} from Deny",
+                        nearest - deny.right()
+                    );
+                }
+            }
+            width += 10.0;
+        }
+        assert!(ever_shared, "the hatches never shared the row at any width");
+        assert!(ever_alone, "the hatches shared the row even where they cannot fit");
+    }
+
+    /// How tall the note row comes out at a given window width.
+    fn note_row_height(app: &mut PromptApp, width: f32) -> f32 {
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 16.0);
+        let mut height = None;
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), egui::vec2(width, 700.0)), |ui| {
+            egui::Panel::bottom("t").show(ui, |ui| {
+                let cluster = cluster_width(ui);
+                app.note_row(ui, cluster, true, !app.state.shown().unwrap().interactive());
+                height = Some(ui.min_rect().height());
+            });
+        });
+        out.textures_delta.clear();
+        height.expect("the row drew")
+    }
+
+    #[test]
+    fn a_checkbox_with_more_to_say_takes_a_row_rather_than_the_note_fields_place() {
+        // The stream box carries a second sentence when it is dead — why it
+        // cannot be ticked — and that sentence is part of what has to fit
+        // beside the field. A window wide enough for the box alone is not
+        // wide enough for both, and the answer is a taller row, never a
+        // narrower field: the field is centred on the two buttons below it.
+        let ordinary = note_row_height(&mut a_window_showing("sleep 1"), 900.0);
+        let interactive =
+            note_row_height(&mut an_interactive_window_showing("vim /etc/hosts"), 900.0);
+
+        assert!(
+            interactive > ordinary,
+            "the dead checkbox's explanation was not measured: {interactive} against {ordinary}"
+        );
+        // And at the size the window opens at, the ordinary one is one row.
+        let wide = note_row_height(&mut a_window_showing("sleep 1"), WINDOW_SIZE[0]);
+        assert!(wide <= ordinary, "a wider window gave the note row more height, not less");
+    }
+
 }
 
