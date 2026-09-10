@@ -10,7 +10,7 @@
 //! | [`DaemonMsg::Request`] | The one and only request. Always first. |
 //! | [`DaemonMsg::QueueDepth`] | The "N more waiting" badge changed. |
 //! | [`DaemonMsg::Output`] | A chunk of an approved command's output. |
-//! | [`DaemonMsg::Finished`] | How it ended. The prompt closes. |
+//! | [`DaemonMsg::Finished`] | How it ended. The last frame either way. |
 //!
 //! | Prompt → daemon | |
 //! |---|---|
@@ -307,7 +307,12 @@ pub enum DaemonMsg {
         /// character the daemon never saw.
         text: String,
     },
-    /// How the command ended. The prompt closes on this frame.
+    /// How the command ended. The last frame the daemon sends.
+    ///
+    /// What the window does with it is the window's own business and is not on
+    /// the wire: a run nobody asked to watch closes here, and one the reader
+    /// ticked the stream box on stays for a few seconds with the result on it.
+    /// The frame says how it ended and nothing about how long anyone looks.
     Finished(Outcome),
 }
 
@@ -333,8 +338,11 @@ pub enum DaemonMsg {
 /// Timed-out and killed-by-user are deliberately *not* variants. Both end the
 /// command with a signal, and the distinction between them belongs to the
 /// tool result and to the audit log, which is where anyone can still read it
-/// after the window is gone. The window closes on this frame, so a field it
-/// would draw for no time at all is not worth a wire field.
+/// after the window is gone. A window that lingers over this frame draws the
+/// outcome for seconds rather than for none, which is an argument for keeping
+/// the wording plain, not for a field: "ended by signal 9" is what happened,
+/// and which of the two reasons it was is a sentence the tool result already
+/// gives the agent and the log already gives the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Outcome {

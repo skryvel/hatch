@@ -675,6 +675,10 @@ impl Hatch {
 /// takes to read one line and exit, not a period anybody looks at anything.
 /// It is bounded because [`PromptSession::close`] is unconditional and a
 /// wedged window must not be able to hold a finished request open.
+///
+/// It is not the linger. A streamed run's window stays on screen for as long
+/// as [`crate::prompt_ui`] says it does, and this daemon waits none of it: see
+/// [`Windup`].
 const FINAL_FRAME_GRACE: Duration = Duration::from_millis(500);
 
 /// How often the client is told the request is still alive.
@@ -1152,7 +1156,7 @@ impl Daemon {
         // live view, and nothing else. Killing it could leave a half-finished
         // state the user never asked for.
         progress.enter(Phase::Executing);
-        let result = match work {
+        let (result, windup) = match work {
             Work::Run { argv, env, cwd } => {
                 self.run_it(&argv, &env, &cwd, stream, &session, &mut detail).await
             }
@@ -1167,10 +1171,20 @@ impl Daemon {
         // refused in `prepare`.
 
         note_prompt_death(&session, &mut detail);
-        // The window closes on the frame that was just sent; this waits for it
-        // to do so, under a bound of the daemon's own, and then ends it.
-        let _ = tokio::time::timeout(FINAL_FRAME_GRACE, session.window_gone().cancelled()).await;
-        session.close().await;
+        match windup {
+            Windup::Close => {
+                // The window closes on the frame that was just sent; this
+                // waits for it to do so, under a bound of the daemon's own,
+                // and then ends it.
+                let _ =
+                    tokio::time::timeout(FINAL_FRAME_GRACE, session.window_gone().cancelled())
+                        .await;
+                session.close().await;
+            }
+            // Nothing is waited for here, and that is the point: the agent's
+            // result must not depend on how long a person reads a window.
+            Windup::Detach => session.detach(),
+        }
 
         Outcome { verdict: LogVerdict::Approve, note: None, detail, result }
     }
@@ -1187,6 +1201,24 @@ enum Prepared {
     Ready(Job),
     /// Refused before anyone was interrupted.
     Refused(Outcome),
+}
+
+/// What becomes of the window once the operation it authorised is over.
+///
+/// Two arms rather than a `bool` because the difference is not a flag on one
+/// behaviour: one of them waits for the window and ends it, and the other
+/// stops owning it entirely. The step that reads this is the last thing the
+/// request does, so the name is what says which of the two happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Windup {
+    /// End it. The window closes itself on the outcome frame; the daemon
+    /// gives it [`FINAL_FRAME_GRACE`] to do so and then kills and reaps it.
+    Close,
+    /// Let it go. A streamed run has finished and the window is showing the
+    /// output to the person who asked to watch it, so the request stops
+    /// waiting for it and stops ending it — see
+    /// [`crate::prompter::PromptSession::detach`].
+    Detach,
 }
 
 /// Which of the four things happened while the window was open.
@@ -1401,6 +1433,11 @@ impl Daemon {
 
 impl Daemon {
     /// Run an approved command to completion and describe what happened.
+    ///
+    /// The second half of the answer is what to do with the window, which only
+    /// this function knows: it is the one that sent the outcome frame, and
+    /// whether the window has a reason to stay depends on whether that frame
+    /// was sent at all and on whether anybody asked to watch.
     async fn run_it(
         &self,
         argv: &[String],
@@ -1409,7 +1446,7 @@ impl Daemon {
         stream: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> CallToolResult {
+    ) -> (CallToolResult, Windup) {
         // The live view is a display preference and nothing else: execution is
         // identical either way, so the only difference is whether a sink is
         // wired at all.
@@ -1452,10 +1489,17 @@ impl Daemon {
                 // "was signalled", and both would be a plausible-looking lie
                 // about a command that never started. The window is closed
                 // instead, and the agent is told the truth.
-                return CallToolResult::error(vec![ContentBlock::text(format!(
-                    "the user approved this, but hatch could not start it, so nothing ran: \
-                     {error}"
-                ))]);
+                return (
+                    CallToolResult::error(vec![ContentBlock::text(format!(
+                        "the user approved this, but hatch could not start it, so nothing ran: \
+                         {error}"
+                    ))]),
+                    // No outcome frame means a window still drawing "it is
+                    // running". Nothing will ever tell it otherwise, so it is
+                    // closed here rather than handed to a reader who would be
+                    // watching a command that never started.
+                    Windup::Close,
+                );
             }
         };
 
@@ -1465,10 +1509,26 @@ impl Daemon {
             run.killed_by_user = Some(output.killed_by_user);
             run.timed_out = Some(output.timed_out);
         }
-        if let Some(frame) = finished_frame(&output) {
-            let _ = session.outbox().finished(frame).await;
-        }
-        CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))])
+        // A streamed run's window stays: the reader ticked a box asking to
+        // watch this command, and for anything short of a slow one the whole
+        // run is over before they have read a line. Only when the outcome
+        // actually reached the window, though — a window that was not told the
+        // command ended has no reason to close itself, and handing that one
+        // over would be leaving it for the reader to explain.
+        let windup = match finished_frame(&output) {
+            Some(frame) => {
+                let told = session.outbox().finished(frame).await;
+                match told && stream {
+                    true => Windup::Detach,
+                    false => Windup::Close,
+                }
+            }
+            None => Windup::Close,
+        };
+        (
+            CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))]),
+            windup,
+        )
     }
 
     /// Apply an approved file replacement and describe what happened.
@@ -1479,7 +1539,7 @@ impl Daemon {
         plan: &SwapPlan,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> CallToolResult {
+    ) -> (CallToolResult, Windup) {
         // Re-validated and re-hashed inside `apply`, which is what makes every
         // error here a guarantee that the file on disk was not touched.
         let applied = swap::apply(path, content, plan, &self.denylist);
@@ -1501,7 +1561,7 @@ impl Daemon {
             .finished(protocol::Outcome::Exit { code: i32::from(!landed) })
             .await;
 
-        match applied {
+        let result = match applied {
             Ok(()) => CallToolResult::success(vec![ContentBlock::text(format!(
                 "wrote {}: {} bytes, mode {:04o}, owner {}:{}",
                 path.display(),
@@ -1511,7 +1571,11 @@ impl Daemon {
                 plan.landing_group,
             ))]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
-        }
+        };
+        // A swap writes a file and says nothing. There is no output to hold up
+        // and no stream checkbox to have ticked, so its window closes on the
+        // outcome as every window used to.
+        (result, Windup::Close)
     }
 }
 
@@ -3897,8 +3961,13 @@ mod tests {
             let harness =
                 Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
             within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
+            // A streamed run detaches its window rather than closing it, so
+            // the request returning is no longer the moment the pipe is
+            // drained. See `StubPrompter::settled`.
+            harness.prompter.settled().await;
 
-            let sent = &harness.prompter.recorded()[0].sent;
+            let recorded = harness.prompter.recorded();
+            let sent = &recorded[0].sent;
             let of = |want: exec::Stream| -> String {
                 sent.iter()
                     .filter_map(|msg| match msg {
@@ -3925,6 +3994,86 @@ mod tests {
                 )),
                 "the window is told how it ended: {sent:?}"
             );
+        }
+
+        // --- what becomes of the window ------------------------------------
+
+        /// Which of the two things the daemon did with the window, once its
+        /// channel has finished.
+        async fn windup_of(harness: &Harness) -> bool {
+            harness.prompter.settled().await;
+            harness.prompter.recorded()[0].detached
+        }
+
+        #[tokio::test]
+        async fn a_run_the_reader_asked_to_watch_leaves_its_window_with_them() {
+            // The window outlives the request on purpose: it is showing the
+            // output to the person who ticked the box, and the agent's result
+            // must not wait for them to finish reading it.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let result =
+                within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            assert!(
+                windup_of(&harness).await,
+                "the window was killed at the moment it had something to show"
+            );
+            assert_eq!(harness.verdict(), "approve");
+        }
+
+        #[tokio::test]
+        async fn a_run_nobody_asked_to_watch_has_its_window_ended_as_before() {
+            let harness = Harness::new(vec![approve()]);
+            within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
+
+            assert!(!windup_of(&harness).await, "a headless run left a window behind");
+        }
+
+        #[tokio::test]
+        async fn a_swap_has_its_window_ended_whatever_the_stream_box_said() {
+            // A swap writes a file and prints nothing, so there is nothing to
+            // linger over. The checkbox is not even offered for one, and a
+            // window that stayed anyway would be an empty viewer.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let target = harness.dir.path().join("swapped");
+            within(harness.daemon.swap_file(
+                SwapFileParams {
+                    title: "write a file".to_string(),
+                    path: target.display().to_string(),
+                    content: "hello\n".to_string(),
+                    reason: "because a test asked".to_string(),
+                    root: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert!(!windup_of(&harness).await, "a swap left a window behind");
+        }
+
+        #[tokio::test]
+        async fn a_command_that_could_not_be_started_leaves_no_window_behind() {
+            // No outcome frame is sent on this path, so the window is still
+            // drawing "it is running" and nothing will ever tell it otherwise.
+            // Handing that one to a reader would be handing them an orphan.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let mut params = run_of("echo hello");
+            // A working directory that is one, so it passes validation, and
+            // that cannot be entered, so the spawn fails. Nothing ran and
+            // nobody decided anything.
+            let shut = harness.dir.path().join("shut");
+            std::fs::create_dir_all(&shut).unwrap();
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            params.cwd = Some(shut.display().to_string());
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+            // Put it back, or the temporary directory cannot be cleaned up.
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert!(!windup_of(&harness).await, "a window that was told nothing was left open");
         }
 
         #[tokio::test]

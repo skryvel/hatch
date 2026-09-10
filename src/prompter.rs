@@ -21,6 +21,9 @@
 //! | [`PromptSession::kill_requested`] | Fires when the user presses Kill. Plugs straight into [`crate::exec::RunOpts::cancel`]. |
 //! | [`PromptSession::window_gone`] | Fires when the window is no longer there. |
 //!
+//! and two ways for the request to be done with it: [`PromptSession::close`],
+//! which ends the window, and [`PromptSession::detach`], which gives it up.
+//!
 //! The two orders that matter, in full:
 //!
 //! **Approve, stream, finish.**
@@ -39,6 +42,8 @@
 //! }).await;
 //! outbox.finished(outcome_of(&out)).await;
 //! session.close().await;                       // the window is over
+//! // -- or, when the user asked to watch it --
+//! session.detach();                            // the window is theirs now
 //! ```
 //!
 //! The forwarding task is not optional: [`crate::exec::run`] backpressures on
@@ -79,6 +84,14 @@
 //! future of a client that hung up — drops the session, and the child dies with
 //! it. `close` exists so the common paths are also *deterministic*, not merely
 //! eventual.
+//!
+//! [`PromptSession::detach`] is the one exception, and it is narrow: a streamed
+//! command has finished, the window has been told so, and there is no question
+//! left for a click to answer. The window outlives the request on purpose,
+//! showing its output to the person who asked to watch it, and from that moment
+//! the daemon neither waits for it nor ends it. What keeps that from being an
+//! orphan is on the window's side — a countdown, a channel that ends when the
+//! daemon does, and a backstop thread — not here.
 //!
 //! The session deliberately does not take a [`tokio_util::sync::CancellationToken`]
 //! for this. A token would make the kill something the caller has to remember to
@@ -215,6 +228,7 @@ pub struct PromptSession {
     gone: CancellationToken,
     reaped: CancellationToken,
     shutdown: CancellationToken,
+    detached: CancellationToken,
 }
 
 impl PromptSession {
@@ -273,6 +287,36 @@ impl PromptSession {
         self.shutdown.cancel();
         let _ = tokio::time::timeout(REAP_TIMEOUT, self.reaped.cancelled()).await;
     }
+
+    /// Give the window up: stop owning it, and stop ending it.
+    ///
+    /// The one exception to "the daemon ends the window", and it is narrow on
+    /// purpose. A streamed run finishes and the window has been told so; the
+    /// person who ticked the box to watch it is still reading the output, and
+    /// the tool result must not wait for them. So the request lets go: no
+    /// signal, no reap, no waiting.
+    ///
+    /// What makes that safe is that there is nothing left to decide. The
+    /// verdict was given, the command has run, and the window's own state
+    /// machine cannot produce a second verdict — see
+    /// [`crate::prompt_ui::PromptState::decide`]. A frame arriving from a
+    /// detached window is read by nobody, because this is the last thing the
+    /// request does with the session.
+    ///
+    /// Whatever is already queued for the window is still delivered: dropping
+    /// the session closes the outbox, and the writing task drains it before it
+    /// hands the window over. If any of that fails — an unwritable pipe, a
+    /// window that stopped reading — the window is killed as it would have
+    /// been, because a window that never received its outcome is a window with
+    /// no reason to close itself.
+    ///
+    /// Call it *instead of* [`PromptSession::close`], never as well: it
+    /// consumes the session, so the type says which of the two happened.
+    pub fn detach(self) {
+        self.detached.cancel();
+        // And dropped here, which closes the outbox. `Drop` sees the token and
+        // leaves the shutdown alone.
+    }
 }
 
 impl Drop for PromptSession {
@@ -280,7 +324,14 @@ impl Drop for PromptSession {
         // The backstop for every path that does not reach `close`, a dropped
         // handler future included. Signal only: a `Drop` cannot await, so the
         // reaping is left to the task that owns the child.
-        self.shutdown.cancel();
+        //
+        // A detached window is the one thing this must not end, and the check
+        // is here rather than in `detach` so that it also covers the panic and
+        // the early return *after* a hand-over: once the window has been given
+        // up, no path out of the request takes it back.
+        if !self.detached.is_cancelled() {
+            self.shutdown.cancel();
+        }
     }
 }
 
@@ -343,6 +394,10 @@ pub struct WindowSide {
     /// Hold it in whatever owns the process; dropping it says the process has
     /// been waited for. [`PromptSession::close`] returns when it does.
     pub reaped: DropGuard,
+    /// Fires when the daemon has given the window up rather than ended it —
+    /// see [`PromptSession::detach`]. Deliver what is already queued, then
+    /// leave the window alone.
+    pub detached: CancellationToken,
 }
 
 /// The two ends of one session.
@@ -356,6 +411,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
     let gone = CancellationToken::new();
     let reaped = CancellationToken::new();
     let shutdown = CancellationToken::new();
+    let detached = CancellationToken::new();
 
     let session = PromptSession {
         verdict: verdict_rx,
@@ -364,6 +420,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
         gone: gone.clone(),
         reaped: reaped.clone(),
         shutdown: shutdown.clone(),
+        detached: detached.clone(),
     };
     let side = WindowSide {
         verdict: verdict_tx,
@@ -372,6 +429,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
         shutdown,
         gone: gone.drop_guard(),
         reaped: reaped.drop_guard(),
+        detached,
     };
     (session, side)
 }
@@ -477,7 +535,8 @@ impl Prompter for ProcessPrompter {
 
         let (session, side) = session_pair();
         let gone = session.window_gone();
-        let WindowSide { verdict, messages, kill, shutdown, gone: gone_guard, reaped } = side;
+        let WindowSide { verdict, messages, kill, shutdown, gone: gone_guard, reaped, detached } =
+            side;
 
         tokio::spawn(read_from_window(stdout, verdict, kill, gone_guard));
         tokio::spawn(write_to_window(WriteToWindow {
@@ -488,6 +547,7 @@ impl Prompter for ProcessPrompter {
             shutdown,
             gone,
             reaped,
+            detached,
             write_timeout: self.write_timeout,
         }));
         Ok(session)
@@ -544,16 +604,34 @@ struct WriteToWindow {
     shutdown: CancellationToken,
     gone: CancellationToken,
     reaped: DropGuard,
+    detached: CancellationToken,
     write_timeout: Duration,
+}
+
+/// What this task does with the child once there is nothing left to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Signal it and reap it. Every ending but the one below.
+    Kill,
+    /// Leave it running and only reap it when it goes: the daemon detached,
+    /// and everything it had queued reached the pipe first. See
+    /// [`PromptSession::detach`].
+    HandOver,
 }
 
 /// Write to the window until there is no more to say, then end the process.
 ///
 /// This task owns the child, so it is also the one that kills and reaps it. The
-/// kill is unconditional on every exit path -- including the one where the
-/// window already left -- because `wait` on a process that is already dead is
-/// how a zombie is collected, and a `start_kill` on one is an error we do not
-/// need to hear about.
+/// kill is unconditional on every exit path but one -- including the one where
+/// the window already left -- because `wait` on a process that is already dead
+/// is how a zombie is collected, and a `start_kill` on one is an error we do
+/// not need to hear about.
+///
+/// The exception is [`Ending::HandOver`]: the daemon detached and every frame
+/// it queued was written, so the window is now somebody's to read and this task
+/// stays only to reap it when it goes. Its stdin is deliberately held open for
+/// that whole time -- closing it would reach the window as the channel ending,
+/// which is one of the ways a detached window leaves.
 async fn write_to_window(w: WriteToWindow) {
     let WriteToWindow {
         mut child,
@@ -563,21 +641,34 @@ async fn write_to_window(w: WriteToWindow) {
         shutdown,
         gone,
         reaped,
+        detached,
         write_timeout,
     } = w;
     let mut depth_open = true;
+    let ending;
 
     loop {
         let msg = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => { ending = Ending::Kill; break }
             // The window left. Nothing more can be delivered to it, and the
             // reader has already told the daemon.
-            _ = gone.cancelled() => break,
+            _ = gone.cancelled() => { ending = Ending::Kill; break }
             msg = messages.recv() => match msg {
                 Some(msg) => msg,
-                None => break,
+                // The outbox is closed, which is the last thing `detach` does.
+                // Everything it held has been written by now, so a detached
+                // window has had its outcome and can be handed over.
+                None => {
+                    ending = match detached.is_cancelled() {
+                        true => Ending::HandOver,
+                        false => Ending::Kill,
+                    };
+                    break;
+                }
             },
-            update = depth.recv(), if depth_open => match update {
+            // Nothing about the queue behind other windows is worth saying to
+            // a window the daemon has already let go of.
+            update = depth.recv(), if depth_open && !detached.is_cancelled() => match update {
                 Ok(depth) => DaemonMsg::QueueDepth { depth: badge(depth) },
                 // The badge is a latest-value display, so a lagged receiver has
                 // missed nothing that matters: the next value it reads is the
@@ -602,16 +693,25 @@ async fn write_to_window(w: WriteToWindow) {
         // window still on screen seconds after its own countdown reached zero.
         let written = tokio::time::timeout(write_timeout, write_frame(&mut stdin, &msg));
         tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => { ending = Ending::Kill; break }
             done = written => match done {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => break,
+                // A frame that did not land is a window that did not hear the
+                // thing it would have closed itself over, so it is killed even
+                // if the daemon has let go of it. This is the one path that
+                // takes a hand-over back.
+                Ok(Err(_)) | Err(_) => { ending = Ending::Kill; break }
             },
         }
     }
 
-    let _ = child.start_kill();
+    if ending == Ending::Kill {
+        let _ = child.start_kill();
+    }
     let _ = child.wait().await;
+    // Held until the child is gone, so a handed-over window keeps a live
+    // channel to read the end of. See this function's docs.
+    drop(stdin);
     drop(reaped);
 }
 
@@ -649,7 +749,7 @@ mod stub {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tokio::sync::broadcast;
+    use tokio::sync::{broadcast, watch};
 
     use super::{DaemonMsg, PromptSession, Prompter, Request, Verdict, WindowSide, session_pair};
 
@@ -661,6 +761,9 @@ mod stub {
     pub struct StubPrompter {
         script: Mutex<VecDeque<Reply>>,
         log: Arc<Mutex<Vec<Recorded>>>,
+        /// How many windows are still on their channel. See
+        /// [`StubPrompter::settled`].
+        open: watch::Sender<usize>,
     }
 
     /// What one window did, from the daemon's side of it.
@@ -672,6 +775,10 @@ mod stub {
         pub sent: Vec<DaemonMsg>,
         /// Every queue depth it was told about after the request.
         pub depths: Vec<usize>,
+        /// Whether the daemon gave this window up rather than ending it — see
+        /// [`PromptSession::detach`]. Only true once the window's channel has
+        /// finished, so read it after [`StubPrompter::settled`].
+        pub detached: bool,
     }
 
     /// One scripted window.
@@ -761,7 +868,21 @@ mod stub {
             StubPrompter {
                 script: Mutex::new(script.into_iter().map(Into::into).collect()),
                 log: Arc::new(Mutex::new(Vec::new())),
+                open: watch::channel(0).0,
             }
+        }
+
+        /// Wait until every window has finished with its channel.
+        ///
+        /// It exists because a detached window is one the daemon deliberately
+        /// stops waiting for — see [`PromptSession::detach`] — so a request
+        /// returning no longer means the last frame has been taken off the
+        /// pipe. A test that reads [`StubPrompter::recorded`] after a streamed
+        /// run has to wait for the window rather than for the agent, and this
+        /// is that wait, without a sleep in it.
+        pub async fn settled(&self) {
+            let mut open = self.open.subscribe();
+            let _ = open.wait_for(|count| *count == 0).await;
         }
 
         /// Every request that reached a window, in order.
@@ -804,12 +925,25 @@ mod stub {
 
             let index = {
                 let mut log = self.log.lock().unwrap();
-                log.push(Recorded { request: req, sent: Vec::new(), depths: Vec::new() });
+                log.push(Recorded {
+                    request: req,
+                    sent: Vec::new(),
+                    depths: Vec::new(),
+                    detached: false,
+                });
                 log.len() - 1
             };
 
             let (session, side) = session_pair();
-            tokio::spawn(window(reply, side, depth, self.log.clone(), index));
+            self.open.send_modify(|count| *count += 1);
+            tokio::spawn(window(
+                reply,
+                side,
+                depth,
+                self.log.clone(),
+                index,
+                self.open.clone(),
+            ));
             Ok(session)
         }
     }
@@ -821,8 +955,16 @@ mod stub {
         mut depth: broadcast::Receiver<usize>,
         log: Arc<Mutex<Vec<Recorded>>>,
         index: usize,
+        open: watch::Sender<usize>,
     ) {
-        let WindowSide { verdict, mut messages, kill, shutdown, gone, reaped } = side;
+        // Decremented on every path out, the early returns included, so
+        // `settled` cannot wait for a window that has already given up.
+        let _counted = Counted(open);
+        // The stub has no process, so a hand-over and a close end this task the
+        // same way. Which of the two it was is still worth recording: it is the
+        // difference between a window the daemon ended and one it left for a
+        // reader, and the server's tests have no other way to see it.
+        let WindowSide { verdict, mut messages, kill, shutdown, gone, reaped, detached } = side;
 
         if !reply.delay.is_zero() {
             tokio::select! {
@@ -842,6 +984,8 @@ mod stub {
         };
 
         let kill_at = match reply.then {
+            // A window that ends here was never detached: the daemon has not
+            // even had the chance. The record already says so.
             Then::Die => return,
             Then::Kill(delay) => Some(tokio::time::Instant::now() + delay),
             Then::Stay => None,
@@ -874,8 +1018,18 @@ mod stub {
                 },
             }
         }
+        log.lock().unwrap()[index].detached = detached.is_cancelled();
         drop(gone);
         drop(reaped);
+    }
+
+    /// One window's place in the count `settled` waits on.
+    struct Counted(watch::Sender<usize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.send_modify(|count| *count = count.saturating_sub(1));
+        }
     }
 }
 
@@ -959,6 +1113,30 @@ mod tests {
     fn no_depth() -> (broadcast::Sender<usize>, broadcast::Receiver<usize>) {
         let (tx, rx) = broadcast::channel(8);
         (tx, rx)
+    }
+
+    // ---- being done with a session ----------------------------------------
+
+    #[tokio::test]
+    async fn only_detaching_leaves_the_window_running() {
+        // Three ways for a request to be done with a session. Two of them end
+        // the window and one hands it over, and the difference is a single
+        // token: a `Drop` that cancelled the shutdown anyway would make
+        // `detach` a comment rather than a behaviour.
+        let (session, side) = session_pair();
+        drop(session);
+        assert!(side.shutdown.is_cancelled(), "a dropped session must end its window");
+        assert!(!side.detached.is_cancelled());
+
+        let (session, side) = session_pair();
+        within(session.close()).await;
+        assert!(side.shutdown.is_cancelled(), "a closed session must end its window");
+        assert!(!side.detached.is_cancelled());
+
+        let (session, side) = session_pair();
+        session.detach();
+        assert!(!side.shutdown.is_cancelled(), "a detached window was told to shut down");
+        assert!(side.detached.is_cancelled(), "and was not told it had been let go");
     }
 
     // ---- the stub ----------------------------------------------------------
@@ -1562,6 +1740,110 @@ mod tests {
         })
         .await
         .expect("the window outlived the session that owned it");
+    }
+
+    /// A window that writes down its own pid and every frame it is sent, and
+    /// leaves only when something ends it.
+    ///
+    /// Detaching is the one path that ends nothing, so every test using this
+    /// finishes by killing it: the daemon's writing task holds the child's
+    /// standard input open for as long as the child lives, which is what gives
+    /// a handed-over window a channel to notice the daemon going away on.
+    fn detachable_window(
+        pidfile: &std::path::Path,
+        frames: &std::path::Path,
+    ) -> ProcessPrompter {
+        fake_window(&format!(
+            "echo $$ > {}; while IFS= read -r line; do printf '%s\n' \"$line\" >> \"{}\"; done",
+            pidfile.display(),
+            frames.display()
+        ))
+    }
+
+    /// End a window the test detached, and wait for it to be gone.
+    async fn end(pid: nix::unistd::Pid) {
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        until_gone(pid).await;
+    }
+
+    #[tokio::test]
+    async fn a_detached_window_is_left_running() {
+        // The whole of what makes a linger possible. Every other path out of a
+        // request signals the window; this one must not, or the window the
+        // reader asked to keep is killed at the moment it is handed to them.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let framefile = dir.path().join("frames");
+        let p = detachable_window(&pidfile, &framefile);
+        let (_tx, rx) = no_depth();
+        let session = within(p.prompt(sample_request(), rx)).await.unwrap();
+        let pid = pid_of(&pidfile).await;
+
+        session.detach();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alive(pid), "detaching killed the window it was supposed to hand over");
+        end(pid).await;
+    }
+
+    #[tokio::test]
+    async fn a_detached_window_is_given_everything_that_was_queued_for_it() {
+        // The outcome is queued and the session is given up in the same breath,
+        // so the hand-over has to drain before it lets go. A window that never
+        // heard how the command ended would still be drawing "it is running",
+        // with nothing left anywhere to tell it otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let framefile = dir.path().join("frames");
+        let p = detachable_window(&pidfile, &framefile);
+        let (_tx, rx) = no_depth();
+        let session = within(p.prompt(sample_request(), rx)).await.unwrap();
+        let pid = pid_of(&pidfile).await;
+        let outbox = session.outbox();
+        assert!(within(outbox.output(Stream::Stdout, "hello\n".to_string())).await);
+        assert!(within(outbox.finished(Outcome::Exit { code: 0 })).await);
+        drop(outbox);
+
+        session.detach();
+
+        let seen = frames(&framefile, 3).await;
+        assert_eq!(
+            seen[1..],
+            [
+                DaemonMsg::Output { stream: Stream::Stdout, text: "hello\n".to_string() },
+                DaemonMsg::Finished(Outcome::Exit { code: 0 }),
+            ]
+        );
+        end(pid).await;
+    }
+
+    /// On a runtime of its own thread, for the reason
+    /// `closing_does_not_wait_out_a_window_that_stopped_reading` gives: the
+    /// writing task has to be genuinely blocked in a system call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_window_that_would_not_take_its_last_frame_is_ended_even_after_a_detach() {
+        // The hand-over is conditional on the window actually having been told.
+        // `sleep` never reads its standard input, so the pipe fills and the
+        // write gives up -- and a window that was told nothing has no reason to
+        // close itself, which is exactly the orphan this must not leave.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let p = fake_window(&format!("echo $$ > {}; {FAKE_WINDOW_LIFETIME}", pidfile.display()))
+            .with_write_timeout(Duration::from_millis(200));
+        let (_tx, rx) = no_depth();
+        let session = within(p.prompt(sample_request(), rx)).await.unwrap();
+        let pid = pid_of(&pidfile).await;
+        let outbox = session.outbox();
+        // Comfortably more than a pipe holds, and under the outbox's capacity
+        // so that queueing it is not itself a wait.
+        for _ in 0..60 {
+            assert!(within(outbox.output(Stream::Stdout, "x".repeat(16384))).await);
+        }
+        drop(outbox);
+
+        session.detach();
+
+        until_gone(pid).await;
     }
 
     #[tokio::test]

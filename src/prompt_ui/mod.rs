@@ -1,7 +1,8 @@
 //! The `hatch prompt` window: the phase machine, and the NDJSON wiring that
 //! feeds it.
 //!
-//! One process draws one window and exits. It speaks [`crate::protocol`] on
+//! One process draws one window and exits — usually when the daemon says so,
+//! and once on its own; see "After the command". It speaks [`crate::protocol`] on
 //! its own stdin and stdout, and it owns nothing: not the clock, not the
 //! rendering, not the decision to apply. What it owns is a phase — which of
 //! the things a window can be at this moment — and the promise that exactly
@@ -22,9 +23,38 @@
 //! stream. What enforces it here is that [`PromptState::decide`] is the only
 //! thing that builds a [`PromptMsg::Verdict`], and it answers only in
 //! [`Phase::AwaitingVerdict`] — which is a phase it leaves on the way out. A
-//! double-click, a second button pressed in the same frame, and a click on a
-//! window that is already running all reach a state that is no longer waiting
-//! for a verdict, and get nothing to send.
+//! double-click, a second button pressed in the same frame, a click on a
+//! window that is already running, and every button on a window that has
+//! outlived its request all reach a state that is no longer waiting for a
+//! verdict, and get nothing to send.
+//!
+//! # After the command
+//!
+//! A window whose reader ticked "Stream output to this window" does not close
+//! on [`DaemonMsg::Finished`]. The whole life of an ordinary command is
+//! milliseconds, so closing there took the output away at the instant it
+//! arrived — the box working exactly as built and being useless. Instead the
+//! window *lingers* for [`LINGER`], showing the result with a countdown on it,
+//! and a button turns it into a *detached viewer*: no countdown, no verdict,
+//! just the output, a way to copy it and a way to close it. A run nobody asked
+//! to watch is unchanged and closes on the frame.
+//!
+//! From the moment that frame is sent the daemon has let go — see
+//! [`crate::prompter::PromptSession::detach`] — so this is the only state in
+//! this program's life with nothing outside it holding a deadline over it. Two
+//! things follow, and both are load-bearing:
+//!
+//! * **It cannot decide anything.** [`Phase::Lingering`] and
+//!   [`Phase::Detached`] are past [`Phase::AwaitingVerdict`] and no phase
+//!   returns there, so [`PromptState::decide`] produces nothing; the guard's
+//!   two keys are answered before they reach it as well. A verdict from a
+//!   detached window is not merely ignored by the daemon — it cannot be built.
+//! * **It has to end itself.** Four ways out, and each has a backstop that
+//!   does not need the event loop: the countdown ([`arm_linger_backstop`]),
+//!   the reader closing it (the viewport's close, then [`arm_exit_backstop`]),
+//!   the channel ending because the daemon has gone (the reader thread, after
+//!   [`CHANNEL_END_GRACE`]), and a window that never opened or stopped drawing
+//!   (`eframe` returning, which returns from [`run_prompt`]).
 //!
 //! # Input
 //!
@@ -49,8 +79,9 @@ pub mod visibility;
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -89,12 +120,54 @@ const CLOCK_TICK: Duration = Duration::from_secs(1);
 
 /// How long the process may take to leave after it has decided to.
 ///
-/// The daemon waits 500 ms for the window to go and then kills it, so a
-/// window that lingers is a window that is killed — which works, and is not a
-/// plan. Asking the viewport to close is the ordinary path; this is the
-/// backstop for an event loop that is no longer running one, and it is a
-/// thread precisely because a wedged loop cannot run a timer of its own.
+/// Asking the viewport to close is the ordinary path; this is the backstop for
+/// an event loop that is no longer running one, and it is a thread precisely
+/// because a wedged loop cannot run a timer of its own.
+///
+/// It used to be belt to the daemon's braces — a window that would not go was
+/// killed 500 ms after its outcome. A window the daemon has let go of has no
+/// braces, so this is the only thing between "the reader closed it" and the
+/// process actually ending.
 const EXIT_BACKSTOP: Duration = Duration::from_millis(250);
+
+/// How long a finished window stays when the reader asked to watch the
+/// command run.
+///
+/// The bug this exists for: everything up to `Finished` takes milliseconds for
+/// an ordinary command, so a window that closed on that frame closed at the
+/// exact moment the output it was asked to show arrived. Ten seconds is long
+/// enough to read a screenful and reach the button that keeps it, and short
+/// enough that a reader running one command after another is not collecting
+/// windows. It is not long enough to *read* a long output in, which is what
+/// the button is for.
+///
+/// It applies to streamed runs only. A window nobody asked to watch has
+/// nothing to linger over and closes on the outcome as it always did.
+const LINGER: Duration = Duration::from_secs(10);
+
+/// How long after the countdown has run out the process leaves anyway.
+///
+/// [`LINGER`] is enforced by the event loop, and a lingering window is the
+/// first state in this program's life with no daemon watching it — nothing
+/// else will kill it if that loop stops running. So the countdown gets a
+/// thread as well, and the slack is what separates "the loop is busy" from
+/// "the loop is gone".
+const LINGER_BACKSTOP: Duration = Duration::from_secs(2);
+
+/// How long the process may outlive its own channel.
+///
+/// The daemon holds this window's stdin open for as long as the window lives,
+/// so the channel ending means the daemon has gone — at which point nothing
+/// will ever arrive again and nothing is left to kill this process either.
+/// The grace is there so the ordinary ending, where the state machine sees the
+/// break and closes properly, is the one that happens.
+const CHANNEL_END_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a "copied" note stays up.
+///
+/// A button that puts something on the clipboard and says nothing is a button
+/// the reader presses twice.
+const COPY_NOTICE: Duration = Duration::from_secs(2);
 
 /// How much of an approved command's output the window keeps.
 ///
@@ -232,6 +305,19 @@ pub enum Phase {
     AwaitingVerdict,
     /// The operation was approved and is running; the window is an indicator.
     Running,
+    /// The command has finished, the reader asked to watch it, and the window
+    /// is holding the result up for a few seconds before taking itself away.
+    ///
+    /// Reachable only through [`Phase::Running`], and only for a run the
+    /// reader ticked the stream box on.
+    Lingering,
+    /// The reader kept the window. It is a viewer now: the output, a way to
+    /// copy it and a way to close it, and no decision of any kind.
+    ///
+    /// The request that opened this window is over by the time this phase is
+    /// reachable, and the daemon has let go of the process — see
+    /// [`crate::prompter::PromptSession::detach`].
+    Detached,
     /// Over. The process is leaving.
     Closed,
 }
@@ -255,6 +341,9 @@ pub struct PromptState {
     outcome: Option<Outcome>,
     output: VecDeque<(Stream, String)>,
     output_bytes: usize,
+    output_dropped: bool,
+    streaming: bool,
+    linger_until: Option<Instant>,
     broken: Option<String>,
     close_taken: bool,
 }
@@ -276,6 +365,9 @@ impl PromptState {
             outcome: None,
             output: VecDeque::new(),
             output_bytes: 0,
+            output_dropped: false,
+            streaming: false,
+            linger_until: None,
             broken: None,
             close_taken: false,
         }
@@ -327,6 +419,41 @@ impl PromptState {
     /// The approved command's output so far, oldest first.
     pub fn output(&self) -> &VecDeque<(Stream, String)> {
         &self.output
+    }
+
+    /// The output as one string, which is what is drawn and what is copied.
+    ///
+    /// One place, so the copy action cannot drift from the view: a button that
+    /// puts something other than what is on screen on the clipboard is worse
+    /// than no button.
+    pub fn output_text(&self) -> String {
+        self.output().iter().map(|(_, chunk)| chunk.as_str()).collect()
+    }
+
+    /// Whether the cap has already thrown some of the output away.
+    ///
+    /// Said out loud once there is a copy action: a window that hands over the
+    /// last megabyte of a command's output while looking like it is handing
+    /// over all of it is a window that lies quietly.
+    pub fn output_dropped(&self) -> bool {
+        self.output_dropped
+    }
+
+    /// Whether the reader asked to watch this run.
+    ///
+    /// Recorded from the verdict rather than from the checkbox, because the
+    /// verdict is the thing that was actually sent: a box unticked in the same
+    /// frame as Approve must not change what happens afterwards.
+    pub fn streaming(&self) -> bool {
+        self.streaming
+    }
+
+    /// Whether the window is showing a result rather than asking anything.
+    ///
+    /// The two phases with no question in them, and the test every path that
+    /// could produce a verdict checks itself against.
+    pub fn is_viewer(&self) -> bool {
+        matches!(self.phase, Phase::Lingering | Phase::Detached)
     }
 
     /// Why the channel ended badly, if it did.
@@ -410,7 +537,24 @@ impl PromptState {
             DaemonMsg::Output { stream, text } => self.push_output(stream, text),
             DaemonMsg::Finished(outcome) => {
                 self.outcome = Some(outcome);
-                self.phase = Phase::Closed;
+                // The reader ticked a box that says "I want to watch this".
+                // For anything but a slow command the whole run is over in
+                // milliseconds, so a window that closed on this frame closed
+                // at the moment the output arrived — the box working exactly
+                // as built and being useless. A streamed run therefore stays,
+                // with the result on it, until its own clock or its reader
+                // says otherwise.
+                //
+                // Nothing else changes. A run nobody asked to watch has no
+                // result to hold up and closes here as it always did, and the
+                // daemon still waits its own grace for that.
+                self.phase = match self.streaming {
+                    true => {
+                        self.linger_until = Some(Instant::now() + LINGER);
+                        Phase::Lingering
+                    }
+                    false => Phase::Closed,
+                };
             }
         }
     }
@@ -424,7 +568,65 @@ impl PromptState {
         if self.phase == Phase::Closed {
             return;
         }
-        self.broken = Some(why.into());
+        // Not a failure once the window is only a viewer. The request is over,
+        // the daemon holds this window's stdin for as long as the window lives,
+        // and so the channel ending means the daemon has gone — which is news
+        // about hatch, not about this window, and there is nobody left to tell.
+        // It still ends the process: a viewer with no channel is exactly the
+        // orphan this window must never become.
+        if !self.is_viewer() {
+            self.broken = Some(why.into());
+        }
+        self.phase = Phase::Closed;
+    }
+
+    /// Let the clock move the window on.
+    ///
+    /// The one thing this window's own clock is allowed to decide, and it is
+    /// allowed to decide it because there is no longer a question open: a
+    /// linger that has run out closes. The approval deadline is not decided
+    /// here and never will be — that clock belongs to the daemon, which
+    /// enforces it by killing this process.
+    pub fn tick(&mut self, now: Instant) {
+        if self.phase == Phase::Lingering && self.linger_until.is_some_and(|until| now >= until) {
+            self.phase = Phase::Closed;
+        }
+    }
+
+    /// Seconds until a lingering window takes itself away, at `now`.
+    ///
+    /// `None` in every other phase, which is what tells the drawing half that
+    /// there is no countdown to say out loud. Rounded up, so the number the
+    /// reader sees is the number of seconds they still have: it reads 1 for
+    /// the whole of the last second and reaches 0 as the window goes.
+    pub fn linger_seconds_remaining(&self, now: Instant) -> Option<u64> {
+        let until = self.linger_until.filter(|_| self.phase == Phase::Lingering)?;
+        let left = until.saturating_duration_since(now);
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
+
+    /// Keep the window: stop the countdown and become a viewer.
+    ///
+    /// Returns whether it did anything, which is how the drawing half knows
+    /// not to arm anything twice. Only from [`Phase::Lingering`], and the
+    /// phase it moves to has no way back to a question: [`PromptState::decide`]
+    /// answers in [`Phase::AwaitingVerdict`] alone, and no phase returns there.
+    pub fn keep(&mut self) -> bool {
+        if self.phase != Phase::Lingering {
+            return false;
+        }
+        self.phase = Phase::Detached;
+        self.linger_until = None;
+        true
+    }
+
+    /// End the window because the reader asked to, or because the desktop did.
+    ///
+    /// Deliberately not a failure and deliberately without a reason: a window
+    /// somebody closed has nothing to report to the operator. Before a verdict
+    /// the daemon reads the dead process as a denial, which is what a window
+    /// closed from its title bar already meant.
+    pub fn dismiss(&mut self) {
         self.phase = Phase::Closed;
     }
 
@@ -440,6 +642,9 @@ impl PromptState {
         // Approve is the only verdict that leaves anything to watch. The rest
         // return a note to the agent and there is nothing further to show, so
         // the window is over the moment the frame is written.
+        if let Verdict::Approve { stream } = verdict {
+            self.streaming = stream;
+        }
         self.phase = match verdict {
             Verdict::Approve { .. } => Phase::Running,
             Verdict::Deny { .. } | Verdict::Revise { .. } | Verdict::SelfRun { .. } => {
@@ -469,12 +674,28 @@ impl PromptState {
         while self.output_bytes > OUTPUT_CAP && self.output.len() > 1 {
             if let Some((_, dropped)) = self.output.pop_front() {
                 self.output_bytes -= dropped.len();
+                self.output_dropped = true;
             }
         }
     }
 }
 
 // ---- reading the channel ---------------------------------------------------
+
+/// What the reader saw in the item it has just handed over.
+///
+/// An item cannot be looked at after it has been sent, and these are the two
+/// facts a thread outside the event loop needs about one: that the daemon has
+/// said its last word, and that the channel is over. Both are the moments a
+/// backstop is armed at, and neither may depend on the loop having run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Noticed {
+    /// The outcome has arrived. Nothing follows it, and from here the window
+    /// answers to its own clock.
+    pub final_frame: bool,
+    /// The channel has ended, well or badly. This is the last item there is.
+    pub last: bool,
+}
 
 /// Turn the daemon's half of the channel into [`Incoming`] items until there
 /// is nothing left to believe.
@@ -485,8 +706,10 @@ impl PromptState {
 ///
 /// `wake` runs after each item so an event loop asleep on its own timer
 /// notices immediately; the loop's periodic repaint is for the clock, not for
-/// this.
-pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn()) {
+/// this. It is told what the item was, because this thread is the one place
+/// that learns the daemon has finished without needing the loop to be running
+/// — see [`arm_linger_backstop`].
+pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn(Noticed)) {
     for line in reader.lines() {
         let item = match line {
             Ok(line) => match protocol::read_message::<DaemonMsg>(&line) {
@@ -501,17 +724,22 @@ pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn()
             },
             Err(e) => Incoming::Broken(format!("this window could not read from hatch: {e}")),
         };
-        let last = matches!(item, Incoming::Broken(_));
+        // Read before the item is given away, reported after: the loop must
+        // not be woken for something it cannot yet see.
+        let noticed = Noticed {
+            final_frame: matches!(item, Incoming::Frame(DaemonMsg::Finished(_))),
+            last: matches!(item, Incoming::Broken(_)),
+        };
         if tx.send(item).is_err() {
             return;
         }
-        wake();
-        if last {
+        wake(noticed);
+        if noticed.last {
             return;
         }
     }
     let _ = tx.send(Incoming::Broken("hatch closed the channel".to_string()));
-    wake();
+    wake(Noticed { final_frame: false, last: true });
 }
 
 // ---- the window ------------------------------------------------------------
@@ -554,10 +782,28 @@ pub fn run_prompt() -> anyhow::Result<()> {
             apply_font_size(&cc.egui_ctx, font_size);
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
+            let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal));
+            let kept = app.kept();
             std::thread::spawn(move || {
-                read_frames(io::stdin().lock(), &tx, || ctx.request_repaint());
+                read_frames(io::stdin().lock(), &tx, |noticed| {
+                    ctx.request_repaint();
+                    // The daemon's last word. Everything after this is the
+                    // window's own business, so the deadline that does not
+                    // need the event loop is armed here — on this thread,
+                    // which has just proved it is running.
+                    if noticed.final_frame {
+                        arm_linger_backstop(Arc::clone(&kept), Arc::clone(&app_fatal));
+                    }
+                });
+                // The channel is over, and the daemon holds this window's
+                // stdin for as long as the window lives — so this is the
+                // daemon going away, and nothing will ever arrive again.
+                // The state machine has been told and will close in the
+                // ordinary way; this is what happens if it does not.
+                std::thread::sleep(CHANNEL_END_GRACE);
+                leave(&app_fatal);
             });
-            Ok(Box::new(PromptApp::new(rx, Box::new(io::stdout()), app_fatal)))
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("the approval window could not be opened: {e}"))?;
@@ -583,6 +829,13 @@ struct PromptApp {
     /// Whether the guard was open when this frame's input was judged, so the
     /// drawing half of the frame agrees with the judging half.
     guard_open: bool,
+    /// Set when the reader keeps a lingering window, and read by the thread
+    /// in [`arm_linger_backstop`]. Shared rather than checked through the
+    /// state machine, because the point of that thread is to work when
+    /// nothing is running the state machine any more.
+    kept: Arc<AtomicBool>,
+    /// When something was last put on the clipboard, so the window can say so.
+    copied: Option<Instant>,
     fatal: Arc<OnceLock<String>>,
 }
 
@@ -602,8 +855,16 @@ impl PromptApp {
             note: String::new(),
             guard: Guard::new(Instant::now()),
             guard_open: false,
+            kept: Arc::new(AtomicBool::new(false)),
+            copied: None,
             fatal,
         }
+    }
+
+    /// The flag the linger backstop reads, so the thread that arms it can be
+    /// started before the window has anything to keep.
+    fn kept(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.kept)
     }
 }
 
@@ -633,17 +894,51 @@ pub fn answer<W: Write>(out: &mut W, state: &mut PromptState, msg: Option<Prompt
     }
 }
 
+/// End the process now, saying why if there is a why.
+///
+/// Every backstop below ends here, so an exit forced by a thread reports what
+/// an exit through the event loop would have reported.
+fn leave(fatal: &OnceLock<String>) -> ! {
+    match fatal.get() {
+        Some(why) => {
+            eprintln!("hatch prompt: {why}");
+            std::process::exit(1);
+        }
+        None => std::process::exit(0),
+    }
+}
+
 /// Leave in `EXIT_BACKSTOP`, whatever the event loop is doing by then.
 fn arm_exit_backstop(fatal: Arc<OnceLock<String>>) {
     std::thread::spawn(move || {
         std::thread::sleep(EXIT_BACKSTOP);
-        match fatal.get() {
-            Some(why) => {
-                eprintln!("hatch prompt: {why}");
-                std::process::exit(1);
-            }
-            None => std::process::exit(0),
+        leave(&fatal);
+    });
+}
+
+/// Leave when the linger has run out, unless the reader kept the window.
+///
+/// Armed by the reading thread, on the outcome frame, and that is the point of
+/// it: until now every window had a daemon holding a deadline over it, and a
+/// lingering one does not. A deadline the event loop arms is no deadline at
+/// all against a loop that has stopped running, so this one is armed by the
+/// thread that took the frame off the pipe and enforced by a thread of its
+/// own. Both ends of it are outside the loop.
+///
+/// It is armed for a window that will not linger too, which costs nothing: one
+/// closes in milliseconds and the daemon kills it in half a second, so a
+/// deadline twelve seconds out is only ever reached by a window that is
+/// already broken.
+///
+/// `kept` is the reader's answer, and it is read once, at the end: pressing
+/// the button is what turns this from a deadline into nothing.
+fn arm_linger_backstop(kept: Arc<AtomicBool>, fatal: Arc<OnceLock<String>>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(LINGER + LINGER_BACKSTOP);
+        if kept.load(Ordering::SeqCst) {
+            return;
         }
+        leave(&fatal);
     });
 }
 
@@ -657,6 +952,15 @@ impl eframe::App for PromptApp {
             self.act(action);
         }
         self.guard_open = self.guard.is_open(now);
+        // The linger's own clock. What enforces it when this loop is not the
+        // thing running is `arm_linger_backstop`, armed by the reader thread.
+        self.state.tick(now);
+        // The desktop's own close: the title bar, the compositor, a session
+        // ending. A detached window has no daemon left to kill it, so this is
+        // the path that has to end the process rather than only hide it.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.state.dismiss();
+        }
         if self.state.take_close() {
             if let Some(why) = self.state.broken() {
                 let _ = self.fatal.set(why.to_string());
@@ -703,6 +1007,14 @@ impl PromptApp {
         egui::Panel::bottom("hatch-controls").show(ui, |ui| self.controls(ui, guard_open));
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.state.is_viewer() {
+                // The question has been answered and the command has run, so
+                // the two panes arguing about what the command says are of no
+                // further use. What is worth the window now is what it
+                // printed.
+                self.viewer(ui, &title);
+                return;
+            }
             panes::draw_headline(ui, &title, &reason);
             ui.separator();
             // There is always one once a request has arrived: a payload that
@@ -713,6 +1025,47 @@ impl PromptApp {
         });
     }
 
+    /// What a finished streamed run shows: its command, named once, and all
+    /// of the output it produced.
+    ///
+    /// The command is the one-line display form and not the two panes: those
+    /// exist so a reader can tell what they are approving apart from what it
+    /// looks like, and nothing is being approved any more. It is here at all
+    /// because output with nothing naming it is output the reader has to
+    /// remember the provenance of.
+    fn viewer(&self, ui: &mut egui::Ui, title: &str) {
+        ui.label(egui::RichText::new(title).strong());
+        if let Some(Shown::Command { raw, .. }) = self.state.shown() {
+            ui.label(
+                egui::RichText::new(protocol::display_line(raw)).monospace().small().weak(),
+            );
+        }
+        if self.state.output_dropped() {
+            ui.label(
+                egui::RichText::new(
+                    "Earlier output was dropped: this window keeps the last megabyte.",
+                )
+                .small()
+                .color(ui.visuals().warn_fg_color),
+            );
+        }
+        ui.separator();
+        let text = self.state.output_text();
+        if text.is_empty() {
+            ui.label(egui::RichText::new("It printed nothing.").weak());
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("hatch-viewer-output")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                // Already decoded by the daemon; drawn, never decoded again.
+                // See `crate::protocol`.
+                ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
+            });
+    }
+
     /// Carry out one decision the guard made.
     ///
     /// A decision, not a suggestion: it is applied where it is received. The
@@ -720,6 +1073,17 @@ impl PromptApp {
     /// while the window awaits a verdict, and it leaves that phase on the way
     /// out.
     fn act(&mut self, action: Action) {
+        // A window that is only showing a result has nothing to decide, so the
+        // two keys the guard owns mean the only things left: Escape puts the
+        // window away, and Enter means nothing at all. Neither reaches
+        // `decide`, which is a second lock on the same door rather than the
+        // first — `decide` answers in `AwaitingVerdict` alone.
+        if self.state.is_viewer() {
+            if action == Action::Deny {
+                self.state.dismiss();
+            }
+            return;
+        }
         let verdict = match action {
             Action::Approve => Verdict::Approve { stream: self.stream },
             Action::Deny => Verdict::Deny { note: self.note.clone() },
@@ -736,15 +1100,116 @@ impl PromptApp {
     /// what decides between them and the two must never both be drawn.
     fn controls(&mut self, ui: &mut egui::Ui, guard_open: bool) {
         ui.add_space(4.0);
-        self.status_row(ui);
         match self.state.phase() {
             Phase::AwaitingVerdict => {
+                self.status_row(ui);
                 self.verdict_area(ui, guard_open);
             }
-            Phase::Running => self.running_row(ui),
-            Phase::WaitingForRequest | Phase::Closed => {}
+            Phase::Running => {
+                self.status_row(ui);
+                self.running_row(ui);
+            }
+            // No approval clock here: it measured the time somebody had to
+            // decide, that time was used, and a second countdown beside the
+            // one that matters now is two numbers the reader has to tell
+            // apart.
+            Phase::Lingering | Phase::Detached => self.viewer_row(ui),
+            Phase::WaitingForRequest | Phase::Closed => self.status_row(ui),
         }
         ui.add_space(4.0);
+    }
+
+    /// What a finished window offers: how it ended, how long it is staying,
+    /// and the actions that decide nothing.
+    ///
+    /// Nothing in this row can produce a verdict, and that is not a matter of
+    /// which buttons are drawn: the request is over, the daemon has let go of
+    /// this process, and [`PromptState::decide`] answers only in
+    /// [`Phase::AwaitingVerdict`], which no phase returns to.
+    fn viewer_row(&mut self, ui: &mut egui::Ui) {
+        let closing = self.state.linger_seconds_remaining(Instant::now());
+        let (weak, warn, bad) = {
+            let visuals = ui.visuals();
+            (visuals.weak_text_color(), visuals.warn_fg_color, visuals.error_fg_color)
+        };
+        let body = egui::TextStyle::Body.resolve(ui.style()).size;
+
+        ui.vertical_centered(|ui| {
+            if let Some(outcome) = self.state.outcome() {
+                let (text, clean) = panes::outcome_text(outcome);
+                let colour = if clean { weak } else { bad };
+                ui.label(egui::RichText::new(text).color(colour).strong());
+            }
+            match closing {
+                // Colour *and* size, never colour alone, for the reason the
+                // approval countdown gives: this number is the reader's last
+                // chance to keep what is on the screen.
+                Some(left) => ui.label(
+                    egui::RichText::new(panes::closing_text(left))
+                        .color(warn)
+                        .strong()
+                        .size(body * IMMINENT_SCALE),
+                ),
+                None => ui.label(
+                    egui::RichText::new("Kept. This window is yours to close.").small().color(weak),
+                ),
+            };
+        });
+
+        ui.add_space(6.0);
+        let width = cluster_width(ui);
+        let (mut keep, mut close) = (false, false);
+        let (mut copy_output, mut copy_command) = (false, false);
+        let has_command = matches!(self.state.shown(), Some(Shown::Command { .. }));
+        ui.vertical_centered(|ui| {
+            centred_row(ui, width, |ui| {
+                if closing.is_some() {
+                    keep = unfocusable(
+                        ui,
+                        egui::Button::new(strong("Keep this window"))
+                            .min_size(primary_button(ui)),
+                    )
+                    .clicked();
+                    // The same gap the verdict buttons keep, for a weaker
+                    // reason: nothing here is dangerous, but a pointer on its
+                    // way to Keep must not find Close under it.
+                    ui.add_space(PRIMARY_GAP);
+                }
+                close = unfocusable(ui, egui::Button::new("Close")).clicked();
+            });
+            ui.add_space(4.0);
+            centred_row(ui, width, |ui| {
+                copy_output = secondary(ui, "Copy output").clicked();
+                if has_command {
+                    copy_command = secondary(ui, "Copy command").clicked();
+                }
+                if self.copied.is_some_and(|at| at.elapsed() < COPY_NOTICE) {
+                    ui.label(egui::RichText::new("copied").small().color(weak));
+                }
+            });
+        });
+
+        if keep && self.state.keep() {
+            // Read by the backstop thread, which is the one thing still
+            // holding a deadline over this window. Set before anything else
+            // so a stall between here and the next frame cannot lose it.
+            self.kept.store(true, Ordering::SeqCst);
+        }
+        if close {
+            self.state.dismiss();
+        }
+        // The output as it is on screen, and the command as it really is: the
+        // one-line form above is drawn with chip glyphs standing in for tabs
+        // and newlines, and pasting those into a shell would be pasting a
+        // different command from the one that ran.
+        if copy_output {
+            ui.ctx().copy_text(self.state.output_text());
+            self.copied = Some(Instant::now());
+        }
+        if copy_command && let Some(Shown::Command { raw, .. }) = self.state.shown() {
+            ui.ctx().copy_text(raw.source().to_string());
+            self.copied = Some(Instant::now());
+        }
     }
 
     /// The clock and the badge.
@@ -774,7 +1239,13 @@ impl PromptApp {
             ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(align))
         };
 
-        if let Some(left) = self.state.seconds_remaining(Utc::now()) {
+        // Nothing once the operation has ended. The number measures the time
+        // somebody had to decide, and after an outcome that time is not left:
+        // a window on its way out would flash a stale "N s left to decide"
+        // under a result that has already arrived.
+        if self.state.outcome().is_none()
+            && let Some(left) = self.state.seconds_remaining(Utc::now())
+        {
             let text = egui::RichText::new(countdown_text(left));
             child(ui, egui::Layout::top_down(egui::Align::Center)).label(match urgency(left) {
                 Urgency::Calm => text.color(calm),
@@ -797,8 +1268,7 @@ impl PromptApp {
     fn running_row(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
         if self.stream {
-            let text: String =
-                self.state.output().iter().map(|(_, chunk)| chunk.as_str()).collect();
+            let text = self.state.output_text();
             egui::ScrollArea::vertical()
                 .id_salt("hatch-output")
                 .max_height(ui.text_style_height(&egui::TextStyle::Monospace) * RUNNING_OUTPUT_ROWS)
@@ -1356,6 +1826,207 @@ mod tests {
         assert_eq!(state.phase(), Phase::Closed);
     }
 
+    // ---- lingering, and what it becomes ------------------------------------
+
+    /// A window whose streamed command has just finished.
+    fn a_lingering_state() -> PromptState {
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+        state.decide(Verdict::Approve { stream: true });
+        state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "hello\n".to_string() });
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        state
+    }
+
+    #[test]
+    fn a_run_the_reader_asked_to_watch_stays_instead_of_closing() {
+        // The bug. An ordinary command is approved, runs and finishes inside a
+        // few milliseconds, so a window that closed on the outcome closed at
+        // the moment the output it was asked to show arrived.
+        let state = a_lingering_state();
+
+        assert_eq!(state.phase(), Phase::Lingering);
+        assert!(!state.should_close(), "the window went at the moment it had something to show");
+        assert_eq!(state.outcome(), Some(&Outcome::Exit { code: 0 }));
+        assert_eq!(state.output_text(), "hello\n");
+    }
+
+    #[test]
+    fn a_run_nobody_asked_to_watch_closes_on_the_outcome_as_it_always_did() {
+        // The other half of the fix: nothing changes for the default path, so
+        // an agent's headless command still costs the reader no window at all.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+        state.decide(Verdict::Approve { stream: false });
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+
+        assert_eq!(state.phase(), Phase::Closed);
+        assert_eq!(state.linger_seconds_remaining(Instant::now()), None);
+    }
+
+    #[test]
+    fn the_window_that_is_about_to_go_says_how_long_it_has() {
+        let state = a_lingering_state();
+
+        assert_eq!(
+            state.linger_seconds_remaining(Instant::now()),
+            Some(LINGER.as_secs()),
+            "the countdown did not start at the whole linger"
+        );
+        // Rounded up, so the last second reads as a second rather than as
+        // nothing, and it reaches zero exactly where the window goes.
+        assert_eq!(state.linger_seconds_remaining(Instant::now() + LINGER), Some(0));
+        assert_eq!(
+            state.linger_seconds_remaining(Instant::now() + LINGER * 2),
+            Some(0),
+            "a clock past the deadline must not wrap round"
+        );
+    }
+
+    #[test]
+    fn the_linger_running_out_closes_the_window() {
+        let mut state = a_lingering_state();
+
+        state.tick(Instant::now());
+        assert_eq!(state.phase(), Phase::Lingering, "it went early");
+
+        state.tick(Instant::now() + LINGER);
+
+        assert_eq!(state.phase(), Phase::Closed);
+        assert!(state.take_close(), "the process was never told to leave");
+        assert_eq!(state.broken(), None, "a countdown running out is not a failure");
+    }
+
+    #[test]
+    fn keeping_the_window_stops_the_countdown_for_good() {
+        let mut state = a_lingering_state();
+
+        assert!(state.keep());
+
+        assert_eq!(state.phase(), Phase::Detached);
+        assert_eq!(state.linger_seconds_remaining(Instant::now()), None, "it is still counting");
+        state.tick(Instant::now() + LINGER * 100);
+        assert_eq!(state.phase(), Phase::Detached, "the clock took a window somebody kept");
+        assert_eq!(state.output_text(), "hello\n", "and the output it was kept for is gone");
+    }
+
+    #[test]
+    fn keeping_is_only_possible_from_the_phase_that_is_counting_down() {
+        let mut fresh = PromptState::new();
+        assert!(!fresh.keep());
+        assert_eq!(fresh.phase(), Phase::WaitingForRequest);
+
+        let mut awaiting = PromptState::new();
+        awaiting.handle(DaemonMsg::Request(a_request(90)));
+        assert!(!awaiting.keep(), "a window with a question open is not a viewer");
+        assert_eq!(awaiting.phase(), Phase::AwaitingVerdict);
+
+        let mut running = PromptState::new();
+        running.handle(DaemonMsg::Request(a_request(90)));
+        running.decide(Verdict::Approve { stream: true });
+        assert!(!running.keep(), "there is nothing to keep until it has finished");
+        assert_eq!(running.phase(), Phase::Running);
+
+        let mut kept = a_lingering_state();
+        assert!(kept.keep());
+        assert!(!kept.keep(), "keeping twice is not keeping");
+        assert_eq!(kept.phase(), Phase::Detached);
+    }
+
+    #[test]
+    fn no_verdict_can_come_out_of_a_window_that_has_outlived_its_request() {
+        // The rule the whole hand-over rests on. By the time either of these
+        // phases is reachable the daemon has returned to the agent and let go
+        // of this process: a verdict from here would be answering a question
+        // nobody is listening to, so there must be no way to build one.
+        for detached in [false, true] {
+            let mut state = a_lingering_state();
+            if detached {
+                assert!(state.keep());
+            }
+            let was = state.phase();
+            for verdict in [
+                Verdict::Approve { stream: true },
+                Verdict::Approve { stream: false },
+                Verdict::Deny { note: "no".to_string() },
+                Verdict::Revise { kind: ReviseKind::Explain, note: String::new() },
+                Verdict::Revise { kind: ReviseKind::Simplify, note: String::new() },
+                Verdict::SelfRun { note: String::new() },
+            ] {
+                assert_eq!(state.decide(verdict.clone()), None, "{verdict:?} from {was:?}");
+            }
+            assert_eq!(state.request_kill(), None, "there is nothing left to kill");
+            assert_eq!(state.phase(), was, "a refused verdict moved the window anyway");
+        }
+    }
+
+    #[test]
+    fn a_viewer_whose_channel_ends_still_closes_and_still_is_not_a_failure() {
+        // The daemon holds a handed-over window's standard input for as long
+        // as the window lives, so this is hatch itself going away. There is
+        // nobody left to report it to, and nobody left to end this process
+        // either — so it ends itself, quietly.
+        for detached in [false, true] {
+            let mut state = a_lingering_state();
+            if detached {
+                assert!(state.keep());
+            }
+
+            state.channel_broken("hatch closed the channel");
+
+            assert!(state.should_close(), "a viewer with no channel is an orphan");
+            assert_eq!(state.broken(), None, "the daemon going away is not this window's failure");
+        }
+    }
+
+    #[test]
+    fn the_guards_two_keys_decide_nothing_once_the_request_is_over() {
+        // Enter and Escape never reach a widget — the guard takes them out of
+        // the frame either way — so what they mean is decided here. On a
+        // window with nothing to decide, Escape puts it away and Enter does
+        // nothing at all, and neither writes a frame to a daemon that has
+        // already returned.
+        for (action, after) in
+            [(Action::Approve, Phase::Lingering), (Action::Deny, Phase::Closed)]
+        {
+            let (mut app, sink) = a_finished_window();
+            app.act(action);
+            assert_eq!(app.state.phase(), after, "{action:?}");
+            assert!(sink.lock().unwrap().is_empty(), "{action:?} answered a request that is over");
+        }
+
+        let (mut app, sink) = a_finished_window();
+        assert!(app.state.keep());
+        app.act(Action::Approve);
+        assert_eq!(app.state.phase(), Phase::Detached);
+        app.act(Action::Deny);
+        assert_eq!(app.state.phase(), Phase::Closed);
+        assert!(sink.lock().unwrap().is_empty(), "a detached viewer wrote to the daemon");
+    }
+
+    #[test]
+    fn what_would_be_copied_is_what_is_on_the_screen() {
+        // One string, built once, so the button cannot drift from the view.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+        state.decide(Verdict::Approve { stream: true });
+        state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "one\n".to_string() });
+        state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "two\n".to_string() });
+
+        assert_eq!(state.output_text(), "one\ntwo\n");
+        assert!(!state.output_dropped(), "nothing was dropped");
+    }
+
+    #[test]
+    fn output_the_cap_threw_away_is_admitted_to() {
+        // A copy action over a capped buffer is a window that can hand over
+        // less than it appears to. Saying so is the difference between a cap
+        // and a quiet lie.
+        let state = after_output(64, 64 * 1024);
+
+        assert!(state.output_dropped(), "the cap bit without the window admitting it");
+    }
+
     // ---- failing closed ----------------------------------------------------
 
     #[test]
@@ -1480,13 +2151,46 @@ mod tests {
     /// Read `input` to the end and collect everything the window would see,
     /// plus how many times the event loop was woken.
     fn read_all(input: &str) -> (Vec<Incoming>, usize) {
+        read_noticing(input).0
+    }
+
+    /// The same, plus what the reader said about each item it handed over.
+    fn read_noticing(input: &str) -> ((Vec<Incoming>, usize), Vec<Noticed>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let wakes = std::sync::atomic::AtomicUsize::new(0);
-        read_frames(input.as_bytes(), &tx, || {
-            wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seen = std::sync::Mutex::new(Vec::new());
+        read_frames(input.as_bytes(), &tx, |noticed| {
+            seen.lock().unwrap().push(noticed);
         });
         drop(tx);
-        (rx.into_iter().collect(), wakes.load(std::sync::atomic::Ordering::Relaxed))
+        let noticed = seen.into_inner().unwrap();
+        ((rx.into_iter().collect(), noticed.len()), noticed)
+    }
+
+    #[test]
+    fn the_reader_says_when_the_daemon_has_had_its_last_word() {
+        // Not a convenience: the backstop that bounds a lingering window is
+        // armed off this, on this thread, precisely so that a window whose
+        // event loop has stopped is still bounded by something.
+        let request = protocol::encode(&DaemonMsg::Request(a_request(90))).unwrap();
+        let output = protocol::encode(&DaemonMsg::Output {
+            stream: Stream::Stdout,
+            text: "hi".to_string(),
+        })
+        .unwrap();
+        let finished =
+            protocol::encode(&DaemonMsg::Finished(Outcome::Exit { code: 0 })).unwrap();
+
+        let (_, noticed) = read_noticing(&format!("{request}\n{output}\n{finished}\n"));
+
+        assert_eq!(
+            noticed,
+            vec![
+                Noticed { final_frame: false, last: false },
+                Noticed { final_frame: false, last: false },
+                Noticed { final_frame: true, last: false },
+                Noticed { final_frame: false, last: true },
+            ]
+        );
     }
 
     #[test]
@@ -1529,7 +2233,7 @@ mod tests {
 
         // Nothing to assert but that this returns: a reader that ignored a
         // closed channel would run to the end of a stdin that never ends.
-        read_frames(format!("{depth}\n").as_bytes(), &tx, || {});
+        read_frames(format!("{depth}\n").as_bytes(), &tx, |_| {});
     }
 
     #[test]
@@ -1595,6 +2299,20 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()));
         app.state.handle(DaemonMsg::Request(a_request(90)));
+        (app, sink)
+    }
+
+    /// The same window, once its streamed command has finished: lingering,
+    /// with the daemon already gone from the other end.
+    fn a_finished_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (mut app, sink) = an_awaiting_window();
+        app.state.decide(Verdict::Approve { stream: true });
+        app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(app.state.phase(), Phase::Lingering);
+        // Nothing has been written yet: `decide` hands back the frame and
+        // `answer` is what sends it, and this window's verdict never went
+        // through `answer`.
+        assert!(sink.lock().unwrap().is_empty());
         (app, sink)
     }
 
@@ -1759,6 +2477,76 @@ mod tests {
         );
         app.state.handle(DaemonMsg::Request(request));
         app
+    }
+
+    /// The same window once its streamed command has finished, with `printed`
+    /// on the screen.
+    fn a_finished_window_showing(command: &str, printed: &str) -> PromptApp {
+        let mut app = a_window_showing(command);
+        app.state.decide(Verdict::Approve { stream: true });
+        app.state
+            .handle(DaemonMsg::Output { stream: Stream::Stdout, text: printed.to_string() });
+        app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 3 }));
+        app
+    }
+
+    #[test]
+    fn a_lingering_window_shows_the_output_the_outcome_and_how_long_it_is_staying() {
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("a line it printed"), "the output is not on screen: {drawn}");
+        assert!(drawn.contains("exit 3"), "the window does not say how it ended: {drawn}");
+        assert!(
+            drawn.contains("closing in"),
+            "the window is about to take itself away without saying so: {drawn}"
+        );
+        assert!(drawn.contains("Keep this window"), "there is no way to keep it: {drawn}");
+        assert!(drawn.contains("Copy output"), "there is no way to take the output: {drawn}");
+        assert!(drawn.contains("echo marker"), "the output has nothing naming it: {drawn}");
+        assert!(
+            !drawn.contains("Approve") && !drawn.contains("Deny"),
+            "a window with nothing to decide still offered a verdict: {drawn}"
+        );
+        // Two countdowns on one window is two numbers the reader has to tell
+        // apart, and one of them measures time that has already been used.
+        assert!(
+            !drawn.contains("to decide"),
+            "the approval clock is still running under a finished command: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_kept_window_drops_the_countdown_and_keeps_everything_else() {
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+        assert!(app.state.keep());
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(!drawn.contains("closing in"), "a kept window is still counting down: {drawn}");
+        assert!(
+            !drawn.contains("Keep this window"),
+            "a kept window still offers to be kept: {drawn}"
+        );
+        assert!(drawn.contains("a line it printed"), "the output it was kept for: {drawn}");
+        assert!(drawn.contains("Copy output"), "{drawn}");
+        assert!(drawn.contains("Copy command"), "{drawn}");
+        assert!(drawn.contains("Close"), "there is no way to put it away: {drawn}");
+        assert!(
+            !drawn.contains("Approve") && !drawn.contains("Deny"),
+            "a detached viewer offered a verdict: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_finished_window_that_printed_nothing_says_so() {
+        // Rather than an empty box, which reads as a view that failed to load.
+        let mut app = a_finished_window_showing("true", "");
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("printed nothing"), "{drawn}");
     }
 
     #[test]

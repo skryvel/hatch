@@ -42,7 +42,7 @@
 
 use eframe::egui::{self, Color32, RichText, Ui};
 
-use crate::protocol::{Payload, ProtocolError};
+use crate::protocol::{Outcome, Payload, ProtocolError};
 use crate::render::diff::{Row, Side};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::render::{Span, SpanKind, Spans};
@@ -247,6 +247,45 @@ pub fn countdown_text(seconds_left: i64) -> String {
                 0 => format!("{minutes} min left to decide"),
                 rest => format!("{minutes} min {rest} s left to decide"),
             }
+        }
+    }
+}
+
+/// What the linger countdown says, once a streamed command has finished.
+///
+/// Seconds and a verb, for the reason [`countdown_text`] gives: the number is
+/// being compared against "can I reach the button in time", and that is a
+/// quantity of seconds rather than a clock. Different words from the approval
+/// countdown on purpose — these two numbers mean opposite things, and a reader
+/// who has just watched one run out must not read the other as more of it.
+pub fn closing_text(seconds_left: u64) -> String {
+    match seconds_left {
+        0 => "closing now".to_string(),
+        1 => "closing in 1 s".to_string(),
+        seconds => format!("closing in {seconds} s"),
+    }
+}
+
+/// How the approved operation ended, in words, and whether that is the ending
+/// nobody needs to look at.
+///
+/// The flag rather than a colour: this module works out what a line says, and
+/// the window works out how loudly to say it — the visuals are the caller's,
+/// because the colours come from the reader's theme.
+///
+/// `false` covers every ending that is not a clean exit, the signals included:
+/// a command hatch killed at the Kill button ended by signal too, and a reader
+/// who pressed that button is not surprised to see it called out.
+pub fn outcome_text(outcome: &Outcome) -> (String, bool) {
+    match outcome {
+        Outcome::Exit { code: 0 } => ("Finished — exit 0".to_string(), true),
+        Outcome::Exit { code } => (format!("Finished — exit {code}"), false),
+        Outcome::Signal { signal } => (format!("Ended by signal {signal}"), false),
+        // Defanged here and not upstream: this is the one variant carrying
+        // text from outside, and it is drawn beside a number the reader is
+        // meant to trust.
+        Outcome::ElevationFailed { message } => {
+            (format!("Nothing ran — {}", defang(message)), false)
         }
     }
 }
@@ -1968,6 +2007,45 @@ mod tests {
     }
 
     #[test]
+    fn the_closing_countdown_reads_as_a_quantity_of_seconds() {
+        assert_eq!(closing_text(10), "closing in 10 s");
+        assert_eq!(closing_text(1), "closing in 1 s", "a window does not close in 1 seconds");
+        assert_eq!(closing_text(0), "closing now");
+        // Deliberately not the approval countdown's words: the two numbers
+        // mean opposite things and appear minutes apart on the same window.
+        assert!(!closing_text(10).contains("decide"));
+    }
+
+    #[test]
+    fn how_it_ended_is_said_plainly_and_only_a_clean_exit_is_quiet() {
+        assert_eq!(outcome_text(&Outcome::Exit { code: 0 }), ("Finished — exit 0".into(), true));
+        assert_eq!(outcome_text(&Outcome::Exit { code: 3 }), ("Finished — exit 3".into(), false));
+        assert_eq!(
+            outcome_text(&Outcome::Signal { signal: 9 }),
+            ("Ended by signal 9".into(), false)
+        );
+        // Every nonzero ending is called out, including the one the reader
+        // caused themselves: a window that stayed quiet about a failure would
+        // be the exit code reaching the agent and nobody else.
+        for code in [1, 2, 127, -1] {
+            assert!(!outcome_text(&Outcome::Exit { code }).1, "exit {code} was drawn as fine");
+        }
+    }
+
+    #[test]
+    fn text_that_came_from_outside_is_defanged_before_it_is_drawn() {
+        // The one outcome carrying a message, drawn beside a number the
+        // reader is meant to trust. A bidi override in it would reorder the
+        // line it sits on.
+        let (text, clean) = outcome_text(&Outcome::ElevationFailed {
+            message: "\u{202E}denied".to_string(),
+        });
+        assert!(!text.contains('\u{202E}'), "an override reached the screen: {text}");
+        assert!(text.contains("[RLO]"), "{text}");
+        assert!(!clean);
+    }
+
+    #[test]
     fn every_glyph_the_panes_draw_is_one_monospace_advance() {
         // What the whole character-count fit rests on. A drawn line is
         // measured in characters and laid out in pixels, and the two agree
@@ -1993,8 +2071,10 @@ mod tests {
                 let ascii = width('0');
                 assert!(ascii > 0.0, "the monospace font draws nothing at all");
                 // The three compact chip glyphs, and the arrow a variable's
-                // note is drawn with.
-                for c in ['\u{2192}', '\u{21B5}', '\u{21E4}'] {
+                // note is drawn with. The tab's `⇥` and the note's `→` are
+                // deliberately different glyphs, and both are checked: the
+                // pair used to be one arrow doing two jobs.
+                for c in ['\u{21E5}', '\u{21B5}', '\u{21E4}'] {
                     assert_eq!(
                         width(c),
                         ascii,

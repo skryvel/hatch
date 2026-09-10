@@ -132,8 +132,15 @@ pub enum ChipTier {
 /// is exactly the failure a chip exists to prevent. `⇤` says what a carriage
 /// return does, which is to go back to the start of the line rather than to
 /// open a new one, and it pairs with `↵` for the CRLF case.
+///
+/// `⇥` for the tab and not the plain arrow `→`, which is the glyph a
+/// resolved variable's note already uses — `$HOME → /home/user`. Two meanings
+/// behind one glyph, told apart only by where they appear, is the argument
+/// that lost when the chips stopped being uniform. `⇥` is the tab key's own
+/// glyph, it pairs with `⇤` the way the two keys do, and it is one advance
+/// of the same font.
 const STRUCTURAL: &[(char, &str)] = &[
-    ('\u{0009}', "\u{2192}"),  // TAB, drawn as →
+    ('\u{0009}', "\u{21E5}"),  // TAB, drawn as ⇥
     ('\u{000A}', "\u{21B5}"),  // LF, drawn as ↵
     ('\u{000D}', "\u{21E4}"),  // CR, drawn as ⇤
 ];
@@ -455,7 +462,7 @@ mod tests {
     /// Every compact glyph this module promises, written out by hand, for
     /// the same reason `EXPECTED_LABELS` is.
     const EXPECTED_GLYPHS: &[(char, &str)] = &[
-        ('\u{0009}', "\u{2192}"),
+        ('\u{0009}', "\u{21E5}"),
         ('\u{000A}', "\u{21B5}"),
         ('\u{000D}', "\u{21E4}"),
     ];
@@ -581,7 +588,7 @@ mod tests {
         // would stop a reader telling layout from content.
         let spans = classify("a\tb\nc");
         assert_eq!(chips(&spans), vec!['\t', '\n']);
-        assert_eq!(labels(&spans), vec!["\u{2192}", "\u{21B5}"]);
+        assert_eq!(labels(&spans), vec!["\u{21E5}", "\u{21B5}"]);
     }
 
     #[test]
