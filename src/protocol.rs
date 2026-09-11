@@ -307,6 +307,22 @@ pub enum DaemonMsg {
         /// character the daemon never saw.
         text: String,
     },
+    /// The elevation program has been started and the password dialog is
+    /// expected; nothing the user approved has run yet.
+    ///
+    /// A frame of its own with no payload. No payload because the sentence
+    /// belongs to the window — the daemon knows *that* a second gate is now
+    /// in front of the operation, and the window knows how it words things to
+    /// a reader — and a text field here would be one more place for the
+    /// daemon to put a string on somebody's screen.
+    ///
+    /// A frame at all because of what the window is showing at that moment.
+    /// It has had its verdict, it has shrunk to a running indicator, and it
+    /// says the operation is running. That is not true yet: a password dialog
+    /// from another process is about to appear on top of it, and a reader who
+    /// has been told "it is running" has no reason to connect the two, or to
+    /// know that dismissing the dialog stops something they already approved.
+    Elevating,
     /// How the command ended. The last frame the daemon sends.
     ///
     /// What the window does with it is the window's own business and is not on
@@ -318,14 +334,9 @@ pub enum DaemonMsg {
 
 /// How an approved operation ended.
 ///
-/// # Why `ElevationFailed` is here before elevation is
+/// # Why `ElevationFailed` is one of these
 ///
-/// Nothing constructs it yet: `root:` is deferred with the rest of the
-/// elevation path. It is in the type anyway, and the wire-compatibility
-/// argument is not the reason — both ends of this channel are the same build,
-/// so a variant added later would cost nothing (see the module docs).
-///
-/// The reason is that the spec calls an elevation failure a *routine*
+/// The spec calls an elevation failure a *routine*
 /// outcome — the user approves in hatch and then dismisses the polkit
 /// password dialog — and [`crate::audit::LogVerdict::ElevationFailed`]
 /// already records it. An enum of `Exit` and `Signal` alone would be a type
@@ -360,6 +371,21 @@ pub enum Outcome {
     /// The operation was approved, but root elevation failed or was
     /// cancelled, so nothing ran.
     ElevationFailed {
+        /// What to tell the user, as text.
+        message: String,
+    },
+    /// The operation was approved and elevation was attempted, and hatch
+    /// cannot say whether it ran.
+    ///
+    /// The third variant exists for the reason the second one does, one step
+    /// further along. [`Outcome::ElevationFailed`] stops an exit code being
+    /// invented for a command that never ran; this stops *either* of the
+    /// other two being drawn for a command hatch has no evidence about. The
+    /// window closes on this frame, so whatever it says here is the last
+    /// thing the person who approved the operation reads about it, and
+    /// "Finished — exit 1" or "Nothing ran" would both be a claim hatch
+    /// cannot support. See [`crate::exec::elevate::RootOutcome::Unclear`].
+    Unclear {
         /// What to tell the user, as text.
         message: String,
     },
@@ -443,6 +469,18 @@ pub enum Payload {
         /// Whether it runs in a terminal of its own, which disables the
         /// stream checkbox.
         interactive: bool,
+        /// How this command will differ from the same command run
+        /// unprivileged, when it will — [`crate::exec::elevate::Elevation::caveat`].
+        ///
+        /// `None` for every unelevated request, and a paragraph for a root
+        /// one. It is on the wire rather than written into the window because
+        /// the difference it describes belongs to whichever elevation
+        /// mechanism this build has, and the window is not the place that
+        /// knows which one that is.
+        ///
+        /// Required on the wire like every other field: `None` is an explicit
+        /// null, not an absent key. See the type's own note on defaults.
+        caveat: Option<String>,
     },
     /// A `swap_file` request.
     Swap {
@@ -477,6 +515,43 @@ impl Payload {
             cwd,
             root,
             interactive,
+            caveat: None,
+        }
+    }
+
+    /// The same payload, carrying what the window must tell a reader about how
+    /// an elevated command differs from an ordinary one.
+    ///
+    /// Separate from [`Payload::command`] so that the eighteen call sites that
+    /// build an unelevated payload keep saying `None` by construction rather
+    /// than by each of them remembering to pass it, and so that the one place
+    /// that has an [`crate::exec::elevate::Elevation`] to ask is the one place
+    /// that sets it.
+    ///
+    /// A no-op on a swap payload: a swap has no command line and no elevation
+    /// caveat to attach to one.
+    pub fn with_caveat(self, caveat: Option<&str>) -> Payload {
+        match self {
+            Payload::Command {
+                display_line,
+                spans,
+                raw,
+                danger,
+                cwd,
+                root,
+                interactive,
+                caveat: _,
+            } => Payload::Command {
+                display_line,
+                spans,
+                raw,
+                danger,
+                cwd,
+                root,
+                interactive,
+                caveat: caveat.map(str::to_string),
+            },
+            swap => swap,
         }
     }
 
@@ -952,6 +1027,7 @@ mod tests {
         assert_eq!(
             payload,
             [
+                "caveat",
                 "cwd",
                 "danger",
                 "display_line",

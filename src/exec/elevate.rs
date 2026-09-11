@@ -120,14 +120,31 @@ pub trait Elevation: Send + Sync {
     /// the command not to be affected by that. See [`Run0::spawner_env`].
     fn spawner_env(&self, env: &Env) -> Env;
 
-    /// The argv that runs `command` as root with [`Self::child_env`] applied.
+    /// The argv that runs `inner` as root with [`Self::child_env`] applied.
+    ///
+    /// `inner` is an argv and not a command string, because the two callers
+    /// want different things in front of the elevation wrapper and only one
+    /// of them wants a shell. A `run_command` request is a script and gets
+    /// `bash -c`; a root `swap_file` is `install` with four options and two
+    /// paths, and putting a shell under it would re-parse a path the window
+    /// already committed to for no gain at all. This is the primitive and
+    /// [`Self::argv`] is the shell-shaped case of it.
     ///
     /// # Errors
     ///
     /// [`Unavailable`], on exactly the terms [`Self::available`] uses. There
     /// is no third answer: an implementation that cannot elevate returns an
     /// error, never an argv that runs the command some other way.
-    fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable>;
+    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable>;
+
+    /// The argv that runs the shell script `command` as root.
+    ///
+    /// [`shell_argv`] and then [`Self::elevate`], so the wrapper an elevated
+    /// command gets is the same one the unelevated path uses and the command
+    /// travels as a single `execve` argument either way.
+    fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
+        self.elevate(shell_argv(command), env)
+    }
 
     /// What a finished elevated run means.
     ///
@@ -503,9 +520,10 @@ impl Elevation for Run0 {
     /// `locale_is_forced_for_run0_and_not_for_the_command` pins hatch's half
     /// of that: the two maps do not agree on these keys. The other half —
     /// whether `run0` propagates anything of its own into the unit — is
-    /// systemd's behaviour, not hatch's, and is checked by running
-    /// `run0 --pipe -- bash -c 'env'` through the daemon once the request flow
-    /// is wired. It is named here so that check does not get forgotten.
+    /// systemd's behaviour, not hatch's, and no test here can see it. The
+    /// request flow is wired now, so the check is one `run_command` with
+    /// `root: true` and the command `env`, read off the window. It is named
+    /// here because it is the last unmeasured assumption on this path.
     fn spawner_env(&self, env: &Env) -> Env {
         let mut spawner = env.clone();
         spawner.extend(
@@ -514,7 +532,8 @@ impl Elevation for Run0 {
         spawner
     }
 
-    /// `run0 --pipe --setenv=… -- bash -c '<command>'`.
+    /// `run0 --pipe --setenv=… -- <inner>`, and for a `run_command` request
+    /// that tail is `bash -c '<command>'`.
     ///
     /// In that order, and every part of it earns its place:
     ///
@@ -527,18 +546,20 @@ impl Elevation for Run0 {
     ///   request.
     /// * `--` before the command, so that a command beginning with a dash is
     ///   the command and not another option to `run0`.
-    /// * `bash -c` and the command as one argument, from [`shell_argv`], which
-    ///   is the same wrapper the unelevated path uses. The command is never
-    ///   concatenated into the line: it travels as a single `execve` argument
-    ///   from here to the shell that reads it.
-    fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
+    /// * `inner` last and untouched. For [`Elevation::argv`] that is
+    ///   [`shell_argv`]'s `bash -c` and the command as one argument — the same
+    ///   wrapper the unelevated path uses, so the command is never
+    ///   concatenated into the line but travels as a single `execve` argument
+    ///   from here to the shell that reads it. For a root `swap_file` it is
+    ///   `install` and its arguments, with no shell under them at all.
+    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
         self.available(env)?;
         let mut wrapper = vec!["--pipe".to_string()];
         wrapper.extend(
             self.child_env(env).iter().map(|(key, value)| format!("--setenv={key}={value}")),
         );
         wrapper.push("--".to_string());
-        Ok(ElevatedArgv::wrapping(Run0::PROGRAM, wrapper, shell_argv(command)))
+        Ok(ElevatedArgv::wrapping(Run0::PROGRAM, wrapper, inner))
     }
 
     /// Did the command run, and if not, was it refused.
@@ -705,7 +726,7 @@ impl Elevation for NoElevation {
     /// unelevated one: running the command as the user is not a degraded form
     /// of running it as root, it is a different operation than the one that
     /// was approved.
-    fn argv(&self, _command: &str, _env: &Env) -> Result<ElevatedArgv, Unavailable> {
+    fn elevate(&self, _inner: Vec<String>, _env: &Env) -> Result<ElevatedArgv, Unavailable> {
         Err(self.refusal())
     }
 
@@ -722,6 +743,147 @@ impl Elevation for NoElevation {
     /// Nothing to warn about: nothing runs.
     fn caveat(&self) -> Option<&'static str> {
         None
+    }
+}
+
+// ---- a rehearsed elevation, for the tests a password dialog makes impossible
+
+/// An [`Elevation`] that answers with an outcome a test chose, and elevates
+/// by running the argv it was given without any privilege at all.
+///
+/// # Why this lives here rather than in a test module
+///
+/// [`ElevatedArgv`]'s only constructor is private to this module, on purpose:
+/// it is what makes "an implementation that cannot elevate cannot return an
+/// argv" hold by construction rather than by review. A double built outside
+/// this file could not produce one, so the double belongs inside it. That is
+/// the invariant working — it constrains hatch's own tests exactly as it
+/// constrains a second platform.
+///
+/// # Why it runs the command
+///
+/// The four things a password dialog can do cannot be produced on demand: a
+/// dialog cannot be driven from a test, and this project's rule is that no
+/// test invokes `run0`. But the *mapping* from those four outcomes onto a
+/// tool result, a log verdict and a closing frame is the part most worth
+/// testing, and testing it needs a run that really happens — otherwise every
+/// case reaches the daemon as "hatch could not start it" and the mapping is
+/// never exercised.
+///
+/// So this elevates with a program that runs its arguments and nothing else,
+/// resolved off the same `PATH` the child is given. The command genuinely
+/// runs, as whoever runs the test; [`Elevation::classify`] then returns
+/// whatever the test asked for, which is precisely the seam a real dialog
+/// would sit behind.
+///
+/// Behind the test feature and not `cfg(test)`, for the reason
+/// [`crate::prompter::StubPrompter`] is: the integration tests link the
+/// library compiled without `cfg(test)`.
+#[cfg(any(test, feature = "test-stub-prompter"))]
+pub struct Rehearsed {
+    /// The program put in front of the argv. Either one that runs what
+    /// follows it, or one that ignores it.
+    program: &'static str,
+    /// What [`Elevation::classify`] answers, whatever actually happened.
+    outcome: RootOutcome,
+    /// The refusal [`Elevation::available`] gives, when it refuses.
+    unavailable: Option<String>,
+    /// Every argv this was asked to elevate, in order.
+    seen: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[cfg(any(test, feature = "test-stub-prompter"))]
+impl Rehearsed {
+    /// Elevate by running the argv, and report `outcome` afterwards.
+    ///
+    /// `env` runs its arguments as a command with the environment it was
+    /// given, which for an argv that is already `["bash", "-c", …]` or
+    /// `["install", …]` means the argv runs unchanged. It is in every POSIX
+    /// system's base install and it takes no options hatch needs to avoid.
+    pub fn running(outcome: RootOutcome) -> Rehearsed {
+        Rehearsed::new("env", outcome)
+    }
+
+    /// Elevate by running a program that ignores the argv, and report
+    /// `outcome`.
+    ///
+    /// For the tests that are about the argv hatch *builds* rather than about
+    /// what running it does: `true` exits 0 having done nothing, so the argv
+    /// can be asserted on through [`Rehearsed::seen`] with nothing on disk
+    /// touched.
+    pub fn recording(outcome: RootOutcome) -> Rehearsed {
+        Rehearsed::new("true", outcome)
+    }
+
+    /// An elevation that refuses before anything is spawned.
+    pub fn unavailable(message: &str) -> Rehearsed {
+        Rehearsed {
+            unavailable: Some(message.to_string()),
+            ..Rehearsed::new("true", RootOutcome::Ran { exit: Some(0) })
+        }
+    }
+
+    fn new(program: &'static str, outcome: RootOutcome) -> Rehearsed {
+        Rehearsed {
+            program,
+            outcome,
+            unavailable: None,
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every argv this was asked to elevate, in order.
+    pub fn seen(&self) -> Vec<Vec<String>> {
+        self.seen.lock().expect("the recording lock").clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-stub-prompter"))]
+impl Elevation for Rehearsed {
+    fn mechanism(&self) -> &'static str {
+        self.program
+    }
+
+    fn available(&self, _env: &Env) -> Result<(), Unavailable> {
+        match &self.unavailable {
+            Some(message) => Err(Unavailable { message: message.clone() }),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Run0`]'s, so that what the window resolves variables against has the
+    /// same shape in a test as in production.
+    fn child_env(&self, env: &Env) -> Env {
+        Run0::new().child_env(env)
+    }
+
+    /// [`Run0`]'s, including the forced locale. A double that quietly dropped
+    /// it would make every test pass over the one condition
+    /// [`Run0::classify`]'s third rule exists to enforce.
+    fn spawner_env(&self, env: &Env) -> Env {
+        Run0::new().spawner_env(env)
+    }
+
+    /// The program, then the argv unchanged. No wrapper of its own: `run0`'s
+    /// `--pipe` and `--setenv` are `run0`'s, and a double that invented
+    /// options for a program that does not take them would not run.
+    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
+        self.available(env)?;
+        self.seen.lock().expect("the recording lock").push(inner.clone());
+        // Resolved off the child's `PATH` for the reason `available` is: the
+        // spawn searches that one, not the daemon's.
+        let program = lookup(self.program, env)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| self.program.to_string());
+        Ok(ElevatedArgv::wrapping(&program, Vec::new(), inner))
+    }
+
+    fn classify(&self, _exit: Option<i32>, _stderr: &str, _spawned_with: &Env) -> RootOutcome {
+        self.outcome.clone()
+    }
+
+    fn caveat(&self) -> Option<&'static str> {
+        Some(RUN0_CAVEAT)
     }
 }
 
@@ -756,6 +918,54 @@ mod tests {
     }
 
     // ---- the argv ----------------------------------------------------------
+
+    #[test]
+    fn a_direct_argv_is_elevated_without_a_shell_under_it() {
+        let (_dir, env) = with_run0();
+        let install = vec![
+            "install".to_string(),
+            "-m".to_string(),
+            "0644".to_string(),
+            "--".to_string(),
+            "/stage/a".to_string(),
+            "/etc/hosts".to_string(),
+        ];
+        let argv = Run0::new().elevate(install.clone(), &env).expect("run0 is on this PATH");
+
+        assert_eq!(argv.program(), Run0::PROGRAM);
+        // The tail is the argv it was handed, untouched and unwrapped. A
+        // `bash -c` under `install` would re-parse two paths the window has
+        // already committed to, and `swap_file` never displays a command line
+        // for a reader to notice it in.
+        assert_eq!(&argv.as_slice()[argv.as_slice().len() - install.len()..], &install[..]);
+        assert!(
+            !argv.as_slice().contains(&"bash".to_string()),
+            "a shell was put under a direct argv: {:?}",
+            argv.as_slice()
+        );
+        // Everything else about the wrapper is the same as a command's.
+        assert_eq!(argv.as_slice()[1], "--pipe");
+        assert!(argv.as_slice().contains(&"--".to_string()));
+    }
+
+    #[test]
+    fn a_command_is_the_shell_shaped_case_of_the_same_primitive() {
+        let (_dir, env) = with_run0();
+        let run0 = Run0::new();
+        assert_eq!(
+            run0.argv("echo hi", &env).unwrap(),
+            run0.elevate(shell_argv("echo hi"), &env).unwrap(),
+            "the two entry points built different argvs for the same command"
+        );
+    }
+
+    #[test]
+    fn a_platform_that_cannot_elevate_refuses_a_direct_argv_too() {
+        let refusing = NoElevation::for_os("plan9");
+        assert!(refusing.elevate(vec!["install".to_string()], &Env::new()).is_err());
+        assert!(refusing.argv("true", &Env::new()).is_err());
+    }
+
 
     #[test]
     fn the_root_argv_is_the_line_the_spec_names() {

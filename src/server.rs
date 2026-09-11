@@ -58,6 +58,31 @@
 //!    that dies now costs the Kill button and the live view, and nothing else.
 //! 6. **Write exactly one audit line.**
 //!
+//! ## The second gate, and the three things it can leave behind
+//!
+//! A `root: true` operation has a gate step 5 does not: after the approval,
+//! polkit asks for a password in a dialog of its own. That wait sits inside
+//! the execution timeout, because the dialog lives inside the lifetime of the
+//! process hatch spawned, and that process is what the execution deadline
+//! kills. Nothing is added to the bound the tool description advertises, and
+//! there is no path on which a dialog nobody answers blocks the call past it.
+//!
+//! What comes back is not a second verdict. It is one of three facts, and the
+//! daemon has to keep them apart:
+//!
+//! * **It ran.** The status is the command's, and this is an ordinary
+//!   approval.
+//! * **Nothing ran** — the dialog was dismissed, or there was no way to ask.
+//!   That is [`LogVerdict::ElevationFailed`], never a nonzero exit code: a
+//!   refusal and a failing command end with the same status, so reporting the
+//!   number would send the agent off to fix a command that never started. It
+//!   is also not a denial by the user; they approved this, and something
+//!   after them did not.
+//! * **hatch cannot tell.** That is [`LogVerdict::ElevationUnclear`], and it
+//!   is not a softer version of either of the others. Both of those are
+//!   claims; this is the absence of one, and the only honest answer when the
+//!   evidence that separates them is missing.
+//!
 //! ## Why there is exactly one audit line
 //!
 //! Not because every exit path remembers to write one. `Outcome` is the
@@ -117,6 +142,7 @@ use tokio_util::sync::CancellationToken;
 use crate::audit::{AuditLog, AuditRecord, LogDetail, LogVerdict, RunDetail, SwapDetail};
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
+use crate::exec::elevate::{Elevation, RootOutcome};
 use crate::exec::env::build_child_env;
 use crate::exec::{Chunk, Env, Output, RunOpts};
 use crate::paths::Paths;
@@ -126,7 +152,7 @@ use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
-use crate::swap::{ApplyError, PlanKind, SwapPlan};
+use crate::swap::{ApplyError, PlanKind, RootWrite, SwapPlan};
 use crate::{exec, protocol, swap};
 
 /// Caps on the agent-controlled strings, in **bytes** of UTF-8, not
@@ -568,7 +594,17 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          - cwd: absolute working directory. Optional.\n\
          - interactive: true if the command needs a terminal — a full-screen program, a pager, a \
          prompt that expects typing.\n\
-         - root: leave it false. Root is not available yet and asking for it fails the call."
+         - root: true runs it as root. Ask for this only when the work genuinely needs it — a \
+         permission error without it is a normal result you may retry with it. It costs the \
+         person a second interruption: after they approve in hatch's window, the system asks \
+         them for a password in a dialog of its own, and dismissing that dialog stops the \
+         command. Both of those waits are inside the {total} seconds above. A root command may \
+         also be given a terminal where an ordinary one is not, so it may colour its output.\n\
+         \n\
+         Three answers mean the command did not run: the person refused it, the password dialog \
+         was dismissed, or hatch could not tell what happened. The last one is not a failure you \
+         should retry — it says hatch does not know whether the command ran, so running it again \
+         may run it twice. Ask the person."
     );
 
     let swap_file = format!(
@@ -594,7 +630,11 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          - path: absolute path of the file to write.\n\
          - content: the complete new contents of the file.\n\
          - reason: why this is needed now, in a sentence or two.\n\
-         - root: leave it false. Root is not available yet and asking for it fails the call."
+         - root: true writes the file as root, for a path this user cannot write. The person \
+         approves the same diff either way, and then the system asks them for a password in a \
+         dialog of its own; dismissing it means nothing is written. A root write keeps the \
+         file's existing owner and mode, or creates it owned by root — the window states which, \
+         and the write either matches what it stated or does not happen."
     );
 
     ToolDescriptions { run_command, swap_file }
@@ -708,6 +748,18 @@ pub struct Daemon {
     queue: ApprovalQueue,
     audit: AuditLog,
     denylist: Denylist,
+    /// How this build runs an approved operation as root.
+    ///
+    /// A `dyn` and not `Run0`, because the whole of hatch's knowledge about
+    /// `run0`, polkit and systemd is meant to sit behind this one value and
+    /// the daemon is meant never to learn which implementation it is holding
+    /// — see [`crate::exec::elevate`]. It is also what makes every root
+    /// outcome reachable from a test: the four things a password dialog can
+    /// do cannot be produced on demand, and a fake implementation returning
+    /// each of them in turn can.
+    elevation: Arc<dyn Elevation>,
+    /// Where approved bytes wait between the approval and a root write.
+    stage_dir: PathBuf,
 }
 
 impl Daemon {
@@ -721,13 +773,48 @@ impl Daemon {
     /// directory that no longer sits inside it.
     pub fn new(paths: &Paths, config: Config, prompter: Arc<dyn Prompter>) -> Daemon {
         let denylist = Denylist::new(&paths.protected(), paths.home(), &config.denylist_extra);
+        let stage_dir = paths.stage_dir();
+        // The one sweep, and it is here because here is startup: one of these
+        // exists per `hatch serve`. Anything in the staging directory now is
+        // approved content from a daemon that did not get to write it — a
+        // `SIGKILL`, a power cut — which `Staged`'s drop guard cannot reach
+        // by construction. Sweeping at any later moment would delete the
+        // staged bytes of a request somebody is deciding on in another
+        // window.
+        //
+        // A sweep that fails does not stop the daemon. The failure is worth
+        // saying out loud, but a daemon that refuses to start leaves the user
+        // doing privileged things by hand with no window and no audit record
+        // at all, which is the worse of the two.
+        if let Err(error) = swap::sweep_stage(&stage_dir) {
+            eprintln!(
+                "hatch could not sweep the staging directory {}: {error}",
+                stage_dir.display()
+            );
+        }
         Daemon {
             config: Arc::new(config),
             prompter,
             queue: ApprovalQueue::new(),
             audit: AuditLog::new(&paths.log_dir()),
             denylist,
+            elevation: Arc::from(crate::exec::elevate::platform()),
+            stage_dir,
         }
+    }
+
+    /// The same daemon, elevating through `elevation` instead of through the
+    /// platform's mechanism.
+    ///
+    /// Behind the test feature and not `cfg(test)`, for the reason
+    /// [`crate::prompter::StubPrompter`] is: the integration tests link the
+    /// library compiled without `cfg(test)`. There is no production caller —
+    /// a build that could be handed an elevation of somebody else's choosing
+    /// is a build where "this ran as root" means whatever that choice says.
+    #[cfg(any(test, feature = "test-stub-prompter"))]
+    pub fn with_elevation(mut self, elevation: Arc<dyn Elevation>) -> Daemon {
+        self.elevation = elevation;
+        self
     }
 
     /// The running config, for the tool descriptions.
@@ -806,6 +893,7 @@ enum Phase {
     Queued = 0,
     AwaitingApproval = 1,
     Executing = 2,
+    Elevating = 3,
 }
 
 impl Phase {
@@ -814,6 +902,11 @@ impl Phase {
             Phase::Queued => "queued behind another approval",
             Phase::AwaitingApproval => "awaiting the user's decision",
             Phase::Executing => "approved; running",
+            // One message covering the whole elevated run rather than two,
+            // because hatch is never told that the password was typed: there
+            // is no moment at which it could honestly switch to "running".
+            // This sentence is true from the spawn to the end either way.
+            Phase::Elevating => "approved; waiting for the system password dialog, then running",
         }
     }
 
@@ -821,7 +914,8 @@ impl Phase {
         match value {
             0 => Phase::Queued,
             1 => Phase::AwaitingApproval,
-            _ => Phase::Executing,
+            2 => Phase::Executing,
+            _ => Phase::Elevating,
         }
     }
 }
@@ -963,8 +1057,29 @@ struct Job {
 
 /// What an approval authorises.
 enum Work {
-    Run { argv: Vec<String>, env: Env, cwd: PathBuf },
-    Swap { path: PathBuf, content: Vec<u8>, plan: SwapPlan },
+    Run(RunPlan),
+    Swap { path: PathBuf, content: Vec<u8>, plan: SwapPlan, root: bool },
+}
+
+/// Everything an approved command needs in order to run, and to be read
+/// afterwards.
+///
+/// One struct rather than four parameters, for the reason [`RunOpts`] is one:
+/// the four travel together from the moment they are built to the moment they
+/// are used, and a signature that spreads them out is a signature whose call
+/// sites can put two booleans in the wrong order.
+struct RunPlan {
+    argv: Vec<String>,
+    env: Env,
+    cwd: PathBuf,
+    /// Whether `argv` elevates.
+    ///
+    /// Carried rather than re-derived from the argv, because "does this start
+    /// with run0" is exactly the kind of platform knowledge the elevation
+    /// module exists to keep out of the daemon. It decides how the finished
+    /// run is *read* — an elevated run's exit status may not be the command's
+    /// at all — so getting it wrong is not a cosmetic error.
+    elevated: bool,
 }
 
 impl Daemon {
@@ -1155,20 +1270,21 @@ impl Daemon {
         // authorised: a window that dies now loses the Kill button and the
         // live view, and nothing else. Killing it could leave a half-finished
         // state the user never asked for.
-        progress.enter(Phase::Executing);
-        let (result, windup) = match work {
-            Work::Run { argv, env, cwd } => {
-                self.run_it(&argv, &env, &cwd, stream, &session, &mut detail).await
-            }
-            Work::Swap { path, content, plan } => {
-                self.swap_it(&path, &content, &plan, &session, &mut detail).await
+        // Still step 5, and for a root operation there is a second gate
+        // inside it: the user has approved, and the system is about to ask
+        // them for a password in a dialog of its own. That wait can be the
+        // longest part of the whole call, so the client's ticker has to
+        // describe it rather than claim the command is running.
+        progress.enter(match work.elevated() {
+            true => Phase::Elevating,
+            false => Phase::Executing,
+        });
+        let (verdict, result, windup) = match work {
+            Work::Run(run) => self.run_it(&run, stream, &session, &mut detail).await,
+            Work::Swap { path, content, plan, root } => {
+                self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
             }
         };
-
-        // Step 6 is elevation, which lands with the root path: an elevation
-        // failure is its own outcome and must never be reported as a nonzero
-        // exit code. Nothing here can produce one, because `root: true` is
-        // refused in `prepare`.
 
         note_prompt_death(&session, &mut detail);
         match windup {
@@ -1186,7 +1302,22 @@ impl Daemon {
             Windup::Detach => session.detach(),
         }
 
-        Outcome { verdict: LogVerdict::Approve, note: None, detail, result }
+        // Not `LogVerdict::Approve` unconditionally. An approval that hit a
+        // dismissed password dialog is an approval whose operation never
+        // happened, and one whose elevation hatch could not read is an
+        // approval it cannot report either way; both are their own verdicts,
+        // and the log is where anyone later asks what actually ran as root.
+        Outcome { verdict, note: None, detail, result }
+    }
+}
+
+impl Work {
+    /// Whether carrying this out will ask for a password.
+    fn elevated(&self) -> bool {
+        match self {
+            Work::Run(run) => run.elevated,
+            Work::Swap { root, .. } => *root,
+        }
     }
 }
 
@@ -1294,12 +1425,6 @@ impl Daemon {
             Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(&cwd), message))
         };
 
-        if params.root {
-            return refuse(not_yet(
-                "run a command as root",
-                "Ask for the unelevated form, or ask the user to run it themselves.",
-            ));
-        }
         if params.interactive {
             return refuse(not_yet(
                 "run a command in a terminal",
@@ -1334,20 +1459,61 @@ impl Daemon {
             }
         }
 
-        let spans = render_command(&params.command, &env);
+        // Everything below is decided twice, once for each path, and the two
+        // halves have to agree on three things: the argv that runs, the
+        // environment it runs with, and the line the window draws. They are
+        // built together here so that they cannot be made to disagree.
+        //
+        // For an elevated request the environment splits in two. `run0` is
+        // spawned with a forced locale so that hatch can read its
+        // diagnostics; the command receives the constructed environment plus
+        // hatch's pager defaults, passed explicitly as `--setenv`. The window
+        // resolves variables against the *command's* environment, because
+        // that is the one the command will actually have — resolving against
+        // the spawner's would put a value on screen that the command never
+        // sees. See `crate::exec::elevate::Run0::spawner_env`.
+        let (argv, spawn_env, line, caveat) = if params.root {
+            let elevated = match self.elevation.argv(&params.command, &env) {
+                Ok(elevated) => elevated,
+                // Nothing was rendered and nobody was asked: this build
+                // cannot elevate here at all, which is a fact about the
+                // machine rather than a decision anybody made.
+                Err(unavailable) => return refuse(refusal_text(&unavailable.to_string())),
+            };
+            (
+                elevated.as_slice().to_vec(),
+                self.elevation.spawner_env(&env),
+                // The whole line, `run0` and every `--setenv` included. The
+                // reader is approving a root command, and the parts of a root
+                // command line somebody would most want folded away are the
+                // parts that decide what it does.
+                elevated.display_line(),
+                self.elevation.caveat(),
+            )
+        } else {
+            (
+                // A direct argv, never a string handed to another shell: the
+                // rendering below is a rendering *of these three arguments*.
+                vec!["bash".to_string(), "-c".to_string(), params.command.clone()],
+                env.clone(),
+                params.command.clone(),
+                None,
+            )
+        };
+        let render_env = match params.root {
+            true => self.elevation.child_env(&env),
+            false => env.clone(),
+        };
+
+        let spans = render_command(&line, &render_env);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
-        let payload = Payload::command(&spans, Vec::new(), cwd.clone(), false, false);
+        let payload = Payload::command(&spans, Vec::new(), cwd.clone(), params.root, false)
+            .with_caveat(caveat);
         Prepared::Ready(Job {
             detail: detail(&cwd),
             payload,
-            // A direct argv, never a string handed to another shell: the
-            // rendering above is a rendering *of these three arguments*.
-            work: Work::Run {
-                argv: vec!["bash".to_string(), "-c".to_string(), params.command],
-                env,
-                cwd,
-            },
+            work: Work::Run(RunPlan { argv, env: spawn_env, cwd, elevated: params.root }),
         })
     }
 
@@ -1369,18 +1535,20 @@ impl Daemon {
             Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(None), message))
         };
 
-        if params.root {
-            return refuse(not_yet(
-                "write a file as root",
-                "Ask for a path this user can write, or ask the user to place the file \
-                 themselves.",
-            ));
+        // Before the denylist and before the filesystem, because it is the
+        // one refusal here that is about the machine rather than about the
+        // request: a build with no way to elevate cannot honour this whatever
+        // the path turns out to be, and finding that out after the user has
+        // read a diff spends their attention on a write that was never going
+        // to happen.
+        if params.root && let Err(unavailable) = self.elevation.available(&build_child_env(&self.config)) {
+            return refuse(refusal_text(&unavailable.to_string()));
         }
         if let Err(refusal) = swap::validate(&path, &self.denylist) {
             return refuse(refusal_text(&refusal.to_string()));
         }
 
-        let plan = match swap::plan(&path, &content, false) {
+        let plan = match swap::plan(&path, &content, params.root) {
             Ok(plan) => plan,
             Err(error) => return refuse(refusal_text(&format!("{error:#}"))),
         };
@@ -1424,7 +1592,7 @@ impl Daemon {
         Prepared::Ready(Job {
             detail: detail(plan.hash_before.clone()),
             payload: Payload::swap(path.clone(), plan.clone(), &rows),
-            work: Work::Swap { path, content, plan },
+            work: Work::Swap { path, content, plan, root: params.root },
         })
     }
 }
@@ -1440,13 +1608,13 @@ impl Daemon {
     /// was sent at all and on whether anybody asked to watch.
     async fn run_it(
         &self,
-        argv: &[String],
-        env: &Env,
-        cwd: &Path,
+        run: &RunPlan,
         stream: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> (CallToolResult, Windup) {
+    ) -> (LogVerdict, CallToolResult, Windup) {
+        let RunPlan { argv, env, cwd, elevated } = run;
+        let elevated = *elevated;
         // The live view is a display preference and nothing else: execution is
         // identical either way, so the only difference is whether a sink is
         // wired at all.
@@ -1459,6 +1627,15 @@ impl Daemon {
         } else {
             (None, None)
         };
+
+        // Immediately before the spawn, because that is when the dialog
+        // appears and there is nothing between the two. The window has its
+        // verdict and has shrunk to a running indicator; without this it
+        // would say the operation is running while a password dialog it
+        // cannot see sits on top of it, unexplained.
+        if elevated {
+            session.outbox().elevating().await;
+        }
 
         let started = std::time::Instant::now();
         let ran = exec::run(
@@ -1490,6 +1667,13 @@ impl Daemon {
                 // about a command that never started. The window is closed
                 // instead, and the agent is told the truth.
                 return (
+                    // The elevation program failing to start is an elevation
+                    // failure and nothing else: nothing was elevated, so
+                    // nothing ran, and the log has a verdict that says so.
+                    match elevated {
+                        true => LogVerdict::ElevationFailed,
+                        false => LogVerdict::Approve,
+                    },
                     CallToolResult::error(vec![ContentBlock::text(format!(
                         "the user approved this, but hatch could not start it, so nothing ran: \
                          {error}"
@@ -1503,8 +1687,24 @@ impl Daemon {
             }
         };
 
+        // What the run means. For an unelevated command that is the exit
+        // status and nothing else; for an elevated one the status may not be
+        // the command's at all, so it is read through the elevation that
+        // produced it. `None` here is "no interpretation needed", not "it
+        // worked".
+        let root = elevated.then(|| self.read_root(&output, env));
+
         if let LogDetail::RunCommand(run) = detail {
-            run.exit_code = output.exit_code;
+            // The exit code is recorded only when it is the command's. An
+            // elevated run that was refused ends with a status too — the same
+            // 1 a failing command produces — and writing that number under
+            // `exit_code` would put a command's result in the log for a
+            // command that never ran.
+            run.exit_code = match &root {
+                Some(RootOutcome::Ran { exit }) => *exit,
+                Some(_) => None,
+                None => output.exit_code,
+            };
             run.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
             run.killed_by_user = Some(output.killed_by_user);
             run.timed_out = Some(output.timed_out);
@@ -1515,7 +1715,45 @@ impl Daemon {
         // actually reached the window, though — a window that was not told the
         // command ended has no reason to close itself, and handing that one
         // over would be leaving it for the reader to explain.
-        let windup = match finished_frame(&output) {
+        let (verdict, result, frame) = match root {
+            // Unelevated, or elevated and the command demonstrably ran: the
+            // status is the command's and is reported as it always was.
+            None | Some(RootOutcome::Ran { .. }) => (
+                LogVerdict::Approve,
+                CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))]),
+                finished_frame(&output),
+            ),
+            Some(outcome) => {
+                let (verdict, message, frame) = elevation_ending(&outcome);
+                // What goes with the message depends on what the outcome
+                // claims, and the difference is the whole point of the three
+                // being separate.
+                //
+                // `Denied` and `Failed` say **nothing ran**. There is no
+                // exit code, no stdout and no stderr belonging to a command
+                // that never started, and printing `describe_run`'s "exit
+                // code: 1 / stdout: (empty)" underneath them would hand the
+                // agent the one number this module exists to keep it away
+                // from — the status a refusal and a failing command share.
+                // Only the elevation program's own first line goes with it.
+                //
+                // `Unclear` says hatch does not know, and there the captured
+                // output is the evidence: it is what anybody deciding whether
+                // the command ran would look at, and withholding it would
+                // leave the question unanswerable as well as unanswered.
+                let text = match &outcome {
+                    RootOutcome::Unclear { .. } => {
+                        format!("{message}\n\n{}", describe_run(&output, elapsed))
+                    }
+                    _ => match first_line(&output.stderr) {
+                        "" => message,
+                        line => format!("{message}\n\n{line}"),
+                    },
+                };
+                (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Some(frame))
+            }
+        };
+        let windup = match frame {
             Some(frame) => {
                 let told = session.outbox().finished(frame).await;
                 match told && stream {
@@ -1525,10 +1763,54 @@ impl Daemon {
             }
             None => Windup::Close,
         };
-        (
-            CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))]),
-            windup,
-        )
+        (verdict, result, windup)
+    }
+
+    /// What an elevated run that has finished actually means.
+    ///
+    /// A wrapper around [`Elevation::classify`] holding the one thing that
+    /// function cannot see: whether hatch ended the run itself.
+    ///
+    /// `classify` is a pure function of how the process ended, and a process
+    /// hatch killed ended with a signal and an empty standard error — which
+    /// reads exactly like a command that ran and was killed. On this path it
+    /// is not: the password dialog lives inside `run0`'s lifetime, so a run
+    /// killed at the execution deadline may be a command hatch stopped, or
+    /// may be a dialog nobody ever answered with nothing behind it at all.
+    /// hatch has no way to tell those apart — nothing reports that a password
+    /// was typed — so it says so, and the captured output is returned
+    /// alongside for whoever can tell.
+    ///
+    /// This is deliberately not [`RootOutcome::Denied`]. A dialog nobody
+    /// answered is not a person refusing: the agent must be able to
+    /// distinguish an absent user from a refusing one here for the same
+    /// reason the approval timeout is distinct from a denial.
+    ///
+    /// One thing this does not know and nothing in hatch currently does:
+    /// `run0` runs the command as a transient systemd unit rather than as a
+    /// child in its own process group, so hatch's kill may end the client
+    /// that was watching and leave the unit running. That is one more reason
+    /// the answer here is "unclear" rather than "killed", and it wants
+    /// measuring.
+    fn read_root(&self, output: &Output, spawned_with: &Env) -> RootOutcome {
+        if output.timed_out || output.killed_by_user {
+            let how = match output.timed_out {
+                true => format!(
+                    "hatch ended it at the {}s execution deadline",
+                    self.config.exec_timeout_secs
+                ),
+                false => "the user pressed Kill".to_string(),
+            };
+            return RootOutcome::Unclear {
+                exit: output.exit_code,
+                message: format!(
+                    "{how}, and the password dialog sits inside the elevated run, so hatch \
+                     cannot tell a command it stopped from a dialog nobody answered; the \
+                     output below is what there is"
+                ),
+            };
+        }
+        self.elevation.classify(output.exit_code, &output.stderr, spawned_with)
     }
 
     /// Apply an approved file replacement and describe what happened.
@@ -1537,19 +1819,20 @@ impl Daemon {
         path: &Path,
         content: &[u8],
         plan: &SwapPlan,
+        root: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> (CallToolResult, Windup) {
+    ) -> (LogVerdict, CallToolResult, Windup) {
+        if root {
+            return self.swap_as_root(path, content, plan, session, detail).await;
+        }
         // Re-validated and re-hashed inside `apply`, which is what makes every
         // error here a guarantee that the file on disk was not touched.
         let applied = swap::apply(path, content, plan, &self.denylist);
         let landed = applied.is_ok();
 
-        if landed && let LogDetail::SwapFile(swap) = detail {
-            swap.hash_after = Some(sha256_hex(content));
-            swap.mode = Some(format!("{:04o}", plan.landing_mode));
-            swap.owner = Some(format!("{}:{}", plan.landing_owner, plan.landing_group));
-            swap.bytes = Some(content.len() as u64);
+        if landed {
+            record_landing(detail, content, plan);
         }
 
         // The window closes on this frame. A swap has no process and so no
@@ -1575,7 +1858,273 @@ impl Daemon {
         // A swap writes a file and says nothing. There is no output to hold up
         // and no stream checkbox to have ticked, so its window closes on the
         // outcome as every window used to.
-        (result, Windup::Close)
+        (LogVerdict::Approve, result, Windup::Close)
+    }
+
+    /// Apply an approved file replacement as root: stage the bytes, then let
+    /// `install` land them.
+    ///
+    /// The shape is deliberately the same as the unelevated path's and the
+    /// differences are all in one direction. The checks are the same checks
+    /// in the same order — [`swap::stage_root`] runs them — and what changes
+    /// is only who does the writing and how long the gap between the last
+    /// check and the write is. See that function for where the residual
+    /// window is and why it is wider here.
+    async fn swap_as_root(
+        &self,
+        path: &Path,
+        content: &[u8],
+        plan: &SwapPlan,
+        session: &PromptSession,
+        detail: &mut LogDetail,
+    ) -> (LogVerdict, CallToolResult, Windup) {
+        let env = build_child_env(&self.config);
+
+        // Re-check, then stage. Nothing is written anywhere until both checks
+        // have passed, so a refusal here leaves the target untouched and
+        // leaves no approved bytes on disk either.
+        let staged = match swap::stage_root(path, content, plan, &self.denylist, &self.stage_dir) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = session
+                    .outbox()
+                    .finished(protocol::Outcome::Exit { code: 1 })
+                    .await;
+                return (
+                    LogVerdict::Approve,
+                    CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
+                    Windup::Close,
+                );
+            }
+        };
+        // Destructured, not consumed: `staged.staged` is the drop guard that
+        // removes the approved bytes, and it has to outlive the command that
+        // reads them. Holding it in a binding until the end of this function
+        // is what makes "removed on every exit path" true without a cleanup
+        // call on each of them.
+        let RootWrite { staged, argv } = staged;
+
+        let elevated = match self.elevation.elevate(argv, &env) {
+            Ok(elevated) => elevated,
+            Err(unavailable) => {
+                return self
+                    .elevation_ended(
+                        session,
+                        &RootOutcome::from(unavailable),
+                        String::new(),
+                    )
+                    .await;
+            }
+        };
+
+        // After the re-check, not before it. A swap that is about to be
+        // refused for drift asks for no password at all, and a window that
+        // had already been told to expect one would be describing a dialog
+        // that never appears.
+        session.outbox().elevating().await;
+
+        let ran = exec::run(
+            elevated.as_slice(),
+            // The spawner's environment, not the command's. `install` is not
+            // the approved command — it is hatch's own way of landing bytes a
+            // human approved — but `run0` is still the process whose
+            // diagnostics decide what this outcome means, so it gets the
+            // forced locale for the same reason a root `run_command` does.
+            &self.elevation.spawner_env(&env),
+            // `/` because every path in the argv is absolute and nothing here
+            // resolves a relative one. The request named a file, not a
+            // working directory, so there is none to honour.
+            Path::new("/"),
+            RunOpts {
+                timeout: Some(Duration::from_secs(self.config.exec_timeout_secs)),
+                cancel: session.kill_requested(),
+                cap_bytes: self.config.output_cap_bytes,
+                chunks: None,
+            },
+        )
+        .await;
+
+        let output = match ran {
+            Ok(output) => output,
+            Err(error) => {
+                return self
+                    .elevation_ended(
+                        session,
+                        &RootOutcome::Failed {
+                            message: format!(
+                                "hatch could not start {}, so nothing was written: {error}",
+                                self.elevation.mechanism()
+                            ),
+                        },
+                        String::new(),
+                    )
+                    .await;
+            }
+        };
+
+        // The staged bytes have been read by now if they were ever going to
+        // be. Dropped here rather than at the end of the function so that the
+        // approved content is gone before anything is reported about it.
+        drop(staged);
+
+        match self.read_root(&output, &self.elevation.spawner_env(&env)) {
+            RootOutcome::Ran { exit: Some(0) } => {
+                record_landing(detail, content, plan);
+                let _ = session
+                    .outbox()
+                    .finished(protocol::Outcome::Exit { code: 0 })
+                    .await;
+                (
+                    LogVerdict::Approve,
+                    CallToolResult::success(vec![ContentBlock::text(format!(
+                        "wrote {} as root: {} bytes, mode {:04o}, owner {}:{}",
+                        path.display(),
+                        content.len(),
+                        plan.landing_mode,
+                        plan.landing_owner,
+                        plan.landing_group,
+                    ))]),
+                    Windup::Close,
+                )
+            }
+            // Elevation succeeded and `install` itself failed: a read-only
+            // mount, an immutable attribute, an owner that does not resolve.
+            // An ordinary failed write, reported as one — the user gave a
+            // password and it was used, so this is not an elevation outcome.
+            RootOutcome::Ran { exit } => {
+                let _ = session
+                    .outbox()
+                    .finished(protocol::Outcome::Exit { code: exit.unwrap_or(1) })
+                    .await;
+                (
+                    LogVerdict::Approve,
+                    CallToolResult::error(vec![ContentBlock::text(format!(
+                        "the user approved this and the elevation succeeded, but the write \
+                         failed, so the file on disk is as it was: {} exited {}. {}",
+                        self.elevation.mechanism(),
+                        match exit {
+                            Some(code) => code.to_string(),
+                            None => "on a signal".to_string(),
+                        },
+                        first_line(&output.stderr),
+                    ))]),
+                    Windup::Close,
+                )
+            }
+            outcome => self.elevation_ended(session, &outcome, output.stderr).await,
+        }
+    }
+
+    /// Tell the window, the log and the agent the same thing about an
+    /// elevation that did not end in a command running.
+    ///
+    /// One function for all three so that they cannot disagree, which on this
+    /// path is the failure worth designing against: a window that closes
+    /// saying "nothing ran" over a log line saying `approve` is worse than
+    /// either being wrong on its own.
+    async fn elevation_ended(
+        &self,
+        session: &PromptSession,
+        outcome: &RootOutcome,
+        stderr: String,
+    ) -> (LogVerdict, CallToolResult, Windup) {
+        let (verdict, message, frame) = elevation_ending(outcome);
+        let _ = session.outbox().finished(frame).await;
+        let text = match stderr.trim().is_empty() {
+            true => message,
+            false => format!("{message}\n\n{}", first_line(&stderr)),
+        };
+        (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Windup::Close)
+    }
+}
+
+/// Fill in the half of a swap record that only a completed write knows.
+///
+/// Shared by the two apply paths rather than written twice, because the two
+/// have to record the same facts about the same plan: a root write whose log
+/// line said something different from an unelevated one would make the audit
+/// log's own answer to "what landed here" depend on how it got there.
+fn record_landing(detail: &mut LogDetail, content: &[u8], plan: &SwapPlan) {
+    if let LogDetail::SwapFile(swap) = detail {
+        swap.hash_after = Some(sha256_hex(content));
+        swap.mode = Some(format!("{:04o}", plan.landing_mode));
+        swap.owner = Some(format!("{}:{}", plan.landing_owner, plan.landing_group));
+        swap.bytes = Some(content.len() as u64);
+    }
+}
+
+/// The first line of `text`, trimmed. What a diagnostic's useful part is, and
+/// the only part of another program's standard error hatch puts in a sentence
+/// of its own.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
+/// The verdict, the sentence and the closing frame for an elevation that did
+/// not end in a command running.
+///
+/// The three answers are produced together because they are three renderings
+/// of one fact and the whole design here is that they agree. Each arm is a
+/// different claim about the world and the difference between them is the
+/// point:
+///
+/// * [`RootOutcome::Denied`] and [`RootOutcome::Failed`] both mean **nothing
+///   ran**, which is a positive statement hatch can make and which tells the
+///   agent it is safe to ask again.
+/// * [`RootOutcome::Unclear`] means hatch does not know, which is not a
+///   weaker version of either. It gets its own log verdict for that reason:
+///   somebody auditing what ran as root has to be able to find the lines
+///   where the answer is unknown, and neither `approve` nor
+///   `elevation_failed` would bring them back.
+fn elevation_ending(outcome: &RootOutcome) -> (LogVerdict, String, protocol::Outcome) {
+    match outcome {
+        RootOutcome::Denied | RootOutcome::Failed { .. } => {
+            // `elevation_failure` answers `Some` for exactly these two and
+            // `None` for the other two, so this is not a default: it is the
+            // module that owns the distinction being asked for its own words.
+            let message = outcome
+                .elevation_failure()
+                .unwrap_or_else(|| "the elevation did not happen".to_string());
+            (
+                LogVerdict::ElevationFailed,
+                format!(
+                    "approved, but root elevation failed or was cancelled: {message}. This is \
+                     not a refusal by the user — they approved this in hatch's window, and the \
+                     system then asked for a password separately. Nothing ran and nothing \
+                     changed, so asking again is safe."
+                ),
+                protocol::Outcome::ElevationFailed { message },
+            )
+        }
+        RootOutcome::Unclear { exit, message } => {
+            let exit = match exit {
+                Some(code) => format!("status {code}"),
+                None => "a signal".to_string(),
+            };
+            (
+                LogVerdict::ElevationUnclear,
+                format!(
+                    "approved, and hatch cannot say whether it ran: {message} (it ended with \
+                     {exit}). Do not retry this — if it did run, a retry runs it a second \
+                     time. Ask the user to check the machine and tell you what they find."
+                ),
+                protocol::Outcome::Unclear { message: message.clone() },
+            )
+        }
+        // `Ran` is matched out by both callers before they get here, so
+        // reaching this is hatch having lost track of an elevated run. Fail
+        // towards saying so: a run reported as unclear costs a question, and
+        // one reported as having succeeded costs the guarantee.
+        RootOutcome::Ran { .. } => {
+            let message =
+                "hatch mishandled the result of an elevated run and cannot say whether it ran"
+                    .to_string();
+            (
+                LogVerdict::ElevationUnclear,
+                message.clone(),
+                protocol::Outcome::Unclear { message },
+            )
+        }
     }
 }
 
@@ -2709,7 +3258,9 @@ mod tests {
     mod flow {
         use super::*;
         use crate::audit::LogVerdict;
+        use crate::exec::elevate::Rehearsed;
         use crate::prompter::{ProcessPrompter, Reply, StubPrompter};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use crate::protocol::{ReviseKind, Verdict};
 
         /// One daemon over a temporary hatch directory, with a scripted
@@ -3181,18 +3732,560 @@ mod tests {
             assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
         }
 
-        #[tokio::test]
-        async fn root_is_refused_without_asking_anyone() {
-            let harness = Harness::new(Vec::new());
-            let mut params = run_of("true");
+        // --- the root path ----------------------------------------------------
+
+        /// A harness whose daemon elevates through `elevation` instead of
+        /// through the platform's mechanism.
+        ///
+        /// This is what makes every root outcome reachable. A password dialog
+        /// cannot be driven from a test, nothing in this file may invoke
+        /// `run0`, and the four things that dialog can do are exactly what the
+        /// mapping under test has to get right — so the dialog's seam is
+        /// replaced and everything on this side of it is the real flow.
+        fn rooted(script: Vec<Reply>, elevation: Arc<dyn Elevation>) -> Harness {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::scratch(dir.path());
+            let config = quick(&paths);
+            let prompter = Arc::new(StubPrompter::new(script));
+            let daemon = Arc::new(
+                Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>)
+                    .with_elevation(elevation),
+            );
+            Harness { dir, paths, daemon, prompter }
+        }
+
+        fn root_run(command: &str) -> RunCommandParams {
+            let mut params = run_of(command);
             params.root = true;
-            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+            params
+        }
+
+        fn swap_of(path: &Path, content: &str, root: bool) -> SwapFileParams {
+            SwapFileParams {
+                title: "change it".to_string(),
+                path: path.display().to_string(),
+                content: content.to_string(),
+                reason: "because a test asked".to_string(),
+                root,
+            }
+        }
+
+        /// Every frame the one window was sent.
+        fn frames(harness: &Harness) -> Vec<crate::protocol::DaemonMsg> {
+            harness.prompter.recorded()[0].sent.clone()
+        }
+
+        #[tokio::test]
+        async fn a_root_command_runs_through_the_elevation_and_is_recorded_as_approved() {
+            let elevation = Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) }));
+            let harness = rooted(vec![approve()], Arc::clone(&elevation) as Arc<_>);
+
+            let result =
+                within(harness.daemon.run_command(root_run("echo hi"), Caller::quiet())).await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            assert!(result_text(&result).contains("hi"), "{}", result_text(&result));
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["root"], true);
+            assert_eq!(record["exit_code"], 0);
+            // The command went through the elevation rather than round it.
+            assert_eq!(elevation.seen(), vec![vec!["bash".to_string(), "-c".to_string(), "echo hi".to_string()]]);
+        }
+
+        #[tokio::test]
+        async fn the_window_shows_the_whole_elevated_line_and_the_caveat() {
+            let harness = rooted(
+                vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            within(harness.daemon.run_command(root_run("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let Payload::Command { raw, root, caveat, .. } = shown.payload else {
+                panic!("not a command payload");
+            };
+            // The elevation program is in the line the reader approves, not
+            // folded away behind a flag. A window showing `echo hi` for a
+            // request that runs `<something> bash -c 'echo hi'` would be the
+            // rendering-fidelity failure this whole tool exists to avoid.
+            assert!(raw.contains("bash -c"), "the wrapper is not on screen: {raw}");
+            assert!(raw.ends_with("'echo hi'"), "{raw}");
+            assert!(root, "the header would not say ROOT");
+            // And the reader is told, before approving, that a root command
+            // may behave differently from the same command run as them.
+            let caveat = caveat.expect("a root request drew no caveat");
+            assert!(caveat.contains("terminal"), "{caveat}");
+        }
+
+        #[tokio::test]
+        async fn an_unelevated_command_draws_neither_the_wrapper_nor_a_caveat() {
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })]);
+            within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let Payload::Command { raw, root, caveat, .. } = shown.payload else {
+                panic!("not a command payload");
+            };
+            assert_eq!(raw, "echo hi");
+            assert!(!root);
+            assert_eq!(caveat, None, "an ordinary command was given a root warning");
+        }
+
+        #[tokio::test]
+        async fn a_dismissed_password_dialog_is_an_elevation_failure_and_never_an_exit_code() {
+            // The command exits 1 *and* the dialog was dismissed, which is the
+            // collision the whole classifier exists for: both produce status 1.
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Denied)),
+            );
+
+            let result =
+                within(harness.daemon.run_command(root_run("exit 1"), Caller::quiet())).await;
 
             assert_eq!(result.is_error, Some(true));
             let text = result_text(&result);
-            assert!(text.contains("not a decision by the user"), "{text}");
+            assert!(text.contains("elevation failed or was cancelled"), "{text}");
+            assert!(text.contains("not a refusal by the user"), "{text}");
+            assert!(text.contains("asking again is safe"), "{text}");
+            // The number a refusal and a failing command share must not be
+            // reported as the command's. This is the mutant worth catching:
+            // saying "exit code: 1" sends the agent off to fix a command that
+            // never ran.
+            assert!(!text.contains("exit code"), "a refusal was reported as an exit code: {text}");
+
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "elevation_failed");
+            assert_eq!(record["exit_code"], serde_json::Value::Null, "{record}");
+            // And the window closed saying nothing ran, rather than drawing a
+            // status for a command that never started.
+            assert!(
+                frames(&harness).iter().any(|f| matches!(
+                    f,
+                    crate::protocol::DaemonMsg::Finished(protocol::Outcome::ElevationFailed { .. })
+                )),
+                "{:?}",
+                frames(&harness)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_elevation_that_could_not_happen_is_a_failure_and_not_a_denial() {
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Failed {
+                    message: "no authentication agent is running".to_string(),
+                })),
+            );
+
+            let result =
+                within(harness.daemon.run_command(root_run("true"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                result_text(&result).contains("no authentication agent"),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(harness.verdict(), "elevation_failed");
+        }
+
+        #[tokio::test]
+        async fn an_unclear_elevation_is_reported_as_neither_a_success_nor_a_command_failure() {
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Unclear {
+                    exit: Some(1),
+                    message: "hatch cannot read this mechanism's diagnostics".to_string(),
+                })),
+            );
+
+            let result =
+                within(harness.daemon.run_command(root_run("echo out; exit 1"), Caller::quiet()))
+                    .await;
+
+            let text = result_text(&result);
+            // Not a success.
+            assert_eq!(result.is_error, Some(true), "{text}");
+            // Not "nothing ran" either — that is a claim, and the point of
+            // this outcome is that hatch has no evidence for either claim.
+            assert!(!text.contains("Nothing ran"), "{text}");
+            assert!(!text.contains("asking again is safe"), "{text}");
+            assert!(text.contains("cannot say whether it ran"), "{text}");
+            assert!(text.contains("Do not retry"), "{text}");
+            // The output goes with it: it is the evidence anyone deciding
+            // what happened would actually look at.
+            assert!(text.contains("out"), "{text}");
+
+            let record = harness.only_record();
+            assert_eq!(
+                record["verdict"], "elevation_unclear",
+                "an unknown outcome was filed as something known: {record}"
+            );
+            assert_eq!(record["exit_code"], serde_json::Value::Null, "{record}");
+            assert!(
+                frames(&harness).iter().any(|f| matches!(
+                    f,
+                    crate::protocol::DaemonMsg::Finished(protocol::Outcome::Unclear { .. })
+                )),
+                "the window closed on a claim: {:?}",
+                frames(&harness)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_root_run_hatch_ended_itself_is_unclear_rather_than_killed() {
+            // The elevation would have said the command ran. It cannot know:
+            // the password dialog lives inside the elevated process, so a run
+            // hatch killed may be a command it stopped or a dialog nobody
+            // answered. This is the timeout case the tool description
+            // promises is bounded.
+            let harness = rooted(
+                vec![approve().then_kills_after(Duration::from_millis(150))],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+
+            let result =
+                within(harness.daemon.run_command(root_run("sleep 30"), Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("cannot say whether it ran"), "{text}");
+            assert!(text.contains("Kill"), "{text}");
+            assert_eq!(harness.verdict(), "elevation_unclear");
+        }
+
+        #[tokio::test]
+        async fn an_unelevated_run_hatch_ended_itself_is_still_a_plain_killed_run() {
+            // The other half of the rule above: nothing changes for a command
+            // with no second gate in front of it, because there is nothing
+            // hatch does not know about it.
+            let harness =
+                Harness::new(vec![approve().then_kills_after(Duration::from_millis(150))]);
+
+            let result =
+                within(harness.daemon.run_command(run_of("sleep 30"), Caller::quiet())).await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            assert!(result_text(&result).contains("killed"), "{}", result_text(&result));
+            assert_eq!(harness.verdict(), "approve");
+        }
+
+        #[tokio::test]
+        async fn the_window_is_told_a_password_dialog_is_coming_before_it_is() {
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            within(harness.daemon.run_command(root_run("true"), Caller::quiet())).await;
+
+            let sent = frames(&harness);
+            let elevating = sent
+                .iter()
+                .position(|f| matches!(f, crate::protocol::DaemonMsg::Elevating))
+                .expect("the window was never told: {sent:?}");
+            let finished = sent
+                .iter()
+                .position(|f| matches!(f, crate::protocol::DaemonMsg::Finished(_)))
+                .expect("no outcome frame");
+            // Before, not after. A reader told about the dialog once it is
+            // gone has been told nothing: the whole value of the frame is
+            // that the window stops claiming the operation is running while a
+            // dialog they have to answer is sitting on top of it.
+            assert!(elevating < finished, "{sent:?}");
+        }
+
+        #[tokio::test]
+        async fn an_unelevated_run_never_says_a_password_dialog_is_coming() {
+            let harness = Harness::new(vec![approve()]);
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            assert!(
+                !frames(&harness)
+                    .iter()
+                    .any(|f| matches!(f, crate::protocol::DaemonMsg::Elevating)),
+                "{:?}",
+                frames(&harness)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_build_that_cannot_elevate_refuses_before_anybody_is_asked() {
+            for root in [true, false] {
+                let harness = rooted(
+                    vec![approve()],
+                    Arc::new(Rehearsed::unavailable("there is no way to elevate here")),
+                );
+                let mut params = run_of("true");
+                params.root = root;
+                let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+                if root {
+                    assert_eq!(result.is_error, Some(true));
+                    assert!(
+                        result_text(&result).contains("no way to elevate"),
+                        "{}",
+                        result_text(&result)
+                    );
+                    assert!(harness.prompter.seen().is_empty(), "it cost the user attention");
+                    assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+                } else {
+                    // The refusal is about elevation and nothing else: an
+                    // ordinary command on a machine with no `run0` still runs.
+                    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+                }
+            }
+        }
+
+        // --- the root file path ------------------------------------------------
+
+        #[tokio::test]
+        async fn a_root_swap_installs_with_the_mode_and_owner_the_window_stated() {
+            let elevation = Arc::new(Rehearsed::recording(RootOutcome::Ran { exit: Some(0) }));
+            let harness = rooted(vec![approve()], Arc::clone(&elevation) as Arc<_>);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+            )
+            .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            let argv = elevation.seen().into_iter().next().expect("nothing was elevated");
+            assert_eq!(argv[0], "install");
+            // The mode and owner the window drew, and not any other ones. A
+            // write at 0644 where the window said 0640 is a different file
+            // from the one that was approved.
+            assert_eq!(after(&argv, "-m"), Some("0640".to_string()));
+            assert_eq!(
+                after(&argv, "-o"),
+                Some(crate::swap::Principal::user(nix::unistd::geteuid().as_raw()).to_string())
+            );
+            assert_eq!(argv.last().unwrap(), &target.display().to_string());
+
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["root"], true);
+            assert_eq!(record["mode"], "0640");
+        }
+
+        /// The argument after `flag`.
+        fn after(argv: &[String], flag: &str) -> Option<String> {
+            argv.iter().position(|a| a == flag).and_then(|at| argv.get(at + 1)).cloned()
+        }
+
+        #[tokio::test]
+        async fn a_root_swap_lands_the_exact_approved_bytes() {
+            // `Rehearsed::running` really runs the `install` it is handed, as
+            // whoever runs the test — so this exercises the argv end to end
+            // against a real `install`, with no privilege and no dialog.
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+            )
+            .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().mode() & 0o7777,
+                0o640,
+                "the mode the window stated is not the mode that landed"
+            );
+            // And nothing approved is left lying about afterwards.
+            assert_eq!(staged_files(&harness), 0);
+        }
+
+        /// How many approved-but-unwritten files are sitting in the staging
+        /// directory.
+        fn staged_files(harness: &Harness) -> usize {
+            std::fs::read_dir(harness.paths.stage_dir()).map(|d| d.count()).unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn the_staged_bytes_are_gone_after_a_dismissed_password_dialog() {
+            // `recording`, because a dismissed dialog means the `install`
+            // never ran: the double that runs what it is handed would write
+            // the file and then report that nothing had.
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::recording(RootOutcome::Denied)),
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+            )
+            .await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(harness.verdict(), "elevation_failed");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            // The file the user approved must not outlive the request that
+            // approved it. This is the mutant worth catching: a drop guard
+            // that stops removing leaves approved content on disk after every
+            // refusal.
+            assert_eq!(staged_files(&harness), 0, "approved bytes survived a denial");
+            let record = harness.only_record();
+            assert_eq!(record["hash_after"], serde_json::Value::Null, "{record}");
+        }
+
+        #[tokio::test]
+        async fn a_root_swap_that_drifted_under_review_never_asks_for_a_password() {
+            let elevation = Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) }));
+            let harness = rooted(
+                vec![approve().after(Duration::from_millis(250))],
+                Arc::clone(&elevation) as Arc<_>,
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            // Somebody else writes the file while the window is up.
+            let drifting = target.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                std::fs::write(&drifting, b"somebody else got there first\n").unwrap();
+            });
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+            )
+            .await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(result_text(&result).contains("changed after the request was approved"), "{}", result_text(&result));
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "somebody else got there first\n"
+            );
+            // The re-check runs before the elevation, so a write that is
+            // going to be refused never spends a password the user would have
+            // had to type first.
+            assert!(elevation.seen().is_empty(), "a password was asked for a refused write");
+            assert_eq!(staged_files(&harness), 0);
+        }
+
+        #[tokio::test]
+        async fn a_root_swap_whose_install_failed_is_a_failed_write_and_not_an_elevation_outcome() {
+            // The password was given and used; `install` then could not do
+            // the work. That is an ordinary failed write and must not be
+            // filed as an elevation problem.
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(1) })),
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            // An owner this process cannot give the file, so the real
+            // `install` the double runs fails the way a read-only mount would.
+            let mut params = swap_of(&target, "after\n", true);
+            params.path = target.display().to_string();
+            std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+
+            let result = within(harness.daemon.swap_file(params, Caller::quiet())).await;
+            std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(result_text(&result).contains("the write failed"), "{}", result_text(&result));
+            assert_eq!(harness.verdict(), "approve", "a failed write was filed as an elevation problem");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            assert_eq!(staged_files(&harness), 0);
+        }
+
+        #[tokio::test]
+        async fn a_denied_root_swap_stages_nothing_and_writes_nothing() {
+            let elevation = Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) }));
+            let harness = rooted(
+                vec![Reply::verdict(Verdict::Deny { note: "not that".to_string() })],
+                Arc::clone(&elevation) as Arc<_>,
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            within(harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()))
+                .await;
+
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            assert!(elevation.seen().is_empty());
+            assert_eq!(staged_files(&harness), 0);
+            assert_eq!(harness.verdict(), "deny");
+        }
+
+        #[tokio::test]
+        async fn a_root_swap_is_refused_on_a_protected_path_like_any_other() {
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            let protected = harness.paths.config_file();
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&protected, "x", true), Caller::quiet()),
+            )
+            .await;
+
+            // Root does not buy a way past hatch's own denylist. It is the
+            // one set of paths where the answer does not depend on privilege.
+            assert_eq!(result.is_error, Some(true));
             assert!(harness.prompter.seen().is_empty());
             assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+        }
+
+        #[tokio::test]
+        async fn the_advertised_ceiling_still_bounds_a_root_call() {
+            // The password wait sits inside the execution timeout, because
+            // the dialog lives inside the elevated process and that process
+            // is what the execution deadline kills. So the number the tool
+            // description quotes — the approval wait plus the execution
+            // wait — still bounds the whole call, with nothing added for the
+            // dialog and nothing unbounded anywhere in it.
+            let harness = rooted(
+                vec![approve()],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            let ceiling = harness.daemon.config().client_timeout_secs();
+            assert_eq!(
+                ceiling,
+                harness.daemon.config().timeout_secs + harness.daemon.config().exec_timeout_secs
+            );
+
+            let started = tokio::time::Instant::now();
+            // A command that outlasts the execution deadline stands in for a
+            // dialog nobody answers: both are the elevated process failing to
+            // finish, and hatch ends both the same way.
+            let result =
+                within(harness.daemon.run_command(root_run("sleep 60"), Caller::quiet())).await;
+
+            assert!(
+                started.elapsed() < Duration::from_secs(ceiling),
+                "a root call blocked past the ceiling the agent was told"
+            );
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                result_text(&result).contains("execution deadline"),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(harness.verdict(), "elevation_unclear");
         }
 
         // --- the file path ---------------------------------------------------

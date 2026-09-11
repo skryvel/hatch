@@ -126,6 +126,9 @@ pub enum Shown {
         root: bool,
         /// Whether it runs in a terminal of its own.
         interactive: bool,
+        /// How a root command will differ from the same command run
+        /// unprivileged, defanged for drawing. `None` when it will not.
+        caveat: Option<String>,
     },
     /// A file swap, drawn in whichever of the two views fits — see
     /// [`draw_swap`].
@@ -159,7 +162,7 @@ impl Shown {
     /// The window closes on it rather than drawing part of it.
     pub fn of(payload: &Payload) -> Result<Shown, ProtocolError> {
         match payload {
-            Payload::Command { danger, cwd, root, interactive, .. } => {
+            Payload::Command { danger, cwd, root, interactive, caveat, .. } => {
                 let annotated = payload.rendering()?;
                 // From the rebuilt spans, not from the payload's own `raw`
                 // field: the two are equal by construction, and taking it
@@ -173,6 +176,14 @@ impl Shown {
                     cwd: defang(&cwd.display().to_string()),
                     root: *root,
                     interactive: *interactive,
+                    // Defanged like every other string the daemon sends.
+                    // This one is hatch's own text rather than the agent's,
+                    // which is a reason to expect it to be clean and not a
+                    // reason to let it through unchecked: the rule this
+                    // window holds is that nothing reaches the screen
+                    // undefanged, and an exception for trusted text is how
+                    // the rule stops being one.
+                    caveat: caveat.as_deref().map(defang),
                     longest: widest_line(&annotated).max(widest_line(&raw)),
                     raw,
                     annotated,
@@ -294,6 +305,13 @@ pub fn outcome_text(outcome: &Outcome) -> (String, bool) {
         // meant to trust.
         Outcome::ElevationFailed { message } => {
             (format!("Nothing ran — {}", defang(message)), false)
+        }
+        // Not "nothing ran" and not an exit code. The window is closing on
+        // this line, and the reader's next move — check the machine, or do
+        // not — depends on it saying which of those two hatch is unable to
+        // choose between.
+        Outcome::Unclear { message } => {
+            (format!("hatch cannot tell whether this ran — {}", defang(message)), false)
         }
     }
 }
@@ -763,8 +781,8 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, longest, .. } => {
-            draw_command_header(ui, scan, danger);
+        Shown::Command { annotated, raw, scan, danger, longest, caveat, .. } => {
+            draw_command_header(ui, scan, danger, caveat.as_deref());
             draw_command(ui, annotated, raw, *longest);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
@@ -777,7 +795,12 @@ pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
 /// neither of these lines, so the two rows this can cost are rows a request
 /// that needs them pays for and no other request does. Who it runs as and
 /// where is up in the title row — see [`draw_headline`].
-fn draw_command_header(ui: &mut Ui, report: &ScanReport, danger: &[String]) {
+fn draw_command_header(
+    ui: &mut Ui,
+    report: &ScanReport,
+    danger: &[String],
+    caveat: Option<&str>,
+) {
     let palette = palette(ui);
     if let Some(summary) = scan_summary(report) {
         // Bold, like the marked list: this is one of the two colours the
@@ -795,6 +818,18 @@ fn draw_command_header(ui: &mut Ui, report: &ScanReport, danger: &[String]) {
                 ui.label(RichText::new(label).color(palette.danger).strong());
             }
         });
+    }
+    // Before the approval and not after it. What this says is that a root
+    // command can behave differently from the same command run as the user —
+    // it may be given a terminal, so it may colour its output or stop to ask
+    // something — and a reader learning that from the output pane afterwards
+    // has already approved the thing it is about.
+    //
+    // Warn and not danger: it is a statement about how the command will
+    // behave, not a mark on what the command does, and spending the red on it
+    // would spend it on every root request.
+    if let Some(caveat) = caveat {
+        ui.label(RichText::new(caveat).color(palette.warn).small());
     }
 }
 
@@ -1803,6 +1838,7 @@ mod tests {
             cwd,
             root,
             interactive,
+            caveat: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "a window drew a rendering nobody checked");
@@ -1823,6 +1859,7 @@ mod tests {
             cwd,
             root,
             interactive,
+            caveat: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "the title bar and the panes could disagree");

@@ -32,9 +32,19 @@
 //! with the same exit status, so telling them apart takes more than a number.
 //! All of that -- the argv wrapper, the environment the elevated child gets,
 //! and the classifier -- lives in [`elevate`], behind a trait, so that this
-//! module keeps taking an argv and knowing nothing about privilege. Nothing
-//! calls it yet: the daemon's `root: true` path still refuses, and wiring it
-//! in is its own change.
+//! module keeps taking an argv and knowing nothing about privilege. The daemon
+//! builds an elevated argv there and hands it here like any other, so
+//! everything below this line -- the process group, the deadline, the Kill
+//! button, the output cap -- is the same code for both paths.
+//!
+//! One consequence of that sameness is worth naming, because it is a
+//! difference this module cannot see. A root command's deadline and Kill
+//! button act on the *elevation program*, and the password dialog lives
+//! inside that program's lifetime: a run ended here may be a command that was
+//! stopped or a dialog nobody answered, and the two are indistinguishable
+//! from what [`run`] returns. Reading that distinction -- or admitting it
+//! cannot be read -- belongs to the caller, which is why [`Output`] says what
+//! happened to the process and claims nothing about what it means.
 
 pub mod elevate;
 pub mod env;

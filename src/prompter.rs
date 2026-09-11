@@ -358,6 +358,15 @@ impl Outbox {
         self.send(DaemonMsg::Output { stream, text }).await
     }
 
+    /// Tell the window that the elevation program has been started and a
+    /// password dialog is expected.
+    ///
+    /// Returns whether it was delivered, on the same terms as
+    /// [`Outbox::output`].
+    pub async fn elevating(&self) -> bool {
+        self.send(DaemonMsg::Elevating).await
+    }
+
     /// Tell the window how the command ended. It closes on this frame.
     ///
     /// Returns whether it was delivered, on the same terms as

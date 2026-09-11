@@ -43,6 +43,19 @@ pub enum LogVerdict {
     /// The user approved, but the polkit password dialog was cancelled or
     /// failed, so the operation never ran.
     ElevationFailed,
+    /// The user approved, the elevation was attempted, and hatch cannot say
+    /// whether the operation ran.
+    ///
+    /// Its own verdict rather than a shade of [`LogVerdict::Approve`] or of
+    /// [`LogVerdict::ElevationFailed`], because both of those are claims and
+    /// this is the absence of one. A cancelled password dialog and a command
+    /// that ran and failed end with the same exit status — see
+    /// [`crate::exec::elevate::RootOutcome::Unclear`] — and when the evidence
+    /// that separates them is missing, the log has to be able to say so. A
+    /// reader auditing what ran as root can then find these lines and check
+    /// the machine, which is exactly what neither of the other two verdicts
+    /// would prompt them to do.
+    ElevationUnclear,
     /// The MCP client sent `notifications/cancelled`.
     Cancelled,
     /// The client's transport dropped.
@@ -58,7 +71,7 @@ impl LogVerdict {
     /// Every verdict, once. A new variant belongs here as well as in the
     /// exhaustive match below, so that callers and tests which must cover the
     /// whole set have one list to read rather than a copy of their own.
-    pub const ALL: [LogVerdict; 11] = [
+    pub const ALL: [LogVerdict; 12] = [
         LogVerdict::Approve,
         LogVerdict::Deny,
         LogVerdict::Explain,
@@ -66,6 +79,7 @@ impl LogVerdict {
         LogVerdict::SelfRun,
         LogVerdict::Timeout,
         LogVerdict::ElevationFailed,
+        LogVerdict::ElevationUnclear,
         LogVerdict::Cancelled,
         LogVerdict::Disconnected,
         LogVerdict::PromptDied,
@@ -84,6 +98,7 @@ impl LogVerdict {
             LogVerdict::SelfRun => "self_run",
             LogVerdict::Timeout => "timeout",
             LogVerdict::ElevationFailed => "elevation_failed",
+            LogVerdict::ElevationUnclear => "elevation_unclear",
             LogVerdict::Cancelled => "cancelled",
             LogVerdict::Disconnected => "disconnected",
             LogVerdict::PromptDied => "prompt_died",
@@ -420,6 +435,7 @@ mod tests {
             SelfRun,
             Timeout,
             ElevationFailed,
+            ElevationUnclear,
             Cancelled,
             Disconnected,
             PromptDied,

@@ -344,6 +344,7 @@ pub struct PromptState {
     output_bytes: usize,
     output_dropped: bool,
     streaming: bool,
+    elevating: bool,
     linger_until: Option<Instant>,
     broken: Option<String>,
     close_taken: bool,
@@ -368,6 +369,7 @@ impl PromptState {
             output_bytes: 0,
             output_dropped: false,
             streaming: false,
+            elevating: false,
             linger_until: None,
             broken: None,
             close_taken: false,
@@ -535,9 +537,21 @@ impl PromptState {
                 self.phase = Phase::AwaitingVerdict;
             }
             DaemonMsg::QueueDepth { depth } => self.queue_depth = depth,
-            DaemonMsg::Output { stream, text } => self.push_output(stream, text),
+            DaemonMsg::Elevating => self.elevating = true,
+            DaemonMsg::Output { stream, text } => {
+                // The first byte out of the elevated command is proof that
+                // the dialog was answered and the command is running, which
+                // is the only signal hatch gets: nothing tells the daemon
+                // that a password was typed, so nothing can tell this window
+                // either. A run that prints nothing keeps saying it is
+                // waiting until the outcome arrives, which is the honest
+                // reading of what hatch actually knows.
+                self.elevating = false;
+                self.push_output(stream, text);
+            }
             DaemonMsg::Finished(outcome) => {
                 self.outcome = Some(outcome);
+                self.elevating = false;
                 // The reader ticked a box that says "I want to watch this".
                 // For anything but a slow command the whole run is over in
                 // milliseconds, so a window that closed on this frame closed
@@ -669,6 +683,17 @@ impl PromptState {
     /// The newest chunk is never dropped, whatever its size: a view that
     /// answered a huge write by showing nothing would be worse than one that
     /// briefly holds more than it meant to.
+    /// Whether hatch is waiting on a password dialog that is not its own.
+    ///
+    /// True from the [`DaemonMsg::Elevating`] frame until the first byte of
+    /// output or the outcome, whichever comes first. It is not a claim that a
+    /// dialog is on screen this instant — hatch is never told that the
+    /// password was typed — it is a claim that nothing the user approved is
+    /// known to have run yet, which is the thing the reader needs.
+    pub fn elevating(&self) -> bool {
+        self.elevating
+    }
+
     fn push_output(&mut self, stream: Stream, text: String) {
         self.output_bytes += text.len();
         self.output.push_back((stream, text));
@@ -1269,7 +1294,27 @@ impl PromptApp {
     /// to watch it is to decide whether to press that button, and a decision
     /// is made from the last screenful.
     fn running_row(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
+        // Two different sentences and not one with a suffix, because they say
+        // opposite things about the only question the reader has: whether the
+        // thing they approved has happened. A password dialog from another
+        // process is about to cover this window, and a reader who has just
+        // been told "it is running" would have no reason to link the two.
+        if self.state.elevating() {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Approved. Waiting for the system password dialog.")
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Nothing has run yet. Dismissing that dialog cancels this.",
+                    )
+                    .small(),
+                );
+            });
+        } else {
+            ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
+        }
         if self.stream {
             let text = self.state.output_text();
             egui::ScrollArea::vertical()
@@ -3034,6 +3079,7 @@ mod tests {
             cwd,
             root,
             interactive,
+            caveat: None,
         };
 
         state.handle(DaemonMsg::Request(request));

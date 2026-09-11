@@ -181,6 +181,27 @@
 //! to say so, or step 3 would refuse every create in `/srv` and every shared
 //! project tree forever.
 //!
+//! # The root path is a different write, and says so
+//!
+//! Everything above describes [`apply`], which writes as whoever runs hatch.
+//! A `root: true` request cannot use it — the landing check in step 3 refuses
+//! any plan whose owner this process cannot produce, which is every plan that
+//! needed root in the first place — so it goes through [`stage_root`]
+//! instead: the same two re-checks, then the approved bytes written to
+//! [`crate::paths::Paths::stage_dir`], then an `install` argv for the caller
+//! to elevate.
+//!
+//! The two paths differ in three ways that are properties of `install` rather
+//! than choices made here, and all three are written out at [`stage_root`]
+//! rather than left to be discovered:
+//!
+//! * The gap between the last check and the write is human-sized, not
+//!   microseconds, because the password dialog sits inside it.
+//! * `install` truncates its destination; it is not a `rename`, so an
+//!   interrupted root write can leave the target short.
+//! * `install` follows a symbolic link at the destination, where `rename`
+//!   replaces it.
+//!
 //! ## Durability
 //!
 //! The staged file is `fsync`ed before the rename. The directory is not
@@ -210,6 +231,7 @@ use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -1090,6 +1112,246 @@ fn remedy(kind: ErrorKind) -> Option<&'static str> {
     }
 }
 
+// ---- the root path: stage the approved bytes, then let `install` land them -
+
+/// The program that lands a root swap, and the whole of hatch's dependence on
+/// it.
+///
+/// `install` rather than `cp` or a shell redirection because it is the one
+/// standard tool that takes the mode, the owner and the group as arguments and
+/// applies all three to the file it creates. Doing it in three steps — copy,
+/// `chmod`, `chown` — would put the file on disk at the wrong mode first, and
+/// the file being written here is one a user has already been told will land
+/// at a particular mode.
+const INSTALL: &str = "install";
+
+/// Approved bytes on disk, waiting for something to land them, removed when
+/// this value is dropped.
+///
+/// The guard is the whole of the type. The spec requires the staged file to be
+/// gone on *every* exit path — the write succeeding, the elevation being
+/// refused, the execution deadline, a panic — and a `remove_file` call at each
+/// of those sites is a list somebody eventually fails to extend. `Drop` is the
+/// list the compiler keeps: the file goes when the value does, including out
+/// of an `?` in the middle of a function nobody has written yet.
+///
+/// What it cannot cover is the process dying without unwinding, which is why
+/// [`sweep_stage`] exists.
+#[derive(Debug)]
+pub struct Staged {
+    path: PathBuf,
+}
+
+impl Staged {
+    /// Where the bytes are, for the argv that reads them.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        // Deliberately ignored. This runs on paths that are already reporting
+        // something else — a denial, a deadline, an unwind — and a failure to
+        // remove a file in a 0700 directory is not the fact any of those
+        // callers are trying to tell anybody. The sweep at the next startup
+        // catches whatever this misses.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Write `content` to a new file in `stage_dir` and return the guard that
+/// removes it.
+///
+/// The bytes are written exactly as given and are never transformed: the
+/// diff a human approved and the file `install` copies have to be the same
+/// bytes, and a normalisation applied on the way past here — line endings, a
+/// trailing newline, an encoding — would make the approved diff a description
+/// of something else.
+///
+/// The file is created `0600` and `O_EXCL`, inside a directory that is already
+/// 0700. Both matter for the same reason and neither is redundant: the
+/// directory stops another local user from reading approved content that has
+/// not been written yet, and the mode stops it being readable if the directory
+/// is ever loosened. `O_EXCL` on a v4 UUID is belt and braces over a name that
+/// will not collide.
+pub fn stage_content(stage_dir: &Path, content: &[u8]) -> Result<Staged, ApplyError> {
+    fs::create_dir_all(stage_dir)
+        .map_err(|e| failed(format!("creating the staging directory {}", stage_dir.display()), &e))?;
+    let path = stage_dir.join(uuid::Uuid::new_v4().to_string());
+    // The guard is taken before the write, so a write that fails part way
+    // through still removes what it managed to put there.
+    let staged = Staged { path: path.clone() };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| failed(format!("staging approved content at {}", path.display()), &e))?;
+    file.write_all(content)
+        .map_err(|e| failed(format!("staging approved content at {}", path.display()), &e))?;
+    // Flushed for the same reason the unelevated path flushes: the bytes are
+    // about to be read by another process, and on this side of the copy the
+    // cost is one flush of content a human is already waiting on.
+    file.sync_all()
+        .map_err(|e| failed(format!("flushing approved content at {}", path.display()), &e))?;
+    Ok(staged)
+}
+
+/// Remove everything in `stage_dir`, and say how many entries went.
+///
+/// For the case [`Staged`]'s `Drop` cannot reach: a daemon killed with
+/// `SIGKILL`, or a machine that lost power, between the staging and the write.
+/// Approved content is the most sensitive thing hatch ever puts on disk, so it
+/// is not left to accumulate across restarts.
+///
+/// Run at startup and nowhere else. A sweep during a request would delete the
+/// staged file of a request being decided in another window.
+///
+/// A directory that does not exist is not an error: nothing has been staged
+/// yet, which is the state this function is trying to produce.
+pub fn sweep_stage(stage_dir: &Path) -> std::io::Result<usize> {
+    let entries = match fs::read_dir(stage_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut swept = 0;
+    for entry in entries {
+        let path = entry?.path();
+        // Files only, and no recursion. hatch puts nothing but flat files
+        // here, so a directory in this path is something else's, and a sweep
+        // that removed trees would be a `rm -rf` pointed at a path taken from
+        // an environment variable.
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            swept += 1;
+        }
+    }
+    Ok(swept)
+}
+
+/// `install -m <mode> -o <owner> -g <group> -T -- <staged> <target>`.
+///
+/// Every part of it is the plan the window drew, in the same order the window
+/// states it, and nothing is inferred:
+///
+/// * `-m` takes all twelve bits as four octal digits, so a setuid or setgid
+///   target keeps the bits the window showed instead of silently losing them.
+/// * `-o` and `-g` take [`Principal`]'s `Display`, which is the name when
+///   there is one and the number when there is not — `install` accepts either
+///   in that position, and a uid with no `passwd` entry is an ordinary thing
+///   on a container-mapped or directory-backed system.
+/// * `-T` is not optional. Without it, `install src dir` puts the file
+///   *inside* `dir`, so a target that became a directory between the approval
+///   and the write would land the bytes at a path nobody was shown. The
+///   re-check refuses a directory target a moment earlier; this is the same
+///   refusal made by the tool that does the writing.
+/// * `--` so a path beginning with a dash is a path.
+///
+/// There is no shell. The two paths are `execve` arguments from here to
+/// `install`, so nothing re-parses a filename hatch has already committed to.
+pub fn install_argv(staged: &Path, target: &Path, plan: &SwapPlan) -> Vec<String> {
+    vec![
+        INSTALL.to_string(),
+        "-m".to_string(),
+        format!("{:04o}", plan.landing_mode),
+        "-o".to_string(),
+        plan.landing_owner.to_string(),
+        "-g".to_string(),
+        plan.landing_group.to_string(),
+        "-T".to_string(),
+        "--".to_string(),
+        staged.display().to_string(),
+        target.display().to_string(),
+    ]
+}
+
+/// Everything a root swap needs in order to be run: the bytes, and the argv
+/// that lands them.
+///
+/// The two travel together because the argv names the staged file, so an argv
+/// that outlived its [`Staged`] would name a path that has been removed. Held
+/// as one value, the guard cannot be dropped while the command that reads it
+/// is still to run.
+#[derive(Debug)]
+pub struct RootWrite {
+    /// The approved bytes, removed when this value is dropped.
+    pub staged: Staged,
+    /// The unelevated `install` argv. The caller wraps it — see
+    /// [`crate::exec::elevate::Elevation::elevate`].
+    pub argv: Vec<String>,
+}
+
+/// Re-check everything, then stage the bytes and build the `install` argv.
+///
+/// This is [`apply`]'s first half for the root path, and it makes the same two
+/// checks in the same order and for the same reasons: [`validate`] in full,
+/// because only that can see the path having become a different file, and then
+/// the content hash, because only that defends the decision the human actually
+/// made. Neither is inherited from before the prompt.
+///
+/// **Preconditions: `plan` came from [`plan`] for this same `path` with
+/// `root` true, and a human approved what it described.**
+///
+/// # Where the residual window is, and why it is wider here
+///
+/// The unelevated [`apply`] narrows the gap between its last check and its
+/// write to the microseconds a `rename` takes. This path cannot: between the
+/// hash check here and `install` writing anything, the polkit password dialog
+/// goes up and stays up until a person answers it. The whole of that wait is
+/// inside the window — it is human-sized, and it is bounded only by hatch's
+/// execution deadline killing `run0`.
+///
+/// It is in this order anyway, and the alternative is worse rather than
+/// better. Checking *after* the password would mean spending an
+/// authentication a person has already given and then refusing to use it,
+/// and — the part that decides it — hatch has no way to check after the
+/// password at all: the wait and the write are inside one `run0` process,
+/// with no point between them where hatch runs. The only way to hold a check
+/// on the far side of the dialog would be to elevate a *script* that
+/// re-checks and then installs, and the window for a swap draws a diff and a
+/// landing plan, not a command line, so that script would be code running as
+/// root that nobody was shown. Between a stated residual and an unshown
+/// script, this project takes the stated residual.
+///
+/// Two further facts about this path that the unelevated one does not have,
+/// recorded here rather than discovered later:
+///
+/// * `install` opens the destination and truncates it; it is not a `rename`.
+///   So a crash or a kill part way through a root write can leave the target
+///   short, where the unelevated path leaves it either old or new.
+/// * `install` follows a symbolic link at the destination, where `rename`
+///   replaces it. The [`validate`] call below refuses a symlinked target, so
+///   the exposure is the password wait and not longer — but within that wait,
+///   a target replaced by a link is a root write through it.
+///
+/// Both are consequences of landing the file with `install`, which is what the
+/// window's plan describes. Neither is closed here.
+pub fn stage_root(
+    path: &Path,
+    content: &[u8],
+    plan: &SwapPlan,
+    deny: &Denylist,
+    stage_dir: &Path,
+) -> Result<RootWrite, ApplyError> {
+    // 1. The path, again, in full. See `apply`.
+    validate(path, deny).map_err(ApplyError::Refused)?;
+
+    // 2. The bytes, again. See `apply`.
+    let found = hash_now(path)?;
+    if found != plan.hash_before {
+        return Err(ApplyError::Drift { expected: plan.hash_before.clone(), found });
+    }
+
+    // 3. Only now are the approved bytes written anywhere. Staging before the
+    //    checks would leave a file to clean up on every refusal, and would put
+    //    approved content on disk for a request that is about to be refused.
+    let staged = stage_content(stage_dir, content)?;
+    let argv = install_argv(staged.path(), path, plan);
+    Ok(RootWrite { staged, argv })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1382,191 @@ mod tests {
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+
+    // ---- the root path: staging, the install argv, and the re-check --------
+
+    /// A target that exists, its plan, a staging directory and a denylist
+    /// that protects neither. The four things every root case needs.
+    fn root_fixture(content: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf, SwapPlan) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.conf");
+        fs::write(&target, b"before\n").unwrap();
+        let stage = dir.path().join("stage");
+        let plan = plan(&target, content, true).unwrap();
+        (dir, target, stage, plan)
+    }
+
+    #[test]
+    fn staged_bytes_are_byte_identical_to_the_approved_content() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every byte a diff can carry and a string cannot: a NUL, an invalid
+        // UTF-8 byte, a lone carriage return. The whole promise of staging is
+        // that the file `install` copies is the file the human approved, so
+        // the one thing this must not do is normalise anything.
+        let bytes = b"exact\x00bytes\xff\r no newline";
+        let staged = stage_content(dir.path(), bytes).unwrap();
+        assert_eq!(fs::read(staged.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn the_staged_file_is_private_and_inside_the_staging_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = stage_content(&dir.path().join("stage"), b"x").unwrap();
+        let mode = fs::metadata(staged.path()).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o600, "approved content was readable by someone else");
+        assert_eq!(staged.path().parent().unwrap(), dir.path().join("stage"));
+    }
+
+    #[test]
+    fn the_stage_file_is_removed_on_drop_even_without_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = {
+            let staged = stage_content(dir.path(), b"x").unwrap();
+            assert!(staged.path().exists());
+            staged.path().to_path_buf()
+        };
+        assert!(!path.exists(), "approved bytes survived a path that never wrote them");
+    }
+
+    #[test]
+    fn the_startup_sweep_clears_orphaned_stage_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(dir.path().join("orphan"), "approved once, never written").unwrap();
+        fs::write(dir.path().join("another"), "x").unwrap();
+        assert_eq!(sweep_stage(dir.path()).unwrap(), 2);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        // A staging directory that does not exist yet is the state the sweep
+        // is trying to produce, not a failure to report at startup.
+        assert_eq!(sweep_stage(&dir.path().join("never-made")).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_install_argv_carries_the_planned_mode_owner_and_group() {
+        let mut plan = plan(Path::new("/no/such/file"), b"x", true).unwrap();
+        plan.landing_mode = 0o4755;
+        plan.landing_owner = Principal { id: 0, name: Some("root".to_string()) };
+        plan.landing_group = Principal { id: 42, name: None };
+        let argv = install_argv(Path::new("/stage/abc"), Path::new("/etc/hosts"), &plan);
+
+        assert_eq!(argv[0], "install");
+        // All twelve bits, four digits. A setuid target whose mode arrived as
+        // "755" would land executable-by-all and not setuid, which is a
+        // different file from the one the window described.
+        assert_eq!(pair(&argv, "-m"), Some("4755".to_string()));
+        assert_eq!(pair(&argv, "-o"), Some("root".to_string()));
+        // A gid with no group entry is passed as its number, which `install`
+        // takes in the same position. Losing it would be a write with the
+        // wrong group.
+        assert_eq!(pair(&argv, "-g"), Some("42".to_string()));
+        assert!(argv.contains(&"-T".to_string()), "install could put the file inside a directory");
+        assert_eq!(argv[argv.len() - 2], "/stage/abc");
+        assert_eq!(argv[argv.len() - 1], "/etc/hosts");
+        // The two paths are operands, not options, whatever they start with.
+        assert!(
+            argv.iter().position(|a| a == "--").unwrap() == argv.len() - 3,
+            "the operands are not fenced off: {argv:?}"
+        );
+    }
+
+    /// The argument after `flag` in `argv`.
+    fn pair(argv: &[String], flag: &str) -> Option<String> {
+        argv.iter().position(|a| a == flag).and_then(|at| argv.get(at + 1)).cloned()
+    }
+
+    #[test]
+    fn a_root_write_stages_the_exact_bytes_and_names_them_in_the_argv() {
+        let bytes = b"after\xff\n";
+        let (_dir, target, stage, plan) = root_fixture(bytes);
+        let write = stage_root(&target, bytes, &plan, &deny(), &stage).unwrap();
+
+        assert_eq!(fs::read(write.staged.path()).unwrap(), bytes);
+        assert_eq!(write.argv[write.argv.len() - 2], write.staged.path().display().to_string());
+        assert_eq!(write.argv[write.argv.len() - 1], target.display().to_string());
+    }
+
+    #[test]
+    fn a_root_write_re_checks_the_hash_before_anything_is_staged() {
+        let (_dir, target, stage, plan) = root_fixture(b"after\n");
+        // The world moves while the human reads: the file is not what the
+        // plan was made against any more.
+        fs::write(&target, b"somebody else got there first\n").unwrap();
+
+        let error = stage_root(&target, b"after\n", &plan, &deny(), &stage).unwrap_err();
+
+        assert!(matches!(error, ApplyError::Drift { .. }), "{error}");
+        // Nothing staged, which is the half that matters. Staging first and
+        // checking after would put approved content on disk for a request
+        // that is about to be refused — and, since the caller elevates what
+        // this returns, would spend a password on a write it then refuses.
+        assert_eq!(
+            fs::read_dir(&stage).map(|d| d.count()).unwrap_or(0),
+            0,
+            "approved bytes were staged for a write that was refused"
+        );
+    }
+
+    #[test]
+    fn a_root_write_re_checks_the_path_before_it_re_checks_the_bytes() {
+        let (dir, target, stage, plan) = root_fixture(b"after\n");
+        // The target became a link while the human read the diff. The hash
+        // cannot see this: it describes whichever file the name now means.
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &target).unwrap();
+
+        let error = stage_root(&target, b"after\n", &plan, &deny(), &stage).unwrap_err();
+
+        assert!(
+            matches!(error, ApplyError::Refused(Refusal::Symlink { .. })),
+            "a root write followed a link: {error}"
+        );
+        assert_eq!(fs::read_dir(&stage).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn a_root_write_to_a_protected_path_is_refused_at_the_re_check_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.conf");
+        fs::write(&target, b"before\n").unwrap();
+        let plan = plan(&target, b"after\n", true).unwrap();
+
+        let error =
+            stage_root(&target, b"after\n", &plan, &deny_dir(dir.path()), &dir.path().join("stage"))
+                .unwrap_err();
+
+        assert!(matches!(error, ApplyError::Refused(Refusal::Denied)), "{error}");
+    }
+
+    #[test]
+    fn a_root_plan_keeps_an_existing_files_owner_rather_than_giving_it_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.conf");
+        fs::write(&target, b"before\n").unwrap();
+        set_mode(&target, 0o640);
+
+        let plan = plan(&target, b"after\n", true).unwrap();
+
+        // `root: true` says who does the writing, not who ends up owning the
+        // file. A replacement that quietly re-owned the file to root would be
+        // a change the window never described.
+        assert_eq!(plan.landing_owner.id, geteuid().as_raw());
+        assert_eq!(plan.landing_mode, 0o640);
+        assert_eq!(pair(&install_argv(Path::new("/s"), &target, &plan), "-m"), Some("0640".into()));
+    }
+
+    #[test]
+    fn a_root_create_lands_as_root_where_an_unelevated_one_lands_as_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new.conf");
+
+        let elevated = plan(&target, b"x", true).unwrap();
+        let plain = plan(&target, b"x", false).unwrap();
+
+        assert_eq!(elevated.kind, PlanKind::Create);
+        assert_eq!((elevated.landing_owner.id, elevated.landing_group.id), (0, 0));
+        assert_eq!(plain.landing_owner.id, geteuid().as_raw());
     }
 
     // ---- validate: the order of the checks -------------------------------
