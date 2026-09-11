@@ -1295,7 +1295,15 @@ pub struct RootWrite {
 ///   a target replaced by a link is a root write through it.
 ///
 /// Both are consequences of landing the file with `install`, which is what the
-/// window's plan describes. Neither is closed here.
+/// window's plan describes. Neither is prevented here.
+///
+/// The second one is at least *detected*: [`landed_as_approved`] examines the
+/// target afterwards without following it, so a name that became a link comes
+/// back with the link's own mode and owner and does not match the plan. That
+/// turns a silent root write through somebody else's link into a reported
+/// one. It is worth saying plainly that detecting is not preventing — the
+/// bytes have already gone wherever the link pointed — and the value is that
+/// the user finds out in the same minute rather than never.
 pub fn stage_root(
     path: &Path,
     content: &[u8],
