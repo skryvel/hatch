@@ -1709,12 +1709,6 @@ impl Daemon {
             run.killed_by_user = Some(output.killed_by_user);
             run.timed_out = Some(output.timed_out);
         }
-        // A streamed run's window stays: the reader ticked a box asking to
-        // watch this command, and for anything short of a slow one the whole
-        // run is over before they have read a line. Only when the outcome
-        // actually reached the window, though — a window that was not told the
-        // command ended has no reason to close itself, and handing that one
-        // over would be leaving it for the reader to explain.
         let (verdict, result, frame) = match root {
             // Unelevated, or elevated and the command demonstrably ran: the
             // status is the command's and is reported as it always was.
@@ -1753,6 +1747,12 @@ impl Daemon {
                 (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Some(frame))
             }
         };
+        // A streamed run's window stays: the reader ticked a box asking to
+        // watch this command, and for anything short of a slow one the whole
+        // run is over before they have read a line. Only when the outcome
+        // actually reached the window, though — a window that was not told the
+        // command ended has no reason to close itself, and handing that one
+        // over would be leaving it for the reader to explain.
         let windup = match frame {
             Some(frame) => {
                 let told = session.outbox().finished(frame).await;
