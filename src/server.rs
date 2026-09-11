@@ -1805,8 +1805,7 @@ impl Daemon {
                 exit: output.exit_code,
                 message: format!(
                     "{how}, and the password dialog sits inside the elevated run, so hatch \
-                     cannot tell a command it stopped from a dialog nobody answered; the \
-                     output below is what there is"
+                     cannot tell a command it stopped from a dialog nobody answered"
                 ),
             };
         }
@@ -1908,11 +1907,7 @@ impl Daemon {
             Ok(elevated) => elevated,
             Err(unavailable) => {
                 return self
-                    .elevation_ended(
-                        session,
-                        &RootOutcome::from(unavailable),
-                        String::new(),
-                    )
+                    .elevation_ended(session, &RootOutcome::from(unavailable), "")
                     .await;
             }
         };
@@ -1956,7 +1951,7 @@ impl Daemon {
                                 self.elevation.mechanism()
                             ),
                         },
-                        String::new(),
+                        "",
                     )
                     .await;
             }
@@ -2058,7 +2053,24 @@ impl Daemon {
                     Windup::Close,
                 )
             }
-            outcome => self.elevation_ended(session, &outcome, output.stderr).await,
+            outcome => {
+                // An unclear root write is not the same as an unclear root
+                // command. `install` truncates its destination rather than
+                // renaming onto it, so a write hatch cut short can leave the
+                // file short — which means "hatch cannot say whether it ran"
+                // has to carry "and the file may be neither version".
+                let note = match &outcome {
+                    RootOutcome::Unclear { .. } => format!(
+                        "{}\n\nRead {} before anything else: a root write is not a rename, so \
+                         one that was cut short can leave the file neither as it was nor as it \
+                         was going to be.",
+                        first_line(&output.stderr),
+                        path.display(),
+                    ),
+                    _ => first_line(&output.stderr).to_string(),
+                };
+                self.elevation_ended(session, &outcome, &note).await
+            }
         }
     }
 
@@ -2073,13 +2085,13 @@ impl Daemon {
         &self,
         session: &PromptSession,
         outcome: &RootOutcome,
-        stderr: String,
+        tail: &str,
     ) -> (LogVerdict, CallToolResult, Windup) {
         let (verdict, message, frame) = elevation_ending(outcome);
         let _ = session.outbox().finished(frame).await;
-        let text = match stderr.trim().is_empty() {
+        let text = match tail.trim().is_empty() {
             true => message,
-            false => format!("{message}\n\n{}", first_line(&stderr)),
+            false => format!("{message}\n\n{}", tail.trim()),
         };
         (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Windup::Close)
     }
