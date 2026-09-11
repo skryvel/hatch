@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! let mut session = prompter.prompt(request, queue.subscribe_depth()).await?;
-//! let Ok(Verdict::Approve { stream }) = session.verdict().await else { .. };
+//! let Ok(Verdict::Approve { stream, note }) = session.verdict().await else { .. };
 //! // The approval is now held; the window is a running indicator.
 //! let outbox = session.outbox();
 //! let (tx, rx) = mpsc::channel(..);
@@ -1051,7 +1051,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::protocol::Payload;
+    use crate::protocol::{Payload, approved};
     use crate::render::render_command;
 
     /// A hard ceiling on anything that waits for hatch to end a process.
@@ -1167,7 +1167,7 @@ mod tests {
 
         #[tokio::test]
         async fn stub_records_what_it_was_asked() {
-            let p = StubPrompter::new(vec![Verdict::Approve { stream: false }]);
+            let p = StubPrompter::new(vec![approved(false)]);
             let (_tx, rx) = no_depth();
             within(p.prompt(sample_request(), rx)).await.unwrap();
             assert_eq!(p.seen()[0].title, "sample");
@@ -1177,14 +1177,14 @@ mod tests {
         async fn the_script_is_consumed_one_window_at_a_time() {
             let p = StubPrompter::new(vec![
                 Verdict::Deny { note: "first".to_string() },
-                Verdict::Approve { stream: true },
+                approved(true),
             ]);
             let (_tx, rx) = no_depth();
             let mut first = within(p.prompt(sample_request(), rx)).await.unwrap();
             let (_tx2, rx2) = no_depth();
             let mut second = within(p.prompt(sample_request(), rx2)).await.unwrap();
             assert_eq!(within(first.verdict()).await.unwrap(), Verdict::Deny { note: "first".to_string() });
-            assert_eq!(within(second.verdict()).await.unwrap(), Verdict::Approve { stream: true });
+            assert_eq!(within(second.verdict()).await.unwrap(), approved(true));
             assert_eq!(p.seen().len(), 2);
         }
 
@@ -1223,11 +1223,11 @@ mod tests {
         #[tokio::test]
         async fn a_window_can_die_after_deciding_without_taking_the_approval_with_it() {
             let p = StubPrompter::new(vec![
-                Reply::verdict(Verdict::Approve { stream: true }).then_dies(),
+                Reply::verdict(approved(true)).then_dies(),
             ]);
             let (_tx, rx) = no_depth();
             let mut session = within(p.prompt(sample_request(), rx)).await.unwrap();
-            assert_eq!(within(session.verdict()).await.unwrap(), Verdict::Approve { stream: true });
+            assert_eq!(within(session.verdict()).await.unwrap(), approved(true));
             timeout(PATIENCE, session.window_gone().cancelled()).await.unwrap();
             assert!(
                 !within(session.outbox().output(Stream::Stdout, "late".to_string())).await,
@@ -1238,7 +1238,7 @@ mod tests {
         #[tokio::test]
         async fn a_window_can_press_kill_while_the_command_runs() {
             let p = StubPrompter::new(vec![
-                Reply::verdict(Verdict::Approve { stream: true })
+                Reply::verdict(approved(true))
                     .then_kills_after(Duration::from_millis(20)),
             ]);
             let (_tx, rx) = no_depth();
@@ -1256,7 +1256,7 @@ mod tests {
             // that pressed the button and then stopped existing -- or one that
             // went on pressing it -- would be a worse stand-in than no stub.
             let p = StubPrompter::new(vec![
-                Reply::verdict(Verdict::Approve { stream: true })
+                Reply::verdict(approved(true))
                     .then_kills_after(Duration::from_millis(10)),
             ]);
             let (_tx, rx) = no_depth();
@@ -1298,7 +1298,7 @@ mod tests {
 
         #[tokio::test]
         async fn the_stub_records_what_the_daemon_streamed() {
-            let p = StubPrompter::new(vec![Verdict::Approve { stream: true }]);
+            let p = StubPrompter::new(vec![approved(true)]);
             let (_tx, rx) = no_depth();
             let mut session = within(p.prompt(sample_request(), rx)).await.unwrap();
             within(session.verdict()).await.unwrap();
@@ -1333,7 +1333,7 @@ mod tests {
             // The deadline is the daemon's, and a window still thinking about it
             // does not get to hold the request open past it.
             let p = StubPrompter::new(vec![
-                Reply::verdict(Verdict::Approve { stream: false })
+                Reply::verdict(approved(false))
                     .after(Duration::from_secs(30)),
             ]);
             let (_tx, rx) = no_depth();
@@ -1498,12 +1498,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_verdict_from_the_window_reaches_the_daemon() {
-        let p = window_saying(&[PromptMsg::Verdict(Verdict::Approve { stream: true })]);
+        let p = window_saying(&[PromptMsg::Verdict(approved(true))]);
         let (_tx, rx) = no_depth();
         let mut session = within(p.prompt(sample_request(), rx)).await.unwrap();
         assert_eq!(
             timeout(PATIENCE, session.verdict()).await.unwrap().unwrap(),
-            Verdict::Approve { stream: true }
+            approved(true)
         );
         timeout(PATIENCE, session.close()).await.unwrap();
     }
@@ -1512,7 +1512,7 @@ mod tests {
     async fn only_the_first_verdict_counts() {
         let p = window_saying(&[
             PromptMsg::Verdict(Verdict::Deny { note: "no".to_string() }),
-            PromptMsg::Verdict(Verdict::Approve { stream: false }),
+            PromptMsg::Verdict(approved(false)),
         ]);
         let (_tx, rx) = no_depth();
         let mut session = within(p.prompt(sample_request(), rx)).await.unwrap();
@@ -1530,7 +1530,7 @@ mod tests {
     #[tokio::test]
     async fn kill_from_the_window_fires_the_kill_token() {
         let p = window_saying(&[
-            PromptMsg::Verdict(Verdict::Approve { stream: true }),
+            PromptMsg::Verdict(approved(true)),
             PromptMsg::Kill,
         ]);
         let (_tx, rx) = no_depth();
@@ -1575,14 +1575,14 @@ mod tests {
         let p = fake_window(&format!(
             "echo $$ > {}; IFS= read -r request; {}; exit 0",
             pidfile.display(),
-            frame(&PromptMsg::Verdict(Verdict::Approve { stream: false }))
+            frame(&PromptMsg::Verdict(approved(false)))
         ));
         let (_tx, rx) = no_depth();
         let mut session = within(p.prompt(sample_request(), rx)).await.unwrap();
         let pid = pid_of(&pidfile).await;
         assert_eq!(
             timeout(PATIENCE, session.verdict()).await.unwrap().unwrap(),
-            Verdict::Approve { stream: false }
+            approved(false)
         );
         until_gone(pid).await;
         timeout(PATIENCE, session.window_gone().cancelled()).await.unwrap();

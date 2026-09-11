@@ -1244,8 +1244,8 @@ impl Daemon {
         // not hold every other agent behind it.
         drop(permit);
 
-        let stream = match verdict {
-            Verdict::Approve { stream } => stream,
+        let (stream, note) = match verdict {
+            Verdict::Approve { stream, note } => (stream, note),
             other => {
                 session.close().await;
                 return declined(other, detail);
@@ -1293,7 +1293,18 @@ impl Daemon {
         // happened, and one whose elevation hatch could not read is an
         // approval it cannot report either way; both are their own verdicts,
         // and the log is where anyone later asks what actually ran as root.
-        Outcome { verdict, note: None, detail, result }
+        //
+        // The note goes to both places it goes for every other verdict: into
+        // the result the agent reads, and onto the audit line. `None` rather
+        // than an empty string when nobody typed anything, because the field
+        // means "what the user typed, if anything" and a run of empty notes
+        // down the log would say they typed nothing five different ways.
+        Outcome {
+            verdict,
+            note: (!note.is_empty()).then(|| note.clone()),
+            detail,
+            result: with_note(result, &note),
+        }
     }
 }
 
@@ -2272,6 +2283,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// What the user's own words are labelled with where they reach the agent
+/// beside hatch's.
+///
+/// Trailing space included: it is a prefix, and the one place it is written
+/// is the one place it can be got wrong.
+const USER_NOTE_PREFIX: &str = "the user's note: ";
+
+/// Put the user's note at the end of an approved operation's result, in their
+/// name.
+///
+/// A result is hatch's own account of what happened — an exit status, the
+/// bytes written, the mode the file was left at, the sentence saying hatch
+/// could not re-examine it afterwards. The note is the one part of the answer
+/// a *person* wrote. Run together they read as one voice, and both misreadings
+/// are bad in the same way: the agent takes "do the other one first" for
+/// hatch's instruction, or takes hatch's "only 3 of 40 lines changed" for
+/// something the user said. So the prefix names whose words follow, and it is
+/// put on the user's text and on nothing else.
+///
+/// It is a block of its own after a blank line rather than an interpolation
+/// into a sentence, because the person's text ends the result: everything
+/// after the prefix is theirs, which is the simplest boundary to state and
+/// the only one that survives a note with a line break in it.
+///
+/// The note is relayed exactly as it was typed. It is a person's own message
+/// to their own agent, and the escaping that the agent-written fields get
+/// exists to stop *those* forging a line in hatch's log — a separate problem,
+/// still solved separately: the log renders every string through
+/// [`crate::audit`]'s `visible`, this note included.
+///
+/// An empty note adds nothing at all. A blank line with a label over nothing
+/// is hatch reporting that somebody spoke when nobody did.
+fn with_note(mut result: CallToolResult, note: &str) -> CallToolResult {
+    if note.trim().is_empty() {
+        return result;
+    }
+    result.content.push(ContentBlock::text(format!("\n\n{USER_NOTE_PREFIX}{note}")));
+    result
 }
 
 // ---- the outcomes that are not an approval ---------------------------------
@@ -3467,7 +3518,7 @@ later"), "");
         use crate::exec::elevate::Rehearsed;
         use crate::prompter::{ProcessPrompter, Reply, StubPrompter};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        use crate::protocol::Verdict;
+        use crate::protocol::{Verdict, approved};
 
         /// One daemon over a temporary hatch directory, with a scripted
         /// window in front of it.
@@ -3537,7 +3588,7 @@ later"), "");
         }
 
         fn approve() -> Reply {
-            Reply::verdict(Verdict::Approve { stream: false })
+            Reply::verdict(approved(false))
         }
 
         // --- verdict mapping ----------------------------------------------
@@ -3570,6 +3621,61 @@ later"), "");
                     "the user's own words belong on the line"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn an_approval_relays_what_the_person_typed_to_both_tools() {
+            // The window's field is called "Note to the agent", and an
+            // approval was the one press that threw away what was in it.
+            // Both tools, because the sentence the note lands after is
+            // different in each and the landing must not be.
+            let typed = "fine — but check the mount afterwards";
+            let approve =
+                || Reply::verdict(Verdict::Approve { stream: false, note: typed.to_string() });
+            let tail = format!("{USER_NOTE_PREFIX}{typed}");
+
+            let harness = Harness::new(vec![approve()]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            let text = result_text(&result);
+            assert_ne!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("exit code: 0"), "hatch's own report went missing: {text}");
+            assert!(text.ends_with(&tail), "the run said nothing for the user: {text}");
+            assert_eq!(harness.only_record()["note"].as_str(), Some(typed));
+
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", false), Caller::quiet()),
+            )
+            .await;
+            let text = result_text(&result);
+            assert_ne!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("wrote "), "hatch's own report went missing: {text}");
+            assert!(text.ends_with(&tail), "the write said nothing for the user: {text}");
+            assert_eq!(harness.only_record()["note"].as_str(), Some(typed));
+        }
+
+        #[tokio::test]
+        async fn an_approval_with_an_empty_field_speaks_for_nobody() {
+            // Silence is not a message. A label over nothing would have the
+            // agent looking for words the person did not write, and an empty
+            // string on every approved line would bury the ones they did.
+            let harness = Harness::new(vec![approve()]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(!text.contains("the user's note"), "an empty field spoke: {text}");
+            assert!(text.ends_with("(empty)\n"), "and nothing was appended at all: {text}");
+            assert_eq!(harness.verdict(), "approve");
+            assert!(
+                harness.only_record().get("note").is_none(),
+                "an empty note belongs on no line: {}",
+                harness.only_record()
+            );
         }
 
         #[tokio::test]
@@ -5287,7 +5393,7 @@ later"), "");
         #[tokio::test]
         async fn approved_output_reaches_the_window_when_streaming_was_ticked() {
             let harness =
-                Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+                Harness::new(vec![Reply::verdict(approved(true))]);
             within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
             // A streamed run detaches its window rather than closing it, so
             // the request returning is no longer the moment the pipe is
@@ -5338,7 +5444,7 @@ later"), "");
             // The window outlives the request on purpose: it is showing the
             // output to the person who ticked the box, and the agent's result
             // must not wait for them to finish reading it.
-            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let harness = Harness::new(vec![Reply::verdict(approved(true))]);
             let result =
                 within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await;
 
@@ -5363,7 +5469,7 @@ later"), "");
             // A swap writes a file and prints nothing, so there is nothing to
             // linger over. The checkbox is not even offered for one, and a
             // window that stayed anyway would be an empty viewer.
-            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let harness = Harness::new(vec![Reply::verdict(approved(true))]);
             let target = harness.dir.path().join("swapped");
             within(harness.daemon.swap_file(
                 SwapFileParams {
@@ -5385,7 +5491,7 @@ later"), "");
             // No outcome frame is sent on this path, so the window is still
             // drawing "it is running" and nothing will ever tell it otherwise.
             // Handing that one to a reader would be handing them an orphan.
-            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+            let harness = Harness::new(vec![Reply::verdict(approved(true))]);
             let mut params = run_of("echo hello");
             // A working directory that is one, so it passes validation, and
             // that cannot be entered, so the spawn fails. Nothing ran and
@@ -5411,7 +5517,7 @@ later"), "");
             // arrives, and the final flush has to draw them as what they are —
             // on the stream they were written to, not the other one.
             let harness =
-                Harness::new(vec![Reply::verdict(Verdict::Approve { stream: true })]);
+                Harness::new(vec![Reply::verdict(approved(true))]);
             within(harness.daemon.run_command(
                 run_of("printf '\\342\\202' ; printf 'e' 1>&2"),
                 Caller::quiet(),
@@ -5555,6 +5661,44 @@ later"), "");
     }
 
     #[test]
+    fn the_users_own_words_are_labelled_as_theirs_and_hatchs_are_left_alone() {
+        // A result is hatch's account of what happened with one person's
+        // sentence at the end of it, and an agent reading them as one voice
+        // is wrong in both directions at once.
+        let hatchs = "wrote /etc/hosts: 42 bytes, mode 0644, owner root:root\n\
+                      hatch could not re-examine the file to confirm this";
+        let plain = CallToolResult::success(vec![ContentBlock::text(hatchs.to_string())]);
+
+        let labelled = result_text(&with_note(plain.clone(), "put the old one back after"));
+        assert!(labelled.starts_with(hatchs), "hatch's own report was rewritten: {labelled}");
+        assert_eq!(
+            labelled,
+            format!("{hatchs}\n\nthe user's note: put the old one back after"),
+            "the label goes on the person's text and on nothing else"
+        );
+        assert!(
+            labelled[hatchs.len()..].contains(USER_NOTE_PREFIX),
+            "the prefix must sit between the two voices, not inside hatch's"
+        );
+
+        // Nothing typed, nothing said -- not a label over an empty line.
+        for silence in ["", "   ", "\n"] {
+            assert_eq!(
+                result_text(&with_note(plain.clone(), silence)),
+                hatchs,
+                "{silence:?} was reported as something the person said"
+            );
+        }
+
+        // An approval whose operation failed still carries it: the person
+        // spoke to the agent, not to the exit status.
+        let failed = CallToolResult::error(vec![ContentBlock::text("the write failed".to_string())]);
+        let failed = with_note(failed, "leave it, I will look");
+        assert_eq!(failed.is_error, Some(true), "a note must not turn a failure into a success");
+        assert!(result_text(&failed).contains("the user's note: leave it, I will look"));
+    }
+
+    #[test]
     fn each_verdict_maps_to_its_own_sentence_and_its_own_log_line() {
         use crate::protocol::Verdict;
 
@@ -5588,7 +5732,7 @@ later"), "");
         // An approval must never be reported as a refusal. It cannot arrive
         // here, and if it ever did the answer says so rather than inventing a
         // denial nobody made.
-        let stray = declined(Verdict::Approve { stream: false }, a_run_detail());
+        let stray = declined(crate::protocol::approved(false), a_run_detail());
         assert_eq!(stray.result.is_error, Some(true));
         assert!(result_text(&stray.result).contains("mishandled"));
     }

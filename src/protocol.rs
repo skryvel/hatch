@@ -36,9 +36,12 @@
 //!   field a confused or hostile prompt could fill in. Adding an id here
 //!   would be adding the ability to answer for someone else's window.
 //! * **It cannot approve more than the operation it was shown.** The verdict
-//!   set is closed, and the only thing an [`Verdict::Approve`] carries besides
-//!   itself is `stream`, a display preference. There is no field in which a
-//!   command, an argument, a path or a mode could ride back.
+//!   set is closed, and the two things an [`Verdict::Approve`] carries besides
+//!   itself are `stream`, a display preference, and `note`, the words the
+//!   person typed for the agent. Neither is read by anything that decides
+//!   what runs: the note is text the daemon relays and never interprets, and
+//!   there is still no field in which a command, an argument, a path or a
+//!   mode could ride back.
 //! * **[`PromptMsg::Kill`] is safe by direction.** A prompt that sends it
 //!   early, twice, or for no reason can only stop a command. Everything a
 //!   prompt can say unprompted fails towards deny, which is invariant 2.
@@ -617,16 +620,26 @@ pub enum PromptMsg {
 ///
 /// Everything that is not `Approve` returns a *recoverable* tool error to the
 /// agent carrying the note — a `CallToolResult` with `isError`, not a JSON-RPC
-/// error — so the note is the whole content of three of these four variants.
+/// error — so the note is the whole content of those variants. `Approve`
+/// carries one too, and it is the one case where the person's words arrive
+/// beside hatch's own account of what happened, so the daemon labels them
+/// where it joins the two rather than here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum Verdict {
     /// Run it.
     Approve {
         /// Whether the user ticked Stream output. A display preference and
-        /// nothing more: execution is identical either way, so this is the
-        /// only thing an approval carries besides itself.
+        /// nothing more: execution is identical either way.
         stream: bool,
+        /// What the user typed, returned to the agent.
+        ///
+        /// The window has always had the field and an approval used to drop
+        /// what was in it, which made "Note to the agent" a lie on the one
+        /// button people press most. It changes nothing about what runs —
+        /// the daemon relays it and never reads it — so it is a field here
+        /// and not a decision.
+        note: String,
     },
     /// Do not run it.
     Deny {
@@ -663,6 +676,17 @@ pub enum ReviseKind {
     Simplify,
 }
 
+/// An approval with nothing typed in the note field.
+///
+/// What most of the tests in this crate mean by "approved": they are about
+/// the phase machine, the wire or the daemon's flow, and the note is the one
+/// thing they are not about. The ones that *are* about it say so by writing
+/// the verdict out.
+#[cfg(test)]
+pub(crate) fn approved(stream: bool) -> Verdict {
+    Verdict::Approve { stream, note: String::new() }
+}
+
 /// One of every verdict, for the tests across this crate that must cover the
 /// whole set.
 ///
@@ -676,8 +700,8 @@ pub enum ReviseKind {
 #[cfg(test)]
 pub(crate) fn every_verdict() -> Vec<Verdict> {
     vec![
-        Verdict::Approve { stream: true },
-        Verdict::Approve { stream: false },
+        Verdict::Approve { stream: true, note: "thanks — watch the tail of it".to_string() },
+        approved(false),
         Verdict::Deny { note: "not now".to_string() },
         Verdict::Revise {
             kind: ReviseKind::Explain,
@@ -1059,8 +1083,8 @@ mod tests {
     fn write_message_ends_the_frame_with_exactly_one_newline() {
         let mut out = Vec::new();
         write_message(&mut out, &PromptMsg::Kill).expect("writes");
-        write_message(&mut out, &PromptMsg::Verdict(Verdict::Approve { stream: false }))
-            .expect("writes");
+        let approve = approved(false);
+        write_message(&mut out, &PromptMsg::Verdict(approve)).expect("writes");
         let text = String::from_utf8(out).expect("utf-8");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one message, one line: {text:?}");

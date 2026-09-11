@@ -743,7 +743,7 @@ impl PromptState {
         // Approve is the only verdict that leaves anything to watch. The rest
         // return a note to the agent and there is nothing further to show, so
         // the window is over the moment the frame is written.
-        if let Verdict::Approve { stream } = verdict {
+        if let Verdict::Approve { stream, .. } = verdict {
             self.streaming = stream;
         }
         self.phase = match verdict {
@@ -1205,7 +1205,12 @@ impl PromptApp {
             return;
         }
         let verdict = match action {
-            Action::Approve => Verdict::Approve { stream: self.stream },
+            // The note goes with an approval as it goes with a denial: the
+            // field says "Note to the agent", and which button was pressed
+            // afterwards does not change who the words were for.
+            Action::Approve => {
+                Verdict::Approve { stream: self.stream, note: self.note.clone() }
+            }
             Action::Deny => Verdict::Deny { note: self.note.clone() },
             Action::Ignored | Action::Passthrough => return,
         };
@@ -1519,7 +1524,7 @@ impl PromptApp {
         let approve = self.decision_row(ui, width, &note, &mut decided);
 
         if approve.clicked() {
-            decided = Some(Verdict::Approve { stream: self.stream });
+            decided = Some(Verdict::Approve { stream: self.stream, note });
         }
 
         if let Some(verdict) = decided {
@@ -1849,7 +1854,9 @@ mod tests {
 
     use chrono::Utc;
 
-    use crate::protocol::{DaemonMsg, Outcome, Payload, Request, ReviseKind, Verdict};
+    use crate::protocol::{
+        DaemonMsg, Outcome, Payload, Request, ReviseKind, Verdict, approved, every_verdict,
+    };
     use crate::render::render_command;
 
     #[test]
@@ -2208,12 +2215,14 @@ mod tests {
         state.handle(DaemonMsg::Request(a_request(90)));
         let mut wire = Vec::new();
 
-        let frame = state.decide(Verdict::Approve { stream: true });
+        // With a note in it, because an approval carries one and this is the
+        // test that says what the frame looks like.
+        let frame = state.decide(Verdict::Approve { stream: true, note: "go on".to_string() });
         answer(&mut wire, &mut state, frame);
 
         assert_eq!(
             String::from_utf8(wire).unwrap(),
-            "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true}\n"
+            "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true,\"note\":\"go on\"}\n"
         );
         assert_eq!(state.broken(), None, "a written verdict is not a failure");
     }
@@ -2245,7 +2254,7 @@ mod tests {
     fn an_approval_that_cannot_be_sent_does_not_leave_a_window_pretending() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        let frame = state.decide(Verdict::Approve { stream: true });
+        let frame = state.decide(approved(true));
         assert_eq!(state.phase(), Phase::Running);
 
         answer(&mut Deaf, &mut state, frame);
@@ -2316,7 +2325,7 @@ mod tests {
     fn a_running_window_does_not_draw_a_badge_about_someone_elses_queue() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         state.handle(DaemonMsg::QueueDepth { depth: 7 });
 
         assert_eq!(state.queue_depth(), 7, "the depth is still recorded");
@@ -2330,15 +2339,15 @@ mod tests {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
 
-        assert!(state.decide(Verdict::Approve { stream: true }).is_some());
-        assert_eq!(state.decide(Verdict::Approve { stream: true }), None);
+        assert!(state.decide(approved(true)).is_some());
+        assert_eq!(state.decide(approved(true)), None);
     }
 
     #[test]
     fn a_verdict_pressed_while_the_command_runs_sends_nothing() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
 
         assert_eq!(state.decide(Verdict::Deny { note: String::new() }), None);
         assert_eq!(state.phase(), Phase::Running, "and it did not change what is happening");
@@ -2348,7 +2357,7 @@ mod tests {
     fn no_verdict_can_be_given_before_the_request_arrives() {
         let mut state = PromptState::new();
 
-        assert_eq!(state.decide(Verdict::Approve { stream: true }), None);
+        assert_eq!(state.decide(approved(true)), None);
         assert_eq!(state.phase(), Phase::WaitingForRequest);
     }
 
@@ -2375,7 +2384,7 @@ mod tests {
         // The whole set, minus the one verdict that leaves something to
         // watch. See `crate::protocol::every_verdict` on why the list is not
         // written out here.
-        for verdict in crate::protocol::every_verdict()
+        for verdict in every_verdict()
             .into_iter()
             .filter(|verdict| !matches!(verdict, Verdict::Approve { .. }))
         {
@@ -2398,7 +2407,7 @@ mod tests {
         state.handle(DaemonMsg::Request(a_request(90)));
         assert_eq!(state.request_kill(), None, "nothing has been approved yet");
 
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         assert_eq!(state.request_kill(), Some(PromptMsg::Kill));
 
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
@@ -2411,7 +2420,7 @@ mod tests {
     fn the_outcome_survives_the_frame_that_closed_the_window() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Signal { signal: 9 }));
 
         assert_eq!(state.outcome(), Some(&Outcome::Signal { signal: 9 }));
@@ -2422,7 +2431,7 @@ mod tests {
     fn the_daemon_hanging_up_after_the_outcome_does_not_rewrite_the_ending() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
         state.channel_broken("hatch closed the channel");
 
@@ -2447,7 +2456,7 @@ mod tests {
     fn a_lingering_state() -> PromptState {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "hello\n".to_string() });
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
         state
@@ -2472,7 +2481,7 @@ mod tests {
         // an agent's headless command still costs the reader no window at all.
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
 
         assert_eq!(state.phase(), Phase::Closed);
@@ -2538,7 +2547,7 @@ mod tests {
 
         let mut running = PromptState::new();
         running.handle(DaemonMsg::Request(a_request(90)));
-        running.decide(Verdict::Approve { stream: true });
+        running.decide(approved(true));
         assert!(!running.keep(), "there is nothing to keep until it has finished");
         assert_eq!(running.phase(), Phase::Running);
 
@@ -2560,7 +2569,7 @@ mod tests {
                 assert!(state.keep());
             }
             let was = state.phase();
-            for verdict in crate::protocol::every_verdict() {
+            for verdict in every_verdict() {
                 assert_eq!(state.decide(verdict.clone()), None, "{verdict:?} from {was:?}");
             }
             assert_eq!(state.request_kill(), None, "there is nothing left to kill");
@@ -2617,7 +2626,7 @@ mod tests {
         // One string, built once, so the button cannot drift from the view.
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "one\n".to_string() });
         state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "two\n".to_string() });
 
@@ -2677,7 +2686,7 @@ mod tests {
     fn output_arrives_in_order_with_the_pipe_it_came_from() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "one".to_string() });
         state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "two".to_string() });
 
@@ -2695,7 +2704,7 @@ mod tests {
     fn after_output(chunks: usize, size: usize) -> PromptState {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
         let chunk = "x".repeat(size);
         for _ in 0..chunks {
             state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: chunk.clone() });
@@ -2745,7 +2754,7 @@ mod tests {
     fn one_chunk_larger_than_the_cap_is_still_shown() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: true });
+        state.decide(approved(true));
         state.handle(DaemonMsg::Output {
             stream: Stream::Stdout,
             text: "y".repeat(OUTPUT_CAP * 2),
@@ -2864,7 +2873,7 @@ mod tests {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
 
-        assert!(state.decide(Verdict::Approve { stream: true }).is_some());
+        assert!(state.decide(approved(true)).is_some());
         assert_eq!(state.phase(), Phase::Running);
         assert!(!state.should_close());
     }
@@ -2873,7 +2882,7 @@ mod tests {
     fn finished_closes_the_window() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(a_request(90)));
-        state.decide(Verdict::Approve { stream: false });
+        state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
 
         assert!(state.should_close());
@@ -2914,7 +2923,7 @@ mod tests {
     /// with the daemon already gone from the other end.
     fn a_finished_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (mut app, sink) = an_awaiting_window();
-        app.state.decide(Verdict::Approve { stream: true });
+        app.state.decide(approved(true));
         app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
         assert_eq!(app.state.phase(), Phase::Lingering);
         // Nothing has been written yet: `decide` hands back the frame and
@@ -2975,8 +2984,12 @@ mod tests {
 
     /// Press and release the mouse on the Approve button, the way a hand
     /// would: one frame to place the pointer, one to press, one to release.
-    fn click_approve(open: bool) -> Vec<u8> {
+    ///
+    /// `note` is what is in the note field when the button goes down, which
+    /// is half of what an approval carries.
+    fn click_approve(open: bool, note: &str) -> Vec<u8> {
         let (mut app, sink) = an_awaiting_window();
+        app.note = note.to_string();
         let ctx = egui::Context::default();
         let at = draw(&mut app, &ctx, Vec::new(), open).rect.center();
         let button = |pressed| egui::Event::PointerButton {
@@ -2994,7 +3007,7 @@ mod tests {
     #[test]
     fn a_mouse_click_during_the_guard_approves_nothing() {
         assert!(
-            click_approve(false).is_empty(),
+            click_approve(false, "").is_empty(),
             "a click landed on Approve while the guard was shut"
         );
     }
@@ -3003,8 +3016,28 @@ mod tests {
     fn the_same_click_after_the_guard_does_approve() {
         // The control for the test above: without this, a click that never
         // lands would look like a guard that works.
-        let out = String::from_utf8(click_approve(true)).expect("utf-8");
+        let out = String::from_utf8(click_approve(true, "")).expect("utf-8");
         assert!(out.contains("approve"), "the click did not reach Approve at all: {out:?}");
+    }
+
+    #[test]
+    fn a_note_typed_before_approve_leaves_with_the_approval() {
+        // The field is labelled "Note to the agent", and until now an
+        // approval was the one press that read it and threw it away. Both
+        // ways of approving are asked, because they build the verdict in two
+        // different places.
+        let typed = "fine — but watch the mount";
+
+        let out = String::from_utf8(click_approve(true, typed)).expect("utf-8");
+        assert!(out.contains("\"verdict\":\"approve\""), "the click did not approve: {out}");
+        assert!(out.contains(typed), "the click dropped the note: {out}");
+
+        let (mut app, sink) = an_awaiting_window();
+        app.note = typed.to_string();
+        app.act(Action::Approve);
+        let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
+        assert!(out.contains("\"verdict\":\"approve\""), "the key did not approve: {out}");
+        assert!(out.contains(typed), "the key dropped the note: {out}");
     }
 
     #[test]
@@ -3115,7 +3148,7 @@ mod tests {
     /// on the screen.
     fn a_finished_window_showing(command: &str, printed: &str) -> PromptApp {
         let mut app = a_window_showing(command);
-        app.state.decide(Verdict::Approve { stream: true });
+        app.state.decide(approved(true));
         app.state
             .handle(DaemonMsg::Output { stream: Stream::Stdout, text: printed.to_string() });
         app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 3 }));
@@ -3247,7 +3280,7 @@ mod tests {
     fn an_approved_command_gets_a_window_that_says_so_and_offers_kill() {
         let mut app = a_window_showing("sleep 5");
         app.stream = true;
-        let frame = app.state.decide(Verdict::Approve { stream: true });
+        let frame = app.state.decide(approved(true));
         answer(&mut app.out, &mut app.state, frame);
         app.state.handle(DaemonMsg::Output {
             stream: Stream::Stdout,
@@ -3824,7 +3857,7 @@ mod tests {
         let asking = ground_drawn(&mut asking);
 
         let mut running = a_window_showing("systemctl restart thing");
-        running.state.decide(Verdict::Approve { stream: true });
+        running.state.decide(approved(true));
         assert_eq!(running.state.phase(), Phase::Running, "the window is not running");
         let running = ground_drawn(&mut running);
 

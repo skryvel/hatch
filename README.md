@@ -73,7 +73,10 @@ There are five answers a person can give: approve, deny, ask the agent to
 explain first, ask for a form that is easier to read, or take the job over and
 run it themselves. The last four all return a non-fatal tool error carrying a
 free-text note, so the agent can read the note and come back with something
-better instead of seeing a broken server.
+better instead of seeing a broken server. An approval carries the note too,
+after what hatch has to say about what happened and labelled `the user's
+note:` — the agent is never left to guess which half of an answer a person
+wrote.
 
 ## Requirements
 
