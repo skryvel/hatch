@@ -13,6 +13,17 @@ each time.
 Written in Rust. One binary, two modes: a daemon speaking MCP over streamable
 HTTP on loopback, and a short-lived egui window spawned once per request.
 
+![The hatch approval window showing a request to delete a build directory. The
+agent's title and reason are at the top; below them the command appears twice,
+raw on the left and annotated on the right, with Approve, Deny and three
+narrower buttons along the bottom.](media/layout-dark-side-by-side.png)
+
+*One request, waiting. The left pane is exactly the text being approved; the
+right is the same text annotated. A countdown says how long is left to decide,
+and the badge says how many other requests are queued behind this one. (The red
+`Marked:` row comes from the layout fixture this shot was taken with — this
+build computes no danger markers; see [Known limits](#known-limits).)*
+
 ---
 
 ## Contents
@@ -120,6 +131,10 @@ the required number on startup, so it cannot drift away from your config.
 Queued requests stretch the total further: one approval window is open at a
 time, machine-wide, and further requests wait in arrival order.
 
+Ninety seconds is not long to read a command in. Raising it is the first edit
+most people make and nothing downstream objects — see
+[Raise `timeout_secs`](#raise-timeout_secs).
+
 ### Make the window hard to miss
 
 On Wayland a client cannot raise or focus itself, so the always-on-top hint
@@ -213,6 +228,33 @@ and TAB get a compact dim glyph instead, because uniform alarm is no alarm: if
 a newline in a heredoc shouts as loudly as a right-to-left override, readers
 learn to skip both. This applies to `title` and `reason` too, which frame the
 whole decision.
+
+![Two lines of a copy command. The second line contains a filename with a
+right-to-left override and a path with a non-breaking space; both are drawn as
+orange bracketed labels, while the ordinary line break between the two commands
+is a small dim arrow.](media/command-quiet-and-loud-chips.png)
+
+*The whole argument for the rendering, in one window. `[RLO]` is a Trojan
+Source filename: the second `cp` copies something that reads as `gnp.txt.exe`
+and is not, and without the chip the two lines look like the same kind of
+thing. `[NBSP]` is a non-breaking space inside a path that appears to be
+`staging/archive`. The ordinary newline ending the first line stays a quiet
+`↵`, because if it shouted as loudly as those two nobody would keep reading
+either. The header counts what it found.*
+
+A file replacement gets the same treatment, plus a statement of exactly where
+the bytes will land:
+
+![A file replacement request. A metadata panel lists the target path, that the
+whole file is being replaced, the resulting mode and owner and the size change;
+below it a left/right diff shows the old and new YAML with changed lines
+marked.](media/layout-dark-swap.png)
+
+*The metadata panel is the part a diff cannot show: which file, create or
+replace, at what mode, owned by whom, and how much larger. A replacement
+inherits the existing mode and owner, and the write either matches what the
+window said or does not happen. The tinted cell on the left is a row that side
+has no line for, which is not the same as a blank line.*
 
 **The typing guard.** Every input is inert for 750 ms after the window gains
 focus, and events delivered during that interval are dropped rather than
@@ -348,27 +390,107 @@ refuses to touch it; `run_command` is shown to you in full.
 `$XDG_CONFIG_HOME/hatch/config.toml`, which is `~/.config/hatch/config.toml`
 unless you have set the variable. Mode 0600, because it holds the token.
 
-```toml
-port = 8787
-token = "…"                     # generated on first run
-timeout_secs = 90               # how long a window waits for a decision
-exec_timeout_secs = 300         # how long an approved command may run
-output_cap_bytes = 262144
-exec_path = "/usr/local/bin:/usr/bin:/bin"
-terminal = ["konsole", "-e"]   # interactive mode, which this build refuses
-denylist_extra = []             # absolute, literal path prefixes
-font_size = 16
-theme = "dark"                  # or "light"
+A worked example first — this is closer to what a config looks like after a
+week of use than the defaults are:
 
-[exec_env]                      # the complete child environment, plus PATH
-HOME = "/home/…"
+```toml
+# ~/.config/hatch/config.toml
+
+port = 8787
+token = "…"          # generated on first run; the client is registered against it
+
+timeout_secs = 600       # 90 is the default, and 90 is not enough. See below.
+exec_timeout_secs = 900  # a system upgrade takes longer than five minutes
+output_cap_bytes = 524288
+
+# sbin included, because half of what gets asked for as root lives there
+exec_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+font_size = 18
+theme = "light"
+
+# Things swap_file must not rewrite behind a diff. Absolute, literal prefixes.
+denylist_extra = [
+    "/etc/ssh",
+    "/etc/sudoers.d",
+    "/home/alex/.ssh",
+    "/home/alex/.gnupg",
+    "/home/alex/.local/share/systemd/user",
+]
+
+[exec_env]
+HOME = "/home/alex"
 TERM = "xterm-256color"
+LANG = "en_GB.UTF-8"
+GIT_PAGER = "cat"      # nothing here can talk to a terminal
+SYSTEMD_PAGER = ""
+DEBIAN_FRONTEND = "noninteractive"
 ```
 
-Every field has a default, so a config written by an older build keeps loading
-after new fields appear. `denylist_extra` entries must be absolute literal path
-prefixes: `~` is not expanded, and a relative entry can never match, so either
-one silently protects nothing.
+`[exec_env]` is the complete environment an approved command receives, laid on
+top of `exec_path` as `PATH`. Nothing else is added and nothing is inherited —
+not from the daemon's own environment, not from the sandbox — so whatever you
+write here is the whole of what the command sees, and it is what the window
+resolves `$VAR` against when it shows you a value. The keys are ordinary
+environment pairs: hatch does not interpret them, and the last three are
+there because a command that stops to page its output is a command that hangs
+until the execution timeout kills it. If you spell `PATH` out here it wins over
+`exec_path`.
+
+`denylist_extra` entries must be absolute literal path prefixes. `~` is not
+expanded and a relative entry can never match, so either one silently protects
+nothing — and nothing warns you, because there is no channel to warn on from
+where that list is read.
+
+### Raise `timeout_secs`
+
+The default 90 seconds is the time you get to read a command **from the moment
+the window appears**, and for anything longer than a line it is not enough. The
+number was self-imposed caution rather than a limit anything downstream
+imposes.
+
+What might have forced a low number is a client that gives up on a call while a
+window is still open. It does not, because hatch sends a progress notification
+every five seconds for the whole life of a request — queued, awaiting a
+decision, running, waiting on the password dialog — whenever the client
+supplies a progress token. That is what keeps an idle timer from firing under a
+window somebody is still reading. For Claude Code specifically, at the time of
+writing: the hard ceiling `MCP_TOOL_TIMEOUT` defaults to about 28 hours, and
+the five-minute idle timer is reset by those notifications.
+
+So raise it. 600 is comfortable. The constraint that does bind is the one in
+[Set the client's tool timeout](#set-the-clients-tool-timeout):
+`timeout_secs + exec_timeout_secs` has to stay under whatever ceiling your
+client actually enforces, and `hatch serve` prints that sum on startup — 1500 s
+for the config above, against 390 s for the defaults.
+
+This build still ships 90. Raising it is an edit you make.
+
+### Every key
+
+| Key | Default | What it is |
+|---|---|---|
+| `port` | `8787` | Loopback port the MCP server listens on |
+| `token` | generated | Bearer token the client must present |
+| `timeout_secs` | `90` | How long a window waits for a decision |
+| `exec_timeout_secs` | `300` | How long an approved command may run |
+| `output_cap_bytes` | `262144` | Cap on captured output |
+| `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
+| `terminal` | `["konsole", "-e"]` | Terminal for interactive runs, which this build refuses |
+| `denylist_extra` | `[]` | Extra paths `swap_file` must refuse |
+| `font_size` | `16` | Point size, clamped to 8–48 |
+| `theme` | `"dark"` | `"dark"` or `"light"` |
+| `[exec_env]` | `HOME`, `TERM` | The complete child environment |
+
+Every key is optional and has the default above, so a config written by an
+older build keeps loading unchanged after new keys appear.
+
+Both palettes carry every meaning the window has; neither decides anything.
+`theme = "light"` is the same window as the one at the top of this page:
+
+![The same approval window in the light palette: dark text on a pale ground,
+with the same two panes, the same countdown and the same
+buttons.](media/layout-light-side-by-side.png)
 
 Three directories, in three places, following the XDG base directory spec:
 
