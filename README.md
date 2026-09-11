@@ -18,12 +18,15 @@ them a three-line shell command appears twice, raw on the left and annotated on
 the right, with a countdown, a note field and Approve, Deny and three narrower
 buttons along the bottom.](media/approval-command.png)
 
-*One request, waiting. The left pane is exactly the text being approved — no
-reflow, no colour. The right is the same text annotated: numbered segments,
-`$HOME` shown with the value the command will actually receive, the `&&` that
-ends each segment still on screen, and each line break drawn as a quiet `↵`
-rather than silently swallowed. The header counts what it found and the
-countdown says how long is left before the window denies on its own.*
+*One request, waiting. The header is the agent's own words, marked as such: a
+rule down the side and "The agent says" in front of them. The left pane is
+exactly the text being approved — no reflow, no colour. The right is the same
+text annotated: numbered segments, `$HOME` shown with the value the command
+will actually receive, the `&&` that ends each segment still on screen with the
+line break it is followed by drawn as a quiet `↵` rather than silently
+swallowed. The header counts what it found, the countdown says how long is left
+before the window denies on its own, and the buttons name the keys that do the
+same thing.*
 
 ---
 
