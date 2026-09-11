@@ -773,25 +773,11 @@ impl Daemon {
     /// directory that no longer sits inside it.
     pub fn new(paths: &Paths, config: Config, prompter: Arc<dyn Prompter>) -> Daemon {
         let denylist = Denylist::new(&paths.protected(), paths.home(), &config.denylist_extra);
+        // Not swept here. `run_serve` empties the staging directory once, at
+        // startup, before it binds anything — which is the only moment a
+        // sweep is safe, because at any later one it would delete the staged
+        // bytes of a request somebody is deciding on in another window.
         let stage_dir = paths.stage_dir();
-        // The one sweep, and it is here because here is startup: one of these
-        // exists per `hatch serve`. Anything in the staging directory now is
-        // approved content from a daemon that did not get to write it — a
-        // `SIGKILL`, a power cut — which `Staged`'s drop guard cannot reach
-        // by construction. Sweeping at any later moment would delete the
-        // staged bytes of a request somebody is deciding on in another
-        // window.
-        //
-        // A sweep that fails does not stop the daemon. The failure is worth
-        // saying out loud, but a daemon that refuses to start leaves the user
-        // doing privileged things by hand with no window and no audit record
-        // at all, which is the worse of the two.
-        if let Err(error) = swap::sweep_stage(&stage_dir) {
-            eprintln!(
-                "hatch could not sweep the staging directory {}: {error}",
-                stage_dir.display()
-            );
-        }
         Daemon {
             config: Arc::new(config),
             prompter,
@@ -886,7 +872,7 @@ impl Caller {
 
 // ---- one request, from arrival to audit line -------------------------------
 
-/// Which of the three long waits a request is in, for the progress ticker.
+/// Which of the long waits a request is in, for the progress ticker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Phase {
@@ -3301,6 +3287,56 @@ mod tests {
             !hosts.iter().any(|h| h == "0.0.0.0" || h.is_empty()),
             "an entry that means \"anything\" would undo the protection"
         );
+    }
+
+    #[test]
+    fn only_an_elevated_operation_makes_the_ticker_mention_a_password() {
+        let run = |elevated| {
+            Work::Run(RunPlan {
+                argv: Vec::new(),
+                env: Env::new(),
+                cwd: PathBuf::from("/"),
+                elevated,
+            })
+        };
+        let swap = |root| Work::Swap {
+            path: PathBuf::from("/etc/hosts"),
+            content: Vec::new(),
+            plan: SwapPlan {
+                kind: PlanKind::Create,
+                landing_mode: 0o644,
+                landing_owner: crate::swap::Principal::user(0),
+                landing_group: crate::swap::Principal::group(0),
+                hash_before: None,
+                size_delta: 0,
+            },
+            root,
+        };
+        assert!(run(true).elevated());
+        assert!(!run(false).elevated());
+        assert!(swap(true).elevated());
+        assert!(!swap(false).elevated());
+    }
+
+    #[test]
+    fn the_elevated_phase_says_something_the_others_do_not() {
+        // The ticker is what keeps a long wait alive: each notification
+        // resets the client's idle timer, and the longest silence on a root
+        // request is the one where a password dialog is sitting unanswered.
+        // So the phase has to survive the round trip through the atomic, and
+        // it has to say something an ordinary run does not.
+        for phase in
+            [Phase::Queued, Phase::AwaitingApproval, Phase::Executing, Phase::Elevating]
+        {
+            assert_eq!(Phase::of(phase as u8), phase, "{phase:?} did not survive the ticker");
+        }
+        let elevating = Phase::Elevating.message();
+        assert!(elevating.contains("password"), "{elevating}");
+        assert_ne!(elevating, Phase::Executing.message());
+        // And it stays true for the whole elevated run, because hatch is
+        // never told the password was typed: there is no moment at which it
+        // could honestly change to "running".
+        assert!(elevating.contains("running"), "{elevating}");
     }
 
     #[test]

@@ -1135,8 +1135,9 @@ const INSTALL: &str = "install";
 /// list the compiler keeps: the file goes when the value does, including out
 /// of an `?` in the middle of a function nobody has written yet.
 ///
-/// What it cannot cover is the process dying without unwinding, which is why
-/// [`sweep_stage`] exists.
+/// What it cannot cover is the process dying without unwinding. `hatch serve`
+/// empties the staging directory at startup for that case, before it binds
+/// anything or accepts a request.
 #[derive(Debug)]
 pub struct Staged {
     path: PathBuf,
@@ -1196,39 +1197,6 @@ pub fn stage_content(stage_dir: &Path, content: &[u8]) -> Result<Staged, ApplyEr
     file.sync_all()
         .map_err(|e| failed(format!("flushing approved content at {}", path.display()), &e))?;
     Ok(staged)
-}
-
-/// Remove everything in `stage_dir`, and say how many entries went.
-///
-/// For the case [`Staged`]'s `Drop` cannot reach: a daemon killed with
-/// `SIGKILL`, or a machine that lost power, between the staging and the write.
-/// Approved content is the most sensitive thing hatch ever puts on disk, so it
-/// is not left to accumulate across restarts.
-///
-/// Run at startup and nowhere else. A sweep during a request would delete the
-/// staged file of a request being decided in another window.
-///
-/// A directory that does not exist is not an error: nothing has been staged
-/// yet, which is the state this function is trying to produce.
-pub fn sweep_stage(stage_dir: &Path) -> std::io::Result<usize> {
-    let entries = match fs::read_dir(stage_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-    let mut swept = 0;
-    for entry in entries {
-        let path = entry?.path();
-        // Files only, and no recursion. hatch puts nothing but flat files
-        // here, so a directory in this path is something else's, and a sweep
-        // that removed trees would be a `rm -rf` pointed at a path taken from
-        // an environment variable.
-        if path.is_file() {
-            fs::remove_file(&path)?;
-            swept += 1;
-        }
-    }
-    Ok(swept)
 }
 
 /// `install -m <mode> -o <owner> -g <group> -T -- <staged> <target>`.
@@ -1502,29 +1470,6 @@ mod tests {
             staged.path().to_path_buf()
         };
         assert!(!path.exists(), "approved bytes survived a path that never wrote them");
-    }
-
-    #[test]
-    fn the_startup_sweep_clears_orphaned_stage_files() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path()).unwrap();
-        fs::write(dir.path().join("orphan"), "approved once, never written").unwrap();
-        fs::write(dir.path().join("another"), "x").unwrap();
-        assert_eq!(sweep_stage(dir.path()).unwrap(), 2);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-        // A staging directory that does not exist yet is the state the sweep
-        // is trying to produce, not a failure to report at startup.
-        assert_eq!(sweep_stage(&dir.path().join("never-made")).unwrap(), 0);
-        // Every other error still is one. Absence is the single case that
-        // means "already swept"; a staging directory that is a plain file, or
-        // one that cannot be read, is a misconfiguration the daemon has to
-        // say out loud at startup rather than pass over as an empty sweep.
-        let not_a_directory = dir.path().join("a-file");
-        fs::write(&not_a_directory, b"x").unwrap();
-        assert!(
-            sweep_stage(&not_a_directory).is_err(),
-            "an unusable staging directory was reported as already clean"
-        );
     }
 
     #[test]
