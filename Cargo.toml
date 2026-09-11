@@ -2,6 +2,14 @@
 name = "hatch"
 version = "0.1.0"
 edition = "2024"
+description = "An MCP server that runs a sandboxed agent's shell commands and file writes on the host, but only after a human has read them in an approval window and said yes."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+# No remote is configured for this checkout. Replace with the canonical URL
+# before publishing; a wrong one here is worse than none.
+# repository = "https://example.invalid/REPLACE-ME/hatch"
+keywords = ["mcp", "agent", "sandbox", "approval", "security"]
+categories = ["command-line-utilities", "development-tools"]
 
 [features]
 default = []
