@@ -212,6 +212,16 @@ never in place of it. A reader can use whichever they trust in the moment, and
 a disagreement between them is visible at a glance because the two sit at the
 same height.
 
+**The face is part of the argument.** The panes are set in Hack, chosen rather
+than inherited, for three reasons that are requirements and not preferences: it
+has **no ligatures**, so `&&` is never drawn as one glyph and `!=` never as
+`≠` — a display rendering something that is not the characters is the thing
+this program refuses everywhere else; every glyph has the same advance, which
+is what the side-by-side fit rule measures a column in; and `l`/`1`/`I`,
+`0`/`O`, `,`/`.` and the three quotes are told apart, because a misread quote
+is a different command. All three are tests, the last of them against what is
+actually rasterised.
+
 **The annotation never removes anything.** Splitting a command at a `;` leaves
 the `;` on screen, dimmed, at the end of its segment. Earlier tools of this
 shape replaced separators with newlines, which deletes a character — and a

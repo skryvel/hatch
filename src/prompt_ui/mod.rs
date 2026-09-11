@@ -226,6 +226,92 @@ pub const HEADLINE_SCALE: f32 = 1.5;
 const SMALL_SCALE: f32 = 0.8;
 const HEADING_SCALE: f32 = 1.4;
 
+/// The face the two panes are drawn in.
+///
+/// # Chosen, not inherited
+///
+/// Hack is what egui bundles and what this window has always used, and it was
+/// right by accident until this was written down. It is named here because
+/// the *reasons* it is right are requirements of this program and not
+/// preferences:
+///
+/// * **No ligatures.** A programming face with them draws `&&` as one glyph,
+///   `!=` as `≠`, `->` as `→`. That is the display rendering something that
+///   is not the characters — the thing this project refuses everywhere else —
+///   and it would break the side-by-side fit rule, which counts characters
+///   against one advance. Hack has none, and
+///   `the_pane_draws_two_characters_as_two_characters` is what keeps a
+///   replacement face from having any.
+/// * **One advance, every glyph.** [`panes::widest_line`] measures a line in
+///   characters and the fit rule multiplies by the width of `'0'`. A face
+///   where one glyph is wider makes that arithmetic a guess.
+/// * **The characters that change a command's meaning are told apart.**
+///   `l`/`1`/`I`, `0`/`O`, `,`/`.`, and the three quotes: a misread quote is a
+///   different command. Hack draws a slashed zero and a serifed `1`, and
+///   `the_characters_a_misreading_turns_into_another_command_are_not_alike`
+///   holds it to that by comparing what is actually rasterised.
+///
+/// # Why the fallback chain is one face long
+///
+/// egui's own monospace family falls back to the *proportional* face for
+/// anything Hack lacks, which is a glyph of another width in a column
+/// measured in one. It cannot fire today — everything either pane draws is
+/// ASCII printable plus the handful of glyphs below, and Hack has every one
+/// of them — and "cannot fire" is the kind of claim that stops being true
+/// quietly.
+/// So the family is Hack alone, and a face that lost a glyph would draw a
+/// visible box rather than a silently mismeasured line.
+pub const MONOSPACE_FACE: &str = "Hack";
+
+/// The face everything that is not a command is drawn in.
+///
+/// Ubuntu-Light, which is egui's own, kept deliberately: it is a humanist
+/// sans with open counters that reads well as the prose the headline is. It
+/// carries none of the load above — nothing measured in characters is drawn
+/// in it, and nothing a reader approves is either.
+///
+/// It does draw chips, though, which is why [`MONOSPACE_FACE`] is behind it
+/// in that family. The lingering window names the command it ran as one small
+/// proportional line, chips included, and Ubuntu-Light has no `↵`: the glyph
+/// that stands in for an invisible character was itself drawn as an empty
+/// box. A chip nobody can read is the failure chips exist to prevent, so the
+/// face that has the glyph is the fallback — and it can fire only where
+/// nothing is measured in characters.
+pub const PROPORTIONAL_FACE: &str = "Ubuntu-Light";
+
+/// The glyphs this window draws that are not the source's own characters.
+///
+/// The three structural chips, the arrow that introduces a resolved value,
+/// and the ellipsis egui elides with and this window's own sentences end in.
+/// Listed here because they are the only non-ASCII either family has to
+/// serve, and so are the whole of what the chains above have to be checked
+/// against.
+#[cfg(test)]
+const DRAWN_GLYPHS: &[char] = &['\u{21B5}', '\u{21E5}', '\u{21E4}', '\u{2192}', '\u{2026}'];
+
+/// Install the faces this window draws in.
+///
+/// Applied to the context before anything is laid out, and before
+/// [`apply_font_size`], which sizes what this chooses.
+pub fn apply_faces(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.families.insert(egui::FontFamily::Monospace, vec![MONOSPACE_FACE.to_owned()]);
+    fonts.families.insert(
+        egui::FontFamily::Proportional,
+        vec![
+            PROPORTIONAL_FACE.to_owned(),
+            // The chips' glyphs, which this face does not have. Behind it,
+            // so it is reached only for what Ubuntu-Light cannot draw.
+            MONOSPACE_FACE.to_owned(),
+            // Kept, and only here: the proportional family draws text nothing
+            // measures, so a glyph of another width in it costs nothing.
+            "NotoEmoji-Regular".to_owned(),
+            "emoji-icon-font".to_owned(),
+        ],
+    );
+    ctx.set_fonts(fonts);
+}
+
 /// Draw every text style at the size the config asks for.
 ///
 /// Applied once, to the context's style, rather than at each label: the
@@ -805,6 +891,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
             // context to wake and so a window that never opens never reads a
             // request it could not have shown. Nothing is lost by waiting:
             // the daemon's first write fits in the pipe.
+            apply_faces(&cc.egui_ctx);
             apply_font_size(&cc.egui_ctx, font_size);
             theme::apply(&cc.egui_ctx, theme);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1777,6 +1864,194 @@ mod tests {
         assert!(large.y > small.y, "and the same height");
     }
 
+    // ---- the face the command is read in ----------------------------------
+
+    /// A context with this window's faces and a size on them, run once so
+    /// that its fonts exist.
+    fn a_typeset_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx
+    }
+
+    /// Everything either pane can draw: the set `render::unicode::is_plain`
+    /// admits, plus the glyphs hatch adds. The space is left out — it is
+    /// drawn by the layout and has no glyph of its own in any face.
+    fn drawable() -> Vec<char> {
+        ('!'..='~').chain(DRAWN_GLYPHS.iter().copied()).collect()
+    }
+
+    /// What one character is actually rasterised as, in the face the style
+    /// resolves to: the size of its patch of the atlas, and the coverage in
+    /// it.
+    ///
+    /// The picture and not the codepoint, because both questions asked of it
+    /// below are about what a reader sees. Two characters with the same ink
+    /// cannot be told apart, and a character whose ink is the replacement box
+    /// is one the window is not really drawing.
+    ///
+    /// `Fonts::has_glyph` would be the obvious tool and cannot be used: it
+    /// answers by comparing the resolved face with the family's replacement
+    /// face, so for a family one face long — which the monospace family
+    /// deliberately is — it says no about every character in it.
+    fn ink(ctx: &egui::Context, font: &egui::FontId, c: char) -> (u16, u16, Vec<u8>) {
+        let galley = ctx.fonts_mut(|fonts| {
+            fonts.layout_no_wrap(c.to_string(), font.clone(), egui::Color32::WHITE)
+        });
+        let uv = galley.rows[0].glyphs[0].uv_rect;
+        let image = ctx.fonts(|fonts| fonts.image());
+        let mut pixels = Vec::new();
+        for y in uv.min[1]..uv.max[1] {
+            for x in uv.min[0]..uv.max[0] {
+                pixels.push(image[(usize::from(x), usize::from(y))].a());
+            }
+        }
+        (uv.max[0] - uv.min[0], uv.max[1] - uv.min[1], pixels)
+    }
+
+    /// A character no face this window loads has, so whatever it rasterises
+    /// to is the replacement glyph.
+    const ABSENT: char = '\u{4E00}';
+
+    #[test]
+    fn the_panes_are_drawn_in_the_face_this_window_chose() {
+        // Inherited is how it was right by accident. The monospace family is
+        // one face long on purpose — see `MONOSPACE_FACE` — because egui's
+        // own falls back to the proportional face, which is a glyph of
+        // another width in a column measured in one.
+        let ctx = a_typeset_context();
+        let families = ctx.fonts(|fonts| fonts.definitions().families.clone());
+
+        assert_eq!(
+            families[&egui::FontFamily::Monospace],
+            vec![MONOSPACE_FACE.to_string()],
+            "the pane's family is not this face alone"
+        );
+        assert_eq!(
+            families[&egui::FontFamily::Proportional].first().map(String::as_str),
+            Some(PROPORTIONAL_FACE),
+            "the prose face is not the one that was chosen"
+        );
+    }
+
+    #[test]
+    fn no_glyph_this_window_draws_comes_out_as_an_empty_box() {
+        // Found by looking at the real window. The lingering window names the
+        // command it ran in one small *proportional* line, chips and all, and
+        // Ubuntu-Light has no `↵`: what got drawn where the glyph standing in
+        // for an invisible character should have been was an empty box. That
+        // is the failure a chip exists to prevent, arriving through the font
+        // stack rather than through the renderer.
+        //
+        // Every style the window draws in, because the chips are not the
+        // panes' alone.
+        let ctx = a_typeset_context();
+        let style = ctx.style_of(egui::Theme::Dark);
+        for text_style in
+            [egui::TextStyle::Monospace, egui::TextStyle::Small, egui::TextStyle::Body]
+        {
+            let font = text_style.resolve(&style);
+            let missing = ink(&ctx, &font, ABSENT);
+            for c in drawable() {
+                assert_ne!(
+                    ink(&ctx, &font, c),
+                    missing,
+                    "{text_style:?} draws U+{:04X} {c:?} as the replacement box",
+                    c as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_glyph_a_pane_can_draw_is_one_advance_wide() {
+        // The premise under `panes::advance` and the whole side-by-side fit
+        // rule: a line is measured in characters and the column is measured
+        // in widths of `'0'`. A glyph of another width — or a missing one,
+        // which is width zero and therefore invisible — makes that a guess.
+        let ctx = a_typeset_context();
+        let font = egui::TextStyle::Monospace.resolve(&ctx.style_of(egui::Theme::Dark));
+        ctx.fonts_mut(|fonts| {
+            let advance = fonts.glyph_width(&font, '0');
+            assert!(advance > 0.0, "the face has no zero in it");
+            for c in drawable().into_iter().chain([' ']) {
+                let width = fonts.glyph_width(&font, c);
+                assert_eq!(
+                    width,
+                    advance,
+                    "U+{:04X} {c:?} is {width} wide against an advance of {advance}",
+                    c as u32
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_pane_draws_two_characters_as_two_characters() {
+        // A ligature is the display rendering something that is not the
+        // characters, which is the one thing this whole program refuses. A
+        // face with them would draw `&&` as a single glyph and `!=` as `≠` —
+        // and it would break the fit rule at the same time, since the run
+        // would no longer be as wide as it has characters.
+        let ctx = a_typeset_context();
+        let font = egui::TextStyle::Monospace.resolve(&ctx.style_of(egui::Theme::Dark));
+        let advance = ctx.fonts_mut(|fonts| fonts.glyph_width(&font, '0'));
+
+        for pair in
+            ["&&", "||", "!=", "==", "->", "<-", "=>", ">=", "<=", "::", "|>", "//", "...", ";;"]
+        {
+            let galley = ctx.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(pair.to_string(), font.clone(), egui::Color32::WHITE)
+            });
+            let glyphs: usize = galley.rows.iter().map(|row| row.glyphs.len()).sum();
+            assert_eq!(
+                glyphs,
+                pair.chars().count(),
+                "{pair:?} was drawn as fewer glyphs than it has characters"
+            );
+            let want = advance * pair.chars().count() as f32;
+            // Half a point of slack: a galley's width is rounded to the
+            // pixel grid, and what is being refused here is a glyph going
+            // missing, which costs a whole advance.
+            assert!(
+                (galley.size().x - want).abs() < 0.5,
+                "{pair:?} laid out {} wide against {want} for its characters",
+                galley.size().x
+            );
+        }
+    }
+
+    #[test]
+    fn the_characters_a_misreading_turns_into_another_command_are_not_alike() {
+        // A misread quote is a different command, and `rm -rf /l` is not
+        // `rm -rf /1`. Asked of what is actually rasterised rather than of
+        // the face's name: two characters whose bitmaps match are two
+        // characters a reader cannot tell apart, whatever the face claims.
+        let ctx = a_typeset_context();
+        let font = egui::TextStyle::Monospace.resolve(&ctx.style_of(egui::Theme::Dark));
+
+        for group in [
+            ['l', '1', 'I'].as_slice(),
+            ['0', 'O'].as_slice(),
+            [',', '.'].as_slice(),
+            ['\'', '`', '"'].as_slice(),
+            [';', ':'].as_slice(),
+        ] {
+            for (index, first) in group.iter().enumerate() {
+                for second in &group[index + 1..] {
+                    assert_ne!(
+                        ink(&ctx, &font, *first),
+                        ink(&ctx, &font, *second),
+                        "{first:?} and {second:?} are drawn as the same picture"
+                    );
+                }
+            }
+        }
+    }
+
     fn a_request(seconds_left: i64) -> Request {
         Request {
             title: "delete the build directory".to_string(),
@@ -2713,6 +2988,7 @@ mod tests {
     /// pane a reader sees.
     fn window_text(app: &mut PromptApp, open: bool) -> String {
         let ctx = egui::Context::default();
+        apply_faces(&ctx);
         // Twice: the first frame is what teaches the panels their size, and
         // a pane sized against a zero-height guess is not the pane a user
         // sees.
@@ -3122,6 +3398,7 @@ mod tests {
     fn window_shapes(app: &mut PromptApp, size: egui::Vec2) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         theme::apply(&ctx, theme::Theme::Dark);
+        apply_faces(&ctx);
         apply_font_size(&ctx, 16.0);
         // Three frames: a panel learns its height from the frame before, so a
         // pane measured against the first frame's guess is not the pane a
