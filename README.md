@@ -278,10 +278,13 @@ has no line for, which is not the same as a blank line.*
 **The typing guard.** Every input is inert for 750 ms after the window gains
 focus, and events delivered during that interval are dropped rather than
 buffered and replayed. Enter is never a default-activate: approving takes a
-click or Ctrl+Enter, and Esc is guarded on the same terms. A person mid-burst
-at another window cannot approve something that appeared under their hands.
-The 750 ms is hardcoded and deliberately not a config key — it is a safety
-property, and a setting inviting it to be lowered to zero is a liability.
+click or Ctrl+Enter, and Esc is guarded on the same terms. Both are printed on
+the buttons, and printed exactly: `Ctrl+Shift+Enter` is deliberately inert, so
+a label loose enough for a reader to expect it to work would be the window
+promising something it refuses. A person mid-burst at another window cannot
+approve something that appeared under their hands. The 750 ms is hardcoded and
+deliberately not a config key — it is a safety property, and a setting inviting
+it to be lowered to zero is a liability.
 
 **After Approve the window stays.** It becomes a running indicator with elapsed
 time and a Kill button, and the output pane if streaming was ticked. Kill

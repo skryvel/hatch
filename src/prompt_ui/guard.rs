@@ -99,6 +99,26 @@ pub const GUARD: Duration = Duration::from_millis(750);
 /// than being a dialog nobody can answer or dismiss.
 pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 
+/// What the Approve button says the keyboard shortcut is.
+///
+/// Here rather than beside the button, because a shortcut nobody can see is a
+/// shortcut nobody has, and a shortcut printed loosely is worse than none: a
+/// reader who is told "Ctrl+Enter" and finds that Ctrl+Shift+Enter works too
+/// has learned that the window is approximate about what it accepts. It is
+/// not. [`is_approve_chord`] takes Control and refuses every other modifier
+/// held with it, and this string names exactly that and nothing else.
+///
+/// `the_buttons_name_exactly_the_chords_the_guard_takes` reads this label the
+/// way a user does and holds the rule to it, so the two cannot drift apart.
+pub const APPROVE_CHORD: &str = "Ctrl+Enter";
+
+/// What the Deny button says the keyboard shortcut is.
+///
+/// Bare, and the label says so by naming no modifier at all: Escape with
+/// anything held is [`Action::Ignored`]. Pinned to the rule alongside
+/// [`APPROVE_CHORD`].
+pub const DENY_CHORD: &str = "Esc";
+
 /// What the window should do about one input event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -502,6 +522,67 @@ mod tests {
                 Action::Ignored,
                 "Enter with {m:?}"
             );
+        }
+    }
+
+    /// The chord a button's label names, read the way a user reads it.
+    ///
+    /// A parser and not a table on purpose: what has to be checked is the
+    /// string that reaches the screen, so a label that grew a modifier, lost
+    /// one, or started naming a key this window does not act on fails here
+    /// rather than becoming a promise nothing keeps. `Ctrl` is Control in the
+    /// one spelling the label uses; the three spellings the backends send are
+    /// the rule's business and are covered below.
+    fn named(label: &str) -> (Key, Modifiers) {
+        let mut wanted = Modifiers::NONE;
+        let mut parts = label.split('+').peekable();
+        let mut key = None;
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                key = Some(match part {
+                    "Enter" => Key::Enter,
+                    "Esc" => Key::Escape,
+                    other => panic!("{label:?} names a key this test cannot read: {other:?}"),
+                });
+                break;
+            }
+            match part {
+                "Ctrl" => wanted.ctrl = true,
+                "Shift" => wanted.shift = true,
+                "Alt" => wanted.alt = true,
+                other => panic!("{label:?} names a modifier this test cannot read: {other:?}"),
+            }
+        }
+        (key.expect("a label names a key"), wanted)
+    }
+
+    #[test]
+    fn the_buttons_name_exactly_the_chords_the_guard_takes() {
+        // The labels and the rule, held together. A user who reads
+        // "Ctrl+Enter" off the button expects Control and Enter to approve
+        // and expects nothing else to, so every one of the modifier
+        // combinations the label does not name has to be refused — including
+        // Ctrl+Shift+Enter, which is deliberately inert and which a looser
+        // label would be quietly promising.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+
+        for (label, decides) in [(APPROVE_CHORD, Action::Approve), (DENY_CHORD, Action::Deny)] {
+            let (key, wanted) = named(label);
+            for m in every_modifier_combination() {
+                // Control has three spellings and a backend may send any of
+                // them; they are one modifier, and the label spells it once.
+                let control = m.ctrl || m.command || m.mac_cmd;
+                let is_named = control == wanted.ctrl
+                    && m.shift == wanted.shift
+                    && m.alt == wanted.alt;
+                assert_eq!(
+                    guard.classify(&press(key, m), m, now) == decides,
+                    is_named,
+                    "{label:?} and the guard disagree about {m:?}"
+                );
+            }
         }
     }
 

@@ -1648,15 +1648,10 @@ impl PromptApp {
         let places = flanked_row(ui, height, width, flanks);
 
         let mut verdicts = |ui: &mut egui::Ui| {
-            let approve = unfocusable(
-                ui,
-                egui::Button::new(strong("Approve")).min_size(primary_button(ui)),
-            );
+            let approve = unfocusable(ui, primary(ui, "Approve", guard::APPROVE_CHORD));
             // A pointer that slips off Deny must land on nothing.
             ui.add_space(PRIMARY_GAP);
-            if unfocusable(ui, egui::Button::new(strong("Deny")).min_size(primary_button(ui)))
-                .clicked()
-            {
+            if unfocusable(ui, primary(ui, "Deny", guard::DENY_CHORD)).clicked() {
                 *decided = Some(Verdict::Deny { note: note.to_string() });
             }
             approve
@@ -1796,6 +1791,32 @@ fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
 /// A primary button's label.
 fn strong(label: &str) -> egui::RichText {
     egui::RichText::new(label).strong().size(16.0)
+}
+
+/// One of the two buttons that decide: what it does, and the key that does
+/// the same thing.
+///
+/// # Why the shortcut is on the button
+///
+/// `Ctrl+Enter` and `Escape` have always worked and nothing on screen said
+/// so, which made them discoverable by reading the source. A window whose
+/// fastest way to deny is a secret is a window people answer with the mouse
+/// while they are busy, and the whole point of the escape key here is that
+/// refusing should cost nothing.
+///
+/// It is drawn from [`guard::APPROVE_CHORD`] and [`guard::DENY_CHORD`], which
+/// live beside the rule they describe and are held to it by a test. Nothing
+/// here may word the shortcut for itself: `Ctrl+Shift+Enter` is deliberately
+/// inert, so a label loose enough for a reader to expect it to work would be
+/// this window promising something it refuses to do.
+///
+/// The hint is small and quiet — hatch's own voice, beside the word for what
+/// the button does — and it fits inside the width the button already had, so
+/// the cluster the two buttons are centred in does not move. That claim is
+/// `the_shortcut_hints_fit_the_buttons_that_were_already_there`.
+fn primary(ui: &egui::Ui, label: &str, chord: &str) -> egui::Button<'static> {
+    egui::Button::new((strong(label), egui::RichText::new(chord).small().weak()))
+        .min_size(primary_button(ui))
 }
 
 #[cfg(test)]
@@ -2048,6 +2069,46 @@ mod tests {
                         "{first:?} and {second:?} are drawn as the same picture"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_shortcut_hints_fit_the_buttons_that_were_already_there() {
+        // The rect Approve and Deny are centred in is `cluster_width`, which
+        // is two button minimums and the gap between them, and what sits just
+        // past its edge is the escape hatches. A label that outgrew the
+        // minimum would widen the buttons without widening the rect, and the
+        // fallback that gives the hatches a row of their own would stop
+        // firing when it is needed — so the hint has to fit the button that
+        // was already there, not enlarge it.
+        //
+        // Two sizes, because the minimum is a multiple of the font and the
+        // hint is drawn in a style that follows it: a claim made at one size
+        // only would not be a claim about the reader's size.
+        for points in [11.0, 20.0] {
+            let ctx = egui::Context::default();
+            apply_faces(&ctx);
+            apply_font_size(&ctx, points);
+            let mut measured = Vec::new();
+            let mut out = ctx.run_ui(raw_sized(Vec::new(), opening_size()), |ui| {
+                let least = primary_button(ui).x;
+                for (label, chord) in
+                    [("Approve", guard::APPROVE_CHORD), ("Deny", guard::DENY_CHORD)]
+                {
+                    let width = unfocusable(ui, primary(ui, label, chord)).rect.width();
+                    measured.push((label, width, least));
+                }
+            });
+            out.textures_delta.clear();
+
+            assert_eq!(measured.len(), 2, "the buttons were not drawn");
+            for (label, width, least) in measured {
+                assert!(
+                    width <= least,
+                    "{label} with its shortcut is {width} wide at {points} points, past the \
+                     {least} the cluster is measured from"
+                );
             }
         }
     }
@@ -3114,6 +3175,17 @@ mod tests {
             drawn.contains("rm -rf /var/tmp/build"),
             "the window is asking about a command it does not show: {drawn}"
         );
+    }
+
+    #[test]
+    fn the_window_says_which_keys_decide() {
+        // They always worked; nothing said so, which made them discoverable
+        // by reading the source. The strings are the guard's own, so this
+        // cannot pass against a label the rule does not accept.
+        let drawn = window_text(&mut a_window_showing("rm -rf /var/tmp/build"), true);
+
+        assert!(drawn.contains(guard::APPROVE_CHORD), "no key is offered for Approve: {drawn}");
+        assert!(drawn.contains(guard::DENY_CHORD), "no key is offered for Deny: {drawn}");
     }
 
     #[test]
