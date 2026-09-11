@@ -1995,19 +1995,11 @@ impl Daemon {
                     .outbox()
                     .finished(protocol::Outcome::Exit { code: 0 })
                     .await;
-                let unchecked = match &landed {
-                    // Not folded into silence. hatch was unable to confirm,
-                    // which is a smaller thing than a mismatch and a larger
-                    // one than nothing: the agent is told the difference.
-                    swap::Landed::Unchecked { why } => format!(
-                        "\nhatch could not re-examine the file to confirm this: {why}"
-                    ),
-                    _ => String::new(),
-                };
                 (
                     LogVerdict::Approve,
                     CallToolResult::success(vec![ContentBlock::text(format!(
-                        "wrote {described} as root{unchecked}"
+                        "wrote {described} as root{}",
+                        confirmation_note(&landed)
                     ))]),
                     Windup::Close,
                 )
@@ -2040,21 +2032,7 @@ impl Daemon {
                 )
             }
             outcome => {
-                // An unclear root write is not the same as an unclear root
-                // command. `install` truncates its destination rather than
-                // renaming onto it, so a write hatch cut short can leave the
-                // file short — which means "hatch cannot say whether it ran"
-                // has to carry "and the file may be neither version".
-                let note = match &outcome {
-                    RootOutcome::Unclear { .. } => format!(
-                        "{}\n\nRead {} before anything else: a root write is not a rename, so \
-                         one that was cut short can leave the file neither as it was nor as it \
-                         was going to be.",
-                        first_line(&output.stderr),
-                        path.display(),
-                    ),
-                    _ => first_line(&output.stderr).to_string(),
-                };
+                let note = root_write_note(&outcome, path, &output.stderr);
                 self.elevation_ended(session, &outcome, &note).await
             }
         }
@@ -2095,6 +2073,51 @@ fn record_landing(detail: &mut LogDetail, content: &[u8], plan: &SwapPlan) {
         swap.mode = Some(format!("{:04o}", plan.landing_mode));
         swap.owner = Some(format!("{}:{}", plan.landing_owner, plan.landing_group));
         swap.bytes = Some(content.len() as u64);
+    }
+}
+
+/// What a successful root write adds about hatch's own confidence in it.
+///
+/// Empty when hatch looked and the file is what the window described, which
+/// is the ordinary case and needs no sentence. The other answer is not folded
+/// into that silence: hatch being unable to look is a smaller thing than a
+/// mismatch and a larger one than nothing, and an agent told only "wrote it"
+/// would have no way to know the difference.
+///
+/// [`swap::Landed::Different`] never reaches here — the caller returns an
+/// error before it — so this function is about the two endings that are still
+/// a successful write.
+fn confirmation_note(landed: &swap::Landed) -> String {
+    match landed {
+        swap::Landed::Unchecked { why } => {
+            format!("\nhatch could not re-examine the file to confirm this: {why}")
+        }
+        _ => String::new(),
+    }
+}
+
+/// What goes with an elevation outcome that ended a root *write* rather than
+/// a root command.
+///
+/// The difference is [`RootOutcome::Unclear`], and it matters because of what
+/// `install` is. A root command hatch cannot account for leaves the machine
+/// in an unknown state; a root *write* hatch cannot account for leaves a
+/// named file in one, and `install` truncates its destination rather than
+/// renaming onto it — so "hatch cannot say whether it ran" has to carry "and
+/// that file may be neither version". Naming the path is the whole value: it
+/// is the one thing the reader can act on.
+///
+/// Every other outcome means nothing was written, and the elevation
+/// program's own first line is all there is to add.
+fn root_write_note(outcome: &RootOutcome, path: &Path, stderr: &str) -> String {
+    match outcome {
+        RootOutcome::Unclear { .. } => format!(
+            "{}\n\nRead {} before anything else: a root write is not a rename, so one that was \
+             cut short can leave the file neither as it was nor as it was going to be.",
+            first_line(stderr),
+            path.display(),
+        ),
+        _ => first_line(stderr).to_string(),
     }
 }
 
@@ -3287,6 +3310,43 @@ mod tests {
             !hosts.iter().any(|h| h == "0.0.0.0" || h.is_empty()),
             "an entry that means \"anything\" would undo the protection"
         );
+    }
+
+    #[test]
+    fn a_write_hatch_could_not_confirm_says_so_rather_than_reading_as_confirmed() {
+        // The ordinary ending adds nothing: hatch looked, it matched.
+        assert_eq!(confirmation_note(&crate::swap::Landed::AsApproved), "");
+        // Not looking is a different answer from looking and agreeing, and
+        // the agent is told which one it got. Folding this into silence would
+        // make "wrote it" mean two different things.
+        let note = confirmation_note(&crate::swap::Landed::Unchecked {
+            why: "/etc/secret could not be examined afterwards: Permission denied".to_string(),
+        });
+        assert!(note.contains("could not re-examine"), "{note}");
+        assert!(note.contains("Permission denied"), "{note}");
+    }
+
+    #[test]
+    fn an_unaccountable_root_write_names_the_file_a_reader_has_to_look_at() {
+        let path = Path::new("/etc/systemd/zram-generator.conf");
+        let unclear = RootOutcome::Unclear {
+            exit: None,
+            message: "hatch ended it at the deadline".to_string(),
+        };
+
+        let note = root_write_note(&unclear, path, "");
+        // `install` truncates rather than renaming, so an unaccountable root
+        // write leaves a named file possibly neither version. Naming it is
+        // the one thing the reader can act on.
+        assert!(note.contains("zram-generator.conf"), "{note}");
+        assert!(note.contains("not a rename"), "{note}");
+
+        // Every other outcome means nothing was written, so there is no file
+        // to send anybody to look at — only what the elevation said.
+        let denied = root_write_note(&RootOutcome::Denied, path, "Access denied
+rest");
+        assert_eq!(denied, "Access denied");
+        assert!(!denied.contains("zram-generator.conf"), "{denied}");
     }
 
     #[test]
