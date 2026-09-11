@@ -2372,12 +2372,13 @@ mod tests {
 
     #[test]
     fn everything_that_is_not_an_approval_closes_the_window() {
-        for verdict in [
-            Verdict::Deny { note: "no".to_string() },
-            Verdict::Revise { kind: ReviseKind::Explain, note: String::new() },
-            Verdict::Revise { kind: ReviseKind::Simplify, note: String::new() },
-            Verdict::SelfRun { note: String::new() },
-        ] {
+        // The whole set, minus the one verdict that leaves something to
+        // watch. See `crate::protocol::every_verdict` on why the list is not
+        // written out here.
+        for verdict in crate::protocol::every_verdict()
+            .into_iter()
+            .filter(|verdict| !matches!(verdict, Verdict::Approve { .. }))
+        {
             let mut state = PromptState::new();
             state.handle(DaemonMsg::Request(a_request(90)));
             assert!(state.decide(verdict.clone()).is_some());
@@ -2559,14 +2560,7 @@ mod tests {
                 assert!(state.keep());
             }
             let was = state.phase();
-            for verdict in [
-                Verdict::Approve { stream: true },
-                Verdict::Approve { stream: false },
-                Verdict::Deny { note: "no".to_string() },
-                Verdict::Revise { kind: ReviseKind::Explain, note: String::new() },
-                Verdict::Revise { kind: ReviseKind::Simplify, note: String::new() },
-                Verdict::SelfRun { note: String::new() },
-            ] {
+            for verdict in crate::protocol::every_verdict() {
                 assert_eq!(state.decide(verdict.clone()), None, "{verdict:?} from {was:?}");
             }
             assert_eq!(state.request_kill(), None, "there is nothing left to kill");

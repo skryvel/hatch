@@ -663,6 +663,51 @@ pub enum ReviseKind {
     Simplify,
 }
 
+/// One of every verdict, for the tests across this crate that must cover the
+/// whole set.
+///
+/// There were four hand-written copies of this list — here, in the window,
+/// and twice in the daemon — and a hand-written list is one that goes on
+/// passing after a variant is added to the enum it was written from. So there
+/// is one list, and [`verdict_variant`] beside it is what enforces it: that
+/// match is exhaustive, so a new variant stops this module compiling, and the
+/// arm its author is then made to write is what turns a sample missing from
+/// here into a failing test rather than a quiet pass.
+#[cfg(test)]
+pub(crate) fn every_verdict() -> Vec<Verdict> {
+    vec![
+        Verdict::Approve { stream: true },
+        Verdict::Approve { stream: false },
+        Verdict::Deny { note: "not now".to_string() },
+        Verdict::Revise {
+            kind: ReviseKind::Explain,
+            note: "which files does this touch?".to_string(),
+        },
+        Verdict::Revise { kind: ReviseKind::Simplify, note: "one command at a time".to_string() },
+        Verdict::SelfRun { note: "I will run it here".to_string() },
+    ]
+}
+
+/// How many variants [`Verdict`] has. Grows with the match below, and the
+/// index into an array of this size is what catches it not having.
+#[cfg(test)]
+const VERDICT_VARIANTS: usize = 4;
+
+/// Which variant a verdict is, as a position in an array of
+/// [`VERDICT_VARIANTS`].
+///
+/// The exhaustive match is the point; the number it returns is only how the
+/// test counts what it has seen.
+#[cfg(test)]
+fn verdict_variant(verdict: &Verdict) -> usize {
+    match verdict {
+        Verdict::Approve { .. } => 0,
+        Verdict::Deny { .. } => 1,
+        Verdict::Revise { .. } => 2,
+        Verdict::SelfRun { .. } => 3,
+    }
+}
+
 // ---- renderings on the wire ------------------------------------------------
 
 /// One span, as it crosses the pipe: where it ends, what it is, and whether a
@@ -884,22 +929,38 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_list_has_one_of_every_verdict() {
+        // What the four exhaustive tests in this crate rest on. `seen` is
+        // indexed by `verdict_variant`, so an arm added there without room in
+        // `VERDICT_VARIANTS` panics here rather than being counted quietly,
+        // and a variant left out of the list fails the assertion.
+        let mut seen = [false; VERDICT_VARIANTS];
+        for verdict in every_verdict() {
+            seen[verdict_variant(&verdict)] = true;
+        }
+        assert!(seen.iter().all(|&found| found), "a verdict has no sample: {seen:?}");
+
+        // The two revisions are one variant carrying a kind, so the variant
+        // being present is not the same as both sentences being reachable.
+        let mut kinds = [false; 2];
+        for verdict in every_verdict() {
+            if let Verdict::Revise { kind, .. } = verdict {
+                kinds[match kind {
+                    ReviseKind::Explain => 0,
+                    ReviseKind::Simplify => 1,
+                }] = true;
+            }
+        }
+        assert!(kinds.iter().all(|&found| found), "a revision has no sample: {kinds:?}");
+    }
+
+    #[test]
     fn prompt_messages_round_trip() {
-        let messages = [
-            PromptMsg::Verdict(Verdict::Approve { stream: true }),
-            PromptMsg::Verdict(Verdict::Approve { stream: false }),
-            PromptMsg::Verdict(Verdict::Deny { note: "not now".to_string() }),
-            PromptMsg::Verdict(Verdict::Revise {
-                kind: ReviseKind::Explain,
-                note: "which files does this touch?".to_string(),
-            }),
-            PromptMsg::Verdict(Verdict::Revise {
-                kind: ReviseKind::Simplify,
-                note: "one command at a time".to_string(),
-            }),
-            PromptMsg::Verdict(Verdict::SelfRun { note: "I will run it here".to_string() }),
-            PromptMsg::Kill,
-        ];
+        let messages: Vec<PromptMsg> = every_verdict()
+            .into_iter()
+            .map(PromptMsg::Verdict)
+            .chain([PromptMsg::Kill])
+            .collect();
         for message in messages {
             let encoded = encode(&message).expect("a prompt message encodes");
             assert!(
@@ -1065,16 +1126,9 @@ mod tests {
         // The authority test. A prompt answers the window it was given, and
         // there is no field in which it could answer for another one or
         // approve something other than what it was shown.
-        for message in [
-            PromptMsg::Verdict(Verdict::Approve { stream: true }),
-            PromptMsg::Verdict(Verdict::Deny { note: "no".to_string() }),
-            PromptMsg::Verdict(Verdict::Revise {
-                kind: ReviseKind::Simplify,
-                note: "no".to_string(),
-            }),
-            PromptMsg::Verdict(Verdict::SelfRun { note: "no".to_string() }),
-            PromptMsg::Kill,
-        ] {
+        for message in
+            every_verdict().into_iter().map(PromptMsg::Verdict).chain([PromptMsg::Kill])
+        {
             let json: serde_json::Value =
                 serde_json::from_str(&encode(&message).expect("encodes")).expect("valid JSON");
             for key in json.as_object().expect("an object").keys() {

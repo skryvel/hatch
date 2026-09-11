@@ -3467,7 +3467,7 @@ later"), "");
         use crate::exec::elevate::Rehearsed;
         use crate::prompter::{ProcessPrompter, Reply, StubPrompter};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        use crate::protocol::{ReviseKind, Verdict};
+        use crate::protocol::Verdict;
 
         /// One daemon over a temporary hatch directory, with a scripted
         /// window in front of it.
@@ -3544,28 +3544,8 @@ later"), "");
 
         #[tokio::test]
         async fn every_non_approve_verdict_is_a_recoverable_tool_error() {
-            for (verdict, needle, logged) in [
-                (
-                    Verdict::Deny { note: "no".to_string() },
-                    "denied by user: no",
-                    LogVerdict::Deny,
-                ),
-                (
-                    Verdict::Revise { kind: ReviseKind::Explain, note: "why?".to_string() },
-                    "explain: why?",
-                    LogVerdict::Explain,
-                ),
-                (
-                    Verdict::Revise { kind: ReviseKind::Simplify, note: "shorter".to_string() },
-                    "more legible form: shorter",
-                    LogVerdict::Simplify,
-                ),
-                (
-                    Verdict::SelfRun { note: "mine".to_string() },
-                    "will run this themselves",
-                    LogVerdict::SelfRun,
-                ),
-            ] {
+            for verdict in refusing_verdicts() {
+                let (needle, logged) = expected_of(&verdict);
                 let harness = Harness::new(vec![Reply::verdict(verdict.clone())]);
                 let result = within(harness.daemon.run_command(run_of("true"), Caller::quiet()))
                     .await;
@@ -5525,6 +5505,42 @@ later"), "");
 
     // --- what each outcome says ---------------------------------------------
 
+    /// Every verdict that refuses, which is every verdict but the one that
+    /// runs something.
+    ///
+    /// Off [`crate::protocol::every_verdict`] rather than written out, so a
+    /// verdict added to the protocol is a verdict these tests start asking
+    /// about on their own.
+    fn refusing_verdicts() -> Vec<crate::protocol::Verdict> {
+        crate::protocol::every_verdict()
+            .into_iter()
+            .filter(|verdict| !matches!(verdict, crate::protocol::Verdict::Approve { .. }))
+            .collect()
+    }
+
+    /// What the agent must be told, and what the log must say, for one
+    /// refusing verdict.
+    ///
+    /// The match is exhaustive on purpose: a new verdict does not compile
+    /// until somebody has decided what it says to an agent, which is the one
+    /// thing about it that must not be arrived at by accident.
+    fn expected_of(verdict: &crate::protocol::Verdict) -> (&'static str, LogVerdict) {
+        use crate::protocol::{ReviseKind, Verdict};
+        match verdict {
+            Verdict::Deny { .. } => ("denied by user", LogVerdict::Deny),
+            Verdict::Revise { kind: ReviseKind::Explain, .. } => {
+                ("asks you to explain", LogVerdict::Explain)
+            }
+            Verdict::Revise { kind: ReviseKind::Simplify, .. } => {
+                ("more legible form", LogVerdict::Simplify)
+            }
+            Verdict::SelfRun { .. } => ("will run this themselves", LogVerdict::SelfRun),
+            // `refusing_verdicts` filters it out, and `declined` refuses to
+            // treat it as a refusal at all.
+            Verdict::Approve { .. } => unreachable!("an approval is not a refusal"),
+        }
+    }
+
     fn a_run_detail() -> LogDetail {
         LogDetail::RunCommand(RunDetail {
             command: "true".to_string(),
@@ -5540,43 +5556,34 @@ later"), "");
 
     #[test]
     fn each_verdict_maps_to_its_own_sentence_and_its_own_log_line() {
-        use crate::audit::LogVerdict;
-        use crate::protocol::{ReviseKind, Verdict};
+        use crate::protocol::Verdict;
 
-        let cases = [
-            (
-                Verdict::Deny { note: "no".to_string() },
-                LogVerdict::Deny,
-                "denied by user: no",
-            ),
-            (
-                Verdict::Revise { kind: ReviseKind::Explain, note: "why?".to_string() },
-                LogVerdict::Explain,
-                "explain: why?",
-            ),
-            (
-                Verdict::Revise { kind: ReviseKind::Simplify, note: "shorter".to_string() },
-                LogVerdict::Simplify,
-                "more legible form: shorter",
-            ),
-            (
-                Verdict::SelfRun { note: "mine".to_string() },
-                LogVerdict::SelfRun,
-                "will run this themselves",
-            ),
-        ];
+        let refusing = refusing_verdicts();
         let mut sentences = Vec::new();
-        for (verdict, logged, needle) in cases {
+        for verdict in &refusing {
+            let (needle, logged) = expected_of(verdict);
             let outcome = declined(verdict.clone(), a_run_detail());
             assert_eq!(outcome.verdict, logged, "{verdict:?}");
             assert_eq!(outcome.result.is_error, Some(true), "{verdict:?}");
             let text = result_text(&outcome.result);
             assert!(text.contains(needle), "{verdict:?} said {text}");
+            // The user's own words, wherever the sentence puts them.
+            let note = match verdict {
+                Verdict::Deny { note }
+                | Verdict::Revise { note, .. }
+                | Verdict::SelfRun { note } => note.as_str(),
+                Verdict::Approve { .. } => unreachable!("an approval is not a refusal"),
+            };
+            assert!(text.contains(note), "{verdict:?} dropped the note: {text}");
             sentences.push(text);
         }
         sentences.sort();
         sentences.dedup();
-        assert_eq!(sentences.len(), 4, "two verdicts that read the same are one verdict");
+        assert_eq!(
+            sentences.len(),
+            refusing.len(),
+            "two verdicts that read the same are one verdict"
+        );
 
         // An approval must never be reported as a refusal. It cannot arrive
         // here, and if it ever did the answer says so rather than inventing a
