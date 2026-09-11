@@ -26,13 +26,15 @@
 //!
 //! # What is deliberately not here
 //!
-//! Elevated runs. A `root: true` operation goes through `run0`, whose failure
+//! Elevation. A `root: true` operation goes through `run0`, whose failure
 //! modes are not this module's: a cancelled password dialog is an *elevation*
-//! failure and must not be reported as the command failing, and telling the
-//! two apart needs the real `run0` behaviour observed on a real session.
-//! Classifying that outcome lands with the root path, together with the argv
-//! wrapper that builds an elevated command line. Until then [`run`] is handed
-//! a plain user-level argv and knows nothing about privilege.
+//! failure and must not be reported as the command failing, and the two end
+//! with the same exit status, so telling them apart takes more than a number.
+//! All of that -- the argv wrapper, the environment the elevated child gets,
+//! and the classifier -- lives in [`elevate`], behind a trait, so that this
+//! module keeps taking an argv and knowing nothing about privilege. Nothing
+//! calls it yet: the daemon's `root: true` path still refuses, and wiring it
+//! in is its own change.
 
 pub mod elevate;
 pub mod env;
@@ -58,6 +60,57 @@ use tokio_util::sync::CancellationToken;
 /// it. Named here because [`run`] takes it and never constructs one: the map
 /// is the config's, not the spawner's.
 pub type Env = BTreeMap<String, String>;
+
+// ---- an argv, and the line that stands for it ------------------------------
+
+/// The argv for running `command` through a shell.
+///
+/// Three arguments and never a string: `bash -c <command>` hands the shell one
+/// script, so every quote, space and newline in it is data the shell reads
+/// rather than structure another layer already acted on. Written once and
+/// shared, because the alternative is two call sites that build the same
+/// wrapper and one of them eventually building `format!("bash -c {command}")`
+/// instead — which would re-parse the command at a level the reader was never
+/// shown, and the whole argument for this window is that what is displayed is
+/// what runs.
+pub fn shell_argv(command: &str) -> Vec<String> {
+    vec!["bash".to_string(), "-c".to_string(), command.to_string()]
+}
+
+/// Render an argv as the shell line that would produce it.
+///
+/// This direction is the only safe one. hatch holds an argv — a list of
+/// arguments that are already separate — and needs one line to put on screen;
+/// producing that line by joining with spaces would draw `rm 'my file'` as
+/// `rm my file`, two arguments where one runs, which is a display saying
+/// something other than what happens. So every argument that is not plainly
+/// safe is single-quoted, and a single quote inside one is closed, escaped and
+/// reopened (`'\''`) — the one form that needs no escape table, because
+/// nothing but `'` has any meaning inside single quotes.
+///
+/// An argument is left bare only if it is non-empty and every byte of it is
+/// alphanumeric or one of `_@%+=:,./-`. None of those can start a word, end a
+/// word, open a quote, or mean anything to a shell in argument position, so a
+/// bare word here re-reads as exactly itself. That keeps the common line
+/// readable: `run0 --pipe --setenv=PATH=/usr/bin -- bash -c '…'` quotes the
+/// script and nothing else.
+///
+/// The result is for a human and for a fidelity check, never for execution:
+/// nothing in hatch feeds this string back to a shell.
+pub fn shell_line(argv: &[String]) -> String {
+    argv.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
+}
+
+/// One argument, quoted if it needs it. See [`shell_line`].
+fn shell_quote(arg: &str) -> String {
+    fn bare(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte)
+    }
+    if !arg.is_empty() && arg.bytes().all(bare) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
 
 /// How much is read from a pipe at a time.
 ///
@@ -676,7 +729,7 @@ mod tests {
     }
 
     fn argv(command: &str) -> Vec<String> {
-        vec!["bash".to_string(), "-c".to_string(), command.to_string()]
+        shell_argv(command)
     }
 
     /// The two knobs the plan names, as one call shape: everything else in
@@ -1305,5 +1358,93 @@ mod tests {
         .await
         .expect_err("an empty argv has nothing to run");
         assert!(matches!(err, ExecError::NoProgram), "got {err:?}");
+    }
+
+    // ---- rendering an argv -------------------------------------------------
+
+    #[test]
+    fn a_command_reaches_the_shell_as_one_argument() {
+        // The mutant this is here for replaces the three-element argv with a
+        // single formatted string. Under it `bash` is handed one word, the
+        // rest of the line becomes arguments to the script, and a command
+        // with a space in it stops meaning what the window showed.
+        let argv = shell_argv("echo 'a; b'");
+        assert_eq!(argv, vec!["bash", "-c", "echo 'a; b'"], "three arguments, the last one whole");
+    }
+
+    #[test]
+    fn a_quoted_argument_is_drawn_quoted_rather_than_joined() {
+        assert_eq!(
+            shell_line(&shell_argv("rm 'my file'")),
+            r#"bash -c 'rm '\''my file'\'''"#,
+            "the script is one quoted word and its inner quotes survive"
+        );
+    }
+
+    #[test]
+    fn plain_words_are_left_alone() {
+        // Not cosmetic: the root line is mostly `--setenv=KEY=/some/path`, and
+        // quoting every one of those would bury the one argument that is
+        // genuinely quoted -- the command -- in a line of identical quotes.
+        assert_eq!(
+            shell_line(&[
+                "run0".to_string(),
+                "--pipe".to_string(),
+                "--setenv=PATH=/usr/local/bin:/usr/bin".to_string(),
+                "--".to_string(),
+            ]),
+            "run0 --pipe --setenv=PATH=/usr/local/bin:/usr/bin --"
+        );
+    }
+
+    #[test]
+    fn an_empty_argument_is_still_visible() {
+        // `--setenv=SYSTEMD_PAGER=` is the reason: an empty value is a real
+        // argument, and rendering it as nothing would lose a word from the
+        // line without losing it from the run.
+        assert_eq!(shell_line(&["a".to_string(), String::new(), "b".to_string()]), "a '' b");
+    }
+
+    #[test]
+    fn every_shell_metacharacter_is_quoted() {
+        for hostile in [
+            "a b", "a;b", "a&&b", "a|b", "a>b", "a$b", "a`b`", "a*b", "a~b", "a#b", "a(b)",
+            "a\nb", "a'b", "a\"b", "a\\b", "a!b", "a{b}", "a[b]", "a?b",
+        ] {
+            let line = shell_line(&[hostile.to_string()]);
+            assert!(line.starts_with('\''), "{hostile:?} was left bare as {line:?}");
+        }
+    }
+
+    #[test]
+    fn the_rendered_line_re_splits_into_the_argv_it_came_from() {
+        // The fidelity claim, checked against a real shell rather than
+        // against this module's own idea of quoting. `printf` is the vehicle
+        // only because it writes its arguments back out; what is under test
+        // is that `shell_line` produced a line a shell reads as exactly the
+        // arguments hatch holds. Nothing elevated runs here -- the argv is
+        // built for this test, not taken from the root path.
+        let args = [
+            "it's".to_string(),
+            "two words".to_string(),
+            "$HOME".to_string(),
+            "`id`".to_string(),
+            "a\\b".to_string(),
+            "*".to_string(),
+            String::new(),
+            "-n".to_string(),
+        ];
+        let mut argv = vec!["printf".to_string(), "%s\\n".to_string()];
+        argv.extend(args.iter().cloned());
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(shell_line(&argv))
+            .output()
+            .expect("bash must run");
+        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+        let seen: Vec<String> =
+            String::from_utf8(out.stdout).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(seen, args.to_vec(), "the shell saw different arguments than hatch holds");
     }
 }
