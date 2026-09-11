@@ -204,6 +204,15 @@ being made deliberately.
 Top to bottom: what the agent said it wants and why, then the request itself in
 two panes side by side, then the controls.
 
+**The header is the agent talking, and says so.** The title is the first thing
+read, the most persuasive thing on screen, and written by the party whose
+request is being judged — a reassuring title over a hostile command is the
+cheapest lever a prompt-injected agent has. So the title and the reason are
+drawn as a quotation: a rule down the left of both, and "The agent says" in
+hatch's own small grey italic in front of the first line. Nothing is dimmed or
+hedged; the words keep their size and their contrast. The reader is being told
+whose words these are, not being told to disbelieve them.
+
 **Two panes, same bytes.** The left pane is raw: monospace, no reflow, no
 segmentation, drawn from the same string that becomes the shell's argument. The
 right pane is annotated: numbered segments, highlighting, and `$VAR` references

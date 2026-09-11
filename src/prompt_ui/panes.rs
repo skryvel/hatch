@@ -40,6 +40,7 @@
 //! they arrive defanged and are drawn as they arrive, per
 //! [`crate::protocol::Request`].
 
+use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError};
@@ -670,6 +671,21 @@ fn aside_fits(width: f32, room: f32) -> bool {
     width > 0.0 && width <= room * ASIDE_SHARE
 }
 
+/// How wide the rule beside the agent's words is drawn.
+const QUOTE_RULE: f32 = 2.0;
+
+/// How far the quoted text sits from that rule.
+const QUOTE_GAP: f32 = 8.0;
+
+/// What hatch says in front of the agent's first line.
+///
+/// Short, and not a warning. The agent is usually telling the truth, and a
+/// window that shouted about every title would teach the reader to skip the
+/// one that matters — the same argument that keeps a structural chip quiet.
+/// What this has to do is answer *whose sentence is this*, which takes three
+/// words.
+pub const ATTRIBUTION: &str = "The agent says";
+
 /// The agent's two lines, above everything, with the run context in the
 /// corner of the first one.
 ///
@@ -679,6 +695,28 @@ fn aside_fits(width: f32, room: f32) -> bool {
 /// difference between a label the agent wrote and one hatch substituted.
 /// Classifying what arrives puts every remaining oddity in a box that reads
 /// as hatch's own voice.
+///
+/// # Why the title is marked as a quotation
+///
+/// The title is the first thing read, the most persuasive thing on screen,
+/// and written by the party whose request is being judged. Drawn plainly it
+/// reads as a description of what is about to happen; it is a claim about
+/// intent by the requester, and a prompt-injected agent's cheapest lever is a
+/// reassuring title over a hostile command. The two panes already answer this
+/// for the command — *the colour, the underline and the italics are hatch's
+/// notes, not the command* — and the header had no equivalent.
+///
+/// So the title and the reason are drawn as what they are: quoted. A rule in
+/// hatch's own quiet grey runs down the left of both, and [`ATTRIBUTION`]
+/// leads the first line in that same voice — small, quiet, italic — set in
+/// the same laid-out run as the title, so the whole treatment costs no row at
+/// all. The reading room this window fights for is the point of it; an
+/// attribution that took a line from the command would be paid for out of the
+/// thing the reader is here to read.
+///
+/// Nothing is dimmed, boxed or hedged. The agent's words keep full contrast
+/// and their heading size: the reader is being told *whose* words these are,
+/// not being told to disbelieve them.
 ///
 /// # Why "Runs as … in …" is up here
 ///
@@ -694,19 +732,52 @@ pub fn draw_headline(ui: &mut Ui, title: &str, reason: &str, aside: Option<&RunC
         .max_height(ui.available_height() * HEADLINE_SHARE)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            let width = aside.map_or(0.0, |aside| run_context_width(ui, aside));
-            match aside_fits(width, ui.available_width()) {
-                true => draw_title_row(ui, title, aside.expect("a width came from one"), width),
-                false => {
-                    draw_spans(ui, &classify(title), Weight::Heading);
-                    if let Some(aside) = aside {
-                        ui.horizontal_wrapped(|ui| draw_run_context(ui, aside));
+            quoted(ui, |ui| {
+                let width = aside.map_or(0.0, |aside| run_context_width(ui, aside));
+                match aside_fits(width, ui.available_width()) {
+                    true => {
+                        draw_title_row(ui, title, aside.expect("a width came from one"), width)
+                    }
+                    false => {
+                        draw_attributed(ui, &classify(title), Weight::Heading);
+                        if let Some(aside) = aside {
+                            ui.horizontal_wrapped(|ui| draw_run_context(ui, aside));
+                        }
                     }
                 }
-            }
-            ui.add_space(4.0);
-            draw_spans(ui, &classify(reason), Weight::Body);
+                ui.add_space(4.0);
+                draw_spans(ui, &classify(reason), Weight::Body);
+            });
         });
+}
+
+/// Draw `add` beside a rule that says the text in it is a quotation.
+///
+/// The rule is painted after the block, over the height the block turned out
+/// to need, so a title that wrapped to three lines is marked for all three
+/// without anyone having to predict how many there would be. It is drawn in
+/// the quiet grey the rest of hatch's own chrome uses — see [`palette`] — and
+/// it costs no row: it is beside the text, not above it.
+fn quoted<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let colour = palette(ui).quiet;
+    let room = ui.available_rect_before_wrap();
+    let inside = egui::Rect::from_min_max(
+        egui::pos2(room.left() + QUOTE_RULE + QUOTE_GAP, room.top()),
+        room.max,
+    );
+    let mut block = ui.new_child(egui::UiBuilder::new().max_rect(inside));
+    let out = add(&mut block);
+    let drawn = block.min_rect();
+    ui.painter().vline(
+        room.left() + QUOTE_RULE / 2.0,
+        drawn.y_range(),
+        egui::Stroke::new(QUOTE_RULE, colour),
+    );
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+        room.min,
+        egui::vec2(room.width(), (drawn.bottom() - room.top()).max(0.0)),
+    ));
+    out
 }
 
 /// The title, with the run context right-aligned against the end of its first
@@ -725,7 +796,7 @@ fn draw_title_row(ui: &mut Ui, title: &str, aside: &RunContext, width: f32) {
         egui::pos2(row.right() - width - gap, row.bottom()),
     );
     let mut title_ui = ui.new_child(egui::UiBuilder::new().max_rect(left));
-    draw_spans(&mut title_ui, &classify(title), Weight::Heading);
+    draw_attributed(&mut title_ui, &classify(title), Weight::Heading);
     let used = title_ui.min_rect().height();
 
     let right = egui::Rect::from_min_size(
@@ -1629,6 +1700,70 @@ fn draw_spans(ui: &mut Ui, spans: &Spans, weight: Weight) {
     }
 }
 
+/// The same, with [`ATTRIBUTION`] in front of the first line.
+///
+/// In front of it and not above it: the lead-in is appended into the same
+/// [`egui::text::LayoutJob`] the line is drawn as, so it wraps with the
+/// sentence it introduces and takes no row of its own. See [`draw_headline`]
+/// for why the headline says whose words it is carrying at all.
+///
+/// An empty rendering still gets the lead-in, on a line by itself. A title
+/// the agent left blank is a strange thing for this window to be showing, and
+/// dropping the attribution there would leave the reason below it as the
+/// first line on screen with nothing saying who wrote it.
+fn draw_attributed(ui: &mut Ui, spans: &Spans, weight: Weight) {
+    let palette = palette(ui);
+    let font = font(weight, ui.style());
+    let drawn = lines(spans);
+    let empty: &[&[Span]] = &[&[]];
+    let drawn = if drawn.is_empty() { empty } else { &drawn };
+    for (index, line) in drawn.iter().enumerate() {
+        let job = line_job(line, &palette, &font);
+        let job = match index {
+            0 => led_by(ATTRIBUTION, &palette, ui.style(), job),
+            _ => job,
+        };
+        ui.add(egui::Label::new(job).wrap_mode(wrap_mode(weight)));
+    }
+}
+
+/// One laid-out line with hatch's own words in front of the agent's.
+///
+/// Rebuilt rather than prepended, because a [`egui::text::LayoutJob`]'s
+/// sections are byte ranges into its own text and there is no way to push
+/// anything onto the front of one. Re-appending each section keeps the
+/// formats [`line_job`] chose — chips, separators, resolved values and all —
+/// so this adds a voice and changes nothing about how the line it leads is
+/// drawn.
+///
+/// Small, quiet and italic: the three ways this window already says *hatch is
+/// talking*, none of which the agent's own text is ever drawn in.
+fn led_by(
+    lead: &str,
+    palette: &Palette,
+    style: &egui::Style,
+    job: egui::text::LayoutJob,
+) -> egui::text::LayoutJob {
+    let mut out = egui::text::LayoutJob::default();
+    // A real space and not a `leading_space`, which is an offset the layout
+    // applies and not a character: the two look the same on screen, and only
+    // one of them is there when something reads the line back as a string.
+    out.append(&format!("{lead} "), 0.0, egui::TextFormat {
+        font_id: egui::TextStyle::Small.resolve(style),
+        color: palette.quiet,
+        italics: true,
+        ..Default::default()
+    });
+    for section in &job.sections {
+        out.append(
+            section.byte_range.slice(&job.text),
+            section.leading_space,
+            section.format.clone(),
+        );
+    }
+    out
+}
+
 /// Split a rendering where it asked to be split.
 ///
 /// A break on the first span is not a split: it would put an empty line above
@@ -1800,6 +1935,118 @@ mod tests {
     use crate::render::render_command;
     use crate::render::unicode::classify;
     use crate::swap::Principal;
+
+    #[test]
+    fn a_quotation_is_marked_beside_its_text_and_costs_no_row() {
+        // The geometry of `quoted`, which is the whole of the mark: the rule
+        // stands in the margin the block was given, the text is indented
+        // exactly past it, and the block hands the cursor back where its
+        // contents ended — so the attribution takes no row of the window the
+        // command is read in.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        let mut measured = None;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // Something above it, so the block does not start at the top of
+            // the world: a rule placed by adding to zero is a rule placed
+            // correctly by accident.
+            ui.label("the line above the quotation");
+            let room = ui.available_rect_before_wrap();
+            assert!(room.top() > 0.0, "the block starts at the top of the world");
+            let inside = quoted(ui, |ui| {
+                ui.label("a line of it");
+                ui.label("and another");
+                ui.min_rect()
+            });
+            measured = Some((room, inside, ui.min_rect()));
+        });
+
+        let (room, inside, parent) = measured.expect("the block drew");
+        assert!(
+            (inside.left() - (room.left() + QUOTE_RULE + QUOTE_GAP)).abs() < 0.01,
+            "the text starts at {} and the margin is {} wide from {}",
+            inside.left(),
+            QUOTE_RULE + QUOTE_GAP,
+            room.left()
+        );
+        assert!(
+            (parent.bottom() - inside.bottom()).abs() < 0.01,
+            "the block took {} of height for {} of text",
+            parent.bottom() - room.top(),
+            inside.height()
+        );
+
+        // And the rule itself: one vertical line, in hatch's quiet grey, in
+        // the margin, as tall as everything it is marking.
+        let mut lines = Vec::new();
+        for clipped in &out.shapes {
+            if let egui::epaint::Shape::LineSegment { points, stroke } = &clipped.shape {
+                lines.push((*points, stroke.color, stroke.width));
+            }
+        }
+        out.textures_delta.clear();
+        assert_eq!(lines.len(), 1, "the quotation is marked by {} lines", lines.len());
+        let ([from, to], colour, width) = lines[0];
+        assert_eq!(colour, theme::DARK.quiet, "the rule is not in hatch's own voice");
+        assert!((width - QUOTE_RULE).abs() < 0.01, "the rule is {width} wide");
+        assert!(
+            (from.x - (room.left() + QUOTE_RULE / 2.0)).abs() < 0.01,
+            "the rule is at {} and the margin starts at {}",
+            from.x,
+            room.left()
+        );
+        assert!((from.y - inside.top()).abs() < 0.01, "the rule starts at {}", from.y);
+        assert!((to.y - inside.bottom()).abs() < 0.01, "and ends at {}", to.y);
+    }
+
+    #[test]
+    fn hatch_leads_the_agents_line_in_its_own_voice() {
+        // The lead-in shares a laid-out run with the agent's sentence, which
+        // is what makes it free of a row — and is also the one way it could
+        // come to look like part of that sentence. So it is drawn in the
+        // three marks this window keeps for itself, and the agent's own
+        // sections come through the rebuild unchanged.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        crate::prompt_ui::apply_font_size(&ctx, 16.0);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let palette = palette(ui);
+            let spans = classify("the agent's own sentence");
+            let font = font(Weight::Heading, ui.style());
+            let plain = line_job(&spans, &palette, &font);
+            let led = led_by(ATTRIBUTION, &palette, ui.style(), plain.clone());
+
+            assert!(led.text.starts_with(ATTRIBUTION), "the lead-in is not first: {:?}", led.text);
+            assert_eq!(
+                led.text,
+                format!("{ATTRIBUTION} {}", plain.text),
+                "a real space separates the two, and nothing else was added"
+            );
+
+            let lead = &led.sections[0].format;
+            assert_eq!(
+                lead.font_id,
+                egui::TextStyle::Small.resolve(ui.style()),
+                "the lead-in is not drawn small"
+            );
+            assert_eq!(lead.color, palette.quiet, "the lead-in is not in hatch's grey");
+            assert!(lead.italics, "the lead-in is not italic");
+            assert_ne!(lead.font_id, font, "the lead-in is set like the title it introduces");
+
+            // Everything after it is the agent's line, formatted exactly as
+            // it would have been drawn without any of this.
+            assert_eq!(led.sections.len(), plain.sections.len() + 1);
+            for (after, before) in led.sections[1..].iter().zip(&plain.sections) {
+                assert_eq!(after.format, before.format, "a section changed format");
+                assert_eq!(
+                    after.byte_range.slice(&led.text),
+                    before.byte_range.slice(&plain.text),
+                    "a section changed text"
+                );
+            }
+        });
+        out.textures_delta.clear();
+    }
 
     fn a_command(command: &str) -> Payload {
         Payload::command(

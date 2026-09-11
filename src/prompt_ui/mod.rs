@@ -3732,6 +3732,80 @@ mod tests {
         out
     }
 
+    /// Every straight line the frame painted, with the colour it was painted
+    /// in: the rule beside the agent's words is one of these, and nothing
+    /// else on screen is a line in that colour.
+    fn line_segments(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<([egui::Pos2; 2], egui::Color32)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<([egui::Pos2; 2], egui::Color32)>) {
+            match shape {
+                egui::epaint::Shape::LineSegment { points, stroke } => {
+                    out.push((*points, stroke.color));
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_agents_words_are_marked_as_the_agents() {
+        // The title is the first thing read, the most persuasive thing on
+        // screen, and written by the party whose request is being judged. The
+        // panes say whose each half is; the header used to say nothing at
+        // all, and a reassuring title over a hostile command is the cheapest
+        // lever a prompt-injected agent has.
+        //
+        // Two channels, neither of which costs a row: the words, and the rule
+        // beside them. The rule has to reach both lines — attributing the
+        // title and leaving the reason bare would be worse than saying
+        // nothing, because the reader would learn that unmarked text is
+        // hatch's.
+        let mut app = a_window_showing("ls");
+        let shapes = window_shapes(&mut app, opening_size());
+        let drawn = text_rects(&shapes);
+        let find = |want: &str| {
+            drawn
+                .iter()
+                .find(|(text, _)| text == want)
+                .unwrap_or_else(|| panic!("{want} is not on screen"))
+                .1
+        };
+
+        let title = find(&format!("{} delete the build directory", panes::ATTRIBUTION));
+        let reason = find("the last build left files the tests trip over");
+
+        let quiet = theme::DARK.quiet;
+        let rule = line_segments(&shapes)
+            .into_iter()
+            .filter(|([from, to], colour)| *colour == quiet && from.x == to.x)
+            .min_by(|(a, _), (b, _)| a[0].x.total_cmp(&b[0].x))
+            .map(|(points, _)| points)
+            .expect("nothing on screen says whose words the headline is");
+
+        assert!(rule[0].x < title.left(), "the rule is not beside the words it marks");
+        assert!(
+            rule[0].y <= title.top() && rule[1].y >= reason.bottom(),
+            "the rule covers {:?} and the two lines run {} to {}",
+            rule,
+            title.top(),
+            reason.bottom()
+        );
+        // And the run context, which is hatch's own statement and not the
+        // agent's, is not what the rule is pointing at.
+        assert!(find("Runs as").left() > rule[0].x, "the rule was drawn past hatch's own words");
+    }
+
     #[test]
     fn the_run_context_sits_in_the_corner_of_the_title_row_and_inside_the_window() {
         // The row is placed by subtracting a measured width from the right
@@ -3749,7 +3823,9 @@ mod tests {
                 .1
         };
 
-        let title = find("delete the build directory");
+        // The title is laid out as one run with hatch's attribution leading
+        // it — see `panes::draw_headline` — so this is the whole first line.
+        let title = find(&format!("{} delete the build directory", panes::ATTRIBUTION));
         let runs = find("Runs as");
         let cwd = find("/tmp");
         assert!(
