@@ -1441,6 +1441,16 @@ mod tests {
         // A staging directory that does not exist yet is the state the sweep
         // is trying to produce, not a failure to report at startup.
         assert_eq!(sweep_stage(&dir.path().join("never-made")).unwrap(), 0);
+        // Every other error still is one. Absence is the single case that
+        // means "already swept"; a staging directory that is a plain file, or
+        // one that cannot be read, is a misconfiguration the daemon has to
+        // say out loud at startup rather than pass over as an empty sweep.
+        let not_a_directory = dir.path().join("a-file");
+        fs::write(&not_a_directory, b"x").unwrap();
+        assert!(
+            sweep_stage(&not_a_directory).is_err(),
+            "an unusable staging directory was reported as already clean"
+        );
     }
 
     #[test]

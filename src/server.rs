@@ -2000,7 +2000,10 @@ impl Daemon {
                     LogVerdict::Approve,
                     CallToolResult::error(vec![ContentBlock::text(format!(
                         "the user approved this and the elevation succeeded, but the write \
-                         failed, so the file on disk is as it was: {} exited {}. {}",
+                         failed: {} exited {}. {} Read the file before asking again — unlike \
+                         an unelevated write, a root write is not a rename, so a write that \
+                         failed part way through can leave the file short rather than \
+                         untouched.",
                         self.elevation.mechanism(),
                         match exit {
                             Some(code) => code.to_string(),
@@ -4204,7 +4207,14 @@ mod tests {
                 .unwrap();
 
             assert_eq!(result.is_error, Some(true));
-            assert!(result_text(&result).contains("the write failed"), "{}", result_text(&result));
+            let text = result_text(&result);
+            assert!(text.contains("the write failed"), "{text}");
+            // And it does not claim the file is untouched. `install`
+            // truncates its destination, so a write that failed part way
+            // through can leave it short — the unelevated path's "nothing was
+            // written" guarantee does not hold here and must not be repeated.
+            assert!(!text.contains("exactly as it was"), "{text}");
+            assert!(text.contains("not a rename"), "{text}");
             assert_eq!(harness.verdict(), "approve", "a failed write was filed as an elevation problem");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
             assert_eq!(staged_files(&harness), 0);
