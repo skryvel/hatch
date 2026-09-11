@@ -2338,6 +2338,34 @@ fn note_prompt_death(session: &PromptSession, detail: &mut LogDetail) {
 /// the kernel split the output, very often mid-character, so a window that
 /// decoded for itself would draw a replacement character for a character that
 /// was never broken.
+///
+/// # Decoded, and nothing else — including for a root command
+///
+/// `run0 --pipe` gives the command a terminal, so a root command sees `isatty`
+/// true where the same command run unelevated sees a pipe. It may therefore
+/// colour its output, and a command that redraws a line with a carriage
+/// return will do that too. Those escapes arrive here and are passed on.
+///
+/// Stripping them was considered and refused, and the reason is not that the
+/// escapes are harmless. It is that this function feeds the *live view* and
+/// nothing else: the same bytes are captured separately and go back to the
+/// agent as the tool result. Cleaning one copy and not the other would leave
+/// the window and the result disagreeing about what the command printed, and
+/// a reader who compares the two would be right to trust neither. The
+/// alternative — stripping both — is hatch editing a root command's output
+/// before anybody sees it, which is the same class of thing as editing its
+/// command line.
+///
+/// So the difference is disclosed instead of hidden:
+/// [`crate::exec::elevate::Elevation::caveat`] says a root command may be
+/// given a terminal and may colour its output, and the approval window draws
+/// that sentence *before* the reader approves. The cost is a live view that
+/// can show escape characters as glyphs for a colourful root command. That is
+/// a legibility cost, paid by the reader who asked to watch, and it is the
+/// cheaper of the two.
+///
+/// If this is ever revisited, the thing to change is both copies together and
+/// the caveat with them — not this function on its own.
 async fn pump_output(mut chunks: mpsc::Receiver<Chunk>, outbox: Outbox) {
     let mut tails: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
     while let Some(chunk) = chunks.recv().await {
