@@ -1969,20 +1969,64 @@ impl Daemon {
 
         match self.read_root(&output, &self.elevation.spawner_env(&env)) {
             RootOutcome::Ran { exit: Some(0) } => {
+                // `install` said it did the work. The unelevated path proves
+                // the file is what the window described *before* writing, by
+                // examining the descriptor it is about to rename; this path
+                // cannot, because the writing was done under a privilege
+                // hatch does not have. So it looks afterwards. That cannot
+                // refuse anything, and it is not there to: it is there so
+                // that hatch does not report "mode 0640, owner alice" for a
+                // file that came out some other way.
+                let landed = swap::landed_as_approved(path, plan);
+                let described = format!(
+                    "{}: {} bytes, mode {:04o}, owner {}:{}",
+                    path.display(),
+                    content.len(),
+                    plan.landing_mode,
+                    plan.landing_owner,
+                    plan.landing_group,
+                );
+                if let swap::Landed::Different { found } = &landed {
+                    // The bytes went somewhere, and not to a file matching
+                    // what anybody approved. Reported as an error even though
+                    // the write happened, because the agent's next move —
+                    // and the user's — depends on knowing that the thing on
+                    // disk is not the thing on the screen.
+                    let _ = session
+                        .outbox()
+                        .finished(protocol::Outcome::Exit { code: 1 })
+                        .await;
+                    return (
+                        LogVerdict::Approve,
+                        CallToolResult::error(vec![ContentBlock::text(format!(
+                            "the write happened, but what is on disk is not what was approved. \
+                             The window said {described}, and {} is now {found}. Something \
+                             changed the target between the check and the write, or the owner \
+                             the window named resolved to a different one. Look at the file \
+                             before doing anything else.",
+                            path.display(),
+                        ))]),
+                        Windup::Close,
+                    );
+                }
                 record_landing(detail, content, plan);
                 let _ = session
                     .outbox()
                     .finished(protocol::Outcome::Exit { code: 0 })
                     .await;
+                let unchecked = match &landed {
+                    // Not folded into silence. hatch was unable to confirm,
+                    // which is a smaller thing than a mismatch and a larger
+                    // one than nothing: the agent is told the difference.
+                    swap::Landed::Unchecked { why } => format!(
+                        "\nhatch could not re-examine the file to confirm this: {why}"
+                    ),
+                    _ => String::new(),
+                };
                 (
                     LogVerdict::Approve,
                     CallToolResult::success(vec![ContentBlock::text(format!(
-                        "wrote {} as root: {} bytes, mode {:04o}, owner {}:{}",
-                        path.display(),
-                        content.len(),
-                        plan.landing_mode,
-                        plan.landing_owner,
-                        plan.landing_group,
+                        "wrote {described} as root{unchecked}"
                     ))]),
                     Windup::Close,
                 )
@@ -4115,6 +4159,48 @@ mod tests {
         /// directory.
         fn staged_files(harness: &Harness) -> usize {
             std::fs::read_dir(harness.paths.stage_dir()).map(|d| d.count()).unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn a_root_swap_that_landed_differently_from_the_plan_says_so() {
+            // `recording`, so nothing writes: the test is about what hatch
+            // does when the file it re-examines is not the file the window
+            // described, and the cheapest way to produce that is to change
+            // the target's mode while the window is up. The content is left
+            // alone, so the hash re-check passes and the write proceeds —
+            // which is exactly the shape of the real risk, because the mode
+            // is the part of the plan the content hash cannot see.
+            let harness = rooted(
+                vec![approve().after(Duration::from_millis(250))],
+                Arc::new(Rehearsed::recording(RootOutcome::Ran { exit: Some(0) })),
+            );
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            let moved = target.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                std::fs::set_permissions(&moved, std::fs::Permissions::from_mode(0o600)).unwrap();
+            });
+
+            let result = within(
+                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+            )
+            .await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("not what was approved"), "{text}");
+            assert!(text.contains("0640"), "the approved landing is not named: {text}");
+            assert!(text.contains("0600"), "what is actually there is not named: {text}");
+            // It happened, so it is logged as an approval that ran — but
+            // without a landing record, because the landing is the thing that
+            // did not match.
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["mode"], serde_json::Value::Null, "{record}");
         }
 
         #[tokio::test]

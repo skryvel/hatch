@@ -1352,6 +1352,80 @@ pub fn stage_root(
     Ok(RootWrite { staged, argv })
 }
 
+/// What a finished root write left behind, against what the window promised.
+///
+/// The unelevated path proves this before the write: it `fstat`s the staged
+/// descriptor and refuses unless the mode, uid and gid are the approved ones,
+/// which it can do because it is the process doing the writing. The root path
+/// cannot — the writing is done by `install`, under a privilege hatch does
+/// not have — so the same question is asked afterwards instead. Asking late
+/// cannot refuse, but it can stop hatch reporting a write as having matched a
+/// plan it did not match.
+///
+/// Two cases make this more than a formality:
+///
+/// * `install -o` takes a *name* where the plan carries a number, and on a
+///   system with a user literally named `1000` whose uid is not 1000 those are
+///   different users. [`Principal`] records that ambiguity as accepted; this
+///   is what notices when it bites.
+/// * A target replaced by a symbolic link during the password wait is
+///   followed by `install`, which is the one exposure the re-check cannot
+///   close. `symlink_metadata` does not follow it, so the link's own mode is
+///   what comes back and does not match the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// The file is what the window said it would be.
+    AsApproved,
+    /// It is not, and this is what is there instead.
+    Different {
+        /// The mode, owner and group the file actually carries.
+        found: String,
+    },
+    /// hatch could not look, and says so rather than assuming either answer.
+    ///
+    /// A root write can land in a directory this user cannot traverse, which
+    /// makes the check impossible without the privilege that did the writing.
+    /// That is not evidence of a bad write and must not be reported as one;
+    /// it is the absence of evidence, and the caller says so.
+    Unchecked {
+        /// Why not.
+        why: String,
+    },
+}
+
+/// Compare the file at `path` against the plan the window drew.
+///
+/// Numbers are compared and names are only printed, exactly as [`apply`]'s
+/// pre-write check does: a `passwd` lookup that blinks must not be able to
+/// turn a correct write into a complaint.
+pub fn landed_as_approved(path: &Path, plan: &SwapPlan) -> Landed {
+    // `symlink_metadata`, not `metadata`. If the target is a link, the link
+    // is what `install` wrote through and the link is what this has to
+    // describe — following it here would report the mode of whatever it
+    // points at and agree with a plan that was never applied to this name.
+    let md = match fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) => {
+            return Landed::Unchecked {
+                why: format!("{} could not be examined afterwards: {e}", path.display()),
+            };
+        }
+    };
+    if md.mode() & 0o7777 == plan.landing_mode
+        && md.uid() == plan.landing_owner.id
+        && md.gid() == plan.landing_group.id
+    {
+        return Landed::AsApproved;
+    }
+    Landed::Different {
+        found: landing(
+            md.mode() & 0o7777,
+            &Principal::user(md.uid()),
+            &Principal::group(md.gid()),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,6 +1638,64 @@ mod tests {
         assert_eq!(plan.landing_owner.id, geteuid().as_raw());
         assert_eq!(plan.landing_mode, 0o640);
         assert_eq!(pair(&install_argv(Path::new("/s"), &target, &plan), "-m"), Some("0640".into()));
+    }
+
+    #[test]
+    fn what_landed_is_compared_against_the_plan_and_not_assumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.conf");
+        fs::write(&target, b"after\n").unwrap();
+        set_mode(&target, 0o640);
+        let plan = plan(&target, b"after\n", true).unwrap();
+
+        assert_eq!(landed_as_approved(&target, &plan), Landed::AsApproved);
+
+        // The same file at a mode nobody approved. `install` is told what to
+        // do and is not watched doing it, so this is the only thing standing
+        // between "the window said 0640" and a file that is not 0640.
+        set_mode(&target, 0o600);
+        let Landed::Different { found } = landed_as_approved(&target, &plan) else {
+            panic!("a file at the wrong mode was reported as approved");
+        };
+        assert!(found.contains("0600"), "{found}");
+    }
+
+    #[test]
+    fn a_target_that_became_a_link_does_not_pass_by_having_the_links_mode_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.conf");
+        let elsewhere = dir.path().join("elsewhere.conf");
+        fs::write(&target, b"after\n").unwrap();
+        set_mode(&target, 0o640);
+        let plan = plan(&target, b"after\n", true).unwrap();
+
+        // What the password wait exposes: the name now means a link, and
+        // `install` wrote through it. Following the link here would report
+        // the mode of the file at the other end and agree with a plan that
+        // was never applied to this name.
+        fs::write(&elsewhere, b"after\n").unwrap();
+        set_mode(&elsewhere, 0o640);
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+        assert!(
+            matches!(landed_as_approved(&target, &plan), Landed::Different { .. }),
+            "a link was reported as the approved file"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_examined_is_unchecked_and_not_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan(&dir.path().join("target.conf"), b"x", true).unwrap();
+
+        // Absence of evidence. A root write can land somewhere this user
+        // cannot look, and reporting that as a bad write would cry wolf on
+        // every correct write into a directory hatch cannot traverse.
+        let Landed::Unchecked { why } = landed_as_approved(&dir.path().join("gone"), &plan) else {
+            panic!("a file hatch could not look at was judged anyway");
+        };
+        assert!(why.contains("could not be examined"), "{why}");
     }
 
     #[test]
