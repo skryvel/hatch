@@ -748,9 +748,10 @@ impl PromptState {
         }
         self.phase = match verdict {
             Verdict::Approve { .. } => Phase::Running,
-            Verdict::Deny { .. } | Verdict::Revise { .. } | Verdict::SelfRun { .. } => {
-                Phase::Closed
-            }
+            Verdict::Deny { .. }
+            | Verdict::Revise { .. }
+            | Verdict::SelfRun { .. }
+            | Verdict::StopAndSync { .. } => Phase::Closed,
         };
         Some(PromptMsg::Verdict(verdict))
     }
@@ -1465,17 +1466,17 @@ impl PromptApp {
     }
 
     /// The buttons, the note and the checkbox, weighted so that the two that
-    /// decide do not look like the three that ask.
+    /// decide do not look like the four that ask.
     ///
-    /// Five buttons stacked in one column at one size is the layout that
+    /// Six buttons stacked in one column at one size is the layout that
     /// produces a misclick, and a misclick here is an approval. So Approve
     /// and Deny are one row of large buttons with a real gap between them —
     /// the gap is not decoration, it is the distance a slipped pointer has to
-    /// cross to turn a refusal into a root command — and Explain, Simplify
-    /// and "I'll run it myself" are small buttons out at the right-hand edge
-    /// of the same row. They are escape hatches: they send the agent away
-    /// with something to do and nothing runs, which is the same class of
-    /// outcome as Deny and does not deserve the same size as it.
+    /// cross to turn a refusal into a root command — and the four [`Hatch`]
+    /// buttons are small, out at the right-hand edge of the same row. They
+    /// are escape hatches: they send the agent away with something to do and
+    /// nothing runs, which is the same class of outcome as Deny and does not
+    /// deserve the same size as it.
     ///
     /// # Why they share a row
     ///
@@ -1631,7 +1632,7 @@ impl PromptApp {
         box_ + label + dead + 2.0 * ui.spacing().item_spacing.x
     }
 
-    /// One row: the two buttons that decide, and the three that do not.
+    /// One row: the two buttons that decide, and the four that do not.
     fn decision_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1640,18 +1641,11 @@ impl PromptApp {
         decided: &mut Option<Verdict>,
     ) -> egui::Response {
         let height = primary_button(ui).y;
-        // One list, drawn in one order or the other. Two lists is how a
-        // button ends up in one arrangement and not the other.
-        let hatches = [
-            (Some(ReviseKind::Explain), "Explain first"),
-            (Some(ReviseKind::Simplify), "Ask for something simpler"),
-            (None, "I'll run it myself"),
-        ];
-        let needed = row_width(
-            ui,
-            hatches.iter().map(|(_, label)| *label),
-            egui::TextStyle::Small,
-        );
+        // `Hatch::ALL`, measured and then drawn: one list, in one order or
+        // the other. Two lists is how a button ends up in one arrangement and
+        // not the other.
+        let needed =
+            row_width(ui, Hatch::ALL.iter().map(|hatch| hatch.label()), egui::TextStyle::Small);
         // Past Deny, with the same gap Approve and Deny keep between them: a
         // pointer sliding off Deny lands on the panel, never on a button.
         let flanks = [0.0, needed + PRIMARY_GAP];
@@ -1680,24 +1674,21 @@ impl PromptApp {
         };
 
         let mut hatch_row = |ui: &mut egui::Ui, reversed: bool| {
-            let mut order = hatches;
+            let mut order = Hatch::ALL;
             if reversed {
                 order.reverse();
             }
-            for (kind, label) in order {
-                if secondary(ui, label).clicked() {
-                    *decided = Some(match kind {
-                        Some(kind) => Verdict::Revise { kind, note: note.to_string() },
-                        None => Verdict::SelfRun { note: note.to_string() },
-                    });
+            for hatch in order {
+                if secondary(ui, hatch.label()).clicked() {
+                    *decided = Some(hatch.verdict(note));
                 }
             }
         };
         match places {
             // Right to left, so the row is built from the window's edge
-            // inwards and the three of them end where they started however
-            // wide the labels turn out to be. Reversed, so that reading order
-            // is the same as it is in the fallback below.
+            // inwards and they end where they started however wide the
+            // labels turn out to be. Reversed, so that reading order is the
+            // same as it is in the fallback below.
             Some([_, _, right]) => {
                 ui.scope_builder(
                     egui::UiBuilder::new()
@@ -1793,7 +1784,63 @@ fn unfocusable(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
     ui.add(button.sense(egui::Sense::CLICK))
 }
 
-/// One of the three ways to send the agent away without running anything.
+/// One of the four ways to send the agent away without running anything.
+///
+/// The outcomes themselves, named. They used to be an `Option<ReviseKind>`,
+/// which worked only while "not a revision" could mean exactly one other
+/// thing; a fourth outcome makes that encoding a lie, and a list whose
+/// entries cannot say what they are is a list a button quietly falls out of.
+/// Both of the two things a hatch needs — its label and its verdict — hang
+/// off this one enum, so neither can be added for three of them and forgotten
+/// for the fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hatch {
+    /// Explain what this does before I decide.
+    Explain,
+    /// Send me a more legible form of this.
+    Simplify,
+    /// I will run it myself.
+    SelfRun,
+    /// Stop, and wait for me.
+    StopAndSync,
+}
+
+impl Hatch {
+    /// Every hatch, in the order the row reads left to right.
+    ///
+    /// The one list. The row is measured from it and drawn from it, so a
+    /// button cannot be wide enough to be counted and absent from the
+    /// drawing, or drawn in one arrangement and not the other.
+    const ALL: [Hatch; 4] = [Hatch::Explain, Hatch::Simplify, Hatch::SelfRun, Hatch::StopAndSync];
+
+    /// What the button says.
+    ///
+    /// Short on purpose: all four measure against the room left beside
+    /// Approve and Deny, and a label that outgrows it costs every one of them
+    /// their place on that row. See [`PromptApp::verdict_buttons`].
+    fn label(self) -> &'static str {
+        match self {
+            Hatch::Explain => "Explain first",
+            Hatch::Simplify => "Ask for something simpler",
+            Hatch::SelfRun => "I'll run it myself",
+            Hatch::StopAndSync => "Stop, let's sync",
+        }
+    }
+
+    /// The verdict it sends, carrying whatever the note field holds.
+    fn verdict(self, note: &str) -> Verdict {
+        let note = note.to_string();
+        match self {
+            Hatch::Explain => Verdict::Revise { kind: ReviseKind::Explain, note },
+            Hatch::Simplify => Verdict::Revise { kind: ReviseKind::Simplify, note },
+            Hatch::SelfRun => Verdict::SelfRun { note },
+            Hatch::StopAndSync => Verdict::StopAndSync { note },
+        }
+    }
+}
+
+/// One of the four ways to send the agent away without running anything, as a
+/// button.
 fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
     unfocusable(ui, egui::Button::new(egui::RichText::new(label).small()))
 }
@@ -3111,6 +3158,24 @@ mod tests {
         text
     }
 
+    /// Every string a window of a given size lays out.
+    ///
+    /// The size is the parameter because the controls arrange themselves two
+    /// ways, and which one a reader gets is a question about width.
+    fn window_text_sized(app: &mut PromptApp, size: egui::Vec2) -> String {
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+            out.textures_delta.clear();
+        }
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+        let text = text_on_screen(&out);
+        out.textures_delta.clear();
+        text
+    }
+
     /// A window awaiting a verdict on `command`, which runs in a terminal of
     /// its own and so cannot be streamed to this one.
     fn an_interactive_window_showing(command: &str) -> PromptApp {
@@ -4024,6 +4089,48 @@ mod tests {
         let sharing =
             rest.into_iter().filter(|r| (r.center().y - row).abs() < 0.5 * tallest).collect();
         (primary, sharing)
+    }
+
+    #[test]
+    fn every_escape_hatch_is_on_screen_in_both_arrangements() {
+        // The small buttons are one list drawn two ways, and the measurement
+        // that chooses between the two is taken over that same list. So a
+        // label added to it has to turn up beside the verdicts on a window
+        // with room and in the row of their own on one without — a button
+        // that only the wide arrangement had space for is a button some
+        // readers do not have.
+        for size in [opening_size(), egui::vec2(520.0, 700.0)] {
+            let mut app = a_window_showing("rm -rf /var/tmp/build");
+            let drawn = window_text_sized(&mut app, size);
+            for hatch in Hatch::ALL {
+                assert!(
+                    drawn.contains(hatch.label()),
+                    "{hatch:?} is not on a {size:?} window: {drawn}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_escape_hatch_sends_a_verdict_of_its_own_and_hands_over_the_note() {
+        // Four buttons, four answers. Two that sent the same verdict would be
+        // one answer drawn twice, and one that dropped the note would be a
+        // field the window asked the reader to fill in for nothing.
+        let mut sent = Vec::new();
+        for hatch in Hatch::ALL {
+            let verdict = hatch.verdict("say more about the second one");
+            let note = match &verdict {
+                Verdict::Deny { note }
+                | Verdict::Revise { note, .. }
+                | Verdict::SelfRun { note }
+                | Verdict::StopAndSync { note } => note.as_str(),
+                Verdict::Approve { .. } => panic!("{hatch:?} approves something"),
+            };
+            assert_eq!(note, "say more about the second one", "{hatch:?} dropped the note");
+            sent.push(verdict);
+        }
+        sent.dedup();
+        assert_eq!(sent.len(), Hatch::ALL.len(), "two hatches send the same verdict: {sent:?}");
     }
 
     #[test]

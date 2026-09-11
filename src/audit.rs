@@ -38,6 +38,9 @@ pub enum LogVerdict {
     Simplify,
     /// The user took the operation over and ran it themselves.
     SelfRun,
+    /// The user stopped the work to talk to the agent, without saying
+    /// anything about the request itself.
+    StopAndSync,
     /// The approval window expired unanswered.
     Timeout,
     /// The user approved, but the polkit password dialog was cancelled or
@@ -71,12 +74,13 @@ impl LogVerdict {
     /// Every verdict, once. A new variant belongs here as well as in the
     /// exhaustive match below, so that callers and tests which must cover the
     /// whole set have one list to read rather than a copy of their own.
-    pub const ALL: [LogVerdict; 12] = [
+    pub const ALL: [LogVerdict; 13] = [
         LogVerdict::Approve,
         LogVerdict::Deny,
         LogVerdict::Explain,
         LogVerdict::Simplify,
         LogVerdict::SelfRun,
+        LogVerdict::StopAndSync,
         LogVerdict::Timeout,
         LogVerdict::ElevationFailed,
         LogVerdict::ElevationUnclear,
@@ -96,6 +100,7 @@ impl LogVerdict {
             LogVerdict::Explain => "explain",
             LogVerdict::Simplify => "simplify",
             LogVerdict::SelfRun => "self_run",
+            LogVerdict::StopAndSync => "stop_and_sync",
             LogVerdict::Timeout => "timeout",
             LogVerdict::ElevationFailed => "elevation_failed",
             LogVerdict::ElevationUnclear => "elevation_unclear",
@@ -426,24 +431,14 @@ mod tests {
 
     #[test]
     fn every_log_verdict_serializes_to_a_distinct_tag() {
-        use LogVerdict::*;
-        let all = [
-            Approve,
-            Deny,
-            Explain,
-            Simplify,
-            SelfRun,
-            Timeout,
-            ElevationFailed,
-            ElevationUnclear,
-            Cancelled,
-            Disconnected,
-            PromptDied,
-            Refused,
-        ];
+        // Off `ALL` rather than a copy of it. This test had its own list, and
+        // a list written out beside the one it is meant to check is a test
+        // that goes on passing about a set that has moved on without it — it
+        // would have said "every verdict" while asking about twelve of
+        // thirteen.
         let tags: std::collections::HashSet<_> =
-            all.iter().map(|v| serde_json::to_string(v).unwrap()).collect();
-        assert_eq!(tags.len(), all.len());
+            LogVerdict::ALL.iter().map(|v| serde_json::to_string(v).unwrap()).collect();
+        assert_eq!(tags.len(), LogVerdict::ALL.len(), "two verdicts share a tag");
     }
 
     #[test]

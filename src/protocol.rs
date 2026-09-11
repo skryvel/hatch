@@ -659,6 +659,29 @@ pub enum Verdict {
         /// What the user typed, returned to the agent.
         note: String,
     },
+    /// Do not run it; stop working and wait for the person.
+    ///
+    /// The one verdict that says nothing about the request. Deny is a
+    /// judgement — no to *this* — and an agent that has been denied is right
+    /// to reconsider what it asked for and to ask for something better. This
+    /// is no to *carrying on right now*: the person has something to say that
+    /// a note field is too small for, and the next move is theirs. Nothing
+    /// was weighed, so there is nothing to revise, and a retry or a variation
+    /// is precisely the wrong reading of it.
+    ///
+    /// That is why it is a variant and not a note under [`Verdict::Deny`].
+    /// A note is free text the agent may act on or not; the verdict is the
+    /// part the daemon turns into a sentence of its own and the log records
+    /// under a tag of its own, so "do not try again yet" is carried by the
+    /// type rather than by the hope that somebody reads the prose. It is the
+    /// same test [`ReviseKind`] is on the other side of: Explain and Simplify
+    /// are one variant because they differ only in the sentence, and this is
+    /// its own variant because it differs in what the agent must do next.
+    StopAndSync {
+        /// What the user typed, returned to the agent. Usually the whole
+        /// point of this verdict, which asks for a conversation.
+        note: String,
+    },
 }
 
 /// The two revisions a user can ask for.
@@ -709,13 +732,14 @@ pub(crate) fn every_verdict() -> Vec<Verdict> {
         },
         Verdict::Revise { kind: ReviseKind::Simplify, note: "one command at a time".to_string() },
         Verdict::SelfRun { note: "I will run it here".to_string() },
+        Verdict::StopAndSync { note: "hold on, I want to talk about this".to_string() },
     ]
 }
 
 /// How many variants [`Verdict`] has. Grows with the match below, and the
 /// index into an array of this size is what catches it not having.
 #[cfg(test)]
-const VERDICT_VARIANTS: usize = 4;
+const VERDICT_VARIANTS: usize = 5;
 
 /// Which variant a verdict is, as a position in an array of
 /// [`VERDICT_VARIANTS`].
@@ -729,6 +753,7 @@ fn verdict_variant(verdict: &Verdict) -> usize {
         Verdict::Deny { .. } => 1,
         Verdict::Revise { .. } => 2,
         Verdict::SelfRun { .. } => 3,
+        Verdict::StopAndSync { .. } => 4,
     }
 }
 

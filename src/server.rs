@@ -2378,6 +2378,20 @@ fn declined(verdict: Verdict, detail: LogDetail) -> Outcome {
                  than retrying: {note}"
             ),
         ),
+        // The one refusal that refuses nothing. Everything above is about
+        // the request; this is about the work, so the sentence has to say so
+        // in the same breath as it says stop, or an agent reads "not run" as
+        // a denial and does what a denial invites — ask for a better version
+        // of the same thing.
+        Verdict::StopAndSync { note } => (
+            LogVerdict::StopAndSync,
+            note.clone(),
+            format!(
+                "not run — the user has stopped to sync with you: nothing was judged about \
+                 the request itself, so do not retry it or a variation of it and do not pick \
+                 up something else instead; stop here and wait for them: {note}"
+            ),
+        ),
         // `decide` matches `Approve` out before calling this, so reaching here
         // would mean an approval was about to be reported as a refusal. Fail
         // closed and say so rather than silently denying an approved request.
@@ -3615,7 +3629,8 @@ later"), "");
                     Some(match &verdict {
                         Verdict::Deny { note }
                         | Verdict::Revise { note, .. }
-                        | Verdict::SelfRun { note } => note.as_str(),
+                        | Verdict::SelfRun { note }
+                        | Verdict::StopAndSync { note } => note.as_str(),
                         Verdict::Approve { .. } => unreachable!(),
                     }),
                     "the user's own words belong on the line"
@@ -5641,6 +5656,7 @@ later"), "");
                 ("more legible form", LogVerdict::Simplify)
             }
             Verdict::SelfRun { .. } => ("will run this themselves", LogVerdict::SelfRun),
+            Verdict::StopAndSync { .. } => ("stopped to sync with you", LogVerdict::StopAndSync),
             // `refusing_verdicts` filters it out, and `declined` refuses to
             // treat it as a refusal at all.
             Verdict::Approve { .. } => unreachable!("an approval is not a refusal"),
@@ -5715,7 +5731,8 @@ later"), "");
             let note = match verdict {
                 Verdict::Deny { note }
                 | Verdict::Revise { note, .. }
-                | Verdict::SelfRun { note } => note.as_str(),
+                | Verdict::SelfRun { note }
+                | Verdict::StopAndSync { note } => note.as_str(),
                 Verdict::Approve { .. } => unreachable!("an approval is not a refusal"),
             };
             assert!(text.contains(note), "{verdict:?} dropped the note: {text}");

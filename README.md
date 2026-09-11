@@ -15,7 +15,7 @@ HTTP on loopback, and a short-lived egui window spawned once per request.
 
 ![The hatch approval window. The agent's title and reason are at the top; below
 them a three-line shell command appears twice, raw on the left and annotated on
-the right, with a countdown, a note field and Approve, Deny and three narrower
+the right, with a countdown, a note field and Approve, Deny and the narrower
 buttons along the bottom.](media/approval-command.png)
 
 *One request, waiting. The header is the agent's own words, marked as such: a
@@ -69,14 +69,20 @@ Deletes and renames are deliberately not file operations. They are
 `run_command("rm …")` and `run_command("mv …")`, so the destructive verb is on
 screen as a verb rather than hidden in a JSON field.
 
-There are five answers a person can give: approve, deny, ask the agent to
-explain first, ask for a form that is easier to read, or take the job over and
-run it themselves. The last four all return a non-fatal tool error carrying a
-free-text note, so the agent can read the note and come back with something
-better instead of seeing a broken server. An approval carries the note too,
-after what hatch has to say about what happened and labelled `the user's
-note:` — the agent is never left to guess which half of an answer a person
-wrote.
+There are six answers a person can give: approve, deny, ask the agent to
+explain first, ask for a form that is easier to read, take the job over and run
+it themselves, or stop the work to talk. The last five all return a non-fatal
+tool error carrying a free-text note, so the agent can read the note and come
+back with something better instead of seeing a broken server. An approval
+carries the note too, after what hatch has to say about what happened and
+labelled `the user's note:` — the agent is never left to guess which half of an
+answer a person wrote.
+
+"Stop, let's sync" is the one answer that says nothing about the request. Deny
+is a judgement and invites a better version of the same idea; this says the
+person has something to talk about and the next move is theirs, so the agent is
+told not to retry it, not to send a variation of it, and not to pick up
+something else instead.
 
 ## Requirements
 
@@ -563,8 +569,9 @@ month readably.
 
 Every outcome reaches it, including the ones the agent cannot tell apart. The
 log's verdicts are a superset of the agent-facing ones — `approve`, `deny`,
-`explain`, `simplify`, `self_run`, `timeout`, `elevation_failed`,
-`elevation_unclear`, `cancelled`, `disconnected`, `prompt_died`, `refused` —
+`explain`, `simplify`, `self_run`, `stop_and_sync`, `timeout`,
+`elevation_failed`, `elevation_unclear`, `cancelled`, `disconnected`,
+`prompt_died`, `refused` —
 because a user denial, a client that gave up and a window that crashed all
 answer the agent with "denied", and conflating them here would hide exactly the
 quiet failures the log exists to catch.
