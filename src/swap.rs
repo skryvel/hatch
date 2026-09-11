@@ -519,7 +519,7 @@ pub enum PlanKind {
 ///
 /// So the name is an [`Option`], resolution failure is not an error, and
 /// [`fmt::Display`] falls back to the number. That fallback is also what makes
-/// the value usable as `install -o`'s argument in Task 17b: `install` accepts
+/// the value usable as [`install_argv`]'s `-o` argument: `install` accepts
 /// a name or a numeric id in the same position. The residual ambiguity — a
 /// system with a *user literally named* `1000` whose uid is not 1000 — is
 /// noted and accepted; `install` would resolve the name, which is the same
