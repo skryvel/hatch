@@ -14,7 +14,10 @@
 //! * The separator stays on screen as a [`SpanKind::Separator`] span at the
 //!   end of the segment it closes, drawn as itself and dimmed by the UI.
 //! * The line break is [`Span::break_before`](super::Span::break_before) on
-//!   the *following* span — metadata beside the text, not an edit to it.
+//!   the *following* span — metadata beside the text, not an edit to it. It
+//!   is not asked for when the author's own newline is about to break the
+//!   line anyway; see [`newline_already_ends_the_line`] for what asking twice
+//!   costs.
 //!
 //! Nothing is trimmed either. `a; b` segments into `a`, `;`, ` b`: the space
 //! that happens to follow the separator is part of the command and stays in
@@ -476,8 +479,9 @@ fn references(command: &str) -> Vec<Range<usize>> {
 /// closed.
 pub fn segment(command: &str) -> Spans {
     let mut builder = SpanBuilder::new(command);
+    let found = boundaries(command);
 
-    for boundary in boundaries(command) {
+    for (index, boundary) in found.iter().enumerate() {
         match boundary {
             Boundary::Separator(token) => {
                 // The run before the separator. May be empty — `;;`, or a
@@ -485,11 +489,14 @@ pub fn segment(command: &str) -> Spans {
                 // no-op, so there is nothing to guard against.
                 unicode::classify_into(&mut builder, token.start);
                 builder.push_to(token.end, SpanKind::Separator);
+                if newline_already_ends_the_line(command, token.end, found.get(index + 1)) {
+                    continue;
+                }
             }
             // The newline goes *through* the classifier rather than around
             // it, which is what makes it a chip and not a drawn-as-itself
             // separator.
-            Boundary::Newline(end) => unicode::classify_into(&mut builder, end),
+            Boundary::Newline(end) => unicode::classify_into(&mut builder, *end),
         }
         // On the span that follows, never on the separator: the separator is
         // a character the user is approving and it stays where it is.
@@ -498,6 +505,39 @@ pub fn segment(command: &str) -> Spans {
 
     unicode::classify_into(&mut builder, command.len());
     builder.finish()
+}
+
+/// Whether the author's own newline is already going to end the line this
+/// separator sits on, so segmentation should not ask for a break of its own.
+///
+/// Both passes want a break in the same place, and they want it for different
+/// reasons: segmentation because a separator ends a segment, the classifier
+/// because a newline ends a line. Asking twice is not harmless. Segmentation
+/// asks first, so its break lands on the very next span emitted — which, when
+/// a newline follows the separator, is the newline's own `↵`. The glyph that
+/// says *this line ended here* is then drawn alone at the start of the next
+/// line, one wasted row per segment, and the two panes disagree about a
+/// command neither of them has changed: the raw pane, which has no
+/// segmentation in it, draws `&&↵` together and is right.
+///
+/// So the separator gives way. The newline's break is the one that starts the
+/// next segment, and its `↵` stays at the end of the line it ends. Nothing is
+/// hidden by this and nothing moves: it decides which span carries
+/// [`Span::break_before`](super::Span::break_before), which is layout, and
+/// every character is drawn either way.
+///
+/// Whitespace between the two does not change the answer — it is the run-up to
+/// the newline and belongs on the line it is typed on, which is again where
+/// the raw pane draws it. Anything else in between is a segment with content
+/// in it and gets the break it asked for.
+fn newline_already_ends_the_line(command: &str, after: usize, next: Option<&Boundary>) -> bool {
+    match next {
+        // Through the newline rather than up to it: `end` is one past it and
+        // a newline is whitespace, so including it asks the same question and
+        // spares an offset that could be off by one.
+        Some(Boundary::Newline(end)) => command[after..*end].chars().all(char::is_whitespace),
+        _ => false,
+    }
 }
 
 /// Tag every variable reference in `spans` and hang the value it will
@@ -1095,6 +1135,68 @@ mod tests {
         let spans = render_command("echo a\\\nb");
         assert!(separators(&spans).is_empty());
         assert_eq!(unrender(&spans), "echo a\\\nb");
+    }
+
+    /// What each drawn line of a rendering reads as, breaks honoured and
+    /// chips drawn as their glyphs. The shape of the layout, asked of the
+    /// thing a reader actually sees.
+    fn drawn_lines(spans: &Spans) -> Vec<String> {
+        let mut lines = vec![String::new()];
+        for span in spans.iter() {
+            if span.break_before() && !lines.last().expect("one line to start with").is_empty() {
+                lines.push(String::new());
+            }
+            lines.last_mut().expect("a line to write into").push_str(&span.display_text());
+        }
+        lines
+    }
+
+    #[test]
+    fn a_newline_after_a_separator_keeps_its_glyph_on_the_line_it_ends() {
+        // Both passes want a break in the same place. Segmentation asks
+        // first, so without the rule its break lands on the newline's own
+        // chip and strands a `↵` at the start of the next line — a wasted row
+        // per segment, and the one place the two panes disagreed about a
+        // command neither had changed.
+        assert_eq!(
+            drawn_lines(&render_command("cd /src &&\ncargo build &&\nsystemctl restart x")),
+            vec!["cd /src &&\u{21B5}", "cargo build &&\u{21B5}", "systemctl restart x"],
+        );
+        // The run-up to the newline goes with the line it is typed on, which
+        // is where the pane beside it draws it.
+        assert_eq!(drawn_lines(&render_command("a && \t\nb")), vec!["a && \u{21E5}\u{21B5}", "b"]);
+        assert_eq!(drawn_lines(&render_command("a &&\r\nb")), vec!["a &&\u{21E4}\u{21B5}", "b"]);
+    }
+
+    #[test]
+    fn a_segment_between_a_separator_and_a_newline_still_gets_its_line() {
+        // The rule gives way to the author's newline; it does not give away
+        // segmentation. `&& b` is a segment with something in it and starts a
+        // line of its own, exactly as it would without a newline anywhere.
+        assert_eq!(drawn_lines(&render_command("a && b\nc")), vec!["a &&", " b\u{21B5}", "c"]);
+    }
+
+    #[test]
+    fn a_blank_line_after_a_separator_is_still_a_blank_line() {
+        // The second newline's `↵` is alone on its line because the line it
+        // ends is empty — a fact about the command, not an artefact of the
+        // layout. Losing it here would be hiding a line the reader is
+        // approving.
+        assert_eq!(drawn_lines(&render_command("a &&\n\nb")), vec![
+            "a &&\u{21B5}",
+            "\u{21B5}",
+            "b",
+        ]);
+    }
+
+    #[test]
+    fn giving_way_to_a_newline_changes_no_character_and_no_kind() {
+        // The whole of the change is which span carries `break_before`.
+        let spans = render_command("a &&\nb");
+        assert_eq!(unrender(&spans), "a &&\nb");
+        assert_eq!(separators(&spans), vec!["&&"]);
+        assert_eq!(chips(&spans), vec!['\n'], "the newline is still a chip of its own");
+        assert_eq!(breaks(&spans), vec!["b"], "and the one break starts the next segment");
     }
 
     // --- composition with the chip pass -----------------------------------
