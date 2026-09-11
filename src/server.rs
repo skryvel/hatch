@@ -3290,6 +3290,28 @@ mod tests {
     }
 
     #[test]
+    fn the_first_line_is_what_reaches_a_reader_from_another_programs_diagnostics() {
+        // This decides which part of the elevation program's standard error
+        // is quoted back to the agent and drawn in the window, so an empty
+        // answer is a message that says a root operation failed and does not
+        // say why.
+        assert_eq!(
+            first_line("Failed to start transient service unit: Access denied
+more
+"),
+            "Failed to start transient service unit: Access denied"
+        );
+        assert_eq!(first_line("  padded  
+second"), "padded");
+        // Nothing to quote is an empty answer, which the callers test for
+        // before they build a message around it.
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("
+
+later"), "");
+    }
+
+    #[test]
     fn only_an_elevated_operation_makes_the_ticker_mention_a_password() {
         let run = |elevated| {
             Work::Run(RunPlan {
