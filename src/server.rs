@@ -601,10 +601,10 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          command. Both of those waits are inside the {total} seconds above. A root command may \
          also be given a terminal where an ordinary one is not, so it may colour its output.\n\
          \n\
-         Three answers mean the command did not run: the person refused it, the password dialog \
-         was dismissed, or hatch could not tell what happened. The last one is not a failure you \
-         should retry — it says hatch does not know whether the command ran, so running it again \
-         may run it twice. Ask the person."
+         Two answers mean the command did not run and you may ask again: the person refused it, \
+         or the password dialog was dismissed. A third says hatch could not tell whether it ran. \
+         That one is not a failure to retry — running it again may run it a second time — so ask \
+         the person to check instead."
     );
 
     let swap_file = format!(
