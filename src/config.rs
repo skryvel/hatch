@@ -17,6 +17,37 @@ use crate::prompt_ui::theme::Theme;
 /// Bytes of entropy behind the bearer token.
 const TOKEN_BYTES: usize = 32;
 
+/// How long a request waits for a human decision unless the config says
+/// otherwise.
+///
+/// Ten minutes, where this was ninety seconds. The old number was caution
+/// about the MCP client giving up on a call while a window was still open,
+/// and the caution was misplaced: nothing downstream enforces anything near
+/// it. A client's ceiling is its own setting and is hours rather than
+/// minutes, and the idle timer that would otherwise fire under a window is
+/// reset by the progress notification hatch already sends every few seconds
+/// for the whole life of a request — see `PROGRESS_INTERVAL`.
+///
+/// What ninety seconds did bound was the reader. It is the time a person gets
+/// to read a command **from the moment the window appears**, not from when
+/// they notice it, and for anything longer than one line it ran out while
+/// they were still reading. A timeout resolves as a denial, so the cost of
+/// the low number was landing on the agent as a refusal nobody made.
+///
+/// The bound that still matters is the sum of this and
+/// [`Config::exec_timeout_secs`], which the tool descriptions state and
+/// `hatch serve` prints. Raising this raises that, and the README says so.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// How long an approved command may run unless the config says otherwise.
+///
+/// Five minutes. A runaway-process guard rather than a budget: an approved
+/// command that is still going after this is more likely wedged than slow,
+/// and the result it has produced so far is returned with a marker saying it
+/// was cut short. A package upgrade or a long build is the case that wants
+/// this raised, and raising it is a line in the config.
+const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 300;
+
 /// Point size the approval window draws at unless the config says otherwise.
 ///
 /// Larger than egui's own default, which is tuned for dense tool windows. This
@@ -53,7 +84,8 @@ pub struct Config {
     /// `load_or_create` generates one and writes it back. It is the reason
     /// this file is 0600 and re-tightened on every load.
     pub token: String,
-    /// How long a request waits for a human decision.
+    /// How long a request waits for a human decision. See
+    /// [`DEFAULT_TIMEOUT_SECS`] for why the default is what it is.
     pub timeout_secs: u64,
     /// How long an approved command may run.
     pub exec_timeout_secs: u64,
@@ -109,8 +141,8 @@ impl Default for Config {
         Self {
             port: 8787,
             token: String::new(),
-            timeout_secs: 90,
-            exec_timeout_secs: 300,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            exec_timeout_secs: DEFAULT_EXEC_TIMEOUT_SECS,
             output_cap_bytes: 262144,
             exec_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
             terminal: vec!["konsole".to_string(), "-e".to_string()],
@@ -494,6 +526,22 @@ mod tests {
     fn client_blocking_bound_is_approval_plus_execution() {
         let c = Config::default();
         assert_eq!(c.client_timeout_secs(), c.timeout_secs + c.exec_timeout_secs);
+    }
+
+    #[test]
+    fn the_default_wait_is_long_enough_to_read_a_command_in() {
+        // Pinned rather than left implicit. The number reaches the agent --
+        // the tool descriptions quote the sum, and an agent that believes the
+        // ceiling is lower than it is will mis-plan around it -- so moving it
+        // should be a deliberate edit here and not a side effect somewhere
+        // else. Ninety seconds was the old value and is the one mistake this
+        // test exists to catch a return to.
+        let c = Config::default();
+        assert_eq!(c.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(c.timeout_secs, 600);
+        assert_eq!(c.exec_timeout_secs, DEFAULT_EXEC_TIMEOUT_SECS);
+        assert_eq!(c.exec_timeout_secs, 300);
+        assert_eq!(c.client_timeout_secs(), 900, "what the tool descriptions state");
     }
 
     #[test]

@@ -2797,7 +2797,8 @@ mod tests {
     fn tool_descriptions_state_the_full_blocking_bound() {
         let config = Config::default();
         let text = tool_descriptions(&config).for_tool("run_command").unwrap().to_string();
-        assert!(text.contains("390"), "the blocking bound must be the full one: {text}");
+        assert!(text.contains("900"), "the blocking bound must be the full one: {text}");
+        assert_eq!(config.client_timeout_secs(), 900, "the bound the description quotes");
         assert!(text.contains("only when"), "the description must narrow when to reach for it");
     }
 
@@ -3286,7 +3287,7 @@ mod tests {
             for tool in &tools {
                 let description = tool["description"].as_str().unwrap();
                 assert!(
-                    description.contains("390"),
+                    description.contains("900"),
                     "{} shipped a description without the blocking bound: {description}",
                     tool["name"]
                 );

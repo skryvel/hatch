@@ -13,16 +13,17 @@ each time.
 Written in Rust. One binary, two modes: a daemon speaking MCP over streamable
 HTTP on loopback, and a short-lived egui window spawned once per request.
 
-![The hatch approval window showing a request to delete a build directory. The
-agent's title and reason are at the top; below them the command appears twice,
-raw on the left and annotated on the right, with Approve, Deny and three
-narrower buttons along the bottom.](media/layout-dark-side-by-side.png)
+![The hatch approval window. The agent's title and reason are at the top; below
+them a three-line shell command appears twice, raw on the left and annotated on
+the right, with a countdown, a note field and Approve, Deny and three narrower
+buttons along the bottom.](media/approval-command.png)
 
-*One request, waiting. The left pane is exactly the text being approved; the
-right is the same text annotated. A countdown says how long is left to decide,
-and the badge says how many other requests are queued behind this one. (The red
-`Marked:` row comes from the layout fixture this shot was taken with — this
-build computes no danger markers; see [Known limits](#known-limits).)*
+*One request, waiting. The left pane is exactly the text being approved — no
+reflow, no colour. The right is the same text annotated: numbered segments,
+`$HOME` shown with the value the command will actually receive, the `&&` that
+ends each segment still on screen, and each line break drawn as a quiet `↵`
+rather than silently swallowed. The header counts what it found and the
+countdown says how long is left before the window denies on its own.*
 
 ---
 
@@ -121,19 +122,19 @@ claude mcp add --transport http hatch http://127.0.0.1:8787/mcp \
 ### Set the client's tool timeout
 
 One call can block for the approval wait *plus* the command's own runtime —
-390 seconds with the default 90 s and 300 s. Set your client's MCP tool timeout
-to at least that. If the client gives up first, the agent sees an opaque
-transport failure instead of a clean verdict — and the request you were part
-way through reading vanishes from under you, because a cancellation and a
-dropped connection both close the window and log a denial. `hatch serve` prints
-the required number on startup, so it cannot drift away from your config.
+900 seconds with the defaults, which are 600 s to decide and 300 s to run. Set
+your client's MCP tool timeout to at least that. If the client gives up first,
+the agent sees an opaque transport failure instead of a clean verdict — and the
+request you were part way through reading vanishes from under you, because a
+cancellation and a dropped connection both close the window and log a denial.
+`hatch serve` prints the required number on startup, so it cannot drift away
+from your config.
 
 Queued requests stretch the total further: one approval window is open at a
 time, machine-wide, and further requests wait in arrival order.
 
-Ninety seconds is not long to read a command in. Raising it is the first edit
-most people make and nothing downstream objects — see
-[Raise `timeout_secs`](#raise-timeout_secs).
+Ten minutes to decide is deliberate and the reasoning is in
+[Why the wait is ten minutes](#why-the-wait-is-ten-minutes).
 
 ### Make the window hard to miss
 
@@ -232,7 +233,7 @@ whole decision.
 ![Two lines of a copy command. The second line contains a filename with a
 right-to-left override and a path with a non-breaking space; both are drawn as
 orange bracketed labels, while the ordinary line break between the two commands
-is a small dim arrow.](media/command-quiet-and-loud-chips.png)
+is a small dim arrow.](media/rendering-chips.png)
 
 *The whole argument for the rendering, in one window. `[RLO]` is a Trojan
 Source filename: the second `cp` copies something that reads as `gnp.txt.exe`
@@ -248,7 +249,7 @@ the bytes will land:
 ![A file replacement request. A metadata panel lists the target path, that the
 whole file is being replaced, the resulting mode and owner and the size change;
 below it a left/right diff shows the old and new YAML with changed lines
-marked.](media/layout-dark-swap.png)
+marked.](media/approval-swap.png)
 
 *The metadata panel is the part a diff cannot show: which file, create or
 replace, at what mode, owned by whom, and how much larger. A replacement
@@ -399,8 +400,8 @@ week of use than the defaults are:
 port = 8787
 token = "…"          # generated on first run; the client is registered against it
 
-timeout_secs = 600       # 90 is the default, and 90 is not enough. See below.
-exec_timeout_secs = 900  # a system upgrade takes longer than five minutes
+timeout_secs = 600       # the default; see below for why it is ten minutes
+exec_timeout_secs = 900  # raised: a system upgrade takes longer than five minutes
 output_cap_bytes = 524288
 
 # sbin included, because half of what gets asked for as root lives there
@@ -442,29 +443,29 @@ expanded and a relative entry can never match, so either one silently protects
 nothing — and nothing warns you, because there is no channel to warn on from
 where that list is read.
 
-### Raise `timeout_secs`
+### Why the wait is ten minutes
 
-The default 90 seconds is the time you get to read a command **from the moment
-the window appears**, and for anything longer than a line it is not enough. The
-number was self-imposed caution rather than a limit anything downstream
-imposes.
+`timeout_secs` is the time you get to read a command **from the moment the
+window appears** — not from when you notice it. It was ninety seconds until
+recently, and ninety seconds ran out while people were still reading. A
+timeout is not a neutral outcome: it resolves as a denial and reaches the
+agent as a refusal nobody made.
 
-What might have forced a low number is a client that gives up on a call while a
-window is still open. It does not, because hatch sends a progress notification
-every five seconds for the whole life of a request — queued, awaiting a
-decision, running, waiting on the password dialog — whenever the client
-supplies a progress token. That is what keeps an idle timer from firing under a
-window somebody is still reading. For Claude Code specifically, at the time of
-writing: the hard ceiling `MCP_TOOL_TIMEOUT` defaults to about 28 hours, and
-the five-minute idle timer is reset by those notifications.
+The ninety was caution about an MCP client giving up on a call while a window
+was still open. The caution was misplaced. Nothing downstream enforces
+anything near it: a client's own ceiling is a setting measured in hours, and
+the idle timer that would otherwise fire under an open window is reset by the
+progress notification hatch sends every five seconds for the whole life of a
+request — queued, awaiting a decision, running, waiting on the password dialog
+— whenever the client supplies a progress token. For Claude Code specifically,
+at the time of writing, `MCP_TOOL_TIMEOUT` defaults to about 28 hours and its
+five-minute idle timer is reset by those notifications.
 
-So raise it. 600 is comfortable. The constraint that does bind is the one in
+The bound that does bind is the one in
 [Set the client's tool timeout](#set-the-clients-tool-timeout):
 `timeout_secs + exec_timeout_secs` has to stay under whatever ceiling your
-client actually enforces, and `hatch serve` prints that sum on startup — 1500 s
-for the config above, against 390 s for the defaults.
-
-This build still ships 90. Raising it is an edit you make.
+client actually enforces. `hatch serve` prints that sum on startup — 900 s with
+the defaults, 1500 s for the config above, which raises the execution half.
 
 ### Every key
 
@@ -472,7 +473,7 @@ This build still ships 90. Raising it is an edit you make.
 |---|---|---|
 | `port` | `8787` | Loopback port the MCP server listens on |
 | `token` | generated | Bearer token the client must present |
-| `timeout_secs` | `90` | How long a window waits for a decision |
+| `timeout_secs` | `600` | How long a window waits for a decision |
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
@@ -489,8 +490,8 @@ Both palettes carry every meaning the window has; neither decides anything.
 `theme = "light"` is the same window as the one at the top of this page:
 
 ![The same approval window in the light palette: dark text on a pale ground,
-with the same two panes, the same countdown and the same
-buttons.](media/layout-light-side-by-side.png)
+with the same two panes, the same annotations and the same
+buttons.](media/approval-command-light.png)
 
 Three directories, in three places, following the XDG base directory spec:
 

@@ -198,7 +198,11 @@ fn hatch_token_prints_the_line_for_the_config_it_creates() {
     assert_eq!(token.len(), 43, "32 bytes, base64url, unpadded");
     assert!(printed.contains("claude mcp add"), "the line must be pasteable: {printed}");
     assert!(printed.contains(token), "and carry the token that reached disk: {printed}");
-    assert!(printed.contains("390s"), "and the timeout the client has to be set to: {printed}");
+    assert!(printed.contains("900s"), "and the timeout the client has to be set to: {printed}");
+    assert!(
+        printed.contains("approval 600s + execution 300s"),
+        "and what that number is made of, so neither term can go stale under the sum: {printed}"
+    );
 }
 
 #[test]
