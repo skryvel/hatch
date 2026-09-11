@@ -358,3 +358,230 @@ fn a_relative_xdg_variable_is_ignored_rather_than_resolved_against_the_cwd() {
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.contains("XDG_CONFIG_HOME"), "and the variable must be named: {said}");
 }
+
+// ---- `hatch setup` ---------------------------------------------------------
+//
+// The output of a help command is the whole of its behaviour, so these drive
+// the real binary and read what a person would read. What they are watching
+// for is not that the text is present but that it is *earned*: a page that
+// said "hatch is running" on the strength of an open port, or that quietly
+// wrote a client's configuration on the way past, would pass every in-process
+// test of its own rendering and still be wrong here.
+
+/// The JSON block in a page of output: from its first brace to its last.
+fn json_block(printed: &str) -> serde_json::Value {
+    let start = printed.find('{').expect("a JSON block");
+    let end = printed.rfind('}').expect("a JSON block");
+    serde_json::from_str(&printed[start..=end]).expect("the printed JSON must parse")
+}
+
+/// The token in a config file on disk.
+fn token_on_disk(home: &Path) -> String {
+    std::fs::read_to_string(config_file(home))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("token = "))
+        .expect("a token must have been written")
+        .trim_matches('"')
+        .to_string()
+}
+
+#[test]
+fn hatch_setup_mcp_prints_both_spellings_of_the_token_the_config_file_holds() {
+    // The page is only worth anything if the token on it is the one the daemon
+    // will accept. Both forms are checked against the file, not against each
+    // other: two forms agreeing on a token neither the daemon nor the file has
+    // would be two wrong answers.
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let token = token_on_disk(home.path());
+    assert_eq!(token.len(), 43, "32 bytes, base64url, unpadded");
+
+    assert!(printed.contains("claude mcp add --transport http hatch"), "{printed}");
+    assert!(printed.contains(&format!("Authorization: Bearer {token}")), "{printed}");
+
+    let entry = &json_block(&printed)["mcpServers"]["hatch"];
+    assert_eq!(entry["type"], "http");
+    assert_eq!(entry["url"], "http://127.0.0.1:8787/mcp");
+    assert_eq!(entry["headers"]["Authorization"], format!("Bearer {token}"));
+
+    assert!(printed.contains("at least 900 seconds"), "the client bound: {printed}");
+    assert!(printed.contains("600s to decide plus 300s to run"), "and its terms: {printed}");
+}
+
+#[test]
+fn hatch_setup_mcp_follows_the_config_it_finds_rather_than_the_defaults() {
+    // A user who has moved the port or lengthened the wait has to be given
+    // their own numbers. A page that printed 8787 and 900 to everybody would
+    // be a page that sends them to register a server that is not there.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(config_file(home.path()).parent().unwrap()).unwrap();
+    std::fs::write(
+        config_file(home.path()),
+        "port = 9191\ntoken = \"a-configured-token\"\ntimeout_secs = 1200\nexec_timeout_secs = 600\n",
+    )
+    .unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let printed = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(json_block(&printed)["mcpServers"]["hatch"]["url"], "http://127.0.0.1:9191/mcp");
+    assert!(printed.contains("at least 1800 seconds"), "{printed}");
+    assert!(!printed.contains("8787"), "no default port may appear: {printed}");
+    assert!(!printed.contains("900"), "no default bound may appear: {printed}");
+}
+
+#[test]
+fn hatch_setup_mcp_reports_a_held_port_as_something_listening_and_not_as_hatch() {
+    // The check this command is most tempted to overstate. Something is on the
+    // port here and it is emphatically not hatch -- it is the test harness --
+    // which is exactly the case the wording has to survive.
+    let home = tempfile::tempdir().unwrap();
+    let (_listener, port) = held_port();
+    prepare(home.path(), port, "a-configured-token");
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains(&format!("something is listening on 127.0.0.1:{port}")), "{printed}");
+    for overclaim in ["hatch is running", "hatch is listening"] {
+        assert!(!printed.contains(overclaim), "must not claim `{overclaim}`: {printed}");
+    }
+}
+
+#[test]
+fn hatch_setup_mcp_reports_an_unheld_port_as_nothing_listening() {
+    // The other direction, so that the sentence above is not simply what the
+    // page always says.
+    let home = tempfile::tempdir().unwrap();
+    let port = free_port();
+    prepare(home.path(), port, "a-configured-token");
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains(&format!("nothing is listening on 127.0.0.1:{port}")), "{printed}");
+}
+
+#[test]
+fn hatch_setup_mcp_writes_nothing_but_hatchs_own_config() {
+    // The promise the module docs make, tested where it can actually be
+    // broken. Everything a client is configured by -- `.claude.json`,
+    // `.mcp.json`, `.config/claude` -- lives under the home directory this
+    // child was given, and none of it may appear.
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let mut found: Vec<String> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    assert_eq!(found, vec![".config".to_string(), ".local".to_string()], "{found:?}");
+    assert!(config_file(home.path()).is_file(), "its own config is the one thing it may create");
+}
+
+#[test]
+fn hatch_setup_polkit_prints_the_rule_the_path_and_the_test_that_verifies_it() {
+    // No config and no daemon: the drop-in is a property of the machine, and
+    // this has to be readable by somebody whose daemon will not start.
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("polkit").output().expect("the binary must be runnable");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let printed = String::from_utf8(output.stdout).unwrap();
+
+    assert!(printed.contains("/etc/polkit-1/rules.d/49-hatch-run0.rules"), "{printed}");
+    assert!(printed.contains("org.freedesktop.systemd1.manage-units"), "{printed}");
+    assert!(printed.contains("return polkit.Result.AUTH_ADMIN;"), "{printed}");
+    assert!(printed.contains("run0 true; sleep 5; run0 true"), "{printed}");
+    assert!(printed.contains("must ask for a password twice"), "{printed}");
+    assert!(printed.contains("systemctl"), "the cost of the rule: {printed}");
+    assert!(printed.contains("auth_admin_keep"), "what it is fixing: {printed}");
+}
+
+#[test]
+fn hatch_setup_polkit_asks_for_no_password_and_leaves_no_config_behind() {
+    // It must not run `run0`, which would throw a password dialog onto the
+    // user's desktop in answer to a question they asked at a terminal -- and
+    // it has no business creating hatch's own directories either, since it
+    // reads none of them.
+    let home = tempfile::tempdir().unwrap();
+
+    let output = hatch(home.path(), "setup")
+        .arg("polkit")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary must be runnable");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "a page about /etc must not create anything under HOME"
+    );
+}
+
+#[test]
+fn hatch_setup_with_no_topic_lists_the_topics_that_exist() {
+    let home = tempfile::tempdir().unwrap();
+
+    let output = hatch(home.path(), "setup").output().expect("the binary must be runnable");
+
+    assert!(output.status.success(), "a bare `hatch setup` is a question, not an error");
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains("mcp"), "{printed}");
+    assert!(printed.contains("polkit"), "{printed}");
+}
+
+#[test]
+fn hatch_setup_with_an_unknown_topic_fails_by_naming_the_ones_that_exist() {
+    // The word people will reach for. Being told `mpc` is unrecognised and
+    // nothing else leaves them to guess a second time.
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("mpc").output().expect("the binary must be runnable");
+
+    assert!(!output.status.success(), "an unknown topic is an error");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("mpc"), "it must name what was asked for: {said}");
+    assert!(said.contains("mcp"), "and what exists: {said}");
+    assert!(said.contains("polkit"), "and what exists: {said}");
+}
+
+#[test]
+fn hatch_setup_mcp_names_a_lax_config_at_the_mode_it_found_and_tightens_it() {
+    // The page claims a side effect -- that loading the file put its mode
+    // back to 0600 -- and the claim crosses two modules. Here is where it can
+    // be checked as a fact rather than as a sentence.
+    let home = tempfile::tempdir().unwrap();
+    prepare(home.path(), free_port(), "a-configured-token");
+    std::fs::set_permissions(config_file(home.path()), std::fs::Permissions::from_mode(0o644))
+        .unwrap();
+
+    let output =
+        hatch(home.path(), "setup").arg("mcp").output().expect("the binary must be runnable");
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(printed.contains("at 0644 rather than 0600"), "the mode it found: {printed}");
+
+    let now = std::fs::metadata(config_file(home.path())).unwrap().permissions().mode() & 0o777;
+    assert_eq!(now, 0o600, "and the mode it says it left behind");
+}

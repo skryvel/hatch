@@ -351,6 +351,19 @@ impl Run0 {
     /// The program.
     pub const PROGRAM: &'static str = "run0";
 
+    /// The polkit action `run0` authenticates against.
+    ///
+    /// Nothing passes this to anything: `run0` picks the action itself and
+    /// hatch never names it on a command line. It is a constant because it is
+    /// the subject of a deployment requirement — the drop-in that restores
+    /// the second gate has to name this exact action or it restores nothing,
+    /// and `hatch setup polkit` prints that drop-in. A string written out a
+    /// second time over there is a string that can drift from the one the
+    /// elevation path actually meets, and the failure mode of a drifted
+    /// action id is a rule that matches nothing and a user who believes they
+    /// have two gates. See the module docs, "The two gates".
+    pub const POLKIT_ACTION: &'static str = "org.freedesktop.systemd1.manage-units";
+
     /// The status `run0` exits with when polkit refuses. **Measured, and
     /// deliberately not used as a signal.**
     ///

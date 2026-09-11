@@ -354,17 +354,100 @@ pub fn print_client_line() -> anyhow::Result<()> {
 /// The daemon prints the line for the config it is actually serving, so the
 /// port and the token in it cannot drift from the ones in use.
 pub fn print_client_line_for(config: &Config) -> anyhow::Result<()> {
-    println!(
-        "claude mcp add --transport http hatch http://127.0.0.1:{}/mcp \\\n  --header \"Authorization: Bearer {}\"\n",
-        config.port, config.token
-    );
-    println!(
+    println!("{}\n", client_line(config));
+    println!("{}", client_timeout_note(config));
+    Ok(())
+}
+
+/// The name the server is registered under, in every spelling of the
+/// registration.
+///
+/// One constant rather than a literal per spelling: the CLI form and the JSON
+/// form below describe the same server, and a user who pasted both under two
+/// names would have two entries, one of which authenticates against nothing.
+const CLIENT_NAME: &str = "hatch";
+
+/// The URL a client posts to.
+///
+/// An address rather than a name, and the same address the listener binds.
+/// `localhost` would resolve through the resolver, and the server checks the
+/// `Host` header against a fixed list precisely so that a name somebody else
+/// controls cannot be pointed here.
+pub fn client_url(config: &Config) -> String {
+    format!("http://127.0.0.1:{}/mcp", config.port)
+}
+
+/// The value of the `Authorization` header the client must send.
+pub fn authorization_header(config: &Config) -> String {
+    format!("Bearer {}", config.token)
+}
+
+/// The `claude mcp add` line, with no trailing newline.
+///
+/// Split out from the printing so that everything which shows a user how to
+/// register — `hatch token`, `hatch serve`, `hatch setup mcp` — shows the
+/// same line rather than its own rendering of one.
+pub fn client_line(config: &Config) -> String {
+    format!(
+        "claude mcp add --transport http {CLIENT_NAME} {} \\\n  --header \"Authorization: {}\"",
+        client_url(config),
+        authorization_header(config)
+    )
+}
+
+/// The same registration as a `mcpServers` entry, for clients configured by
+/// file rather than by command.
+///
+/// Built through `serde_json` and pretty-printed rather than written out as
+/// text, so what a user is invited to paste is something that parsed at least
+/// once.
+///
+/// `"type"` is carried explicitly. It is not decoration: a client reading an
+/// entry that has a `url` and no type takes it for a stdio server and skips
+/// it, which fails as a server that never appears rather than as an error.
+pub fn client_json(config: &Config) -> String {
+    /// One server's entry. Serialized from a struct rather than assembled as
+    /// a `serde_json::Value`, because a `Value`'s object is a sorted map and
+    /// would print `headers` above `type` and `url` — valid, and not the
+    /// order anyone writes an entry in. Field order here is the printed
+    /// order.
+    #[derive(Serialize)]
+    struct Entry {
+        #[serde(rename = "type")]
+        transport: &'static str,
+        url: String,
+        headers: BTreeMap<&'static str, String>,
+    }
+
+    #[derive(Serialize)]
+    struct Registration {
+        #[serde(rename = "mcpServers")]
+        servers: BTreeMap<&'static str, Entry>,
+    }
+
+    let entry = Entry {
+        transport: "http",
+        url: client_url(config),
+        headers: BTreeMap::from([("Authorization", authorization_header(config))]),
+    };
+    let registration = Registration { servers: BTreeMap::from([(CLIENT_NAME, entry)]) };
+    serde_json::to_string_pretty(&registration).expect("a tree of strings always serialises")
+}
+
+/// The tool timeout the client has to be set to, and what the number is made
+/// of.
+///
+/// The sum is [`Config::client_timeout_secs`] rather than a number written
+/// here, and both terms are named alongside it: a reader who has raised one
+/// of them in `config.toml` can see their own number in the arithmetic and
+/// knows the total is theirs and not the default.
+pub fn client_timeout_note(config: &Config) -> String {
+    format!(
         "Set your client's MCP tool timeout to at least {}s\n(approval {}s + execution {}s).",
         config.client_timeout_secs(),
         config.timeout_secs,
         config.exec_timeout_secs
-    );
-    Ok(())
+    )
 }
 
 /// 32 bytes of OS entropy, base64url without padding: 43 characters.
@@ -526,6 +609,90 @@ mod tests {
     fn client_blocking_bound_is_approval_plus_execution() {
         let c = Config::default();
         assert_eq!(c.client_timeout_secs(), c.timeout_secs + c.exec_timeout_secs);
+    }
+
+    // ---- the registration, in both of its spellings ----------------------
+
+    /// A config that names a port and a token no default could produce.
+    fn registered() -> Config {
+        Config { port: 9191, token: "a-test-token".to_string(), ..Config::default() }
+    }
+
+    #[test]
+    fn the_url_is_loopback_and_the_configured_port() {
+        // Loopback as an address, because that is what the listener binds and
+        // what the `Host` check accepts. A name here would be a name somebody
+        // else's DNS could answer for.
+        assert_eq!(client_url(&registered()), "http://127.0.0.1:9191/mcp");
+    }
+
+    #[test]
+    fn the_command_line_carries_the_url_and_the_bearer_header_and_continues_cleanly() {
+        // Two lines, and the first ends in a continuation: a user who copies
+        // only the visible first line gets a command that is obviously
+        // unfinished rather than one that registers without a token.
+        let line = client_line(&registered());
+        let (first, second) = line.split_once('\n').expect("the line continues");
+
+        assert!(first.starts_with("claude mcp add --transport http hatch "), "{line}");
+        assert!(first.ends_with(" \\"), "the first line must continue: {line}");
+        assert!(first.contains("http://127.0.0.1:9191/mcp"), "{line}");
+        assert_eq!(second, "  --header \"Authorization: Bearer a-test-token\"");
+        assert!(!line.ends_with('\n'), "the caller owns the trailing newline: {line:?}");
+    }
+
+    #[test]
+    fn the_json_form_parses_and_registers_one_http_server_at_the_same_url_and_token() {
+        // The risk of a second spelling is that it drifts from the first and
+        // somebody pastes the stale one. Both are built from this config, and
+        // this is what says they still agree.
+        let config = registered();
+        let json: serde_json::Value =
+            serde_json::from_str(&client_json(&config)).expect("what is printed must parse");
+
+        let servers = json["mcpServers"].as_object().expect("an mcpServers map");
+        assert_eq!(servers.len(), 1, "one server, not a template with extras: {servers:?}");
+
+        let entry = &servers["hatch"];
+        assert_eq!(entry["type"], "http", "a url with no type is read as stdio and skipped");
+        assert_eq!(entry["url"], client_url(&config));
+        assert_eq!(entry["headers"]["Authorization"], authorization_header(&config));
+    }
+
+    #[test]
+    fn the_json_form_reads_in_the_order_somebody_would_write_it_in() {
+        // A `serde_json::Value` sorts its keys, which would put `headers`
+        // above `type` and `url`. Correct, and not how anyone writes an entry;
+        // the struct in `client_json` is there to keep the printed order.
+        let printed = client_json(&registered());
+        let transport = printed.find("\"type\"").expect("a type");
+        let url = printed.find("\"url\"").expect("a url");
+        let headers = printed.find("\"headers\"").expect("headers");
+        assert!(transport < url && url < headers, "{printed}");
+    }
+
+    #[test]
+    fn both_spellings_name_the_same_server() {
+        let config = registered();
+        let json: serde_json::Value = serde_json::from_str(&client_json(&config)).unwrap();
+        let name = json["mcpServers"].as_object().unwrap().keys().next().unwrap().clone();
+        assert!(
+            client_line(&config).contains(&format!(" {name} ")),
+            "the command must register the name the file registers: {name}"
+        );
+    }
+
+    #[test]
+    fn the_timeout_note_states_the_sum_and_the_two_terms_it_is_made_of() {
+        // Both terms, so that a reader who has raised one of them in their own
+        // config can see their own arithmetic rather than wondering whether
+        // the total is the default.
+        let config = Config { timeout_secs: 1200, exec_timeout_secs: 600, ..registered() };
+        let note = client_timeout_note(&config);
+
+        assert!(note.contains("at least 1800s"), "{note}");
+        assert!(note.contains("approval 1200s + execution 600s"), "{note}");
+        assert!(!note.contains("900"), "the default must not survive a raised config: {note}");
     }
 
     #[test]

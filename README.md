@@ -119,6 +119,13 @@ claude mcp add --transport http hatch http://127.0.0.1:8787/mcp \
   --header "Authorization: Bearer <token>"
 ```
 
+`hatch setup mcp` is the fuller path: the same line with your real port and
+token, the same registration as a `mcpServers` JSON entry for clients
+configured by file, the tool timeout below with the number taken from your
+config, and a note on what it checked — whether *something* is listening on
+the port, which is not the same as hatch being up — and what it cannot see
+from this side. It prints; it never edits your client's configuration.
+
 ### Set the client's tool timeout
 
 One call can block for the approval wait *plus* the command's own runtime —
@@ -162,7 +169,8 @@ systemd ships as `auth_admin_keep`. That suffix is the problem: polkit
 the cache window runs with **no password prompt at all**. hatch's window is
 then the only gate on root, and nothing on screen says so.
 
-Install this drop-in, as root:
+Install this drop-in, as root — `hatch setup polkit` prints it, with this
+section's reasoning and the check below:
 
 ```
 // /etc/polkit-1/rules.d/49-hatch-run0.rules
