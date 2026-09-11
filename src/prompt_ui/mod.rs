@@ -1100,6 +1100,11 @@ impl PromptApp {
     /// half of the frame that judges input and the half that draws it must
     /// agree.
     fn window(&mut self, ui: &mut egui::Ui, guard_open: bool) {
+        // Before anything is laid out, because the panels below take their
+        // frames from this `Ui`'s style. What the window is doing is the
+        // first thing about it a reader takes in, and for a long time three
+        // different things looked like one.
+        theme::wear(ui, mood(self.state.phase()));
         // Agent-controlled text, defanged by the daemon. Drawn as text and
         // not interpreted; nothing here undoes the defanging. Copied out so
         // the panels below can still borrow the state machine.
@@ -1786,6 +1791,22 @@ fn unfocusable(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
 /// One of the three ways to send the agent away without running anything.
 fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
     unfocusable(ui, egui::Button::new(egui::RichText::new(label).small()))
+}
+
+/// Which ground a phase is drawn on.
+///
+/// The mapping and not the colours: [`theme::Mood`] is about what a window is
+/// doing, and this is the one place that says which of this machine's phases
+/// is which of those. `Closed` is a phase the window leaves on, and a window
+/// that repainted itself on the way out would flash a colour at somebody for
+/// one frame, so it keeps whatever it had — which, since nothing else is a
+/// question either, is the asking ground it started in.
+fn mood(phase: Phase) -> theme::Mood {
+    match phase {
+        Phase::Running => theme::Mood::Running,
+        Phase::Lingering | Phase::Detached => theme::Mood::Finished,
+        Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => theme::Mood::Asking,
+    }
 }
 
 /// A primary button's label.
@@ -3756,6 +3777,70 @@ mod tests {
             walk(&clipped.shape, &mut out);
         }
         out
+    }
+
+    /// The colour the window's own panels were painted this frame.
+    ///
+    /// The ground, and not any of the boxes on it: a panel fill is the one
+    /// rectangle that covers most of the window's width, which is what tells
+    /// it from a pane, a button and the note field.
+    fn ground_drawn(app: &mut PromptApp) -> egui::Color32 {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) => out.push((rect.rect, rect.fill)),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let shapes = window_shapes(app, opening_size());
+        let mut rects = Vec::new();
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        // Wide, and actually painted: egui allocates transparent rectangles
+        // for regions that only clip.
+        rects.retain(|(rect, fill)| rect.width() > 0.9 * WINDOW_SIZE[0] && fill.a() > 0);
+        let grounds: Vec<egui::Color32> = rects.iter().map(|(_, fill)| *fill).collect();
+        let first = *grounds.first().expect("the window painted no panel at all");
+        assert!(
+            grounds.iter().all(|fill| *fill == first),
+            "the panels of one window were painted in {} different colours: {grounds:?}",
+            grounds.len()
+        );
+        first
+    }
+
+    #[test]
+    fn a_window_that_is_asking_does_not_look_like_one_that_is_working() {
+        // Three states that looked like one picture. A reader glancing over
+        // has to be able to tell "this is waiting for me" from "this is
+        // happening" and from "this is over" without reading a word of it,
+        // and the buttons going away is not that: it is a difference they
+        // have to look for.
+        //
+        // The colours themselves, and every meaning drawn against them, are
+        // `crate::prompt_ui::theme`'s business. What is asserted here is that
+        // the phase reaches the paint at all, and that no two phases arrive
+        // at the same ground.
+        let mut asking = a_window_showing("systemctl restart thing");
+        let asking = ground_drawn(&mut asking);
+
+        let mut running = a_window_showing("systemctl restart thing");
+        running.state.decide(Verdict::Approve { stream: true });
+        assert_eq!(running.state.phase(), Phase::Running, "the window is not running");
+        let running = ground_drawn(&mut running);
+
+        let mut finished = a_finished_window_showing("systemctl restart thing", "done\n");
+        assert!(finished.state.is_viewer(), "the window is not showing a finished run");
+        let finished = ground_drawn(&mut finished);
+
+        assert_eq!(asking, theme::DARK.chrome, "a window with a question on it moved ground");
+        assert_eq!(running, theme::DARK.running, "a running window looks like one that is asking");
+        assert_eq!(finished, theme::DARK.finished, "a finished window looks like a running one");
     }
 
     #[test]

@@ -300,6 +300,15 @@ time and a Kill button, and the output pane if streaming was ticked. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops.
 
+**Asking, running and finished do not look alike.** The ground the panels are
+drawn on changes with what the window is doing — grey while it has a question
+on it, blue while the command runs, violet once it is over — so a glance says
+which without reading a word. The three are the same lightness and differ only
+in hue, because every colour this window uses to mean something is pinned to a
+contrast ratio against that ground, and a ground that moved in lightness would
+push one of them under. The hue claims nothing about the outcome: a failed run
+is the same violet as a clean one, and what happened is said in words.
+
 ## Threat model
 
 **The primary threat is the agent itself** — confused, prompt-injected, or

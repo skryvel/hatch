@@ -21,7 +21,7 @@
 //!
 //! * **chrome** — the panels: the headline, the header, the controls. A
 //!   mid-grey in dark and a light grey in light, in both cases *not* the
-//!   colour of a pane.
+//!   colour of a pane. It is one of three grounds — see [`Mood`].
 //! * **surface** — inside a pane. The darkest thing on a dark screen and the
 //!   lightest on a light one, so the command has the most contrast available
 //!   to it, and the pane reads as an object of its own.
@@ -47,6 +47,29 @@
 //!   that make an invisible character visible are drawn in it. egui's own
 //!   weak text is 2.7:1, which is a glyph a reader can miss; here it is above
 //!   7:1 on a pane in both themes.
+//!
+//! # Three grounds, one luminance
+//!
+//! A window that is asking, a window whose command is running and a window
+//! showing a finished run are three different things, and they used to be one
+//! picture. [`Mood`] is that difference, and it is carried by the ground the
+//! panels are drawn on.
+//!
+//! The three grounds are separated by **hue and not by lightness**, and that
+//! is a constraint rather than a taste. Every meaning above is pinned to a
+//! contrast ratio against the chrome, several of them within a tenth of their
+//! floor — a mid grey is the one ground a saturated hue cannot get far from
+//! in either direction — so a ground that moved in luminance would push one
+//! of them under. Holding the luminance and turning the hue leaves every
+//! ratio where it was: `every_meaning_survives_every_ground` is the same
+//! assertions again, once per ground, and `the_three_grounds_are_told_apart`
+//! is what stops a tint so slight that nobody sees it.
+//!
+//! Nothing about the moods says whether anything *worked*. A finished run is
+//! a violet window whether it exited zero or not; what happened is said in
+//! words, and in the danger and warn colours, by the row that reports the
+//! outcome. A green ground over "Failed — exit 1" is exactly the kind of
+//! second voice this window does not have.
 
 use eframe::egui::{self, Color32, Stroke};
 use serde::{Deserialize, Serialize};
@@ -86,6 +109,23 @@ impl Theme {
     }
 }
 
+/// What the window is doing, which is what its ground says.
+///
+/// Three states and not two: if a running window and a finished one looked
+/// alike, the change would teach a reader that the window had stopped asking
+/// and nothing more, which they can already see from the buttons being gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mood {
+    /// Waiting for a person. The window has a question on it.
+    Asking,
+    /// The approved command is running. Nothing on screen is a question any
+    /// more, and nothing a reader does here decides anything.
+    Running,
+    /// It is over. The window is showing what happened, and is on its way
+    /// out or has been kept.
+    Finished,
+}
+
 /// Every colour the approval window draws with.
 ///
 /// One struct rather than a scattering of constants, because the claims that
@@ -94,8 +134,14 @@ impl Theme {
 /// if both sides are in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// The panels: everything that is not a pane.
+    /// The panels: everything that is not a pane, while the window is asking
+    /// something.
     pub chrome: Color32,
+    /// The same panels while the approved command is running.
+    pub running: Color32,
+    /// The same panels once it is over and the window is only showing what
+    /// happened.
+    pub finished: Color32,
     /// Inside a pane: the surface the command itself is drawn on.
     pub surface: Color32,
     /// The pane's frame, and every separator.
@@ -140,6 +186,8 @@ pub struct Palette {
 /// dark theme is 5.1:1 and 1.00:1 for the first and third of those.
 pub const DARK: Palette = Palette {
     chrome: Color32::from_rgb(58, 58, 58),
+    running: Color32::from_rgb(38, 58, 82),
+    finished: Color32::from_rgb(72, 48, 78),
     surface: Color32::from_rgb(13, 13, 13),
     border: Color32::from_rgb(132, 132, 132),
     text: Color32::from_rgb(228, 228, 228),
@@ -165,6 +213,8 @@ pub const DARK: Palette = Palette {
 /// pair — which is the relation a reader learns, in either theme.
 pub const LIGHT: Palette = Palette {
     chrome: Color32::from_rgb(201, 201, 201),
+    running: Color32::from_rgb(184, 204, 224),
+    finished: Color32::from_rgb(216, 198, 220),
     surface: Color32::from_rgb(255, 255, 255),
     border: Color32::from_rgb(110, 110, 110),
     text: Color32::from_rgb(26, 26, 26),
@@ -183,6 +233,24 @@ pub const LIGHT: Palette = Palette {
 };
 
 impl Palette {
+    /// The ground this window draws its panels on in `mood`.
+    pub fn ground(self, mood: Mood) -> Color32 {
+        match mood {
+            Mood::Asking => self.chrome,
+            Mood::Running => self.running,
+            Mood::Finished => self.finished,
+        }
+    }
+
+    /// The same palette with `mood`'s ground as its chrome.
+    ///
+    /// A substitution and not a second palette: every other colour is a
+    /// meaning, and a meaning that changed with the phase would be a second
+    /// vocabulary for a reader to learn. Only the ground moves.
+    pub fn in_mood(self, mood: Mood) -> Palette {
+        Palette { chrome: self.ground(mood), ..self }
+    }
+
     /// The egui `Visuals` that draw this palette.
     ///
     /// Every colour the window reads back — through `ui.visuals()` and
@@ -250,9 +318,28 @@ impl Palette {
     }
 }
 
-/// The palette a `Ui` is drawing with.
+/// The palette a `Ui` is drawing with, ground included.
+///
+/// The chrome is read back out of the `Visuals` rather than taken from the
+/// constant, so that `palette.chrome` is the colour actually behind the
+/// widget asking — a palette that named the asking ground while the window
+/// was running would be a fact about the screen that is not true of it.
 pub fn of(ui: &egui::Ui) -> Palette {
-    Theme::of(ui.visuals()).palette()
+    let visuals = ui.visuals();
+    Palette { chrome: visuals.panel_fill, ..Theme::of(visuals).palette() }
+}
+
+/// Put a `Ui` and everything drawn in it into `mood`.
+///
+/// On the `Ui` and not on the context, because this is a property of the
+/// frame being drawn and the phase can change between two of them. egui
+/// resolves a panel's frame from the style of the `Ui` it is shown in — see
+/// `Panel::resolve_frame` — so setting it here reaches the panels, the widgets
+/// in them and [`of`], which is what keeps the ground and the colours drawn
+/// against it from disagreeing.
+pub fn wear(ui: &mut egui::Ui, mood: Mood) {
+    let theme = Theme::of(ui.visuals());
+    ui.style_mut().visuals = theme.palette().in_mood(mood).visuals(theme);
 }
 
 /// Apply a theme to a whole context.
@@ -294,6 +381,20 @@ mod tests {
     /// Both palettes, so every claim below is made about each of them.
     fn palettes() -> [(&'static str, Palette); 2] {
         [("dark", DARK), ("light", LIGHT)]
+    }
+
+    /// Every ground a palette draws its panels on, named.
+    ///
+    /// The three moods are three backgrounds for the same vocabulary, so
+    /// every claim about a colour on the chrome is three claims. Built from
+    /// [`Mood`] by naming each variant, so a fourth mood breaks this build
+    /// rather than quietly going unchecked.
+    fn grounds(palette: Palette) -> [(&'static str, Color32); 3] {
+        [
+            ("asking", palette.ground(Mood::Asking)),
+            ("running", palette.ground(Mood::Running)),
+            ("finished", palette.ground(Mood::Finished)),
+        ]
     }
 
     #[test]
@@ -340,16 +441,78 @@ mod tests {
         // Everything the chrome draws at ordinary weight keeps 4.5:1. Colour
         // is never the only channel for either of them: the marked list says
         // "Marked:" in words and a loud chip carries a background as well.
+        //
+        // Once per ground, because the window has three of them and the
+        // reader is owed the same legibility on each. This is the assertion
+        // that keeps the running and finished grounds a change of hue: they
+        // hold their luminance because every ratio below is measured against
+        // them, several within a tenth of the floor.
         for (name, palette) in palettes() {
-            for (role, colour) in
-                [("text", palette.text), ("quiet", palette.quiet), ("command", palette.command)]
-            {
-                let ratio = contrast(colour, palette.chrome);
-                assert!(ratio >= 4.5, "{name}: {role} is {ratio:.2}:1 on the chrome");
+            for (mood, ground) in grounds(palette) {
+                for (role, colour) in
+                    [("text", palette.text), ("quiet", palette.quiet), ("command", palette.command)]
+                {
+                    let ratio = contrast(colour, ground);
+                    assert!(ratio >= 4.5, "{name}/{mood}: {role} is {ratio:.2}:1 on the chrome");
+                }
+                for (role, colour) in [("danger", palette.danger), ("warn", palette.warn)] {
+                    let ratio = contrast(colour, ground);
+                    assert!(
+                        ratio >= 3.0,
+                        "{name}/{mood}: bold {role} is {ratio:.2}:1 on the chrome"
+                    );
+                }
             }
-            for (role, colour) in [("danger", palette.danger), ("warn", palette.warn)] {
-                let ratio = contrast(colour, palette.chrome);
-                assert!(ratio >= 3.0, "{name}: bold {role} is {ratio:.2}:1 on the chrome");
+        }
+    }
+
+    #[test]
+    fn every_meaning_survives_every_ground() {
+        // The rest of the vocabulary, on each of the three grounds. `quoted`
+        // is the one the running ground could plausibly collide with — it is
+        // the coolest hue in the window and the running ground is a blue —
+        // so it is checked against the ground itself and not only against the
+        // pane it is usually drawn on.
+        for (name, palette) in palettes() {
+            for (mood, ground) in grounds(palette) {
+                let ratio = contrast(palette.quoted, ground);
+                assert!(ratio >= 3.0, "{name}/{mood}: quoted is {ratio:.2}:1 on the chrome");
+                // And the ground is a ground, not a meaning: no mood may land
+                // on a colour this window already uses to say something.
+                for (role, colour) in [
+                    ("danger", palette.danger),
+                    ("warn", palette.warn),
+                    ("quoted", palette.quoted),
+                    ("surface", palette.surface),
+                    ("gap", palette.gap_bg),
+                ] {
+                    assert_ne!(ground, colour, "{name}/{mood}: the ground is the {role} colour");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_three_grounds_are_told_apart() {
+        // A tint nobody notices is a tint that has not been applied. The
+        // three are the same lightness on purpose — see the module docs — so
+        // the distance that matters is the one contrast cannot see, and this
+        // is the crude version of it: how far apart the two colours are in
+        // the cube. Twenty is about where a flat field stops reading as the
+        // same grey.
+        for (name, palette) in palettes() {
+            let all = grounds(palette);
+            for (i, (first, a)) in all.iter().enumerate() {
+                for (second, b) in &all[i + 1..] {
+                    let apart = f64::from(i32::from(a.r()) - i32::from(b.r())).powi(2)
+                        + f64::from(i32::from(a.g()) - i32::from(b.g())).powi(2)
+                        + f64::from(i32::from(a.b()) - i32::from(b.b())).powi(2);
+                    assert!(
+                        apart.sqrt() >= 20.0,
+                        "{name}: {first} and {second} are {:.1} apart in RGB",
+                        apart.sqrt()
+                    );
+                }
             }
         }
     }
@@ -369,13 +532,18 @@ mod tests {
     #[test]
     fn a_pane_is_a_surface_of_its_own_and_its_edge_says_so() {
         for (name, palette) in palettes() {
-            // The fill alone: an anchor for the eye, not a boundary claim.
-            let fill = contrast(palette.surface, palette.chrome);
-            assert!(fill >= 1.5, "{name}: a pane is {fill:.2}:1 against the window around it");
-            // The edge, which is the boundary claim, at what WCAG 1.4.11 asks
-            // of the boundary of a component.
-            let edge = contrast(palette.border, palette.chrome);
-            assert!(edge >= 3.0, "{name}: a pane's border is {edge:.2}:1 against the chrome");
+            // On every ground: the panes are still drawn while the command
+            // runs, so a mood that swallowed a pane's edge would take the
+            // boundary away exactly where the output is arriving.
+            for (mood, ground) in grounds(palette) {
+                // The fill alone: an anchor for the eye, not a boundary claim.
+                let fill = contrast(palette.surface, ground);
+                assert!(fill >= 1.5, "{name}/{mood}: a pane is {fill:.2}:1 against the window");
+                // The edge, which is the boundary claim, at what WCAG 1.4.11
+                // asks of the boundary of a component.
+                let edge = contrast(palette.border, ground);
+                assert!(edge >= 3.0, "{name}/{mood}: a pane's border is {edge:.2}:1 on it");
+            }
             let inner = contrast(palette.border, palette.surface);
             assert!(inner >= 3.0, "{name}: a pane's border is {inner:.2}:1 against the pane");
         }
@@ -422,6 +590,23 @@ mod tests {
             assert_eq!(visuals.text_color(), palette.text, "{name}");
             assert_eq!(visuals.weak_text_color(), palette.quiet, "{name}");
             assert_eq!(visuals.panel_fill, palette.chrome, "{name}");
+            // And a mood swaps the ground and nothing else: the whole point
+            // of `in_mood` is that a reader learns one vocabulary.
+            for (mood, ground) in grounds(palette) {
+                let worn = palette.in_mood(match mood {
+                    "asking" => Mood::Asking,
+                    "running" => Mood::Running,
+                    _ => Mood::Finished,
+                });
+                assert_eq!(worn.visuals(theme).panel_fill, ground, "{name}/{mood}");
+                assert_eq!(worn.text, palette.text, "{name}/{mood}: a mood moved a meaning");
+                assert_eq!(worn.quiet, palette.quiet, "{name}/{mood}");
+                assert_eq!(worn.danger, palette.danger, "{name}/{mood}");
+                assert_eq!(worn.warn, palette.warn, "{name}/{mood}");
+                assert_eq!(worn.quoted, palette.quoted, "{name}/{mood}");
+                assert_eq!(worn.command, palette.command, "{name}/{mood}");
+                assert_eq!(worn.surface, palette.surface, "{name}/{mood}");
+            }
             assert_eq!(visuals.extreme_bg_color, palette.surface, "{name}");
             assert_eq!(visuals.error_fg_color, palette.danger, "{name}");
             assert_eq!(visuals.warn_fg_color, palette.warn, "{name}");
@@ -462,6 +647,38 @@ mod tests {
 
         apply(&ctx, Theme::Dark);
         assert_eq!(ctx.style_of(egui::Theme::Light).visuals.panel_fill, DARK.chrome);
+    }
+
+    #[test]
+    fn a_ui_reads_back_the_ground_it_is_actually_drawing_on() {
+        // `of` is how every widget in the window gets its colours, and the
+        // chrome it reports has to be the colour behind that widget rather
+        // than the one the constant names: a palette that said "asking grey"
+        // while the window was running would be a statement about the screen
+        // that is not true of it.
+        let ctx = egui::Context::default();
+        for theme in [Theme::Dark, Theme::Light] {
+            apply(&ctx, theme);
+            for mood in [Mood::Asking, Mood::Running, Mood::Finished] {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    wear(ui, mood);
+                    assert_eq!(
+                        of(ui).chrome,
+                        theme.palette().ground(mood),
+                        "{theme:?}/{mood:?}: the palette names a ground nobody is drawing on"
+                    );
+                    assert_eq!(
+                        ui.visuals().panel_fill,
+                        theme.palette().ground(mood),
+                        "{theme:?}/{mood:?}: the panel behind it is a third colour"
+                    );
+                    // Everything else is still the theme's own.
+                    assert_eq!(of(ui).quiet, theme.palette().quiet, "{theme:?}/{mood:?}");
+                    assert_eq!(of(ui).surface, theme.palette().surface, "{theme:?}/{mood:?}");
+                });
+                out.textures_delta.clear();
+            }
+        }
     }
 
     #[test]

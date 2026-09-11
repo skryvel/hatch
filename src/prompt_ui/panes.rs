@@ -3029,6 +3029,8 @@ mod tests {
     fn a_palette() -> Palette {
         Palette {
             chrome: Color32::from_rgb(11, 0, 0),
+            running: Color32::from_rgb(17, 0, 0),
+            finished: Color32::from_rgb(18, 0, 0),
             surface: Color32::from_rgb(12, 0, 0),
             border: Color32::from_rgb(13, 0, 0),
             button: Color32::from_rgb(14, 0, 0),
