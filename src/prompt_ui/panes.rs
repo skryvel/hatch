@@ -1849,7 +1849,17 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
                         })
                 }
             };
-            Rows::measured(drawn.content_size.y, drawn.inner_rect.height(), row_height)
+            // Counted at the pitch `show_rows` really laid the diff out at,
+            // which is not `row_height`. It adds an item spacing to the
+            // height it is handed, and the height handed to it here is
+            // already a line plus a gap — so a diff row is a line and two
+            // gaps. That extra gap is how this pane has always looked and is
+            // not this count's business; what is, is that a figure the
+            // caption quotes be counted at the pitch on screen, or a
+            // two-hundred-row diff would be reported as two hundred and
+            // twenty-eight.
+            let pitch = row_height + ui.spacing().item_spacing.y;
+            Rows::measured(drawn.content_size.y, drawn.inner_rect.height(), pitch)
         })
         .inner;
 
@@ -1913,8 +1923,19 @@ fn text_width(ui: &Ui, boxes: usize) -> f32 {
 /// Both terms are needed and neither is the other: a row is a line of text
 /// *plus* the gap to the next one, and the scroll link turns a line index
 /// into an offset by multiplying by exactly this.
+///
+/// The font's term is rounded to whole device pixels first, because that is
+/// what happens to it on the way to the screen: a galley's size is rounded
+/// there, so a pane really advances by the rounded figure and not by the
+/// font's own. The two differ by a third of a point at sixteen, which is
+/// nothing in one line and a whole row in sixty — which is a row of drift in
+/// the scroll link over a long command, and a row of over-count in the
+/// sentence that says how many rows there are. Both of those are the length
+/// of command this window exists for.
 fn row_height(ui: &Ui) -> f32 {
-    ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y
+    let text = ui.text_style_height(&egui::TextStyle::Monospace);
+    let points = ui.ctx().pixels_per_point();
+    (text * points).round() / points + ui.spacing().item_spacing.y
 }
 
 /// How tall the raw pane is when the panes are stacked.
@@ -3955,6 +3976,208 @@ mod tests {
         }
     }
 
+
+    // ---- saying how much of a pane is out of sight -------------------------
+
+    /// Every string a window of `size` draws for `payload`, once its panes
+    /// have stopped changing size.
+    ///
+    /// Through [`draw_payload`], which is the door the window itself uses, so
+    /// what this reads is the header, the caption, the out-of-sight line and
+    /// the panes exactly as a reader gets them. Frames enough for a scroll
+    /// area to learn its content height, for a solid scroll bar to finish
+    /// animating its column in, and for a caption built from the frame before
+    /// to catch up with the panes under it.
+    fn settled_text(payload: &Payload, size: egui::Vec2) -> Vec<(String, i32)> {
+        let ctx = egui::Context::default();
+        crate::prompt_ui::apply_faces(&ctx);
+        crate::prompt_ui::apply_font_size(&ctx, 16.0);
+        theme::apply(&ctx, theme::Theme::Dark);
+        let shown = Shown::of(payload).expect("a real payload");
+        let mut text = Vec::new();
+        for frame in 0..20 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(f64::from(frame) / 60.0),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| draw_payload(ui, &shown));
+            text = drawn_text(&out);
+            out.textures_delta.clear();
+        }
+        text
+    }
+
+    /// The out-of-sight line a window drew, if it drew one.
+    ///
+    /// Found by the clause both of its sentences end in, so a window that
+    /// only has something to say about one axis is still found.
+    fn out_of_sight_line(text: &[(String, i32)]) -> Option<String> {
+        text.iter().map(|(line, _)| line).find(|line| line.contains("for the rest.")).cloned()
+    }
+
+    /// A window the size the reader opens one at.
+    fn a_window() -> egui::Vec2 {
+        egui::vec2(1280.0, 700.0)
+    }
+
+    #[test]
+    fn a_row_half_under_the_edge_is_a_row_that_was_not_read() {
+        // The two counts are rounded apart on purpose: what a pane laid out
+        // rounds up and what it showed rounds down, so a row with its bottom
+        // half below the edge is a row that exists and not a row that was
+        // seen. Getting this backwards is the failure mode that matters --
+        // a window that says nothing over a line the reader cannot finish.
+        let row = 20.0;
+        assert_eq!(Rows::measured(200.0, 200.0, row), Rows { of: 10, shown: 10 });
+        assert!(Rows::measured(200.0, 200.0, row).whole(), "a pane that fits said it did not");
+        assert_eq!(Rows::measured(210.0, 200.0, row), Rows { of: 11, shown: 10 });
+        assert_eq!(Rows::measured(210.0, 200.0, row).hidden(), 1, "half a row is a row");
+        assert_eq!(Rows::measured(1260.0, 200.0, row), Rows { of: 63, shown: 10 });
+
+        // A pane draws n lines in n text heights and n - 1 gaps, and a row is
+        // a text height plus a gap, so a pane that fits its content exactly
+        // comes out a hair under a whole number of rows. That is rounding and
+        // not a hidden row.
+        assert!(Rows::measured(199.4, 200.0, row).whole(), "a gap at the bottom read as a row");
+        // And a pane nobody has drawn yet reports nothing rather than
+        // claiming everything is on screen -- which is the same thing here,
+        // because nothing is what it says out loud.
+        assert!(Rows::default().whole());
+        assert_eq!(Rows::measured(100.0, 100.0, 0.0), Rows::default(), "a font of no height");
+    }
+
+    #[test]
+    fn the_words_say_how_much_is_out_of_sight_and_what_to_do_about_it() {
+        let note = rows_out_of_sight(Rows { of: 63, shown: 24 }, "the command", "the pane below")
+            .expect("a pane showing 24 of 63 rows has something to say");
+        assert!(note.contains("63"), "the sentence does not say how much there is: {note}");
+        assert!(note.contains("24"), "nor how much is on screen: {note}");
+        assert!(note.contains("39"), "nor how much is not: {note}");
+        assert!(note.contains("out of sight"), "nor that that is what it means: {note}");
+        assert!(note.contains("scroll"), "nor what the reader can do about it: {note}");
+        assert!(note.contains("the pane below"), "nor which pane it is about: {note}");
+
+        // Nothing at all when the reader has been shown all of it. The
+        // measurement is a frame old, and "all of it is on screen" is the one
+        // sentence a reader would stop reading on, so this never says it.
+        assert_eq!(rows_out_of_sight(Rows { of: 24, shown: 24 }, "the command", "the pane"), None);
+        assert_eq!(rows_out_of_sight(Rows::default(), "the command", "the pane"), None);
+
+        // And the same sideways, which is the axis the raw pane loses text
+        // off: it does not reflow, so a long line stops at the right edge.
+        let wide = width_out_of_sight(218, 123, "the strip")
+            .expect("a 218-character line in a 123-character strip has something to say");
+        assert!(wide.contains("218"), "the sentence does not say how wide the lines run: {wide}");
+        assert!(wide.contains("123"), "nor how much of that is on screen: {wide}");
+        assert!(wide.contains("sideways"), "nor which way to scroll: {wide}");
+        assert_eq!(width_out_of_sight(123, 123, "the strip"), None, "a line that just fits");
+        assert_eq!(width_out_of_sight(0, 123, "the strip"), None, "an empty command");
+    }
+
+    #[test]
+    fn side_by_side_speaks_for_whichever_pane_is_the_worse_off() {
+        // The two panes are the same height and hold two renderings of one
+        // command, and which of them has the most rows is not something a
+        // reader should have to be told. So one sentence, made true of both
+        // by taking the larger row count against the smaller viewport.
+        let seen = CommandRows {
+            raw: Rows { of: 60, shown: 25 },
+            annotated: Rows { of: 63, shown: 24 },
+        };
+        assert_eq!(seen.worst(), Rows { of: 63, shown: 24 });
+        let note = command_note(CommandView::SideBySide, seen, 40, 120);
+        assert!(note.contains("63"), "the worse pane's row count is not the one quoted: {note}");
+        assert!(note.contains("the panes"), "one sentence did not speak for both: {note}");
+        // Side by side is only offered when every line fits its column whole,
+        // so nothing can be off to the side and nothing says it is -- even
+        // when the numbers handed in would say so anywhere else.
+        assert!(!note.contains("sideways"), "side by side claimed a line ran off it: {note}");
+
+        // Stacked, the strip's own six rows are hatch's layout decision and
+        // not news; the pane the reader reads is the one reported.
+        let note = command_note(CommandView::Stacked, seen, 218, 123);
+        assert!(note.contains("the pane below"), "the wrong pane is reported: {note}");
+        assert!(note.contains("24"), "the annotated pane's figures are not the ones used: {note}");
+        assert!(note.contains("the strip"), "nothing said the strip loses text sideways: {note}");
+        assert!(note.contains("218"), "nor how far the lines run: {note}");
+
+        // And a window showing all of both panes says neither thing.
+        let whole = CommandRows {
+            raw: Rows { of: 6, shown: 20 },
+            annotated: Rows { of: 8, shown: 20 },
+        };
+        assert_eq!(command_note(CommandView::Stacked, whole, 40, 123), "");
+        assert_eq!(command_note(CommandView::SideBySide, whole, 40, 123), "");
+    }
+
+    #[test]
+    fn a_command_that_runs_past_the_bottom_of_its_pane_says_so_in_the_window() {
+        // The reader's report: "when the command has lines beyond what's
+        // being seen we need some sign. why: scrollbar is tiny, easy to think
+        // it ends". Asserted against a real window, because what a pane
+        // manages to show is a fact about a layout and nothing else knows it.
+        //
+        // Sixty short lines: every one of them fits a column, so this is the
+        // side-by-side arrangement, and the two panes are level.
+        let long = (0..60).map(|n| format!("echo {n}")).collect::<Vec<_>>().join("\n");
+        let text = settled_text(&a_command(&long), a_window());
+        let note = out_of_sight_line(&text)
+            .unwrap_or_else(|| panic!("a 60-row command in a 700-point window said nothing"));
+        assert!(note.contains("60"), "the notice does not say how long the command is: {note}");
+        assert!(note.contains("the panes"), "nor which arrangement it is about: {note}");
+
+        // And a command that fits says nothing, so the line means something
+        // when it is there.
+        let text = settled_text(&a_command("cargo build --release"), a_window());
+        assert_eq!(
+            out_of_sight_line(&text),
+            None,
+            "a one-line command was reported as running off the pane: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_line_that_runs_off_the_raw_strip_says_so_too() {
+        // The strip deliberately does not reflow -- that is the promise the
+        // caption makes for it -- so a long line runs past the right edge and
+        // stops there, with a horizontal scroll bar as the only sign it did
+        // not end. In a root request the strip ends part-way through `run0`'s
+        // argument list.
+        let wide = format!("echo {}", "x".repeat(400));
+        let text = settled_text(&a_command(&format!("{wide}\n{wide}\n{wide}")), a_window());
+        let note = out_of_sight_line(&text)
+            .unwrap_or_else(|| panic!("a 405-character line said nothing: {text:?}"));
+        assert!(note.contains("sideways"), "nothing said which way the rest of it is: {note}");
+        // 406 and not 405: the `↵` that ends each line is drawn, so it is
+        // counted -- the same rule the fit measurement uses.
+        assert!(note.contains("406"), "nor how far the lines run: {note}");
+        assert!(note.contains("the strip"), "nor which pane loses them: {note}");
+    }
+
+    #[test]
+    fn a_diff_taller_than_its_pane_says_so_in_the_same_words() {
+        // The swap window's pane is the same promise about a different kind
+        // of text: a list of lines somebody is about to let be written. A
+        // pane showing forty of two hundred of them said so through its
+        // scroll bar alone.
+        let before = (0..200).map(|n| format!("key{n} = {n}\n")).collect::<String>();
+        let after = before.replace("key7 =", "key7 = ");
+        let text = settled_text(&swap_payload(&before, &after), a_window());
+        let note = out_of_sight_line(&text)
+            .unwrap_or_else(|| panic!("a 200-row diff said nothing: {text:?}"));
+        assert!(note.contains("200"), "the notice does not say how long the diff is: {note}");
+        assert!(note.contains("the diff"), "nor what it is counting: {note}");
+
+        // A diff that fits says nothing.
+        let text = settled_text(&swap_payload("a\n", "b\n"), a_window());
+        assert_eq!(
+            out_of_sight_line(&text),
+            None,
+            "a one-line diff was reported as running off the pane: {text:?}"
+        );
+    }
+
     // ---- layout ------------------------------------------------------------
 
     #[test]
@@ -4346,3 +4569,4 @@ mod tests {
         assert_eq!(wire_spans(&spans).len(), spans.len());
     }
 }
+
