@@ -1570,7 +1570,8 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
     // see `rows_out_of_sight`. A window that has drawn no frame yet has a
     // pair of panes that showed nothing of nothing, which says nothing.
     let seen = ui.data(|data| data.get_temp::<CommandRows>(pane_rows_id()).unwrap_or_default());
-    draw_out_of_sight(ui, &command_note(view, seen, longest, pane_chars(ui, 1)));
+    let across = pane_chars(ui, 1);
+    draw_out_of_sight(ui, &command_note(view, seen, longest, across));
 
     let shown = match view {
         CommandView::SideBySide => {
@@ -1600,7 +1601,15 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
                 Pane::Annotated => &annotated_rows,
             };
 
-            let ceiling = raw_ceiling(ui.available_height(), row);
+            // The strip grows a horizontal bar exactly when a line runs past
+            // its right edge, which is the same question the sideways
+            // sentence above asked, so it is asked once and answered here
+            // too.
+            let sideways = match longest > across {
+                true => ui.spacing().scroll.allocated_width(),
+                false => 0.0,
+            };
+            let ceiling = raw_ceiling(ui.available_height(), row, sideways);
             let raw_reach = reach.raw.unwrap_or_else(|| max_offset(raw_rows.rows, row, ceiling));
             let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, raw_reach);
             let drawn_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
@@ -2010,8 +2019,15 @@ fn row_height(ui: &Ui) -> f32 {
 ///
 /// The share is still a ceiling on top of the strip, for the short window
 /// where six rows would be most of what there is.
-fn raw_ceiling(available: f32, row: f32) -> f32 {
-    (RAW_STRIP_ROWS * row).min(available * RAW_SHARE)
+///
+/// `bar` is what a horizontal scroll bar will take out of the box, which is
+/// its allocated width where the strip is going to grow one and zero where it
+/// is not. It is added rather than absorbed, because [`RAW_STRIP_ROWS`] is a
+/// count of rows of *command* and a bar is not one: a strip that paid for its
+/// own bar out of its six rows would show five and a sliver of the sixth, and
+/// a row cut off halfway is the thing this whole pass is about.
+fn raw_ceiling(available: f32, row: f32, bar: f32) -> f32 {
+    (RAW_STRIP_ROWS * row + bar).min(available * RAW_SHARE)
 }
 
 /// The width of one character of the font both panes and both diff views draw
@@ -3400,17 +3416,27 @@ mod tests {
         // 40% share handed the least reading room to the longest commands.
         let row = 22.0;
         let strip = RAW_STRIP_ROWS * row;
-        assert_eq!(raw_ceiling(600.0, row), strip, "a tall window still gets a strip");
+        assert_eq!(raw_ceiling(600.0, row, 0.0), strip, "a tall window still gets a strip");
         assert!(
-            raw_ceiling(600.0, row) < 600.0 * RAW_SHARE,
+            raw_ceiling(600.0, row, 0.0) < 600.0 * RAW_SHARE,
             "the strip is not an improvement on the share it replaced"
         );
         // And the share is still the backstop, for a window too short for
         // even six rows to be a strip rather than the whole of it.
-        assert_eq!(raw_ceiling(100.0, row), 100.0 * RAW_SHARE);
-        assert!(raw_ceiling(100.0, row) < 50.0, "the pane a reader falls back to took half");
-        assert_eq!(raw_ceiling(0.0, row), 0.0, "no window is no ceiling, not a panic");
-        assert!(raw_ceiling(600.0, row) > 0.0, "the raw text is not on screen at all");
+        assert_eq!(raw_ceiling(100.0, row, 0.0), 100.0 * RAW_SHARE);
+        assert!(raw_ceiling(100.0, row, 0.0) < 50.0, "the pane a reader falls back to took half");
+        assert_eq!(raw_ceiling(0.0, row, 0.0), 0.0, "no window is no ceiling, not a panic");
+        assert!(raw_ceiling(600.0, row, 0.0) > 0.0, "the raw text is not on screen at all");
+
+        // A strip that is going to grow a horizontal bar gets the bar's room
+        // on top of its six rows rather than out of them: six rows of command
+        // is what the constant means, and five and a sliver is not six.
+        assert_eq!(raw_ceiling(600.0, row, 14.0), strip + 14.0, "the bar came out of the rows");
+        assert!(
+            raw_ceiling(600.0, row, 14.0) < 600.0 * RAW_SHARE,
+            "the bar pushed the strip past the share that is still its ceiling"
+        );
+        assert_eq!(raw_ceiling(100.0, row, 14.0), 100.0 * RAW_SHARE, "the share still caps it");
     }
 
     #[test]
