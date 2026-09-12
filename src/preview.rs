@@ -742,3 +742,243 @@ pub fn run(scenario: Scenario, shot: Option<PathBuf>, theme: Option<Theme>) -> a
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::prompt_ui::guard::Action;
+    use crate::prompt_ui::panes::{Shown, countdown_text};
+    use crate::protocol::{PromptMsg, every_verdict};
+
+    /// A config that does not depend on the machine the test runs on.
+    fn a_config() -> Config {
+        let mut config = Config::default();
+        config.exec_env.insert("HOME".to_string(), "/home/someone".to_string());
+        config
+    }
+
+    /// A preview's window, wired exactly as [`run`] wires one: the sample in
+    /// its inbox and [`Nobody`] as the only thing it can answer to.
+    ///
+    /// Built by this helper rather than by each test, so that no test can
+    /// accidentally prove something about a window a preview would never
+    /// open.
+    fn a_preview_window(scenario: Scenario) -> (PromptApp, Arc<AtomicUsize>, tempfile::TempDir) {
+        let staging = tempfile::tempdir().expect("a staging directory");
+        let sample = build(scenario, &a_config(), platform().as_ref(), staging.path())
+            .expect("the sample builds");
+        let (to_window, inbox) = std::sync::mpsc::channel();
+        let (nobody, swallowed) = Nobody::new();
+        to_window
+            .send(Incoming::Frame(DaemonMsg::Request(sample.request(600, 0))))
+            .expect("the window has its request");
+        // Dropped on purpose: a preview writes one request and nothing else,
+        // and a window whose channel has ended is a window the daemon has
+        // gone from, which is the truth here.
+        drop(to_window);
+        let mut app = PromptApp::new(inbox, Box::new(nobody), Arc::new(OnceLock::new()));
+        app.take_arrivals();
+        (app, swallowed, staging)
+    }
+
+    #[test]
+    fn every_scenario_builds_a_request_this_window_can_draw() {
+        // The check `PromptState::handle` makes when a request arrives: a
+        // payload whose spans do not tile their source, or whose one-line
+        // form disagrees with them, closes the window instead of being drawn.
+        // A scenario that failed it would open a window saying "waiting for
+        // hatch" and nothing else, which is the one failure a screenshot tool
+        // must not have.
+        let staging = tempfile::tempdir().unwrap();
+        for scenario in Scenario::all() {
+            let sample = build(scenario, &a_config(), platform().as_ref(), staging.path())
+                .unwrap_or_else(|e| panic!("{scenario:?}: {e:#}"));
+            Shown::of(&sample.payload)
+                .unwrap_or_else(|e| panic!("{scenario:?} cannot be drawn: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_root_sample_is_the_root_window_and_names_the_mechanism() {
+        // That the root scenario really is elevated -- the flag the `ROOT`
+        // block and the danger frame are read off -- and that the line is the
+        // elevation program's rather than a bare command with a word in front
+        // of it. What makes it the *same* line the daemon builds is the
+        // agreement test in `crate::server`; this is the half that says the
+        // scenario is about root at all.
+        let staging = tempfile::tempdir().unwrap();
+        let sample = build(Scenario::Root, &a_config(), platform().as_ref(), staging.path())
+            .expect("a root sample is composable without run0 being installed");
+        let Payload::Command { root, display_line, caveat, .. } = &sample.payload else {
+            panic!("the root scenario is not a command");
+        };
+        assert!(*root, "the window would draw it as an ordinary command");
+        assert!(
+            display_line.starts_with(platform().mechanism()),
+            "the elevated line does not start with the elevation program: {display_line}"
+        );
+        assert!(caveat.is_some(), "the window has nothing to say about how a root run differs");
+    }
+
+    #[test]
+    fn approving_a_preview_reaches_nobody() {
+        // Pressing Approve, through the door every approval goes through:
+        // the guard hands back `Action::Approve` and the window turns it into
+        // one frame on its `out`. In a preview that `out` is `Nobody`, so the
+        // frame is produced -- the window really did decide -- and then
+        // swallowed by this process. There is no daemon to read it, and there
+        // is no other kind of `out` this module ever constructs.
+        let (mut app, swallowed, _staging) = a_preview_window(Scenario::Command);
+        assert_eq!(app.state().phase(), Phase::AwaitingVerdict, "the sample never arrived");
+
+        app.act(Action::Approve);
+
+        assert_eq!(
+            app.state().phase(),
+            Phase::Running,
+            "the window did not decide, so this test proves nothing about where a decision goes"
+        );
+        assert!(swallowed.load(Ordering::SeqCst) > 0, "no frame was produced to lose");
+        assert_eq!(app.state().broken(), None, "a preview's channel is not broken, it is absent");
+    }
+
+    #[test]
+    fn every_verdict_a_preview_can_produce_reaches_nobody() {
+        // Approve is the one that would run something, and it is covered
+        // above through the real button path. This is the rest of the set,
+        // driven through the state machine: a verdict a preview can produce
+        // that this test does not know about is a verdict nobody has checked
+        // the destination of.
+        let staging = tempfile::tempdir().unwrap();
+        let sample = build(Scenario::Command, &a_config(), platform().as_ref(), staging.path())
+            .unwrap();
+        for verdict in every_verdict() {
+            let (mut nobody, swallowed) = Nobody::new();
+            let mut state = crate::prompt_ui::PromptState::new();
+            state.handle(DaemonMsg::Request(sample.request(600, 0)));
+            let frame = state.decide(verdict.clone());
+            assert!(matches!(frame, Some(PromptMsg::Verdict(_))), "{verdict:?} produced nothing");
+            crate::prompt_ui::answer(&mut nobody, &mut state, frame);
+            assert!(swallowed.load(Ordering::SeqCst) > 0, "{verdict:?} was never written");
+            assert_eq!(state.broken(), None, "{verdict:?} looked like a broken channel");
+        }
+    }
+
+    #[test]
+    fn a_decided_preview_is_no_longer_a_window() {
+        // What `PreviewApp::logic` closes on. The real window stays open
+        // after an approval because a daemon is starting a command and will
+        // stream it back; a preview has nobody doing that, so a window that
+        // stayed would be showing a run that does not exist.
+        let (mut app, _swallowed, _staging) = a_preview_window(Scenario::Command);
+        assert!(
+            matches!(app.state().phase(), Phase::WaitingForRequest | Phase::AwaitingVerdict),
+            "a preview that has not been decided must stay open to be looked at"
+        );
+
+        app.act(Action::Deny);
+
+        assert!(
+            !matches!(app.state().phase(), Phase::WaitingForRequest | Phase::AwaitingVerdict),
+            "the preview would sit there with a question nobody can answer"
+        );
+    }
+
+    #[test]
+    fn a_shot_stamps_a_deadline_that_reads_as_a_round_number() {
+        // Why `SHOT_SLACK` is a second and not nothing. The countdown is
+        // `deadline - now` truncated to whole seconds, so a deadline exactly
+        // `timeout_secs` away reads one second short the instant any time
+        // passes and two runs of the same command differ. A second ahead
+        // holds the drawn figure at the configured timeout for the whole of
+        // the first second after the stamp, which is far longer than the
+        // frames between the stamp and the photograph take.
+        let staging = tempfile::tempdir().unwrap();
+        let sample =
+            build(Scenario::Command, &a_config(), platform().as_ref(), staging.path()).unwrap();
+        let request = sample.request(600, SHOT_SLACK);
+        for after_ms in [0, 1, 250, 500, 999] {
+            let at = Utc::now() + chrono::Duration::milliseconds(after_ms);
+            let left = (request.deadline - at).num_seconds();
+            assert_eq!(
+                countdown_text(left),
+                "10 min left to decide",
+                "{after_ms} ms after the stamp the countdown reads something else"
+            );
+        }
+        // And without the slack it does not, which is what makes the constant
+        // load-bearing rather than decorative.
+        let unstamped = sample.request(600, 0);
+        assert_ne!(
+            countdown_text((unstamped.deadline - (Utc::now() + chrono::Duration::milliseconds(1)))
+                .num_seconds()),
+            "10 min left to decide",
+        );
+    }
+
+    #[test]
+    fn a_theme_asked_for_on_the_command_line_wins_for_this_run_only() {
+        assert_eq!(palette(Theme::Dark, None), Theme::Dark, "the config is what is previewed");
+        assert_eq!(palette(Theme::Light, None), Theme::Light);
+        assert_eq!(palette(Theme::Dark, Some(Theme::Light)), Theme::Light);
+        assert_eq!(palette(Theme::Light, Some(Theme::Dark)), Theme::Dark);
+    }
+
+    #[test]
+    fn previewing_reads_the_config_and_does_not_touch_it() {
+        // `--theme` overrides the palette for one window. The file it
+        // overrides must be exactly as it was afterwards: a preview that
+        // wrote the palette back would be a display tool quietly editing the
+        // settings it exists to show.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::scratch(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let file = paths.config_file();
+        let written = "font_size = 21\ntheme = \"dark\"\n";
+        std::fs::write(&file, written).unwrap();
+
+        let config = crate::config::display_config_at(&paths);
+        assert_eq!(config.font_size_points(), 21.0, "the preview did not read the config at all");
+        assert_eq!(palette(config.theme, Some(Theme::Light)), Theme::Light);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written, "the config was rewritten");
+    }
+
+    #[test]
+    fn a_sample_writes_only_inside_the_directory_it_was_given() {
+        // The swap scenario is the one thing here that touches the
+        // filesystem, because `swap::plan` stats the target and a
+        // replacement with no file behind it is a create. Everything it
+        // writes is its own, under the directory it was handed.
+        let staging = tempfile::tempdir().unwrap();
+        let path = stage_sample_file(staging.path()).unwrap();
+        assert!(path.starts_with(staging.path()), "{} escaped the staging directory", path.display());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SWAP_BEFORE);
+
+        // And it is stable: the mode and the size are on screen in the
+        // metadata panel, so a second run must not produce a second picture.
+        let again = stage_sample_file(staging.path()).unwrap();
+        assert_eq!(again, path);
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), SWAP_BEFORE);
+    }
+
+    #[test]
+    fn the_swap_sample_replaces_a_file_rather_than_creating_one() {
+        // What the metadata panel in the README's image is of. A create has
+        // no mode to inherit, no owner to keep and no earlier hash, so a
+        // sample that quietly became one would leave that panel saying
+        // nothing while still looking like a screenshot of it.
+        use crate::swap::PlanKind;
+        let staging = tempfile::tempdir().unwrap();
+        let sample = build(Scenario::Swap, &a_config(), platform().as_ref(), staging.path())
+            .unwrap();
+        let Payload::Swap { plan, rows, .. } = &sample.payload else {
+            panic!("the swap scenario is not a swap");
+        };
+        assert_eq!(plan.kind, PlanKind::Replace);
+        assert_eq!(plan.landing_mode, 0o644, "the mode in the panel is whatever the umask gave");
+        assert_eq!(plan.size_delta, 1, "the panel's size line stopped saying `1 byte larger`");
+        assert!(!rows.is_empty(), "there is no diff to draw");
+    }
+}

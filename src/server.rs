@@ -4320,6 +4320,121 @@ later"), "");
             harness.prompter.recorded()[0].sent.clone()
         }
 
+        // --- and what `hatch preview` draws -------------------------------
+
+        /// A directory with an executable named `run0` in it.
+        ///
+        /// Nothing here ever spawns what it finds: it exists so that
+        /// `Run0::available` answers yes and the daemon composes a real
+        /// elevated line instead of refusing, on a machine that may have no
+        /// `run0` of its own. Same fixture as `elevate`'s own tests, for the
+        /// same reason.
+        fn a_path_with_run0(dir: &Path) -> PathBuf {
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let program = bin.join("run0");
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        }
+
+        #[tokio::test]
+        async fn a_preview_is_the_payload_the_daemon_would_have_sent() {
+            // The whole warrant for `hatch preview`, and the reason
+            // `preview::Sample` keeps the words it was built from. A preview
+            // that assembled its payloads by a route of its own would be a
+            // picture of a window nobody is ever shown: it could look right
+            // for years while the daemon drifted underneath it, and the
+            // README's images would document something that does not exist.
+            //
+            // So every scenario is built twice. Once by `preview::build`, and
+            // once by handing the very same request to a real daemon and
+            // taking the payload off the window it opened. They have to be
+            // equal field for field -- the spans, the one-line form, the raw
+            // text, the working directory, the root flag, the caveat, and for
+            // a swap the plan and every diff row.
+            for scenario in crate::preview::Scenario::all() {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = Paths::scratch(dir.path());
+                let mut config = quick(&paths);
+                config.terminal = vec!["bash".to_string()];
+                // So that the root scenario has something to elevate with on
+                // whatever machine this is running on. The daemon and the
+                // preview are then resolving `run0` off the same `PATH`,
+                // which is the only way the two lines can be compared at all.
+                config.exec_path =
+                    format!("{}:{}", a_path_with_run0(dir.path()).display(), config.exec_path);
+
+                // Denied, so nothing runs and nothing is written: this test
+                // is about what the window was shown, not about what came
+                // afterwards.
+                let prompter = Arc::new(StubPrompter::new(vec![Reply::verdict(Verdict::Deny {
+                    note: String::new(),
+                })]));
+                let daemon = Arc::new(Daemon::new(
+                    &paths,
+                    config.clone(),
+                    Arc::clone(&prompter) as Arc<_>,
+                ));
+
+                let elevation = crate::exec::elevate::platform();
+                let sample = crate::preview::build(
+                    scenario,
+                    &config,
+                    elevation.as_ref(),
+                    &dir.path().join("preview"),
+                )
+                .unwrap_or_else(|e| panic!("{scenario:?} could not be built: {e:#}"));
+
+                match &sample.asked {
+                    crate::preview::Asked::Command { command, cwd, root, interactive } => {
+                        daemon
+                            .run_command(
+                                RunCommandParams {
+                                    title: sample.title.clone(),
+                                    command: command.clone(),
+                                    reason: sample.reason.clone(),
+                                    root: *root,
+                                    cwd: Some(cwd.display().to_string()),
+                                    interactive: *interactive,
+                                },
+                                Caller::quiet(),
+                            )
+                            .await
+                    }
+                    crate::preview::Asked::Swap { path, content, root } => {
+                        daemon
+                            .swap_file(
+                                SwapFileParams {
+                                    title: sample.title.clone(),
+                                    path: path.display().to_string(),
+                                    content: content.clone(),
+                                    reason: sample.reason.clone(),
+                                    root: *root,
+                                },
+                                Caller::quiet(),
+                            )
+                            .await
+                    }
+                };
+
+                let recorded = prompter.recorded();
+                assert_eq!(
+                    recorded.len(),
+                    1,
+                    "{scenario:?} never reached a window: the daemon refused a request the \
+                     preview draws"
+                );
+                let request = &recorded[0].request;
+                assert_eq!(
+                    request.payload, sample.payload,
+                    "{scenario:?}: the preview and the daemon built different payloads"
+                );
+                assert_eq!(request.title, sample.title, "{scenario:?}");
+                assert_eq!(request.reason, sample.reason, "{scenario:?}");
+            }
+        }
+
         #[tokio::test]
         async fn a_root_command_runs_through_the_elevation_and_is_recorded_as_approved() {
             let elevation = Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) }));

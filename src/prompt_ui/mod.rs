@@ -888,6 +888,13 @@ pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn(N
 
 // ---- the window ------------------------------------------------------------
 
+/// What [`open_window`] is handed to make the app it is going to run.
+///
+/// A name for it, because eframe's own creator type is one of these wrapped
+/// in a `Result` and a lifetime, and spelling it out at the call site is a
+/// line of angle brackets that says less than the word does.
+pub(crate) type Build = Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>>;
+
 /// Open the window this program draws, whatever is going to fill it.
 ///
 /// The viewport, the faces, the point size and the palette, and then whatever
@@ -913,7 +920,7 @@ pub(crate) fn open_window(
     title: &str,
     font_size: f32,
     theme: theme::Theme,
-    build: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>>,
+    build: Build,
 ) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1078,6 +1085,17 @@ impl PromptApp {
         &self.state
     }
 
+    /// Take in everything that has arrived on the channel.
+    ///
+    /// The first thing [`eframe::App::logic`] does, and a method as well so
+    /// that a caller with no event loop can put a window into the state one
+    /// frame would have put it in. The tests that drive this window without
+    /// a display want that, and so does the preview's own -- both of which
+    /// exist precisely so that the window under test is this one.
+    pub(crate) fn take_arrivals(&mut self) {
+        drain(&mut self.state, &self.inbox);
+    }
+
     /// Whether the typing guard was open when this frame's input was judged.
     ///
     /// The one thing a screenshot has to wait for that is not layout. Until
@@ -1197,7 +1215,7 @@ fn arm_linger_backstop(kept: Arc<AtomicBool>, fatal: Arc<OnceLock<String>>) {
 
 impl eframe::App for PromptApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        drain(&mut self.state, &self.inbox);
+        self.take_arrivals();
         // Before anything is drawn, and before any widget sees the frame.
         // Whatever the guard did not hand back is gone from this frame.
         let now = Instant::now();
