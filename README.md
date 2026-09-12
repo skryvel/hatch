@@ -228,6 +228,17 @@ hatch's own small grey italic in front of the first line. Nothing is dimmed or
 hedged; the words keep their size and their contrast. The reader is being told
 whose words these are, not being told to disbelieve them.
 
+**A root request is a differently shaped window.** When the command will run as
+root the header says `ROOT` reversed out of a filled block, and the whole window
+is framed in the same colour. Both are shapes and not only colours — a block
+where the header has none, a frame where the window has none — so the mark
+survives a reader who cannot tell red from grey, and a screenshot printed in
+black and white. Neither costs a row: the block is the height of the line it
+sits on, and the frame is painted in the margin the panels already leave. It is
+drawn while the window asks, while the command runs and while the result sits on
+screen, because a command that has already run as root is still the thing that
+ran as root.
+
 **Two panes, same bytes.** The left pane is raw: monospace, no reflow, no
 segmentation, drawn from the same string that becomes the shell's argument. The
 right pane is annotated: numbered segments, highlighting, and `$VAR` references

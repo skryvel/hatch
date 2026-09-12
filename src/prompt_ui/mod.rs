@@ -4347,6 +4347,27 @@ mod tests {
     }
 
     #[test]
+    fn the_frame_is_paid_for_out_of_the_margin_and_not_out_of_the_reading() {
+        // The claim that makes an edge the right shape for this: it costs no
+        // row. It is painted over a window the panels have already divided
+        // up, in the margin every panel leaves around its contents, so
+        // nothing it covers is something a reader was reading. Asserted
+        // against the galleys rather than by reading `ROOT_EDGE`, because
+        // what matters is where the line actually landed.
+        let mut app = a_root_window_showing("rm -rf /var/lib/thing");
+        let shapes = window_shapes(&mut app, opening_size());
+        let window = root_edge(&shapes).expect("the window is not framed");
+        let inside = window.shrink(theme::ROOT_EDGE);
+
+        for (text, rect) in text_rects(&shapes) {
+            assert!(
+                inside.contains_rect(rect.intersect(window)),
+                "the frame is drawn over {text:?} at {rect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_command_that_runs_as_the_reader_is_not_framed() {
         // The frame is the loudest thing this window can say without taking a
         // row, and it says one thing. A window that drew it around every

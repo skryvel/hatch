@@ -387,7 +387,9 @@ pub fn wear(ui: &mut egui::Ui, mood: Mood) {
 /// Thick enough to be a frame rather than a hairline somebody takes for the
 /// compositor's own border, and thin enough to sit inside the margin every
 /// panel already leaves around its contents — so it covers no text and costs
-/// no row. Three points is about a third of that margin.
+/// no row. Three points is about a third of the narrowest of those margins,
+/// which is measured rather than assumed: see
+/// `the_frame_is_paid_for_out_of_the_margin_and_not_out_of_the_reading`.
 pub const ROOT_EDGE: f32 = 3.0;
 
 /// Frame `window` in the colour that says the command in it runs as root.
