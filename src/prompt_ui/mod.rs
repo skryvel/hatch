@@ -5501,6 +5501,436 @@ mod tests {
         assert!(wide <= ordinary, "a wider window gave the note row more height, not less");
     }
 
+    // ---- the chords that flip the boxes ----------------------------------
+
+    /// Run one frame the way [`eframe::App::logic`] does: every event past the
+    /// guard first, and whatever it decided into [`PromptApp::act`].
+    ///
+    /// Through the real [`intercept`] rather than by calling `act` directly,
+    /// because the claim being made is about a keypress and not about an
+    /// [`Action`]: a chord the guard classified and nothing dispatched would
+    /// pass every test that started at `act`.
+    ///
+    /// The shapes are handed back rather than the whole output, and the
+    /// texture deltas are dropped before anything can fail: epaint refuses to
+    /// be dropped holding deltas nobody applied, so a failing assertion made
+    /// while one is alive aborts the whole run instead of naming itself.
+    fn a_live_frame(
+        app: &mut PromptApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        at: Instant,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let mut out = ctx.run_ui(raw_sized(events, opening_size()), |ui| {
+            // The order `logic` runs them in: the guard takes what it is
+            // owed out of the frame before any widget is built.
+            let decided = intercept(&mut app.guard, ui.ctx(), at);
+            for action in decided {
+                app.act(action);
+            }
+            let open = app.guard.is_open(at);
+            app.window(ui, open);
+        });
+        out.textures_delta.clear();
+        std::mem::take(&mut out.shapes)
+    }
+
+    /// The same, after the frames it takes for the panels to learn their
+    /// size: a bottom panel measured against a zero-height guess is not the
+    /// panel a reader sees, and the controls in it are not drawn yet.
+    fn a_settled_frame(
+        app: &mut PromptApp,
+        ctx: &egui::Context,
+        at: Instant,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        a_live_frame(app, ctx, Vec::new(), at);
+        a_live_frame(app, ctx, Vec::new(), at)
+    }
+
+    /// Put the keyboard focus in the note field, by clicking in it.
+    ///
+    /// A click and not a Tab, because Tab lands wherever egui's focus order
+    /// puts it and what this has to be about is the one widget on the window
+    /// that takes text. The field is centred in the panel and level with the
+    /// label naming it, which is enough to find it on a real frame.
+    fn click_into_the_note_field(app: &mut PromptApp, ctx: &egui::Context, at: Instant) {
+        let drawn = a_settled_frame(app, ctx, at);
+        let label = text_rects(&drawn)
+            .into_iter()
+            .find(|(text, _)| text == "Note to the agent")
+            .map(|(_, rect)| rect)
+            .expect("the note field is not labelled on screen");
+        let place = egui::pos2(opening_size().x / 2.0, label.center().y);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: place,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        a_live_frame(app, ctx, vec![egui::Event::PointerMoved(place)], at);
+        a_live_frame(app, ctx, vec![button(true)], at);
+        a_live_frame(app, ctx, vec![button(false)], at);
+    }
+
+    /// One key held down with `modifiers`.
+    fn chord(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Long enough after this window was made that the guard is open.
+    fn past_the_guard() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    /// Every string the frame drew, with the colour it was drawn in.
+    fn text_colours(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    let job = &text.galley.job;
+                    for section in &job.sections {
+                        out.push((
+                            job.text[section.byte_range.start.0..section.byte_range.end.0]
+                                .to_string(),
+                            section.format.color,
+                        ));
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Whether `said` was drawn in the colour this window warns in.
+    ///
+    /// The colour is read off the same frame rather than out of a default
+    /// style, because the window wears a palette of its own — see
+    /// [`theme::wear`] — and a claim made against egui's own colours would be
+    /// a claim about a window nobody is looking at. The terminal's capture
+    /// sentence is the warning every command window already draws, so it is
+    /// what "the colour this window warns in" means here.
+    fn drawn_as_a_warning(shapes: &[egui::epaint::ClippedShape], said: &str) -> bool {
+        let drawn = text_colours(shapes);
+        let warn = drawn
+            .iter()
+            .find(|(text, _)| text == TERMINAL_CAPTURE)
+            .map(|(_, colour)| *colour)
+            .expect("nothing on this window is drawn as a warning to compare against");
+        let weak = drawn
+            .iter()
+            .find(|(text, _)| text == "Note to the agent")
+            .map(|(_, colour)| *colour)
+            .expect("the quiet label that names the note field is not on screen");
+        assert_ne!(warn, weak, "this window's warning colour is its quiet one");
+        drawn.iter().any(|(text, colour)| text == said && *colour == warn)
+    }
+
+    /// Every string a frame's shapes carry, for a failure to quote.
+    fn shapes_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        text_rects(shapes).into_iter().map(|(text, _)| text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_chord_ticks_the_box_a_pointer_would_have_and_writes_the_same_thing_down() {
+        // Two ways to say one thing, and they have to be one thing: a window
+        // whose keyboard and mouse remembered different answers would be a
+        // preference nobody could rely on.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::C, egui::Modifiers::ALT)], now);
+        assert!(app.closes_on_decide(), "Alt+C did not reach the box");
+        assert!(PrefsFile::at(&paths).read().close_on_decide, "the chord wrote nothing down");
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::S, egui::Modifiers::ALT)], now);
+        assert!(app.streams(), "Alt+S did not reach the box");
+        assert!(PrefsFile::at(&paths).read().stream, "the chord wrote nothing down");
+
+        // And back, because a chord that could only ever tick would be half a
+        // control.
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::S, egui::Modifiers::ALT)], now);
+        assert!(!app.streams());
+        assert!(!PrefsFile::at(&paths).read().stream, "the untick was not written down");
+    }
+
+    #[test]
+    fn a_chord_during_the_guard_flips_nothing_and_leaves_nothing_behind() {
+        // The whole of why these wait as long as Approve does. What they
+        // write outlives this window, so the burst that cannot approve must
+        // not be able to tick either.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let inside = Instant::now();
+
+        for key in [egui::Key::S, egui::Key::C] {
+            a_live_frame(&mut app, &ctx, vec![chord(key, egui::Modifiers::ALT)], inside);
+        }
+        assert!(!app.streams() && !app.closes_on_decide(), "a burst answered the window");
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs::default(),
+            "a burst wrote a preference that outlives this window"
+        );
+    }
+
+    #[test]
+    fn alt_s_on_a_run_that_has_a_terminal_ticks_nothing_and_points_at_the_reason() {
+        // There is no second stream to show, so the chord must not promise
+        // one — and must not answer with silence either, which is what
+        // teaches a reader that a shortcut does not work.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        app.terminal = true;
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        a_settled_frame(&mut app, &ctx, now);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::S, egui::Modifiers::ALT)], now);
+        let drawn = a_live_frame(&mut app, &ctx, Vec::new(), now);
+        assert!(!app.streams(), "a terminal run promised a stream");
+        assert!(!app.stream, "a refused chord was stored anyway");
+        assert!(
+            !PrefsFile::at(&paths).read().stream,
+            "a chord that could not be obeyed was remembered"
+        );
+        assert!(
+            drawn_as_a_warning(&drawn, STREAM_DEAD),
+            "the chord was refused in silence: {}",
+            shapes_text(&drawn)
+        );
+    }
+
+    #[test]
+    fn alt_c_while_watching_ticks_nothing_and_points_at_the_reason() {
+        // The close box is showing the effective answer, which streaming has
+        // already settled. A chord that changed the stored one underneath
+        // would be an invisible write to a file that outlives the window.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        app.stream = true;
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        a_settled_frame(&mut app, &ctx, now);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::C, egui::Modifiers::ALT)], now);
+        let drawn = a_live_frame(&mut app, &ctx, Vec::new(), now);
+        assert!(!app.close_on_decide, "a refused chord was stored anyway");
+        assert_eq!(PrefsFile::at(&paths).read(), Prefs::default(), "and written down");
+        assert!(
+            drawn_as_a_warning(&drawn, CLOSE_WATCHING),
+            "the chord was refused in silence: {}",
+            shapes_text(&drawn)
+        );
+    }
+
+    #[test]
+    fn a_chord_changes_nothing_once_the_question_has_been_answered() {
+        // The boxes are gone from the window with the question they belonged
+        // to, so a chord that still wrote one would be a preference changing
+        // where nobody could see it change.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        app.state.decide(approved(false));
+        assert_eq!(app.state.phase(), Phase::Running);
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        for key in [egui::Key::S, egui::Key::C] {
+            a_live_frame(&mut app, &ctx, vec![chord(key, egui::Modifiers::ALT)], now);
+        }
+        assert_eq!(PrefsFile::at(&paths).read(), Prefs::default(), "a running window saved a box");
+    }
+
+    #[test]
+    fn the_note_field_still_gets_the_letters_the_chords_are_built_from() {
+        // The reason these are chords and not bare keys: `s` and `c` are two
+        // of the letters somebody types into the note, and a window in which
+        // they mean something else is a window that eats what you write in it.
+        let (mut app, _sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+        click_into_the_note_field(&mut app, &ctx, now);
+
+        let typed = vec![
+            chord(egui::Key::S, egui::Modifiers::NONE),
+            egui::Event::Text("s".to_string()),
+            chord(egui::Key::C, egui::Modifiers::NONE),
+            egui::Event::Text("c".to_string()),
+        ];
+        a_live_frame(&mut app, &ctx, typed, now);
+        assert_eq!(app.note, "sc", "the chords ate what was typed into the note");
+        assert!(!app.streams() && !app.closes_on_decide(), "typing flipped a box");
+    }
+
+    #[test]
+    fn both_chords_approve_while_the_note_field_holds_the_keyboard() {
+        // The guard classifies before any widget sees the frame, so a focused
+        // text field cannot swallow either of them. Asserted for both,
+        // because a rule that held for one and not the other would be exactly
+        // the drift the label is pinned against.
+        for held in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
+            let (mut app, sink) = an_awaiting_window();
+            let ctx = egui::Context::default();
+            apply_faces(&ctx);
+            let now = past_the_guard();
+            click_into_the_note_field(&mut app, &ctx, now);
+
+            // Proof the field really has the keyboard, rather than a click
+            // that missed and a test that would pass either way.
+            a_live_frame(&mut app, &ctx, vec![egui::Event::Text("go on".to_string())], now);
+            assert_eq!(app.note, "go on", "the click did not reach the note field");
+
+            a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, held)], now);
+            let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
+            assert!(out.contains("approve"), "{held:?} did not approve: {out:?}");
+        }
+    }
+
+    // ---- what the window remembers ----------------------------------------
+
+    #[test]
+    fn a_remembered_stream_opens_the_next_window_watching() {
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { stream: true, ..Prefs::default() });
+        let (app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(app.streams(), "the next window opened having forgotten");
+        assert!(
+            matches!(app.approval(), Verdict::Approve { stream: true, .. }),
+            "and would have approved without the view it was asked for"
+        );
+    }
+
+    #[test]
+    fn two_remembered_preferences_that_contradict_each_other_say_which_is_winning() {
+        // Streaming still beats closing, and the reason the box is grey is no
+        // longer anything anybody said about this command — so the sentence
+        // claiming they did would be false. See `CLOSE_WATCHING_ALWAYS`.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs {
+            stream: true,
+            close_on_decide: true,
+            terminal: false,
+        });
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
+
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_WATCHING_ALWAYS), "the window said nothing about it: {said}");
+        assert!(
+            !said.contains(CLOSE_WATCHING),
+            "the window said the reader asked about a command they have not read: {said}"
+        );
+
+        // And the way out is the one the sentence points at: the moment the
+        // reader says something about this command, the window is about this
+        // command again.
+        app.set_stream(false);
+        assert!(app.closes_on_decide(), "unticking Stream did not give the preference back");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_COST), "the box went live without saying what it costs");
+    }
+
+    #[test]
+    fn a_tick_made_in_front_of_this_command_still_says_this_one() {
+        // The other half of the pair above: the old sentence is still the
+        // right one when the reader is the one who just ticked the box.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        app.set_stream(true);
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_WATCHING), "{said}");
+        assert!(!said.contains(CLOSE_WATCHING_ALWAYS), "{said}");
+    }
+
+    #[test]
+    fn a_remembered_terminal_arrives_with_the_sentence_that_says_what_it_costs() {
+        // The one preference in the file that changes how the command runs.
+        // What makes it answerable is that it is visible and that the warning
+        // is drawn whether or not the box is ticked — so a remembered tick
+        // never arrives without it.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { terminal: true, ..Prefs::default() });
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+
+        assert!(app.in_a_terminal(), "the next window opened having forgotten");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(TERMINAL_LABEL), "the control is not on screen: {said}");
+        assert!(said.contains(TERMINAL_CAPTURE), "what it costs is not said: {said}");
+    }
+
+    #[test]
+    fn a_remembered_terminal_cannot_withdraw_one_the_agent_asked_for() {
+        // The control grants and never withdraws, and a preference is not a
+        // way around that. Both directions of the remembered value, because a
+        // rule that held for one of them would be an accident.
+        for remembered in [false, true] {
+            let (_root, paths) = a_prefs_file();
+            PrefsFile::at(&paths).write(&Prefs { terminal: remembered, ..Prefs::default() });
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let mut app = PromptApp::new(
+                rx,
+                Box::new(Vec::new()),
+                Arc::new(OnceLock::new()),
+                PrefsFile::at(&paths),
+            );
+            let mut request = a_request(90);
+            request.payload = Payload::command(
+                &render_command("vim /etc/hosts", &BTreeMap::new()),
+                Vec::new(),
+                PathBuf::from("/tmp"),
+                false,
+                true,
+            );
+            app.state.handle(DaemonMsg::Request(request));
+
+            window_text_sized(&mut app, opening_size());
+            assert!(
+                matches!(app.approval(), Verdict::Approve { terminal: true, .. }),
+                "the agent asked for a terminal and a preference took it away"
+            );
+            // And the agent's ask is not written down as the reader's: the
+            // box was dead, nobody clicked it, and nothing may change.
+            assert_eq!(
+                PrefsFile::at(&paths).read().terminal,
+                remembered,
+                "the agent's ask became the reader's standing decision"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_saving_one_box_leaves_the_ones_it_did_not_touch_alone() {
+        // Several windows are open at once by design. A window that wrote its
+        // own struct would undo the box its neighbour ticked a moment ago.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+
+        // The window beside this one, which this one knows nothing about.
+        PrefsFile::at(&paths).update(|prefs| prefs.terminal = true);
+
+        app.set_close_on_decide(true);
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs { close_on_decide: true, stream: false, terminal: true },
+            "this window trampled what the one beside it saved"
+        );
+    }
 }
-
-
