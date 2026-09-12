@@ -412,12 +412,35 @@ pub struct ScanReport {
     /// them is a potential homoglyph.
     pub non_ascii: usize,
     /// Characters that carry no ink of their own or pass for a space,
-    /// including ASCII controls. A subset of what chips, not of `non_ascii`.
+    /// including ASCII controls, **except the structural three**. A subset of
+    /// what chips, not of `non_ascii`.
     ///
     /// A floor rather than an exact figure: it counts what `INVISIBLE`
     /// knows about, and that table is best-effort. Under-counting here costs
     /// a reader some context in the summary line and costs the display
     /// nothing, since every one of these characters chips either way.
+    ///
+    /// # Why a newline is not counted here
+    ///
+    /// A tab, a newline and a carriage return carry no ink, so they answer to
+    /// the letter of this field — and counting them made the summary line
+    /// announce "2 invisible" above an ordinary two-line command, which is
+    /// every multi-line command there is. A warning that fires on the normal
+    /// case is a warning a reader learns to skip, and it was sitting directly
+    /// above the pane it was meant to draw attention to.
+    ///
+    /// The rule that resolves it is already written above [`STRUCTURAL`]:
+    /// those three are structure a reader needs *located* rather than
+    /// *flagged*, and each is drawn as its own glyph — `⇥`, `↵`, `⇤` — in the
+    /// exact position it occupies. A character that has been located cannot
+    /// also be hidden, so it is not something this count is about. What
+    /// remains here is what would otherwise pass unseen.
+    ///
+    /// This does mean the field consults [`chip_tier`], which [`scan`] is
+    /// otherwise careful not to do. The coupling is to the *set*, not to the
+    /// renderer: were the three ever to stop being drawn as themselves they
+    /// would become hidden characters and belong in this count again, which
+    /// is the same statement read in the other direction.
     pub invisible: usize,
     /// The string is not in Normalization Form C, so at least one visible
     /// glyph is spelled with more codepoints than it needs — the shape a
@@ -443,7 +466,10 @@ pub fn scan(source: &str) -> ScanReport {
         if !c.is_ascii() {
             report.non_ascii += 1;
         }
-        if is_invisible(c) {
+        // Not `is_invisible` alone: the structural three carry no ink either,
+        // and counting them made every multi-line command announce itself as
+        // unusual. See `ScanReport::invisible`.
+        if is_invisible(c) && chip_tier(c) != ChipTier::Structural {
             report.invisible += 1;
         }
     }
@@ -888,8 +914,33 @@ mod tests {
     fn scan_counts_invisibles_separately_from_non_ascii() {
         let report = scan("us\u{0430}r\u{200B}\t");
         assert_eq!(report.non_ascii, 2, "the homoglyph and the zero-width space");
-        assert_eq!(report.invisible, 2, "the zero-width space and the tab");
+        assert_eq!(
+            report.invisible, 1,
+            "the zero-width space; the tab is located by its own glyph, not hidden"
+        );
         assert!(!report.not_nfc);
+    }
+
+    #[test]
+    fn an_ordinary_multi_line_command_is_not_unusual() {
+        // The case that prompted the rule. Two `&&` continuations are what a
+        // multi-line command is made of, and a summary line that called them
+        // out would fire above almost every command hatch ever shows.
+        let command = "cd $HOME/src/service &&\ncargo build --release &&\nsystemctl --user restart service";
+        assert_eq!(scan(command), ScanReport::default(), "{command:?}");
+        // A tab-indented heredoc body, for the same reason.
+        assert_eq!(scan("cat <<'EOF'\n\tindented\nEOF\n"), ScanReport::default());
+        // CRLF is structure too: `⇤↵` locates it in the pane, so the summary
+        // line stays quiet and the glyphs do the telling.
+        assert_eq!(scan("echo one\r\necho two\r\n"), ScanReport::default());
+    }
+
+    #[test]
+    fn an_escape_hidden_among_newlines_is_still_counted() {
+        // The other direction: exempting the structural three must not exempt
+        // anything standing next to them.
+        let report = scan("echo one\n\u{001b}[2J\techo two\n");
+        assert_eq!(report.invisible, 1, "the ANSI escape, and nothing else");
     }
 
     #[test]
