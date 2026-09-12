@@ -3647,6 +3647,77 @@ mod tests {
     }
 
     #[test]
+    fn what_a_terminal_costs_is_drawn_beside_the_control_that_opens_one() {
+        // The one thing about this control a reader cannot work out for
+        // themselves: the terminal is theirs, it behaves like theirs, and
+        // everything that happens in it is sent to the agent -- what they type
+        // included, because the terminal echoes it. If they learn that
+        // afterwards it is too late to matter.
+        let mut app = a_window_showing("pacman -Syu");
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains(TERMINAL_LABEL), "the control is missing: {drawn}");
+        assert!(
+            drawn.contains(TERMINAL_CAPTURE),
+            "the control was offered without saying what it costs: {drawn}"
+        );
+    }
+
+    #[test]
+    fn the_cost_is_said_even_when_nobody_chose_the_terminal() {
+        // The case with the most to warn about and the least reason to expect
+        // a warning: the reader did not ask for a terminal, so nothing they
+        // did would prompt them to wonder what one implies.
+        let mut app = an_interactive_window_showing("vim /etc/hosts");
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains(TERMINAL_CAPTURE), "{drawn}");
+        assert!(drawn.contains(TERMINAL_ASKED), "and why the box cannot be untucked: {drawn}");
+    }
+
+    #[test]
+    fn a_terminal_the_agent_asked_for_cannot_be_taken_away_at_the_window() {
+        // The control grants and never withdraws. A command that needs a
+        // terminal and is denied one does not fail -- it hangs, with nowhere
+        // for anybody to type -- so there is no state of this window in which
+        // a request that asked for one is approved without it.
+        let mut app = an_interactive_window_showing("vim /etc/hosts");
+        // Whatever the reader's own half says, including the default and
+        // including a value nothing in the window can produce.
+        for chosen in [false, true] {
+            app.terminal = chosen;
+            window_text(&mut app, true);
+            assert!(
+                matches!(app.approval(), Verdict::Approve { terminal: true, .. }),
+                "the agent asked for a terminal and the window answered without one"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_terminal_takes_the_stream_box_away_and_says_why() {
+        // The terminal *is* the stream, so the box has nothing left to offer.
+        // It is cleared rather than greyed with a tick still in it: a ticked
+        // box that cannot be untucked reads as a promise to stream, and
+        // nothing is going to.
+        let mut app = a_window_showing("pacman -Syu");
+        app.stream = true;
+        app.terminal = true;
+        let drawn = window_text(&mut app, true);
+
+        assert!(!app.stream, "a terminal run has no stream to promise");
+        assert!(
+            drawn.contains("terminal of its own"),
+            "a checkbox that went dead was left unexplained: {drawn}"
+        );
+        assert!(
+            matches!(app.approval(), Verdict::Approve { stream: false, terminal: true, .. }),
+            "got {:?}",
+            app.approval()
+        );
+    }
+
+    #[test]
     fn a_swap_offers_no_checkbox_for_output_it_will_never_produce() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
@@ -3668,6 +3739,12 @@ mod tests {
         let drawn = window_text(&mut app, true);
 
         assert!(!drawn.contains("Stream output"), "a swap offered to stream output: {drawn}");
+        // Nor a terminal to run in. A swap writes bytes and says nothing:
+        // there is no command for a terminal to hold, so the control would be
+        // a question with no answer -- and the warning beside it would be a
+        // caution about something that cannot happen.
+        assert!(!drawn.contains(TERMINAL_LABEL), "a swap offered a terminal: {drawn}");
+        assert!(!drawn.contains(TERMINAL_CAPTURE), "{drawn}");
     }
 
     #[test]
