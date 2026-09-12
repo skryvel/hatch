@@ -635,6 +635,52 @@ mod tests {
     }
 
     #[test]
+    fn only_a_window_that_died_unasked_is_worth_a_suffix() {
+        // The line `(prompt died while it ran)` means something went wrong.
+        // It was a boolean, so a window closing because its reader had ticked
+        // "Close when I decide" had to be filed under the same word — and the
+        // suffix would then have appeared under every approved command that
+        // person ever ran, which is how the one line that matters stops being
+        // read at all.
+        let line = |end| {
+            let mut record = sample_record(LogVerdict::Approve);
+            if let LogDetail::RunCommand(run) = &mut record.detail {
+                run.prompt = end;
+            }
+            record.summary()
+        };
+        let suffix = "(prompt died while it ran)";
+        assert!(line(Some(PromptEnd::Died)).contains(suffix), "a real death says nothing");
+        assert!(!line(Some(PromptEnd::Dismissed)).contains(suffix), "a close was called a death");
+        assert!(!line(Some(PromptEnd::Held)).contains(suffix));
+        assert!(!line(None).contains(suffix), "an operation that never ran lost no window");
+    }
+
+    #[test]
+    fn where_the_window_went_survives_a_round_trip_through_the_file() {
+        // The suffix is deliberately silent for two of the three, so the
+        // record is the only place the difference is kept. It has to come back
+        // out of the file as the thing that went in.
+        for end in [PromptEnd::Held, PromptEnd::Dismissed, PromptEnd::Died] {
+            let mut record = sample_record(LogVerdict::Approve);
+            if let LogDetail::RunCommand(run) = &mut record.detail {
+                run.prompt = Some(end);
+            }
+            let line = serde_json::to_string(&record).expect("a record encodes");
+            assert_eq!(
+                serde_json::from_str::<AuditRecord>(&line).expect("and decodes"),
+                record
+            );
+        }
+        let tags: std::collections::HashSet<_> =
+            [PromptEnd::Held, PromptEnd::Dismissed, PromptEnd::Died]
+                .iter()
+                .map(|end| serde_json::to_string(end).expect("a tag"))
+                .collect();
+        assert_eq!(tags.len(), 3, "two of them are written down as the same word");
+    }
+
+    #[test]
     fn a_line_this_build_cannot_parse_is_still_shown() {
         let known = serde_json::to_string(&sample_record(LogVerdict::Approve)).unwrap();
         assert!(render_line(&known).contains("Fix DNS resolution"));

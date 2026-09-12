@@ -3446,15 +3446,21 @@ mod tests {
     /// A window in the phase where it has buttons, writing where a test can
     /// read what went out.
     fn an_awaiting_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        an_awaiting_window_remembering(PrefsFile::none())
+    }
+
+    /// The same window, with somewhere to keep its display preferences.
+    ///
+    /// Almost every test here wants nowhere, which is what
+    /// [`an_awaiting_window`] gives: a window under test must not read or
+    /// write the preferences of whoever is running the suite.
+    fn an_awaiting_window_remembering(
+        prefs: PrefsFile,
+    ) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut app =
-            PromptApp::new(
-                rx,
-                Box::new(Sink(Arc::clone(&sink))),
-                Arc::new(OnceLock::new()),
-                PrefsFile::none(),
-            );
+            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()), prefs);
         app.state.handle(DaemonMsg::Request(a_request(90)));
         (app, sink)
     }
@@ -3542,6 +3548,182 @@ mod tests {
         draw(&mut app, &ctx, vec![button(true)], open);
         draw(&mut app, &ctx, vec![button(false)], open);
         sink.lock().expect("sink").clone()
+    }
+
+    // ---- closing on the verdict -------------------------------------------
+
+    /// Where the close control's label is on screen, read off a real frame.
+    fn close_box_at(app: &mut PromptApp, ctx: &egui::Context) -> egui::Pos2 {
+        let mut out = ctx.run_ui(raw(Vec::new()), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.verdict_area(ui, true));
+        });
+        let found = text_rects(&out.shapes)
+            .into_iter()
+            .find(|(text, _)| text == CLOSE_LABEL)
+            .map(|(_, rect)| rect.center());
+        out.textures_delta.clear();
+        found.expect("the close control is not on screen")
+    }
+
+    /// Press and release the mouse on the close control, the way a hand would.
+    fn click_close_box(app: &mut PromptApp) {
+        let ctx = egui::Context::default();
+        apply_font_size(&ctx, 16.0);
+        let at = close_box_at(app, &ctx);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(app, &ctx, vec![egui::Event::PointerMoved(at)], true);
+        draw(app, &ctx, vec![button(true)], true);
+        draw(app, &ctx, vec![button(false)], true);
+    }
+
+    /// A state directory of our own, as the daemon would have left one.
+    fn a_prefs_file() -> (tempfile::TempDir, crate::paths::Paths) {
+        let root = tempfile::tempdir().expect("a scratch directory");
+        let paths = crate::paths::Paths::scratch(root.path());
+        std::fs::create_dir_all(paths.prefs_file().parent().expect("a parent"))
+            .expect("the state directory");
+        (root, paths)
+    }
+
+    #[test]
+    fn ticking_the_box_writes_it_down_and_the_next_window_opens_with_it() {
+        // The whole of "it persists", through the real checkbox: a pointer
+        // presses it, a file is written, and the next window — a different
+        // process, in the life this window actually has — starts with it
+        // ticked.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(!app.closes_on_decide(), "a window starts by staying");
+
+        click_close_box(&mut app);
+        assert!(app.closes_on_decide(), "the click did not reach the box");
+        assert!(
+            PrefsFile::at(&paths).read().close_on_decide,
+            "the box was ticked and nothing was written down"
+        );
+
+        let (next, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(next.closes_on_decide(), "the next window opened having forgotten");
+    }
+
+    #[test]
+    fn unticking_it_is_written_down_too() {
+        // The other direction, which a window that only ever wrote a tick
+        // would get wrong: the preference would be unsettable once set.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
+
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(app.closes_on_decide());
+        click_close_box(&mut app);
+        assert!(!app.closes_on_decide(), "the click did not reach the box");
+        assert!(!PrefsFile::at(&paths).read().close_on_decide, "the untick was not written down");
+    }
+
+    #[test]
+    fn a_window_with_nowhere_to_write_still_ticks() {
+        // A prompt started somewhere the daemon has never been. The
+        // preference is lost, the window is not.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        click_close_box(&mut app);
+        assert!(app.closes_on_decide(), "a window that cannot save cannot be ticked either");
+    }
+
+    #[test]
+    fn the_approval_a_ticked_box_sends_says_the_window_is_going() {
+        // The daemon cannot tell a deliberate close from a crash by looking,
+        // so the frame has to say. See `crate::audit::PromptEnd`.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        click_close_box(&mut app);
+        assert_eq!(
+            app.approval(),
+            Verdict::Approve {
+                stream: false,
+                terminal: false,
+                closing: true,
+                note: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn a_verdict_that_says_it_is_closing_ends_the_window_on_the_frame_it_sent() {
+        // The approval still leaves — the command is authorised by the frame
+        // this hands back — and the window is over as soon as it has.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+        let frame = state.decide(Verdict::Approve {
+            stream: false,
+            terminal: false,
+            closing: true,
+            note: String::new(),
+        });
+        assert!(frame.is_some(), "a closing window still has to send its approval");
+        assert_eq!(state.phase(), Phase::Closed);
+        assert!(state.should_close());
+        assert_eq!(state.broken(), None, "a window that was asked to go has nothing to report");
+    }
+
+    #[test]
+    fn a_window_that_closed_on_its_verdict_cannot_kill_or_decide_again() {
+        // It is past `AwaitingVerdict` and nothing returns there, which is the
+        // same guarantee every other verdict already had.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(a_request(90)));
+        state.decide(Verdict::Approve {
+            stream: false,
+            terminal: false,
+            closing: true,
+            note: String::new(),
+        });
+        assert_eq!(state.request_kill(), None, "a window that has gone offered a Kill button");
+        assert_eq!(state.decide(approved(false)), None, "it answered twice");
+    }
+
+    #[test]
+    fn watching_a_command_beats_a_standing_order_to_close_and_says_so() {
+        // Two instructions that contradict each other. The one given in front
+        // of this command wins, the window says which, and the preference is
+        // not quietly rewritten on the way past.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        click_close_box(&mut app);
+        app.stream = true;
+
+        assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
+        assert!(app.close_on_decide, "the standing preference was overwritten rather than beaten");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_WATCHING), "the window ignored one of the two in silence");
+
+        app.stream = false;
+        assert!(app.closes_on_decide(), "unticking Stream did not give the preference back");
+    }
+
+    #[test]
+    fn a_terminal_run_is_not_a_reason_to_stay() {
+        // The terminal is a window of its own and the reader is about to be
+        // in front of it; hatch's window behind it shows them nothing.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        click_close_box(&mut app);
+        app.terminal = true;
+
+        assert!(app.in_a_terminal());
+        assert!(app.closes_on_decide(), "a terminal run kept a window nobody was going to read");
+    }
+
+    #[test]
+    fn the_cost_of_closing_is_on_screen_before_it_is_incurred() {
+        // Beside the control, at the window's own size, in the frame a reader
+        // decides in — not in a tooltip, for the reason the terminal warning
+        // gives.
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::none());
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_LABEL), "the control is not drawn: {said}");
+        assert!(said.contains(CLOSE_COST), "what it costs is not said: {said}");
     }
 
     #[test]
