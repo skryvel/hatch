@@ -1,5 +1,7 @@
 # hatch
 
+**Let an agent do host work without approval fatigue.**
+
 An MCP server that lets a sandboxed AI coding agent ask for a shell command or
 a file replacement on the host machine. Every request is drawn in a GUI window,
 in a form built to be read, and nothing happens until the person at the
@@ -19,8 +21,9 @@ without an agent asking for anything.
 marked as the agent's own words; below them a three-line shell command appears
 twice, raw on the left and annotated on the right. Along the bottom: a
 countdown, a terminal checkbox carrying a warning that a transcript captures
-what is typed into it, a note field, a stream checkbox, Approve and Deny with
-their keyboard shortcuts, and four narrower buttons.](media/approval-command.png)
+what is typed into it, a note field, a stream checkbox, a box that closes the
+window once a decision is made, Approve and Deny with their keyboard shortcuts,
+and four narrower buttons.](media/approval-command.png)
 
 *One request, waiting. The header is the agent's own words, marked as such: a
 rule down the side and "The agent says" in front of them. The left pane is
@@ -39,6 +42,7 @@ same thing.*
 
 ## Contents
 
+- [What you get](#what-you-get)
 - [What it does](#what-it-does)
 - [Requirements](#requirements)
 - [Install and run](#install-and-run)
@@ -55,6 +59,44 @@ same thing.*
 - [Licence](#licence)
 
 ---
+
+## What you get
+
+- **You read it before it runs.** The command appears twice: exactly as it will
+  be executed, and annotated beside it — segments numbered, `$HOME` shown with
+  the value the command will really receive, the binary that runs underlined. A
+  file write arrives as a diff, with the mode and owner it will land at.
+- **Nothing hides.** Invisible characters, right-to-left overrides and
+  non-breaking spaces are drawn as labels rather than rendered, so a filename
+  that reads `gnp.txt.exe` cannot pretend to be one. A command taller or wider
+  than its pane says so in words, and says how much is out of sight.
+- **A window that opens under your hands cannot be answered by them.** The
+  approval keys are dead for 750 ms — measured not from when the window appears
+  but from when it *gains focus*, because that is the dangerous instant: the
+  click that granted it, and every key already travelling towards whatever held
+  focus before, all land right then. Blocked events are dropped before any
+  widget sees them, so nothing arrives late. Escape denies only when pressed
+  bare. The interval is deliberately not a config key.
+- **One keystroke, and the window gets out of the way.** `Ctrl+Enter` or
+  `Shift+Enter` approves, `Esc` denies, `Alt+S` and `Alt+C` work the two boxes.
+  Tick *Close when I decide* once and it is remembered, along with whether you
+  stream and whether you want a terminal.
+- **Answers other than yes and no.** Ask the agent to explain itself, ask for a
+  version you can actually read, take the job and run it yourself, or stop the
+  whole line of work to talk. Each returns your own words to the agent rather
+  than a broken-server error — and an approval carries your note too.
+- **You can watch it, and stop it.** Output streams into the window while the
+  command runs, with a Kill button. A command that needs a keyboard gets a real
+  terminal, and the window says plainly that everything typed in there goes
+  back to the agent.
+- **Root is systemd's job.** `root: true` runs through `run0`, so the
+  elevation is a transient unit and the password dialog is the system's own —
+  hatch never sees your password. The whole `run0` line is on screen, not just
+  the command inside it, and `hatch setup polkit` writes the rule that stops a
+  second request within five minutes from skipping the prompt.
+- **It writes down what happened.** Every request lands in an append-only log
+  with the verdict, how it ended, and whether it ran as root — including the
+  ones nobody answered.
 
 ## What it does
 
