@@ -383,11 +383,23 @@ pub async fn run(
     // The command is over, so the terminal has nothing left to run. It is
     // given a moment to notice before it is ended, so that the ordinary case
     // does not involve a signal at all.
+    //
+    // The result of the grace period is kept rather than thrown away and asked
+    // for again. A `tokio::time::timeout` that returns `Ok` has already taken
+    // the task's value out of the handle, and a `JoinHandle` polled after that
+    // panics — so a second wait here would turn the ordinary ending, a
+    // terminal that left inside its grace, into a request that died with
+    // "JoinHandle polled after completion". Only the branch that timed out has
+    // a handle left to wait on.
     if terminal_output.is_none() {
-        if tokio::time::timeout(TERMINAL_EXIT_GRACE, &mut running).await.is_err() {
-            closing.cancel();
-        }
-        terminal_output = Some(match (&mut running).await {
+        let joined = match tokio::time::timeout(TERMINAL_EXIT_GRACE, &mut running).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                closing.cancel();
+                (&mut running).await
+            }
+        };
+        terminal_output = Some(match joined {
             Ok(ran) => ran,
             Err(join) => {
                 Err(ExecError::Spawn { program: program.clone(), error: join.to_string() })
@@ -986,6 +998,39 @@ mod tests {
         );
         assert_eq!(out.exit_code, Some(0));
         assert!(out.transcript.unwrap().contains("the end"));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_still_on_its_way_out_is_waited_for_exactly_once() {
+        // The ordinary ending, slowed down enough to see. The runner writes
+        // the status and returns, and the terminal is still up for a moment
+        // afterwards -- a window redrawing, a shell running its exit trap,
+        // konsole saving its scrollback. `run` leaves its loop the instant
+        // the status file appears, so the terminal's result is not in hand
+        // yet, and the grace period below the loop is the only thing that
+        // waits for it. Half a second is well inside that grace, and long
+        // enough that no poll of the loop can collect the terminal first.
+        //
+        // The failure this pins is not a wrong answer but a panic: a grace
+        // period that polls the terminal's join handle, gets the result, and
+        // then polls the same handle again takes the whole request down with
+        // "JoinHandle polled after completion". Every interactive run ends
+        // this way, so the window here is only ever as wide as the gap
+        // between the status file and the terminal leaving.
+        let (dir, env) = fixture();
+        let term =
+            vec!["bash".to_string(), "-c".to_string(), r#"bash "$0"; sleep 0.5"#.to_string()];
+        let out = within(run(&shell_argv("echo done"), &env, dir.path(), opts(&term, dir.path())))
+            .await
+            .expect("the terminal started");
+
+        assert_eq!(out.exit_code, Some(0), "the command's own status, read off the file");
+        let seen = out.transcript.expect("an interactive run always has one");
+        assert!(seen.contains("done"), "got {seen:?}");
+        assert!(
+            !seen.contains("without recording how the command finished"),
+            "the status was there all along; got {seen:?}"
+        );
     }
 
     #[tokio::test]
