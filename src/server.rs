@@ -3653,9 +3653,23 @@ later"), "");
 
         impl Harness {
             fn new(script: Vec<Reply>) -> Harness {
+                Harness::configured(script, |_| {})
+            }
+
+            /// The same harness with the config altered first.
+            ///
+            /// The one thing several of these have to change is `terminal`: a
+            /// real one opens a window and a test suite has no screen. What
+            /// goes in its place is `bash`, which is a terminal in the only
+            /// sense this path depends on — a program handed the runner's path
+            /// that starts it and waits — so everything downstream of it is
+            /// the code that will really run.
+            fn configured(script: Vec<Reply>, edit: impl FnOnce(&mut Config)) -> Harness {
                 let dir = tempfile::tempdir().unwrap();
                 let paths = Paths::scratch(dir.path());
-                let config = quick(&paths);
+                let mut config = quick(&paths);
+                config.terminal = vec!["bash".to_string()];
+                edit(&mut config);
                 let prompter = Arc::new(StubPrompter::new(script));
                 let daemon =
                     Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
@@ -3739,7 +3753,11 @@ later"), "");
             // different in each and the landing must not be.
             let typed = "fine — but check the mount afterwards";
             let approve =
-                || Reply::verdict(Verdict::Approve { stream: false, note: typed.to_string() });
+                || Reply::verdict(Verdict::Approve {
+                    stream: false,
+                    terminal: false,
+                    note: typed.to_string(),
+                });
             let tail = format!("{USER_NOTE_PREFIX}{typed}");
 
             let harness = Harness::new(vec![approve()]);
@@ -3839,6 +3857,125 @@ later"), "");
             assert_eq!(result.is_error, Some(true));
             assert!(result_text(&result).contains("no display"));
             assert_eq!(harness.verdict(), LogVerdict::PromptDied.as_str());
+        }
+
+        // --- the terminal ---------------------------------------------------
+
+        #[tokio::test]
+        async fn a_command_that_asked_for_a_terminal_gets_one_from_an_ordinary_approval() {
+            // The floor. `approved(false)` is the verdict the window sends
+            // when nobody touched anything, and it carries `terminal: false`;
+            // a request that asked for a terminal still has to get one,
+            // because a command that needs one and is denied it hangs rather
+            // than failing.
+            let harness = Harness::new(vec![approve()]);
+            let params =
+                RunCommandParams { interactive: true, ..run_of("echo ran in a terminal") };
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(false), "{text}");
+            assert!(text.contains("ran in a terminal"), "{text}");
+            assert_eq!(harness.verdict(), "approve");
+            assert_eq!(
+                harness.only_record()["interactive"],
+                serde_json::json!(true),
+                "the log is where anyone asks later which kind of run this was"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_terminal_chosen_at_the_window_runs_the_command_in_one() {
+            // The direction the control exists for: the agent asked for
+            // nothing and the person could see a prompt coming.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve {
+                stream: false,
+                terminal: true,
+                note: String::new(),
+            })]);
+            let result =
+                within(harness.daemon.run_command(run_of("echo chosen"), Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(text.contains("chosen"), "{text}");
+            assert_eq!(harness.only_record()["interactive"], serde_json::json!(true));
+        }
+
+        #[tokio::test]
+        async fn a_terminal_run_answers_with_one_transcript_and_no_streams() {
+            // A pty is one stream. Reporting it under `stdout:` would hand the
+            // agent a separation the run did not have, so the two headings are
+            // absent rather than empty and the one that is there says what it
+            // is.
+            let harness = Harness::new(vec![approve()]);
+            let params = RunCommandParams {
+                interactive: true,
+                ..run_of("echo to out; echo to err >&2; exit 4")
+            };
+            let text =
+                result_text(&within(harness.daemon.run_command(params, Caller::quiet())).await);
+
+            assert!(text.contains("transcript:"), "{text}");
+            assert!(!text.contains("stdout:"), "{text}");
+            assert!(!text.contains("stderr:"), "{text}");
+            assert!(text.contains("to out") && text.contains("to err"), "{text}");
+            assert!(text.contains("exit code: 4"), "the status came off the file: {text}");
+        }
+
+        #[tokio::test]
+        async fn a_terminal_run_is_not_cut_off_at_the_execution_deadline() {
+            // The deadline is a runaway-process guard, and in a terminal the
+            // guard is the person in front of it: cutting the run off at it
+            // would end their session mid-keystroke. One second here, against
+            // a command that takes three.
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.exec_timeout_secs = 1;
+            });
+            let params = RunCommandParams { interactive: true, ..run_of("sleep 3; echo survived") };
+            let text =
+                result_text(&within(harness.daemon.run_command(params, Caller::quiet())).await);
+
+            assert!(text.contains("survived"), "hatch killed it at the deadline: {text}");
+            assert!(!text.contains("timed out"), "{text}");
+            assert!(text.contains("exit code: 0"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn a_terminal_that_will_not_start_is_an_error_and_not_a_finished_command() {
+            // kitty exits 0 for a program it could not run, so "the terminal
+            // came back" is not "the command ran". The agent is told plainly
+            // that nothing happened, because the retry is safe and it needs to
+            // know that.
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.terminal = vec!["no-such-terminal-anywhere".to_string()];
+            });
+            let params = RunCommandParams { interactive: true, ..run_of("echo never") };
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("nothing ran"), "{text}");
+            assert!(text.contains("no-such-terminal-anywhere"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn an_ordinary_run_still_keeps_its_two_streams_apart() {
+            // The other side of the transcript change: nothing about the
+            // ordinary path moved, and a diagnostic is still not part of an
+            // answer.
+            let harness = Harness::new(vec![approve()]);
+            let text = result_text(
+                &within(harness.daemon.run_command(
+                    run_of("echo to out; echo to err >&2"),
+                    Caller::quiet(),
+                ))
+                .await,
+            );
+
+            assert!(text.contains("stdout:\nto out\n"), "{text}");
+            assert!(text.contains("stderr:\nto err\n"), "{text}");
+            assert!(!text.contains("transcript:"), "{text}");
+            assert_eq!(harness.only_record()["interactive"], serde_json::json!(false));
         }
 
         // --- the deny rule stops at Approve -------------------------------
