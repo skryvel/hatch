@@ -12,6 +12,8 @@ each time.
 
 Written in Rust. One binary, two modes: a daemon speaking MCP over streamable
 HTTP on loopback, and a short-lived egui window spawned once per request.
+`hatch preview` opens that same window on a sample, so you can look at it
+without an agent asking for anything.
 
 ![The hatch approval window. The agent's title and reason are at the top,
 marked as the agent's own words; below them a three-line shell command appears
@@ -30,6 +32,9 @@ swallowed. The header counts what it found, the countdown says how long is left
 before the window denies on its own, and the buttons name the keys that do the
 same thing.*
 
+<sub>`hatch preview command --shot media/approval-command.png` — see
+[Look at it yourself](#look-at-it-yourself-hatch-preview).</sub>
+
 ---
 
 ## Contents
@@ -39,6 +44,7 @@ same thing.*
 - [Install and run](#install-and-run)
 - [Required for root: the polkit drop-in](#required-for-root-the-polkit-drop-in)
 - [The approval window](#the-approval-window)
+  - [Look at it yourself: `hatch preview`](#look-at-it-yourself-hatch-preview)
 - [Terminals](#terminals)
 - [Threat model](#threat-model)
 - [Known limits](#known-limits)
@@ -237,7 +243,7 @@ black and white. Neither costs a row: the block is the height of the line it
 sits on, and the frame is painted in the margin the panels already leave. It is
 drawn while the window asks, while the command runs and while the result sits on
 screen, because a command that has already run as root is still the thing that
-ran as root.
+ran as root. `hatch preview root` draws one.
 
 **Two panes, same bytes.** The left pane is raw: monospace, no reflow, no
 segmentation, drawn from the same string that becomes the shell's argument. The
@@ -298,6 +304,8 @@ either. The header counts what it found — and counts two, not three: the
 newline carries no ink, but it has been drawn in the place it occupies rather
 than hidden, so it is not what that number is about.*
 
+<sub>`hatch preview chips --shot media/rendering-chips.png`</sub>
+
 A file replacement gets the same treatment, plus a statement of exactly where
 the bytes will land:
 
@@ -311,6 +319,8 @@ replace, at what mode, owned by whom, and how much larger. A replacement
 inherits the existing mode and owner, and the write either matches what the
 window said or does not happen. The tinted cell on the left is a row that side
 has no line for, which is not the same as a blank line.*
+
+<sub>`hatch preview swap --shot media/approval-swap.png`</sub>
 
 **The typing guard.** Every input is inert for 750 ms after the window gains
 focus, and events delivered during that interval are dropped rather than
@@ -336,6 +346,50 @@ in hue, because every colour this window uses to mean something is pinned to a
 contrast ratio against that ground, and a ground that moved in lightness would
 push one of them under. The hue claims nothing about the outcome: a failed run
 is the same violet as a clean one, and what happened is said in words.
+
+### Look at it yourself: `hatch preview`
+
+```sh
+hatch preview                     # the window above, from your own config
+hatch preview root                # the root window: the ROOT block and the frame
+hatch preview --theme light       # the other palette, for this window only
+```
+
+`hatch preview [command|chips|swap|root]` opens the real approval window on a
+sample request, reading the same config `hatch prompt` reads. It is how you see
+what your `font_size`, `theme` and `terminal` settings actually render as
+without having to get an agent to knock on the door.
+
+**It cannot run anything.** There is no daemon behind a preview, and that is
+structural rather than circumstantial: the window's one way to act on a
+decision is to write a verdict down a channel, and the only channel a preview
+ever gives it discards what it is handed. Pressing Approve closes the window
+and runs nothing. The one thing a preview writes to disk is its own sample file
+under `$TMPDIR/hatch-preview`, because a file replacement is planned against a
+file that exists.
+
+Each sample is built through the calls the daemon makes — the same renderer,
+the same payload constructors, the same plan — and handed to the same window
+code, which is checked by a test that asks a real daemon for the same request
+and compares the two payloads field for field. A preview that looked right
+while the daemon drifted underneath it would be worse than no preview.
+
+`--shot PATH` waits for the window to settle, photographs its own viewport and
+exits, writing a PNG at the window's native size. That is how every image on
+this page is made, and the command for each one is printed under it. It needs a
+display but no compositor screenshot permission — egui reads its own
+framebuffer — and two runs produce byte-identical files, because the countdown
+is stamped to a round figure for a shot. It exits non-zero if no picture
+reached the disk.
+
+There is no image of the root window on this page yet.
+`hatch preview root --shot media/approval-root.png` is what makes one.
+
+On a machine with no `run0` — a container, a non-systemd distribution — the
+root preview still draws, and says on standard error that hatch would have
+refused the real request there. The line in the window is composed by the code
+that composes the real one, given the same child environment; what that machine
+lacks is permission to run it, not the ability to describe it.
 
 ## Terminals
 
@@ -615,11 +669,19 @@ Every key is optional and has the default above, so a config written by an
 older build keeps loading unchanged after new keys appear.
 
 Both palettes carry every meaning the window has; neither decides anything.
-`theme = "light"` is the same window as the one at the top of this page:
+`hatch preview` draws a sample window from this file, which is the quickest way
+to see what a `font_size` or a `theme` actually looks like before an agent
+does. `theme = "light"` is the same window as the one at the top of this page:
 
 ![The same approval window in the light palette: dark text on a pale ground,
 with the same two panes, the same annotations and the same
 buttons.](media/approval-command-light.png)
+
+<sub>`hatch preview command --theme light --shot media/approval-command-light.png`</sub>
+
+`hatch preview --theme light` draws one window in the other palette without
+writing anything: the config file says what it said before, and the next real
+request is drawn in whatever that is.
 
 Three directories, in three places, following the XDG base directory spec:
 
