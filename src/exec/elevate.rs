@@ -43,6 +43,18 @@
 //! The same rule at the other end: [`NoElevation::classify`] cannot report an
 //! exit status, because a command that was never elevated was never run.
 //!
+//! [`Elevation::compose`] is the one place the rule is worth reading twice.
+//! It builds the elevated argv *without* asking whether this machine can
+//! elevate, so that `hatch preview` can draw the root window on a machine
+//! with no `run0` on it — the line is a function of the request, and the
+//! availability check is a fact about the host. It is not a way round the
+//! paragraph above: it returns the same [`ElevatedArgv`], built by the same
+//! private constructor, so an implementation with no elevation program still
+//! has nothing to return but an error. What it can produce that
+//! [`Elevation::elevate`] cannot is an argv naming a program that is not
+//! installed, and that fails at `execve` rather than quietly running the
+//! command as the user.
+//!
 //! # Two environments, and why they differ
 //!
 //! A root run involves two processes and they do not get the same
@@ -120,7 +132,8 @@ pub trait Elevation: Send + Sync {
     /// the command not to be affected by that. See [`Run0::spawner_env`].
     fn spawner_env(&self, env: &Env) -> Env;
 
-    /// The argv that runs `inner` as root with [`Self::child_env`] applied.
+    /// What elevating `inner` would look like, without asking whether this
+    /// machine can do it.
     ///
     /// `inner` is an argv and not a command string, because the two callers
     /// want different things in front of the elevation wrapper and only one
@@ -128,14 +141,51 @@ pub trait Elevation: Send + Sync {
     /// `bash -c`; a root `swap_file` is `install` with four options and two
     /// paths, and putting a shell under it would re-parse a path the window
     /// already committed to for no gain at all. This is the primitive and
-    /// [`Self::argv`] is the shell-shaped case of it.
+    /// [`Self::compose_argv`] is the shell-shaped case of it.
+    ///
+    /// # Why this is separate from [`Self::elevate`]
+    ///
+    /// [`Self::elevate`] answers two questions at once — *can this machine
+    /// elevate* and *what does elevating this look like* — and the daemon
+    /// needs both, in that order: a request this machine cannot honour must
+    /// be refused before anybody is asked to read it. `hatch preview` needs
+    /// only the second, because it runs nothing at all; the whole of what it
+    /// produces is a picture of a line. Splitting the two is what lets a
+    /// preview draw the real root window on a machine that could not actually
+    /// run one, without inventing a character: it is the same function, given
+    /// the same child environment, producing the same argv and the same
+    /// [`ElevatedArgv::inner_at`].
+    ///
+    /// What it deliberately does **not** open is the hole the module docs are
+    /// about. [`ElevatedArgv::wrapping`] is still the only constructor and
+    /// still puts the elevation program in front, so an implementation with
+    /// nothing to put there has nothing to return here either — see
+    /// [`NoElevation::compose`]. The most this can produce is an argv naming
+    /// a program that is missing, and a missing program fails loudly at
+    /// `execve` rather than quietly running the command as the user.
     ///
     /// # Errors
     ///
-    /// [`Unavailable`], on exactly the terms [`Self::available`] uses. There
-    /// is no third answer: an implementation that cannot elevate returns an
-    /// error, never an argv that runs the command some other way.
-    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable>;
+    /// [`Unavailable`], when this mechanism has no elevation to compose at
+    /// all. There is no third answer: an implementation that cannot elevate
+    /// returns an error, never an argv that runs the command some other way.
+    fn compose(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable>;
+
+    /// The argv that runs `inner` as root with [`Self::child_env`] applied,
+    /// on a machine that can.
+    ///
+    /// [`Self::available`] and then [`Self::compose`], in that order, which is
+    /// the order every caller that is going to *spawn* something wants: the
+    /// refusal that is about the machine comes before the work that is about
+    /// the request.
+    ///
+    /// # Errors
+    ///
+    /// [`Unavailable`], on exactly the terms [`Self::available`] uses.
+    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
+        self.available(env)?;
+        self.compose(inner, env)
+    }
 
     /// The argv that runs the shell script `command` as root.
     ///
@@ -144,6 +194,16 @@ pub trait Elevation: Send + Sync {
     /// travels as a single `execve` argument either way.
     fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
         self.elevate(shell_argv(command), env)
+    }
+
+    /// [`Self::argv`] for a caller that is only going to draw the line.
+    ///
+    /// The same [`shell_argv`] wrapper over [`Self::compose`] rather than over
+    /// [`Self::elevate`]. Nothing in this crate spawns what comes back: the
+    /// one caller is [`crate::preview`], which has no daemon, no verdict
+    /// channel and nothing to run a command with.
+    fn compose_argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
+        self.compose(shell_argv(command), env)
     }
 
     /// What a finished elevated run means.
@@ -615,8 +675,13 @@ impl Elevation for Run0 {
     ///   concatenated into the line but travels as a single `execve` argument
     ///   from here to the shell that reads it. For a root `swap_file` it is
     ///   `install` and its arguments, with no shell under them at all.
-    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        self.available(env)?;
+    ///
+    /// Composed and not gated: whether this machine has `run0` at all is
+    /// [`Elevation::available`]'s question, and [`Elevation::elevate`] asks it
+    /// first on behalf of everything that is going to spawn the result. The
+    /// line itself is a function of the request and the child environment, and
+    /// of nothing about the machine.
+    fn compose(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
         let mut wrapper = vec!["--pipe".to_string()];
         wrapper.extend(
             self.child_env(env).iter().map(|(key, value)| format!("--setenv={key}={value}")),
@@ -789,7 +854,13 @@ impl Elevation for NoElevation {
     /// unelevated one: running the command as the user is not a degraded form
     /// of running it as root, it is a different operation than the one that
     /// was approved.
-    fn elevate(&self, _inner: Vec<String>, _env: &Env) -> Result<ElevatedArgv, Unavailable> {
+    ///
+    /// This is the half of the split that keeps the module's invariant whole.
+    /// [`Elevation::compose`] asks nothing about the machine, so an
+    /// implementation could answer it on a machine that cannot elevate — but
+    /// only if it had an elevation program to name, and this one has none.
+    /// There is nothing here to return but the refusal.
+    fn compose(&self, _inner: Vec<String>, _env: &Env) -> Result<ElevatedArgv, Unavailable> {
         Err(self.refusal())
     }
 
@@ -930,8 +1001,7 @@ impl Elevation for Rehearsed {
     /// The program, then the argv unchanged. No wrapper of its own: `run0`'s
     /// `--pipe` and `--setenv` are `run0`'s, and a double that invented
     /// options for a program that does not take them would not run.
-    fn elevate(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        self.available(env)?;
+    fn compose(&self, inner: Vec<String>, env: &Env) -> Result<ElevatedArgv, Unavailable> {
         self.seen.lock().expect("the recording lock").push(inner.clone());
         // Resolved off the child's `PATH` for the reason `available` is: the
         // spawn searches that one, not the daemon's.
@@ -1027,6 +1097,50 @@ mod tests {
         let refusing = NoElevation::for_os("plan9");
         assert!(refusing.elevate(vec!["install".to_string()], &Env::new()).is_err());
         assert!(refusing.argv("true", &Env::new()).is_err());
+    }
+
+    #[test]
+    fn composing_a_line_asks_nothing_about_the_machine_that_would_run_it() {
+        // The property `hatch preview` rests on, stated from both ends: on a
+        // `PATH` with `run0` on it the two agree byte for byte, and on a
+        // `PATH` without one the gated call refuses while the composed line
+        // is unchanged. A preview is therefore showing the line the daemon
+        // would have built, on a machine where the daemon would have refused
+        // to build one.
+        let run0 = Run0::new();
+        let (_dir, here) = with_run0();
+        assert_eq!(
+            run0.compose_argv("systemctl status nginx", &here).unwrap(),
+            run0.argv("systemctl status nginx", &here).unwrap(),
+            "the gate changed the line it is supposed only to guard"
+        );
+
+        let mut elsewhere = here.clone();
+        elsewhere.insert("PATH".to_string(), "/nowhere".to_string());
+        assert!(
+            run0.argv("systemctl status nginx", &elsewhere).is_err(),
+            "this PATH has a run0 on it after all, and the test proves nothing"
+        );
+        let composed = run0.compose_argv("systemctl status nginx", &elsewhere).unwrap();
+        assert_eq!(composed.program(), Run0::PROGRAM);
+        assert_eq!(
+            composed.display_line(),
+            run0.compose_argv("systemctl status nginx", &here)
+                .unwrap()
+                .display_line()
+                .replace(here.get("PATH").unwrap().as_str(), "/nowhere"),
+            "the composed line said something other than what the child environment holds"
+        );
+    }
+
+    #[test]
+    fn a_platform_with_no_elevation_program_composes_nothing_either() {
+        // The half of the split that must not become a hole: composing skips
+        // the availability question, and an implementation with nothing to
+        // put in front of the argv still has nothing to return.
+        let refusing = NoElevation::for_os("plan9");
+        assert!(refusing.compose(vec!["install".to_string()], &Env::new()).is_err());
+        assert!(refusing.compose_argv("true", &Env::new()).is_err());
     }
 
 
