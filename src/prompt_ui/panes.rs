@@ -369,11 +369,24 @@ pub fn plan_facts(plan: &SwapPlan) -> Vec<(&'static str, String)> {
 }
 
 /// How much bigger or smaller the file gets.
+///
+/// A one-byte change says "1 byte", not "1 bytes". This is a line in a panel
+/// whose whole job is to be read carefully before someone approves a write,
+/// and a sentence that reads as a formatting slip invites the eye to skim the
+/// four facts beside it.
 fn size_delta(delta: i64) -> String {
     match delta {
         0 => "the same number of bytes".to_string(),
-        delta if delta > 0 => format!("{delta} bytes larger"),
-        delta => format!("{} bytes smaller", -delta),
+        delta if delta > 0 => format!("{} larger", bytes(delta)),
+        delta => format!("{} smaller", bytes(-delta)),
+    }
+}
+
+/// A byte count and its noun, agreeing in number.
+fn bytes(count: i64) -> String {
+    match count {
+        1 => "1 byte".to_string(),
+        count => format!("{count} bytes"),
     }
 }
 
@@ -2449,6 +2462,18 @@ mod tests {
         assert_eq!(facts[1], ("Mode", "4755".to_string()), "setuid was rounded away");
         assert_eq!(facts[2].1, "root:0", "a gid with no name lost its number");
         assert_eq!(facts[3].1, "3 bytes smaller");
+    }
+
+    #[test]
+    fn a_single_byte_is_a_byte_and_not_bytes() {
+        // The panel is read once, carefully, before somebody approves a write
+        // to a file. A line that reads as a formatting slip is an invitation
+        // to skim the four beside it.
+        assert_eq!(size_delta(1), "1 byte larger");
+        assert_eq!(size_delta(-1), "1 byte smaller");
+        assert_eq!(size_delta(2), "2 bytes larger");
+        assert_eq!(size_delta(-2), "2 bytes smaller");
+        assert_eq!(size_delta(0), "the same number of bytes");
     }
 
     #[test]

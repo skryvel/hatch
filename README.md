@@ -13,10 +13,12 @@ each time.
 Written in Rust. One binary, two modes: a daemon speaking MCP over streamable
 HTTP on loopback, and a short-lived egui window spawned once per request.
 
-![The hatch approval window. The agent's title and reason are at the top; below
-them a three-line shell command appears twice, raw on the left and annotated on
-the right, with a countdown, a note field and Approve, Deny and the narrower
-buttons along the bottom.](media/approval-command.png)
+![The hatch approval window. The agent's title and reason are at the top,
+marked as the agent's own words; below them a three-line shell command appears
+twice, raw on the left and annotated on the right. Along the bottom: a
+countdown, a terminal checkbox carrying a warning that a transcript captures
+what is typed into it, a note field, a stream checkbox, Approve and Deny with
+their keyboard shortcuts, and four narrower buttons.](media/approval-command.png)
 
 *One request, waiting. The header is the agent's own words, marked as such: a
 rule down the side and "The agent says" in front of them. The left pane is
@@ -281,7 +283,9 @@ and is not, and without the chip the two lines look like the same kind of
 thing. `[NBSP]` is a non-breaking space inside a path that appears to be
 `staging/archive`. The ordinary newline ending the first line stays a quiet
 `↵`, because if it shouted as loudly as those two nobody would keep reading
-either. The header counts what it found.*
+either. The header counts what it found — and counts two, not three: the
+newline carries no ink, but it has been drawn in the place it occupies rather
+than hidden, so it is not what that number is about.*
 
 A file replacement gets the same treatment, plus a statement of exactly where
 the bytes will land:
