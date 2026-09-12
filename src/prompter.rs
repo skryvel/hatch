@@ -543,7 +543,7 @@ impl Prompter for ProcessPrompter {
         // The request goes first and exactly once, before any task exists that
         // could write anything else. A failure here is a window that never
         // opened, and the child dies with the `Command` on the way out.
-        tokio::time::timeout(self.write_timeout, write_frame(&mut stdin, &DaemonMsg::Request(req)))
+        tokio::time::timeout(self.write_timeout, write_frame(&mut stdin, &DaemonMsg::Request(Box::new(req))))
             .await
             .context("the approval window did not read its request")?
             .context("the request could not be written to the approval window")?;
@@ -1113,6 +1113,7 @@ mod tests {
             reason: "a test asked for a window".to_string(),
             deadline: Utc::now() + chrono::Duration::seconds(90),
             queue_depth: 0,
+            number: Some(1),
             payload: Payload::command(
                 &render_command("true", &BTreeMap::new()),
                 Vec::new(),

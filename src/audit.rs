@@ -133,6 +133,22 @@ pub struct AuditRecord {
     /// When the outcome was recorded, local time, to the second.
     #[serde(with = "rfc3339_secs")]
     pub ts: DateTime<Local>,
+    /// Which approval window this was, counting from one, if it ever became
+    /// one.
+    ///
+    /// The same number the window wore in its title bar, so a person who says
+    /// *I denied forty-seven* has said something this file can be searched
+    /// for. Absent on a line for a request hatch refused before anybody was
+    /// asked: there was no window, so there is no number, and writing a zero
+    /// would invent one.
+    ///
+    /// It is a handle and not an identity. The counter is the running
+    /// daemon's and starts again at one when it restarts -- see
+    /// [`crate::queue::Admission::number`] -- so a month's file can hold two
+    /// `#3`s. `ts` is what tells them apart, which is why the number is
+    /// beside it rather than instead of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
     /// The agent's one-line summary of what it wanted.
     pub title: String,
     /// The agent's justification, as it was shown to the user.
@@ -359,8 +375,15 @@ impl AuditRecord {
     /// operation itself.
     fn summary(&self) -> String {
         let mut line = format!(
-            "{}  {:<16}  {}  |  {}",
+            "{}  {:<5}{:<16}  {}  |  {}",
             self.ts.format("%Y-%m-%d %H:%M:%S"),
+            // A column of its own, left empty rather than skipped for a
+            // refusal that never got a number: the verdicts below it stay in
+            // line, which is what makes a file read by eye readable at all.
+            match self.number {
+                Some(number) => format!("#{number}"),
+                None => String::new(),
+            },
             self.verdict,
             visible(&self.title),
             self.detail.summary()
@@ -455,6 +478,7 @@ mod tests {
     fn sample_record(verdict: LogVerdict) -> AuditRecord {
         AuditRecord {
             ts: fixed_ts(),
+            number: Some(47),
             title: "Fix DNS resolution".to_string(),
             reason: "resolved is stale after the netctl change".to_string(),
             verdict,
@@ -544,6 +568,7 @@ mod tests {
         // absent, not present-and-null.
         let record = AuditRecord {
             ts: fixed_ts(),
+            number: Some(2),
             title: "Add staging host".to_string(),
             reason: "the deploy target moved".to_string(),
             verdict: LogVerdict::Deny,
@@ -632,6 +657,33 @@ mod tests {
         }
         assert!(line.contains("# systemctl"), "root must be visible: {line}");
         assert!(line.contains("deny            "), "verdicts must be padded into a column: {line}");
+        assert!(line.contains("#47"), "the number the window wore is missing from: {line}");
+    }
+
+    #[test]
+    fn the_number_the_window_wore_is_written_down_and_is_absent_when_there_was_none() {
+        // The number is a handle: a person says "I denied forty-seven" and
+        // this file is what they say it into. A request hatch refused before
+        // anybody was asked never became a window, so it has no number -- and
+        // an absent key says that, where a zero would invent one.
+        let numbered = sample_record(LogVerdict::Deny);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&numbered).unwrap()).unwrap();
+        assert_eq!(json["number"], 47);
+
+        let mut refused = sample_record(LogVerdict::Refused);
+        refused.number = None;
+        let text = serde_json::to_string(&refused).unwrap();
+        assert!(!text.contains("number"), "a request nobody saw carries no number: {text}");
+
+        // And the column is still a column, so the verdicts below a refusal
+        // stay in line with the ones above it.
+        let (with, without) = (numbered.summary(), refused.summary());
+        assert_eq!(
+            with.find("deny"),
+            without.find("refused"),
+            "the verdict column moved:\n{with}\n{without}"
+        );
     }
 
     #[test]
@@ -742,6 +794,7 @@ mod tests {
     fn swap_record() -> AuditRecord {
         AuditRecord {
             ts: fixed_ts(),
+            number: Some(3),
             title: "Add staging host".to_string(),
             reason: "the deploy target moved".to_string(),
             verdict: LogVerdict::Approve,

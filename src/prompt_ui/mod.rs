@@ -117,6 +117,27 @@ use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, 
 /// also the name eframe reports to the desktop.
 const APP_ID: &str = "hatch-prompt";
 
+/// What an approval window is called before it knows which one it is.
+///
+/// Every window is built with this, because the viewport exists before the
+/// request does -- the reader opens a window and then it is told what to ask.
+/// A numbered one renames itself the moment the request lands; see
+/// [`numbered_title`] and [`PromptState::take_title`].
+pub(crate) const WINDOW_TITLE: &str = "hatch — approval";
+
+/// What window `number` is called.
+///
+/// The number is in the title because the title bar is the only place a
+/// window is named where a person is looking at something other than the
+/// window: alt-tab, a task switcher, a dock. Two approval windows are the
+/// same object there, and a reader who answered one while the next opened in
+/// the same instant has no way to tell that the second is a second. It costs
+/// no row inside the window, which is the other half of why it is here and
+/// not on a line of its own.
+pub(crate) fn numbered_title(number: u64) -> String {
+    format!("{WINDOW_TITLE} #{number}")
+}
+
 /// The size the window opens at.
 ///
 /// Wide enough for the side-by-side diff to be the view a `swap_file` request
@@ -553,6 +574,7 @@ pub struct PromptState {
     linger_until: Option<Instant>,
     broken: Option<String>,
     close_taken: bool,
+    title_taken: bool,
 }
 
 impl Default for PromptState {
@@ -578,6 +600,7 @@ impl PromptState {
             linger_until: None,
             broken: None,
             close_taken: false,
+            title_taken: false,
         }
     }
 
@@ -701,6 +724,28 @@ impl PromptState {
         true
     }
 
+    /// The name this window should be wearing, once and only once.
+    ///
+    /// `None` until a numbered request has arrived, and `None` for ever
+    /// afterwards: the title is set from the request that named it and a
+    /// window never gets a second request. The latch is here, beside
+    /// [`PromptState::take_close`]'s, rather than in the eframe app, because
+    /// it is a fact about what the daemon has said and not about what the
+    /// event loop has drawn -- and asking the compositor to rename a window
+    /// sixty times a second is sixty round trips to say the same thing.
+    ///
+    /// A request with no number leaves the window with the title it was
+    /// opened with, which is the whole of how `hatch preview` avoids claiming
+    /// to be request #1 of anything. See [`Request::number`].
+    pub fn take_title(&mut self) -> Option<String> {
+        if self.title_taken {
+            return None;
+        }
+        let number = self.request.as_ref()?.number?;
+        self.title_taken = true;
+        Some(numbered_title(number))
+    }
+
     /// Seconds left before the approval expires, at `now`.
     ///
     /// Read off the deadline every time rather than counted down, so a window
@@ -749,7 +794,7 @@ impl PromptState {
                     }
                 };
                 self.queue_depth = req.queue_depth;
-                self.request = Some(req);
+                self.request = Some(*req);
                 self.shown = Some(shown);
                 self.phase = Phase::AwaitingVerdict;
             }
@@ -1075,7 +1120,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
 
     let app_fatal = Arc::clone(&fatal);
     open_window(
-        "hatch — approval",
+        WINDOW_TITLE,
         font_size,
         theme,
         Box::new(move |cc| {
@@ -1415,6 +1460,13 @@ fn arm_linger_backstop(kept: Arc<AtomicBool>, fatal: Arc<OnceLock<String>>) {
 impl eframe::App for PromptApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.take_arrivals();
+        // As soon as the request that names this window has arrived, and
+        // never again: the viewport was built before there was a request to
+        // name it after. `Title` is the only way to say it once the window
+        // exists, and the state machine's latch is what keeps it to once.
+        if let Some(title) = self.state.take_title() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
         // Before anything is drawn, and before any widget sees the frame.
         // Whatever the guard did not hand back is gone from this frame.
         let now = Instant::now();
@@ -2897,6 +2949,7 @@ mod tests {
             reason: "the last build left files the tests trip over".to_string(),
             deadline: Utc::now() + chrono::Duration::seconds(seconds_left),
             queue_depth: 0,
+            number: Some(47),
             payload: Payload::command(
                 &render_command("rm -rf target", &BTreeMap::new()),
                 Vec::new(),
@@ -2923,7 +2976,7 @@ mod tests {
     #[test]
     fn the_close_is_taken_once_and_only_once() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         assert!(!state.take_close(), "there is nothing to close yet");
 
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
@@ -2933,13 +2986,50 @@ mod tests {
         assert!(state.should_close(), "and it is still closing");
     }
 
+    #[test]
+    fn the_window_takes_the_number_of_the_request_it_was_given_into_its_title() {
+        // Two approval windows are the same object in a task switcher, which
+        // is where a reader answering one and seeing the next open read the
+        // second as the first being clobbered. The number is what tells them
+        // apart there.
+        let mut state = PromptState::new();
+        assert_eq!(state.take_title(), None, "a window with no request has nothing to be called");
+
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        assert_eq!(
+            state.take_title().as_deref(),
+            Some("hatch — approval #47"),
+            "the window is not wearing the number it was sent"
+        );
+        assert_eq!(state.take_title(), None, "it would rename the window on every frame");
+    }
+
+    #[test]
+    fn a_request_nobody_numbered_leaves_the_window_the_name_it_opened_with() {
+        // `hatch preview` builds one of these to draw the real window from,
+        // and a preview is not the first request of anything. Nothing to
+        // take means nothing is sent, and the title stays as `open_window`
+        // set it.
+        let mut state = PromptState::new();
+        let mut request = a_request(90);
+        request.number = None;
+        state.handle(DaemonMsg::Request(Box::new(request)));
+        assert_eq!(state.take_title(), None);
+    }
+
+    #[test]
+    fn a_numbered_title_is_the_plain_one_with_the_number_on_the_end() {
+        assert_eq!(numbered_title(1), format!("{WINDOW_TITLE} #1"));
+        assert_eq!(numbered_title(47), "hatch — approval #47");
+    }
+
     // ---- the wiring --------------------------------------------------------
 
     #[test]
     fn draining_hands_every_arrival_to_the_state_machine() {
         let mut state = PromptState::new();
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Incoming::Frame(DaemonMsg::Request(a_request(90)))).unwrap();
+        tx.send(Incoming::Frame(DaemonMsg::Request(Box::new(a_request(90))))).unwrap();
         tx.send(Incoming::Frame(DaemonMsg::QueueDepth { depth: 5 })).unwrap();
 
         drain(&mut state, &rx);
@@ -2963,7 +3053,7 @@ mod tests {
     #[test]
     fn a_verdict_goes_out_as_one_framed_line() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         let mut wire = Vec::new();
 
         // With a note in it, because an approval carries one and this is the
@@ -3010,7 +3100,7 @@ mod tests {
     #[test]
     fn an_approval_that_cannot_be_sent_does_not_leave_a_window_pretending() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         let frame = state.decide(approved(true));
         assert_eq!(state.phase(), Phase::Running);
 
@@ -3039,7 +3129,7 @@ mod tests {
         assert!(state.request().is_none(), "there is nothing to draw yet");
 
         let sent = a_request(90);
-        state.handle(DaemonMsg::Request(sent.clone()));
+        state.handle(DaemonMsg::Request(Box::new(sent.clone())));
 
         assert_eq!(state.request(), Some(&sent), "the window would draw something else");
     }
@@ -3052,7 +3142,7 @@ mod tests {
     #[test]
     fn the_countdown_stops_at_zero_rather_than_running_negative() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(-30)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(-30))));
 
         assert_eq!(state.seconds_remaining(Utc::now()), Some(0));
     }
@@ -3064,7 +3154,7 @@ mod tests {
         let mut state = PromptState::new();
         let mut req = a_request(90);
         req.queue_depth = 3;
-        state.handle(DaemonMsg::Request(req));
+        state.handle(DaemonMsg::Request(Box::new(req)));
 
         assert_eq!(state.queue_depth(), 3);
         assert_eq!(state.queue_badge(), Some(3));
@@ -3073,7 +3163,7 @@ mod tests {
     #[test]
     fn nothing_waiting_is_not_a_badge() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert_eq!(state.queue_badge(), None);
     }
@@ -3081,7 +3171,7 @@ mod tests {
     #[test]
     fn a_running_window_does_not_draw_a_badge_about_someone_elses_queue() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(false));
         state.handle(DaemonMsg::QueueDepth { depth: 7 });
 
@@ -3094,7 +3184,7 @@ mod tests {
     #[test]
     fn a_second_press_of_the_same_button_sends_nothing() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert!(state.decide(approved(true)).is_some());
         assert_eq!(state.decide(approved(true)), None);
@@ -3103,7 +3193,7 @@ mod tests {
     #[test]
     fn a_verdict_pressed_while_the_command_runs_sends_nothing() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
 
         assert_eq!(state.decide(Verdict::Deny { note: String::new() }), None);
@@ -3121,7 +3211,7 @@ mod tests {
     #[test]
     fn the_verdict_that_goes_out_is_the_one_that_was_pressed() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         let sent = state.decide(Verdict::Revise {
             kind: ReviseKind::Simplify,
@@ -3146,7 +3236,7 @@ mod tests {
             .filter(|verdict| !matches!(verdict, Verdict::Approve { .. }))
         {
             let mut state = PromptState::new();
-            state.handle(DaemonMsg::Request(a_request(90)));
+            state.handle(DaemonMsg::Request(Box::new(a_request(90))));
             assert!(state.decide(verdict.clone()).is_some());
 
             assert!(state.should_close(), "{verdict:?} left the window open");
@@ -3161,7 +3251,7 @@ mod tests {
         let mut state = PromptState::new();
         assert_eq!(state.request_kill(), None);
 
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         assert_eq!(state.request_kill(), None, "nothing has been approved yet");
 
         state.decide(approved(false));
@@ -3176,7 +3266,7 @@ mod tests {
     #[test]
     fn the_outcome_survives_the_frame_that_closed_the_window() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Signal { signal: 9 }));
 
@@ -3187,7 +3277,7 @@ mod tests {
     #[test]
     fn the_daemon_hanging_up_after_the_outcome_does_not_rewrite_the_ending() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
         state.channel_broken("hatch closed the channel");
@@ -3199,9 +3289,9 @@ mod tests {
     #[test]
     fn nothing_arriving_after_the_close_can_reopen_the_window() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(Verdict::Deny { note: String::new() });
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert!(state.should_close());
         assert_eq!(state.phase(), Phase::Closed);
@@ -3212,7 +3302,7 @@ mod tests {
     /// A window whose streamed command has just finished.
     fn a_lingering_state() -> PromptState {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "hello\n".to_string() });
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
@@ -3237,7 +3327,7 @@ mod tests {
         // The other half of the fix: nothing changes for the default path, so
         // an agent's headless command still costs the reader no window at all.
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
 
@@ -3298,12 +3388,12 @@ mod tests {
         assert_eq!(fresh.phase(), Phase::WaitingForRequest);
 
         let mut awaiting = PromptState::new();
-        awaiting.handle(DaemonMsg::Request(a_request(90)));
+        awaiting.handle(DaemonMsg::Request(Box::new(a_request(90))));
         assert!(!awaiting.keep(), "a window with a question open is not a viewer");
         assert_eq!(awaiting.phase(), Phase::AwaitingVerdict);
 
         let mut running = PromptState::new();
-        running.handle(DaemonMsg::Request(a_request(90)));
+        running.handle(DaemonMsg::Request(Box::new(a_request(90))));
         running.decide(approved(true));
         assert!(!running.keep(), "there is nothing to keep until it has finished");
         assert_eq!(running.phase(), Phase::Running);
@@ -3382,7 +3472,7 @@ mod tests {
     fn what_would_be_copied_is_what_is_on_the_screen() {
         // One string, built once, so the button cannot drift from the view.
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "one\n".to_string() });
         state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "two\n".to_string() });
@@ -3415,8 +3505,8 @@ mod tests {
     #[test]
     fn a_second_request_is_not_believed() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert!(state.should_close());
         assert!(state.broken().is_some(), "and it said why");
@@ -3442,7 +3532,7 @@ mod tests {
     #[test]
     fn output_arrives_in_order_with_the_pipe_it_came_from() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
         state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "one".to_string() });
         state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "two".to_string() });
@@ -3460,7 +3550,7 @@ mod tests {
     /// Feed `chunks` chunks of `size` bytes to an approved command's window.
     fn after_output(chunks: usize, size: usize) -> PromptState {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
         let chunk = "x".repeat(size);
         for _ in 0..chunks {
@@ -3510,7 +3600,7 @@ mod tests {
     #[test]
     fn one_chunk_larger_than_the_cap_is_still_shown() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(true));
         state.handle(DaemonMsg::Output {
             stream: Stream::Stdout,
@@ -3545,7 +3635,7 @@ mod tests {
         // Not a convenience: the backstop that bounds a lingering window is
         // armed off this, on this thread, precisely so that a window whose
         // event loop has stopped is still bounded by something.
-        let request = protocol::encode(&DaemonMsg::Request(a_request(90))).unwrap();
+        let request = protocol::encode(&DaemonMsg::Request(Box::new(a_request(90)))).unwrap();
         let output = protocol::encode(&DaemonMsg::Output {
             stream: Stream::Stdout,
             text: "hi".to_string(),
@@ -3569,7 +3659,7 @@ mod tests {
 
     #[test]
     fn each_line_becomes_a_frame_and_wakes_the_window() {
-        let request = protocol::encode(&DaemonMsg::Request(a_request(90))).unwrap();
+        let request = protocol::encode(&DaemonMsg::Request(Box::new(a_request(90)))).unwrap();
         let depth = protocol::encode(&DaemonMsg::QueueDepth { depth: 2 }).unwrap();
 
         let (seen, wakes) = read_all(&format!("{request}\n{depth}\n"));
@@ -3618,7 +3708,7 @@ mod tests {
     #[test]
     fn queue_depth_updates_do_not_disturb_the_verdict_phase() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.handle(DaemonMsg::QueueDepth { depth: 4 });
 
         assert_eq!(state.phase(), Phase::AwaitingVerdict);
@@ -3628,7 +3718,7 @@ mod tests {
     #[test]
     fn approve_moves_to_running_and_the_window_stays_open() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert!(state.decide(approved(true)).is_some());
         assert_eq!(state.phase(), Phase::Running);
@@ -3638,7 +3728,7 @@ mod tests {
     #[test]
     fn finished_closes_the_window() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(approved(false));
         state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
 
@@ -3648,7 +3738,7 @@ mod tests {
     #[test]
     fn countdown_comes_from_the_deadline_not_a_local_timer() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(42)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(42))));
 
         let left = state.seconds_remaining(Utc::now()).expect("a request sets the deadline");
         assert!((left - 42).abs() <= 1, "the countdown said {left}s, not 42s");
@@ -3683,7 +3773,7 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut app =
             PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()), prefs);
-        app.state.handle(DaemonMsg::Request(a_request(90)));
+        app.state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         (app, sink)
     }
 
@@ -3878,7 +3968,7 @@ mod tests {
         // The approval still leaves — the command is authorised by the frame
         // this hands back — and the window is over as soon as it has.
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         let frame = state.decide(Verdict::Approve {
             stream: false,
             terminal: false,
@@ -3896,7 +3986,7 @@ mod tests {
         // It is past `AwaitingVerdict` and nothing returns there, which is the
         // same guarantee every other verdict already had.
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
         state.decide(Verdict::Approve {
             stream: false,
             terminal: false,
@@ -4086,7 +4176,7 @@ mod tests {
             false,
         );
         app.state = PromptState::new();
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
     }
 
@@ -4103,7 +4193,7 @@ mod tests {
             true,
         );
         app.state = PromptState::new();
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
     }
 
@@ -4120,7 +4210,7 @@ mod tests {
             false,
             false,
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
     }
 
@@ -4249,7 +4339,7 @@ mod tests {
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(45);
         request.queue_depth = 2;
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4292,7 +4382,7 @@ mod tests {
             true,
             false,
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4332,7 +4422,7 @@ mod tests {
         request.title = long;
         request.payload = app.state.request().expect("a request").payload.clone();
         app.state = PromptState::new();
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4356,7 +4446,7 @@ mod tests {
             false,
             false,
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4384,7 +4474,7 @@ mod tests {
             },
             &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4407,7 +4497,7 @@ mod tests {
             false,
             true,
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4509,7 +4599,7 @@ mod tests {
             },
             &crate::render::diff::side_by_side("", "hi\n"),
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
 
@@ -4544,7 +4634,7 @@ mod tests {
             caveat: None,
         };
 
-        state.handle(DaemonMsg::Request(request));
+        state.handle(DaemonMsg::Request(Box::new(request)));
 
         assert!(state.should_close(), "the window drew a frame it could not check");
         assert!(state.broken().is_some(), "and it did not say why");
@@ -4555,7 +4645,7 @@ mod tests {
     #[test]
     fn a_request_that_can_be_drawn_is_kept_in_its_checked_form() {
         let mut state = PromptState::new();
-        state.handle(DaemonMsg::Request(a_request(90)));
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
 
         assert!(state.shown().is_some(), "the window has nothing to draw");
         assert_eq!(state.phase(), Phase::AwaitingVerdict);
@@ -5133,7 +5223,7 @@ mod tests {
             },
             &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
         );
-        app.state.handle(DaemonMsg::Request(request));
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         assert!(!app.state.runs_as_root(), "a swap answered the command's question");
         assert_eq!(root_edge(&window_shapes(&mut app, opening_size())), None);
@@ -5899,7 +5989,7 @@ mod tests {
                 false,
                 true,
             );
-            app.state.handle(DaemonMsg::Request(request));
+            app.state.handle(DaemonMsg::Request(Box::new(request)));
 
             window_text_sized(&mut app, opening_size());
             assert!(

@@ -234,6 +234,10 @@ impl Sample {
             reason: self.reason.clone(),
             deadline: Utc::now() + chrono::Duration::seconds(timeout_secs as i64 + slack),
             queue_depth: self.queue_depth,
+            // A preview is not the first request of anything. Nobody is
+            // counting windows here, so this one has no number to put in its
+            // title bar -- see `Request::number`.
+            number: None,
             payload: self.payload.clone(),
         }
     }
@@ -623,7 +627,7 @@ impl PreviewApp {
         // The receiver lives in the window this struct owns, so this cannot
         // fail; if it somehow did, the window would sit on "waiting for
         // hatch" and the shot deadline would end the process with a reason.
-        let _ = self.to_window.send(Incoming::Frame(DaemonMsg::Request(request)));
+        let _ = self.to_window.send(Incoming::Frame(DaemonMsg::Request(Box::new(request))));
     }
 
     /// Ask for the picture, take it, and write it.
@@ -884,7 +888,7 @@ mod tests {
         let (to_window, inbox) = std::sync::mpsc::channel();
         let (nobody, swallowed) = Nobody::new();
         to_window
-            .send(Incoming::Frame(DaemonMsg::Request(sample.request(600, 0))))
+            .send(Incoming::Frame(DaemonMsg::Request(Box::new(sample.request(600, 0)))))
             .expect("the window has its request");
         // Dropped on purpose: a preview writes one request and nothing else,
         // and a window whose channel has ended is a window the daemon has
@@ -996,7 +1000,7 @@ mod tests {
         for verdict in every_verdict() {
             let (mut nobody, swallowed) = Nobody::new();
             let mut state = crate::prompt_ui::PromptState::new();
-            state.handle(DaemonMsg::Request(sample.request(600, 0)));
+            state.handle(DaemonMsg::Request(Box::new(sample.request(600, 0))));
             let frame = state.decide(verdict.clone());
             assert!(matches!(frame, Some(PromptMsg::Verdict(_))), "{verdict:?} produced nothing");
             crate::prompt_ui::answer(&mut nobody, &mut state, frame);

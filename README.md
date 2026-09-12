@@ -276,6 +276,16 @@ hatch's own small grey italic in front of the first line. Nothing is dimmed or
 hedged; the words keep their size and their contrast. The reader is being told
 whose words these are, not being told to disbelieve them.
 
+**Each window has a number, and wears it in its title bar.** The first window
+a running hatch opens is `hatch — approval #1`, the next is `#2`. Two approval
+windows are otherwise the same object in alt-tab and in a task switcher, which
+is where answering one and seeing the next open in the same instant reads as
+the first being clobbered. The number costs no row inside the window, and the
+audit log carries it too, so "I denied forty-seven" is something the file can
+be searched for. It counts the windows of the *running* daemon: restart hatch
+and the next window is `#1` again, which is why the log keeps the timestamp
+beside the number rather than instead of it.
+
 **A root request is a differently shaped window.** When the command will run as
 root the header says `ROOT` reversed out of a filled block, and the whole window
 is framed in the same colour. Both are shapes and not only colours — a block
@@ -873,7 +883,9 @@ says so at startup.
 Append-only JSONL at `$XDG_STATE_HOME/hatch/log/hatch-YYYY-MM.jsonl` — by
 default `~/.local/state/hatch/log/`. One line per outcome, flushed per record,
 a new file each month, never rotated or pruned. `hatch log` renders the current
-month readably.
+month readably, with each line led by the number the window wore. A request
+hatch refused before anybody was asked never became a window, so it has no
+number and the key is absent rather than zero.
 
 Every outcome reaches it, including the ones the agent cannot tell apart. The
 log's verdicts are a superset of the agent-facing ones — `approve`, `deny`,

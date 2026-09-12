@@ -47,6 +47,32 @@
 //! UI simply stops drawing is a smaller mechanism than one the queue would have
 //! to track windows to silence.
 //!
+//! # Every window gets a number
+//!
+//! [`Admission::number`] is the ordinal the window puts in its title bar --
+//! `hatch — approval #47` -- and the daemon writes into the audit record, so
+//! a person can say *I answered forty-seven* and the log has a line with that
+//! number on it.
+//!
+//! It is drawn here rather than at arrival, and that is the whole reason it
+//! lives in this module: this is the one place that decides which request is
+//! a window on screen and in what order. A number handed out at arrival would
+//! be spent by every request that was cancelled or timed out while queued, so
+//! the numbers a person actually saw would have gaps in them and the next one
+//! would be unguessable. Handed out at admission, they are the windows, in
+//! the order they opened, starting at one. It is read under the same lock as
+//! the badge, so a window's number and its badge describe the same instant.
+//!
+//! **It does not survive a restart.** A fresh daemon opens `#1` again. The
+//! alternative is a file written on the approval path -- before each window,
+//! or the number is wrong after a crash -- and a number is not worth a write
+//! that can fail in front of a person waiting to decide something. What the
+//! number is for is the next few minutes: the window in front of you, the one
+//! that just closed, the line you are about to grep for. The audit record
+//! carries a timestamp, and that is the identity that is durable; the number
+//! is a handle, and two runs of the daemon in one month can both have written
+//! a `#3`.
+//!
 //! # Fairness
 //!
 //! `tokio::sync::Semaphore` is documented fair -- "permits are given out in the
@@ -124,6 +150,10 @@ pub struct ApprovalQueue {
 struct State {
     /// Tasks parked in [`ApprovalQueue::acquire`]. Never the holder.
     waiting: usize,
+    /// How many windows this daemon has opened, including the one being
+    /// admitted. The next admission is `opened + 1` -- see the header for why
+    /// it is counted here and why it starts again at one on every run.
+    opened: u64,
     updates: broadcast::Sender<usize>,
 }
 
@@ -140,7 +170,10 @@ impl ApprovalQueue {
     #[must_use]
     pub fn new() -> Self {
         let (updates, _) = broadcast::channel(DEPTH_UPDATES);
-        Self { lock: Arc::new(Semaphore::new(1)), state: Mutex::new(State { waiting: 0, updates }) }
+        Self {
+            lock: Arc::new(Semaphore::new(1)),
+            state: Mutex::new(State { waiting: 0, opened: 0, updates }),
+        }
     }
 
     /// Wait for the approval lock, in arrival order.
@@ -158,8 +191,8 @@ impl ApprovalQueue {
         // Stop being a waiter, read the depth and subscribe, all under one lock
         // -- see `State`. From here this task is the holder, so the depth it
         // reads already excludes it.
-        let (depth, updates) = waiting.admitted();
-        Admission { permit: ApprovalPermit(permit), depth, updates }
+        let (depth, number, updates) = waiting.admitted();
+        Admission { permit: ApprovalPermit(permit), depth, number, updates }
     }
 
     /// How many approvals are waiting right now, excluding whichever holds the
@@ -202,6 +235,7 @@ pub struct ApprovalPermit(#[allow(dead_code)] OwnedSemaphorePermit);
 pub struct Admission {
     permit: ApprovalPermit,
     depth: usize,
+    number: u64,
     updates: broadcast::Receiver<usize>,
 }
 
@@ -216,6 +250,17 @@ impl Admission {
     #[must_use]
     pub fn queue_depth(&self) -> u32 {
         badge(self.depth)
+    }
+
+    /// Which window this is: the first the daemon opened is 1, the next is 2.
+    ///
+    /// For [`crate::protocol::Request::number`], which is what the window
+    /// puts in its title bar, and for the audit record, so the two say the
+    /// same number about the same request. See the header for why it is drawn
+    /// at admission and why it starts again at one on every run.
+    #[must_use]
+    pub fn number(&self) -> u64 {
+        self.number
     }
 
     /// Split into the permit to release at the verdict and the receiver to hand
@@ -255,12 +300,18 @@ impl<'a> Waiting<'a> {
     }
 
     /// Leave the count as the new holder: the depth read here is the badge for
-    /// the window about to open, and the subscription is taken under the same
-    /// lock so nothing can change between the two.
-    fn admitted(mut self) -> (usize, broadcast::Receiver<usize>) {
+    /// the window about to open, its number is drawn here too, and the
+    /// subscription is taken under the same lock so nothing can change
+    /// between the three.
+    fn admitted(mut self) -> (usize, u64, broadcast::Receiver<usize>) {
         let state = self.state.take().expect("a waiter leaves the count exactly once");
-        let s = leave(state);
-        (s.waiting, s.updates.subscribe())
+        let mut s = leave(state);
+        // Saturating rather than wrapping, so the one number a person is
+        // asked to read aloud can never start again at zero. A daemon would
+        // have to open a window every nanosecond for five hundred years to
+        // reach it.
+        s.opened = s.opened.saturating_add(1);
+        (s.waiting, s.opened, s.updates.subscribe())
     }
 }
 
@@ -424,6 +475,59 @@ mod tests {
             served.push(i);
         }
         assert_eq!(served, (0..40).collect::<Vec<_>>());
+    }
+
+    // ---- the number --------------------------------------------------------
+
+    #[tokio::test]
+    async fn windows_are_numbered_from_one_in_the_order_they_open() {
+        // The number is what a person says out loud -- "I answered
+        // forty-seven" -- so it has to count the windows they saw, in the
+        // order they saw them, with the first one called one.
+        let q = Arc::new(ApprovalQueue::new());
+        let open = q.acquire().await;
+        assert_eq!(open.number(), 1, "the first window this daemon opened is not #1");
+
+        let mut depth = q.subscribe();
+        let (numbers_tx, mut numbers_rx) = mpsc::unbounded_channel();
+        for i in 0..3usize {
+            let numbers_tx = numbers_tx.clone();
+            let _parked = park(&q, &mut depth, i + 1, move |admitted| {
+                let _ = numbers_tx.send(admitted.number());
+                drop(admitted);
+            })
+            .await;
+        }
+        drop(numbers_tx);
+        drop(open);
+
+        let mut numbers = Vec::new();
+        while let Some(number) = within(numbers_rx.recv()).await {
+            numbers.push(number);
+        }
+        assert_eq!(numbers, vec![2, 3, 4], "the numbers are not the windows in their order");
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_goes_away_spends_no_number() {
+        // A number is drawn at admission and nowhere else, which is what
+        // keeps the sequence a person sees free of holes: a request that was
+        // cancelled or timed out while it was still queued never became a
+        // window, so the next window that opens is the next number.
+        let q = Arc::new(ApprovalQueue::new());
+        let open = q.acquire().await;
+        let mut depth = q.subscribe();
+
+        let abandoned = tokio::spawn({
+            let q = Arc::clone(&q);
+            async move { q.acquire().await }
+        });
+        assert_eq!(within(depth.recv()).await.unwrap(), 1, "the waiter did not park");
+        abandoned.abort();
+        assert_eq!(within(depth.recv()).await.unwrap(), 0, "the waiter did not leave");
+
+        drop(open);
+        assert_eq!(q.acquire().await.number(), 2, "a waiter that never opened took a number");
     }
 
     // ---- the badge ---------------------------------------------------------

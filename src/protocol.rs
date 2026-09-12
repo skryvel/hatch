@@ -286,7 +286,15 @@ pub fn read_message<M: DeserializeOwned>(line: &str) -> Result<M, ProtocolError>
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
     /// The request. Always the first frame, and there is never a second.
-    Request(Request),
+    ///
+    /// Boxed because it is ten times the size of every other frame on this
+    /// channel, and an enum is as large as its largest variant wherever one
+    /// is held: a window streaming a command's output moves one of these per
+    /// chunk, and without the box each of those chunks would carry the
+    /// footprint of a request that arrived once and is long since over. The
+    /// allocation is paid on the one frame that has already allocated the
+    /// whole rendering.
+    Request(Box<Request>),
     /// The queue behind this window changed. A struct variant rather than a
     /// newtype because an internally tagged enum needs its content to be a
     /// map: `{"type":"queue_depth"}` has nowhere to put a bare number.
@@ -425,6 +433,22 @@ pub struct Request {
     /// How many approvals were waiting behind this one when the window
     /// opened. Later changes arrive as [`DaemonMsg::QueueDepth`].
     pub queue_depth: u32,
+    /// Which window this is, counting from one: the number the window puts in
+    /// its title bar, and the number the audit record carries.
+    ///
+    /// Two windows are otherwise the same object in a task switcher, and
+    /// answering one while the next opens in the same instant reads as the
+    /// first being clobbered. The number is what tells them apart there, and
+    /// it is a handle a person can say out loud into a log.
+    ///
+    /// `None` is *not* a daemon that forgot. It means nobody is counting:
+    /// [`crate::preview`] builds one of these to draw a window with, and a
+    /// preview is not the first of anything. A window with no number keeps
+    /// the title it was opened with. Required on the wire like every other
+    /// field -- an explicit null, not an absent key. See
+    /// [`crate::queue::Admission::number`] for where a real one comes from
+    /// and why it starts again at one on every run of the daemon.
+    pub number: Option<u64>,
     /// What is being asked for.
     pub payload: Payload,
 }
@@ -993,6 +1017,7 @@ mod tests {
             reason: "the last run left root-owned files behind".to_string(),
             deadline: Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap(),
             queue_depth: 0,
+            number: Some(47),
             payload: Payload::command(
                 &rendering("rm -rf /tmp/build"),
                 vec!["rm -rf".to_string()],
@@ -1017,7 +1042,7 @@ mod tests {
     #[test]
     fn daemon_messages_round_trip() {
         let messages = [
-            DaemonMsg::Request(sample_request()),
+            DaemonMsg::Request(Box::new(sample_request())),
             DaemonMsg::QueueDepth { depth: 3 },
             DaemonMsg::Output {
                 stream: Stream::Stderr,
@@ -1087,7 +1112,7 @@ mod tests {
         // time the window could restart by being slow.
         let deadline: DateTime<Utc> = request.deadline;
 
-        let encoded = encode(&DaemonMsg::Request(request)).expect("a request encodes");
+        let encoded = encode(&DaemonMsg::Request(Box::new(request))).expect("a request encodes");
         let json: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
         let field = json["deadline"]
             .as_str()
@@ -1157,10 +1182,10 @@ mod tests {
         let mut request = sample_request();
         request.title = "two\nlines".to_string();
         request.reason = "and a carriage\r\nreturn".to_string();
-        let encoded = encode(&DaemonMsg::Request(request.clone())).expect("encodes");
+        let encoded = encode(&DaemonMsg::Request(Box::new(request.clone()))).expect("encodes");
         assert!(!encoded.contains('\n'));
         let back: DaemonMsg = read_message(&encoded).expect("decodes");
-        assert_eq!(back, DaemonMsg::Request(request), "and the newline is still in the text");
+        assert_eq!(back, DaemonMsg::Request(Box::new(request)), "and the newline is still in the text");
     }
 
     #[test]
@@ -1183,12 +1208,15 @@ mod tests {
         // A field dropped from `Request` still round-trips -- both ends would
         // simply stop sending it -- so the round-trip tests cannot see it.
         // This can.
-        let encoded = encode(&DaemonMsg::Request(sample_request())).expect("encodes");
+        let encoded = encode(&DaemonMsg::Request(Box::new(sample_request()))).expect("encodes");
         let json: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
         let mut keys: Vec<&str> =
             json.as_object().expect("an object").keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["deadline", "payload", "queue_depth", "reason", "title", "type"]);
+        assert_eq!(
+            keys,
+            ["deadline", "number", "payload", "queue_depth", "reason", "title", "type"]
+        );
 
         let mut payload: Vec<&str> =
             json["payload"].as_object().expect("an object").keys().map(String::as_str).collect();
@@ -1211,7 +1239,7 @@ mod tests {
 
     #[test]
     fn a_missing_field_is_a_decode_error_and_not_a_default() {
-        let encoded = encode(&DaemonMsg::Request(sample_request())).expect("encodes");
+        let encoded = encode(&DaemonMsg::Request(Box::new(sample_request()))).expect("encodes");
         let mut json: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
         for field in ["title", "reason", "deadline", "queue_depth", "payload"] {
             let mut short = json.clone();

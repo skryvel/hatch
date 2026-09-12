@@ -1136,11 +1136,20 @@ impl Daemon {
     /// One request, and the one place an audit record is written.
     async fn serve(&self, asked: Asked, caller: Caller) -> CallToolResult {
         let (title, reason) = asked.headline();
-        let outcome = self.decide(asked, caller, &title, &reason).await;
+        // An out-parameter rather than a field on `Outcome`, and that is the
+        // point of it: the number is drawn in one place, half way through
+        // `decide`, and every one of the eight ways out of that function
+        // after it would otherwise have to remember to carry it. Written
+        // where it is drawn and read here, no exit path is involved at all.
+        // A request refused before the queue never opens a window, never
+        // draws a number, and leaves this `None`.
+        let mut number = None;
+        let outcome = self.decide(asked, caller, &title, &reason, &mut number).await;
 
         // The only `append` in the crate's request path. See `Outcome`.
         let record = AuditRecord {
             ts: Local::now(),
+            number,
             title,
             reason,
             verdict: outcome.verdict,
@@ -1163,12 +1172,17 @@ impl Daemon {
     /// The order is the whole design: refuse before queueing, queue before
     /// prompting, start the clock at the window and not at the queue, and stop
     /// applying the deny rule the moment a verdict arrives.
+    ///
+    /// `number` is written the moment this request becomes a window and is
+    /// left alone otherwise -- see [`Daemon::serve`], which reads it however
+    /// this function returns.
     async fn decide(
         &self,
         asked: Asked,
         caller: Caller,
         title: &str,
         reason: &str,
+        number: &mut Option<u64>,
     ) -> Outcome {
         // Step 1. Validate and render. A refusal never reaches a person:
         // prompting for something that is going to be refused spends the
@@ -1198,6 +1212,11 @@ impl Daemon {
             }
         };
         let badge = admission.queue_depth();
+        // The request is a window from here on, so this is where it gets its
+        // number: the same one the title bar wears and the audit record
+        // carries. See `queue::Admission::number` for why the counter is the
+        // queue's and why it starts again at one on every run.
+        *number = Some(admission.number());
         let (permit, depths) = admission.into_parts();
 
         // Step 3. The window, and only now the clock. The deadline is computed
@@ -1211,6 +1230,7 @@ impl Daemon {
             reason: reason.to_string(),
             deadline: Utc::now() + chrono::Duration::seconds(self.config.timeout_secs as i64),
             queue_depth: badge,
+            number: *number,
             payload,
         };
         let mut session = match self.prompter.prompt(request, depths).await {
@@ -5836,6 +5856,55 @@ later"), "");
             let record = harness.only_record();
             assert_eq!(record["title"], shown.title, "the log and the window agree: {record}");
             assert_eq!(record["reason"], "the build needs it", "{record}");
+        }
+
+        #[tokio::test]
+        async fn every_window_is_numbered_and_the_log_says_the_same_number() {
+            // The number exists so a person can point at one of two
+            // identical-looking windows, which is only worth anything if the
+            // number in the title bar and the number in the file are the same
+            // number. Two requests through one daemon, in order, so the
+            // second is visibly not the first.
+            let harness = Harness::new(vec![
+                Reply::verdict(Verdict::Deny { note: "no".to_string() }),
+                Reply::verdict(Verdict::Deny { note: "still no".to_string() }),
+            ]);
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            within(harness.daemon.run_command(run_of("false"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen();
+            assert_eq!(
+                shown.iter().map(|request| request.number).collect::<Vec<_>>(),
+                vec![Some(1), Some(2)],
+                "the windows are not numbered in the order they opened"
+            );
+            let logged = harness.logged();
+            assert_eq!(
+                logged.iter().map(|record| record["number"].as_u64()).collect::<Vec<_>>(),
+                vec![Some(1), Some(2)],
+                "the log does not agree with the windows: {logged:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_request_refused_before_anybody_was_asked_has_no_number() {
+            // Nothing was shown, so there is nothing for a number to name.
+            // The counter is not spent either: the next window to open is #1.
+            let harness = Harness::new(vec![approve()]);
+            let mut refused = run_of("true");
+            refused.cwd = Some("/no/such/directory/anywhere".to_string());
+            within(harness.daemon.run_command(refused, Caller::quiet())).await;
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let logged = harness.logged();
+            assert_eq!(logged.len(), 2, "{logged:?}");
+            assert_eq!(logged[0]["verdict"], LogVerdict::Refused.as_str(), "{logged:?}");
+            assert_eq!(logged[0].get("number"), None, "a request nobody saw was numbered");
+            assert_eq!(
+                logged[1]["number"].as_u64(),
+                Some(1),
+                "a refusal spent the number the first window should have had: {logged:?}"
+            );
         }
 
         #[tokio::test]
