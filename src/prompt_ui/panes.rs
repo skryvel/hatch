@@ -1334,6 +1334,19 @@ const ROW_EPSILON: f32 = 0.05;
 /// be telling them they had seen everything on the evidence of where their
 /// scroll bar is.
 ///
+/// One loop survives that, and it is the reason for a test rather than a
+/// paragraph. Being above the panes, this sentence's own height is part of
+/// how tall they are, and what it says is measured off them — so two layouts
+/// could in principle each imply the other, a sentence a character from
+/// wrapping fitting on one row when the pane is short and on two when it is
+/// tall. It takes a coincidence of a window width and a row count either side
+/// of a digit, and a window that flickered between two sentences for as long
+/// as it was open would be worse than the scroll bar this replaces. So it is
+/// swept rather than argued away: see
+/// `the_line_above_the_panes_settles_at_every_window_size`, which drags a
+/// window through every width a reader plausibly would, at two heights, and
+/// requires the last frames of each to draw the same line.
+///
 /// # Why there is no sentence for the case where it all fits
 ///
 /// Because it would be a claim of completeness, and this measurement is one
@@ -4059,23 +4072,52 @@ mod tests {
     /// animating its column in, and for a caption built from the frame before
     /// to catch up with the panes under it.
     fn settled_text(payload: &Payload, size: egui::Vec2) -> Vec<(String, i32)> {
+        frames_of(payload, size, SETTLED).pop().expect("some frames were drawn")
+    }
+
+    /// Frames enough for everything in this window to stop moving.
+    const SETTLED: u32 = 20;
+
+    /// A context set up the way [`crate::prompt_ui::open_window`] sets one up.
+    ///
+    /// Expensive — building the font atlas is most of it — so a test that
+    /// draws many windows builds one of these and re-uses it, which is also
+    /// the more honest thing to draw: a reader dragging a window wider is one
+    /// context and many sizes, not many windows.
+    fn a_drawing_context() -> egui::Context {
         let ctx = egui::Context::default();
         crate::prompt_ui::apply_faces(&ctx);
         crate::prompt_ui::apply_font_size(&ctx, 16.0);
         theme::apply(&ctx, theme::Theme::Dark);
+        ctx
+    }
+
+    /// What a window of `size` drew on each of its first `frames` frames.
+    fn frames_of(payload: &Payload, size: egui::Vec2, frames: u32) -> Vec<Vec<(String, i32)>> {
+        frames_in(&a_drawing_context(), payload, size, frames)
+    }
+
+    /// The same, in a context that has already drawn something.
+    fn frames_in(
+        ctx: &egui::Context,
+        payload: &Payload,
+        size: egui::Vec2,
+        frames: u32,
+    ) -> Vec<Vec<(String, i32)>> {
         let shown = Shown::of(payload).expect("a real payload");
-        let mut text = Vec::new();
-        for frame in 0..20 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                time: Some(f64::from(frame) / 60.0),
-                ..Default::default()
-            };
-            let mut out = ctx.run_ui(input, |ui| draw_payload(ui, &shown));
-            text = drawn_text(&out);
-            out.textures_delta.clear();
-        }
-        text
+        (0..frames)
+            .map(|frame| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(ctx.input(|i| i.time) + f64::from(frame + 1) / 60.0),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| draw_payload(ui, &shown));
+                let text = drawn_text(&out);
+                out.textures_delta.clear();
+                text
+            })
+            .collect()
     }
 
     /// The out-of-sight line a window drew, if it drew one.
@@ -4246,6 +4288,59 @@ mod tests {
             None,
             "a one-line diff was reported as running off the pane: {text:?}"
         );
+    }
+
+
+    #[test]
+    fn the_line_above_the_panes_settles_at_every_window_size() {
+        // The one loop in this: the notice is drawn *above* the panes, so its
+        // height is part of how tall they are, and what it says is measured
+        // off them. Two layouts could in principle each imply the other -- a
+        // sentence one character from wrapping fits on one row, which leaves
+        // the pane a row taller, which drops the row count past a digit
+        // boundary, which shortens the sentence, which fits on one row; and
+        // the two-row version implies the one-row version back. A window that
+        // flickered between two sentences for as long as it was open would be
+        // a worse thing than the bar this replaced.
+        //
+        // Argued away on paper it is a coincidence of a width and a row count.
+        // Swept here instead, because "unlikely" is not a property. Every
+        // width across the range a reader might drag a window through, at two
+        // heights, on a command long enough and wide enough that both halves
+        // of the sentence are in play: the last two frames have to draw the
+        // same line.
+        let wide = format!("rsync -avz {} src dest", "--exclude '*.tmp' ".repeat(12));
+        let command = (0..14)
+            .map(|n| match n % 7 {
+                0 => wide.clone(),
+                _ => format!("systemctl --user restart worker-{n}.service"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = a_command(&command);
+
+        let ctx = a_drawing_context();
+        let (mut down, mut across) = (0, 0);
+        for height in [260.0_f32, 420.0] {
+            for width in (460..=1500).step_by(7) {
+                let size = egui::vec2(width as f32, height);
+                let frames = frames_in(&ctx, &payload, size, SETTLED);
+                let notes: Vec<_> =
+                    frames.iter().rev().take(4).map(|frame| out_of_sight_line(frame)).collect();
+                assert!(
+                    notes.windows(2).all(|pair| pair[0] == pair[1]),
+                    "a {width} by {height} window never settles on one sentence: {notes:#?}"
+                );
+                let settled = notes.first().cloned().flatten().unwrap_or_default();
+                down += usize::from(settled.contains("out of sight"));
+                across += usize::from(settled.contains("sideways"));
+            }
+        }
+        // And the sweep really did draw the sentence it is about -- both
+        // halves of it -- rather than passing over three hundred windows that
+        // had nothing to say.
+        assert!(down > 200, "only {down} of the swept windows reported rows out of sight");
+        assert!(across > 100, "only {across} of them reported a line running off the side");
     }
 
     // ---- layout ------------------------------------------------------------
