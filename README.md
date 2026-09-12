@@ -37,6 +37,7 @@ same thing.*
 - [Install and run](#install-and-run)
 - [Required for root: the polkit drop-in](#required-for-root-the-polkit-drop-in)
 - [The approval window](#the-approval-window)
+- [Terminals](#terminals)
 - [Threat model](#threat-model)
 - [Known limits](#known-limits)
 - [Configuration](#configuration)
@@ -53,7 +54,7 @@ hatch exposes two MCP tools. Both block until a human answers.
 
 | Tool | Parameters | On approval |
 |------|-----------|-------------|
-| `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply |
+| `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply. A run in a terminal returns one `transcript` instead of the two streams — see [Terminals](#terminals) |
 | `swap_file` | `title`, `path` (absolute), `content`, `reason`, `root?` | Replaces or creates the file and returns the final `mode`, `owner` and `bytes` |
 
 `title` and `reason` are required on both. `title` is the first thing the
@@ -321,6 +322,56 @@ contrast ratio against that ground, and a ground that moved in lightness would
 push one of them under. The hue claims nothing about the outcome: a failed run
 is the same violet as a clean one, and what happened is said in words.
 
+## Terminals
+
+Some commands do not fail without a terminal, they hang: a `pacman`
+confirmation, an editor, a pager, anything that reads standard input. hatch
+runs those in a terminal of your own.
+
+**Either side can ask for one.** The agent sets `interactive: true` when it
+knows its command wants typing at. You can tick **Run it in a terminal** in the
+window when you can see that it does and the agent could not — `pacman -S foo`
+is the everyday case. The control only ever *grants*: a request that asked for
+a terminal shows the box ticked and dead, because a command that needs one and
+is denied it hangs with nowhere for anyone to type.
+
+**Everything in that terminal is sent to the agent, including what you type
+into it.** The terminal is recorded with `script(1)`, and a terminal echoes
+what is typed at it, so a password typed at a prompt inside that window ends up
+in the agent's context. The window says so beside the control, before you
+choose. Treat that terminal as a place the agent is watching, because it is.
+
+**The result has a different shape, and the agent is told so.** A pty is a
+single stream: what the command wrote to standard output, what it wrote to
+standard error and what you typed all arrive interleaved with nothing marking
+which was which. So a terminal run returns one `transcript` — escape sequences
+stripped, capped at `output_cap_bytes` like any other output — and `stdout` and
+`stderr` are absent rather than empty. Splitting it into two streams it never
+had would be hatch inventing a distinction for the agent to rely on.
+
+**There is no execution deadline.** `exec_timeout_secs` is a runaway-process
+guard, and in a terminal the guard is you. Cutting the run off at five minutes
+would end your session mid-keystroke. **Kill still works** and still takes down
+the command and everything it started.
+
+**Configuring it.** `terminal` is an argv with the program first, and the
+runner's path is appended to it, so what goes in the list is everything up to
+but not including the program the terminal is asked to start:
+
+```toml
+terminal = ["konsole", "--nofork", "-e"]   # the default
+terminal = ["kitty"]                       # kitty has no -e
+```
+
+`--nofork` on konsole is not decoration. Without it, a konsole started while
+KDE's "run all Konsole windows in a single process" setting is on hands its
+arguments to the konsole already running and returns immediately, which puts
+the command in a process hatch never started: Kill would reach nothing.
+
+Nothing here reads the terminal's own exit status — kitty exits `0` whatever
+its program did — so a small runner inside the terminal writes the command's
+status to a file and that file is the answer.
+
 ## Threat model
 
 **The primary threat is the agent itself** — confused, prompt-injected, or
@@ -359,7 +410,9 @@ the part of that which rests on you.
   no directory under `$HOME`, so a binary the agent wrote is not on it.
 - **No rc files are sourced.** A non-interactive `bash -c` with a constructed
   environment reads no `~/.bashrc`, so an agent-writable dotfile cannot
-  redefine a command after you have read it.
+  redefine a command after you have read it. A run in a terminal is still
+  `bash -c` and still sources nothing, but the terminal around it is another
+  program with settings of its own — see [Known limits](#known-limits).
 - **Every outcome is logged**, including the ones nobody was watching.
 
 ## Known limits
@@ -395,6 +448,15 @@ to syscall time; it does not close it. (`rename(2)` never follows its final
 component, so swapping the target file itself cannot redirect the bytes.) For a
 root write the polkit password wait sits inside the remaining window, which
 widens it to however long the dialog stays up.
+
+**A terminal run's environment is constructed and then added to.** Everywhere
+else the child environment comes from your config file and nothing else. An
+interactive run goes through a terminal emulator, which is another program with
+settings of its own: a konsole profile that exports variables exports them into
+the command too, and hatch cannot see that happen. The working directory is the
+one exception it takes back rather than concedes — the runner enters the
+directory the window stated before it starts anything, so a profile's initial
+directory cannot move a command somewhere the window did not say.
 
 **A root command runs on a terminal where an unprivileged one runs on pipes.**
 `run0` may allocate a pty, so the same command can behave differently as root —
@@ -528,7 +590,7 @@ the defaults, 1500 s for the config above, which raises the execution half.
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
-| `terminal` | `["konsole", "-e"]` | Terminal for interactive runs, which this build refuses |
+| `terminal` | `["konsole", "--nofork", "-e"]` | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e` |
 | `denylist_extra` | `[]` | Extra paths `swap_file` must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |
 | `theme` | `"dark"` | `"dark"` or `"light"` |
@@ -586,9 +648,6 @@ a newline is itself worth seeing.
 
 Stated so you do not go looking:
 
-- **`interactive: true`** is accepted by the schema and refused by this build,
-  with a message saying it is a missing feature rather than a decision by the
-  user. There is no terminal path yet.
 - **Binary or oversized file content** is refused rather than summarised.
   hatch will not ask anyone to approve a change it cannot draw, and an empty
   diff would say "nothing changes", which is the one thing it must never say.
