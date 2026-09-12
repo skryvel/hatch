@@ -243,7 +243,16 @@ black and white. Neither costs a row: the block is the height of the line it
 sits on, and the frame is painted in the margin the panels already leave. It is
 drawn while the window asks, while the command runs and while the result sits on
 screen, because a command that has already run as root is still the thing that
-ran as root. `hatch preview root` draws one.
+ran as root.
+
+![A root approval window. The whole window is enclosed in a red frame; in the
+header the word ROOT is reversed out of a filled red block, and above the panes
+a warning explains that a root command may be given a terminal where an
+ordinary one gets a pipe. The command is the run0 line, with the approved
+command beginning on its own line below run0's own
+options.](media/approval-root.png)
+
+<sub>`hatch preview root --shot media/approval-root.png`</sub>
 
 **Two panes, same bytes.** The left pane is raw: monospace, no reflow, no
 segmentation, drawn from the same string that becomes the shell's argument. The
@@ -381,9 +390,6 @@ display but no compositor screenshot permission — egui reads its own
 framebuffer — and two runs produce byte-identical files, because the countdown
 is stamped to a round figure for a shot. It exits non-zero if no picture
 reached the disk.
-
-There is no image of the root window on this page yet.
-`hatch preview root --shot media/approval-root.png` is what makes one.
 
 On a machine with no `run0` — a container, a non-systemd distribution — the
 root preview still draws, and says on standard error that hatch would have
