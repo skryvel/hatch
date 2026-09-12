@@ -100,6 +100,19 @@ use crate::swap;
 /// costs milliseconds.
 const SETTLE_FRAMES: u32 = 8;
 
+/// How long the window is left alone before it is photographed, on top of
+/// [`SETTLE_FRAMES`].
+///
+/// A frame count is not on its own enough, because one of the things settling
+/// is measured on the clock rather than in frames: a solid scroll bar animates
+/// its column in over the style's animation time, and until that has finished
+/// the pane beside it is still narrowing. These frames are asked for as fast
+/// as the window will draw them — see [`PreviewApp::photograph`] — so eight of
+/// them can go by in a fraction of it, and two runs of the same command then
+/// photograph the same window at two widths a pixel apart. Three times egui's
+/// own default animation time, and still a fifth of a second.
+const SETTLE_TIME: Duration = Duration::from_millis(250);
+
 /// How long `--shot` waits for a picture before giving up.
 ///
 /// The window has to be created, gain or fail to gain focus, open its typing
@@ -555,6 +568,9 @@ struct Shot {
     path: PathBuf,
     /// Frames drawn since the request landed.
     settled: u32,
+    /// When the first of them was drawn, for the wall-clock half of the wait.
+    /// See [`SETTLE_TIME`].
+    settling_since: Option<Instant>,
     /// Whether the viewport has been asked for its picture.
     asked: bool,
 }
@@ -648,11 +664,17 @@ impl PreviewApp {
             if self.pending.is_some() {
                 // Still waiting for the guard. Nothing has been drawn that is
                 // worth a picture yet.
-            } else if shot.settled >= SETTLE_FRAMES {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-                shot.asked = true;
             } else {
-                shot.settled += 1;
+                let since = *shot.settling_since.get_or_insert_with(Instant::now);
+                match shot.settled >= SETTLE_FRAMES && since.elapsed() >= SETTLE_TIME {
+                    true => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                            egui::UserData::default(),
+                        ));
+                        shot.asked = true;
+                    }
+                    false => shot.settled += 1,
+                }
             }
         }
 
@@ -807,7 +829,8 @@ pub fn run(scenario: Scenario, shot: Option<PathBuf>, theme: Option<Theme>) -> a
                 pending: Some(sample),
                 to_window,
                 timeout_secs,
-                shot: shot.map(|path| Shot { path, settled: 0, asked: false }),
+                shot: shot
+                    .map(|path| Shot { path, settled: 0, settling_since: None, asked: false }),
                 opened_at: Instant::now(),
                 failure: Arc::clone(&app_failure),
                 captured: Arc::clone(&app_captured),

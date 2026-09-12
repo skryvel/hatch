@@ -1526,6 +1526,22 @@ fn command_note(view: CommandView, seen: CommandRows, longest: usize, across: us
 /// thirty-ninth row would have been. It cannot flicker, either — taking the
 /// row can only ever make the panes shorter, so a notice that has appeared
 /// cannot make itself untrue.
+///
+/// # Which boxes carry this line
+///
+/// The four that hold what is being approved: the two command panes in both
+/// arrangements — see [`command_note`] — and the swap window's diff pane in
+/// both of its views. Between them that is every axis a reader can lose text
+/// off, and the sideways half only ever fires on the two boxes that do not
+/// reflow, which are the raw strip and the unified diff.
+///
+/// The window's other scrolling boxes deliberately do not carry it. The
+/// headline holds the agent's title and reason, which are the agent's own
+/// words: an agent that put half of them below a fold would be hiding its own
+/// argument, so there is no attack there and no row worth spending. The
+/// output panes — while the command runs, and after it has — show what
+/// happened rather than what is being decided, they follow their own tail,
+/// and by the time they have anything in them the decision has been made.
 fn draw_out_of_sight(ui: &mut Ui, note: &str) {
     if note.is_empty() {
         return;
