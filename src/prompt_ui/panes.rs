@@ -919,6 +919,11 @@ fn scroll_link_id() -> egui::Id {
     egui::Id::new("hatch-command-scroll")
 }
 
+/// Where the two stacked panes' own account of how far they reach is kept.
+fn pane_reach_id() -> egui::Id {
+    egui::Id::new("hatch-command-reach")
+}
+
 /// Which of the two command panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -944,6 +949,51 @@ impl Default for ScrollLink {
     fn default() -> ScrollLink {
         ScrollLink { driver: Pane::Raw, offset: 0.0 }
     }
+}
+
+/// Where a pane ended up, and the furthest down it had anything to show.
+///
+/// The maximum is measured and not predicted, and it has to be: it depends on
+/// the width the pane really wrapped at, on whether its scroll bars took any
+/// room — egui's float over the content and take none — and on the frame
+/// around it, none of which is settled until the pane has been drawn. The
+/// scroll area hands back the content it laid out and the viewport it laid it
+/// out in, and the difference between them is the offset it clamps anything
+/// larger to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneAt {
+    /// Where the pane is scrolled to.
+    offset: f32,
+    /// The largest offset it has anything to show at.
+    max: f32,
+}
+
+impl PaneAt {
+    /// Whether the only thing between this pane and the offset it was asked
+    /// for is that it has nothing that far down.
+    ///
+    /// Both halves are the point. A pane asked for more than it has *and*
+    /// sitting at its maximum was clamped and did not move. A pane sitting at
+    /// its maximum that was asked for no more than that was put there by the
+    /// reader, and that is the case this must never swallow: scrolling a pane
+    /// to its end is how a reader takes it over.
+    fn clamped(self, want: f32) -> bool {
+        want > self.max + SCROLL_EPSILON && self.offset >= self.max - SCROLL_EPSILON
+    }
+}
+
+/// How far each pane reached when it was last drawn.
+///
+/// Kept from one frame to the next because the question it answers — how far
+/// may this pane be asked to scroll — is asked before the pane that knows
+/// exists. `None` is a pane that has not been drawn yet, which is the first
+/// frame of a window and no other.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct PaneReach {
+    /// How far the raw strip reached.
+    raw: Option<f32>,
+    /// How far the annotated pane reached.
+    annotated: Option<f32>,
 }
 
 /// Where one drawn line of a pane begins: in the source, and on screen.
@@ -1015,14 +1065,21 @@ fn linked_line(from: &[PaneLine], to: &[PaneLine], line: usize) -> usize {
     to.partition_point(|line| line.at <= from.at).saturating_sub(1)
 }
 
-/// The furthest a pane of `rows` rows can be scrolled inside `viewport`.
+/// A first guess at how far a pane of `rows` rows reaches inside `viewport`,
+/// for the one frame before the pane has reported its own.
 ///
-/// Deliberately an under-estimate: the scroll area sits inside a group frame,
-/// so its real viewport is a little shorter than `viewport` and its real
-/// maximum a little larger. Asking for less than a pane can give is safe —
-/// the pane hands back exactly what it was asked for — while asking for more
-/// would be clamped, and a clamped offset is indistinguishable from a reader
-/// scrolling.
+/// It used to be the whole answer, and was deliberately an under-estimate: a
+/// request past a pane's range comes back clamped, a clamped offset was
+/// indistinguishable from a reader scrolling, and staying short of the range
+/// was what kept the two apart. It could not carry that. The row count behind
+/// it is measured in characters, by [`pane_lines`], against a pane whose real
+/// width nothing knows until the pane is drawn — and egui's scroll bars float
+/// over the content rather than taking a column of it, so the real pane is
+/// wider than the measurement thinks and fits a line in fewer rows than it
+/// counted. One row of over-count is all it takes for the guard to invert
+/// into the bug it was there to prevent: the follower clamps, [`drove`] reads
+/// the clamp as a reader, the driver changes hands, and the pane the reader
+/// is holding is dragged back up. See [`PaneAt`] for what settles it now.
 fn max_offset(rows: usize, row: f32, viewport: f32) -> f32 {
     (rows as f32 * row - viewport).max(0.0)
 }
@@ -1031,21 +1088,29 @@ fn max_offset(rows: usize, row: f32, viewport: f32) -> f32 {
 ///
 /// The driver gets exactly what it last reported, so the reader's own pane
 /// never moves under them. The follower gets the place the driver is looking
-/// at, translated through the source offset the two renderings share.
+/// at, translated through the source offset the two renderings share, and
+/// capped at `reach` — the furthest down that pane has anything to show.
+///
+/// The cap is not what keeps [`drove`] honest any more; that is
+/// [`PaneAt::clamped`]'s job. It is there because a scroll area asked for an
+/// offset past its content lays the content out there and draws the gap: a
+/// pane asked for more than it has shows blank space in the frame it is
+/// asked, and corrects itself only in the next one. The end of a long command
+/// is exactly where that would happen, and exactly where a reader is looking.
 fn requested_offset(
     link: ScrollLink,
     pane: Pane,
     of: &PaneRows,
     driver: &PaneRows,
     row: f32,
-    viewport: f32,
+    reach: f32,
 ) -> f32 {
     if link.driver == pane {
         return link.offset;
     }
     let line = linked_line(&driver.lines, &of.lines, line_at(link.offset, row, &driver.lines));
     let at = of.lines.get(line).map_or(0, |line| line.row) as f32 * row;
-    at.min(max_offset(of.rows, row, viewport))
+    at.min(reach)
 }
 
 /// Who drove, after a frame in which both panes were asked for an offset.
@@ -1055,20 +1120,42 @@ fn requested_offset(
 /// The follower is asked first, because it is the pane whose answer is news:
 /// the driver is being handed its own offset and agreeing with it says
 /// nothing.
+///
+/// That order is why a clamp had to be told apart from a reader. A pane that
+/// was asked for more than it has hands back its maximum instead, which is a
+/// disagreement, and it arrives in the arm that takes the driver's role away
+/// from a pane that is agreeing with what it was handed — so a follower with
+/// nothing further to show could unseat the pane the reader had hold of. It
+/// did it every other frame, for as long as they held it: the follower
+/// clamped and took the role, the next frame handed the reader's own pane a
+/// position translated from the clamp and the reader's hand dragged it back,
+/// and the two took turns.
 fn drove(
     link: ScrollLink,
-    raw: f32,
+    raw: PaneAt,
     want_raw: f32,
-    annotated: f32,
+    annotated: PaneAt,
     want_annotated: f32,
 ) -> ScrollLink {
-    if (annotated - want_annotated).abs() > SCROLL_EPSILON {
-        ScrollLink { driver: Pane::Annotated, offset: annotated }
-    } else if (raw - want_raw).abs() > SCROLL_EPSILON {
-        ScrollLink { driver: Pane::Raw, offset: raw }
+    if moved(link, Pane::Annotated, annotated, want_annotated) {
+        ScrollLink { driver: Pane::Annotated, offset: annotated.offset }
+    } else if moved(link, Pane::Raw, raw, want_raw) {
+        ScrollLink { driver: Pane::Raw, offset: raw.offset }
     } else {
         link
     }
+}
+
+/// Whether a pane that is not where it was asked to be was put there by the
+/// reader.
+///
+/// The driver's disagreement always counts, clamp or not. It is already the
+/// pane the other follows, so agreeing that it moved takes nothing from
+/// anyone, and a link that ignored the clamp would keep handing out an offset
+/// its own pane no longer has — which, after a window was made taller, is a
+/// follower reading from a place in the command nobody is looking at.
+fn moved(link: ScrollLink, pane: Pane, at: PaneAt, want: f32) -> bool {
+    (at.offset - want).abs() > SCROLL_EPSILON && (link.driver == pane || !at.clamped(want))
 }
 
 /// The two panes.
@@ -1129,26 +1216,43 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
             // annotated pane wraps at the width of one full-width box.
             let raw_rows = pane_lines(raw, None);
             let annotated_rows = pane_lines(annotated, Some(pane_chars(ui, 1)));
-            let link =
-                ui.data(|data| data.get_temp::<ScrollLink>(scroll_link_id())).unwrap_or_default();
+            let (link, reach) = ui.data(|data| {
+                (
+                    data.get_temp::<ScrollLink>(scroll_link_id()).unwrap_or_default(),
+                    data.get_temp::<PaneReach>(pane_reach_id()).unwrap_or_default(),
+                )
+            });
             let driver = match link.driver {
                 Pane::Raw => &raw_rows,
                 Pane::Annotated => &annotated_rows,
             };
 
             let ceiling = raw_ceiling(ui.available_height(), row);
-            let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, ceiling);
+            let raw_reach = reach.raw.unwrap_or_else(|| max_offset(raw_rows.rows, row, ceiling));
+            let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, raw_reach);
             let at_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
 
             ui.add_space(4.0);
             let rest = ui.available_height();
-            let want_annotated =
-                requested_offset(link, Pane::Annotated, &annotated_rows, driver, row, rest);
+            let annotated_reach =
+                reach.annotated.unwrap_or_else(|| max_offset(annotated_rows.rows, row, rest));
+            let want_annotated = requested_offset(
+                link,
+                Pane::Annotated,
+                &annotated_rows,
+                driver,
+                row,
+                annotated_reach,
+            );
             let at_annotated =
                 draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)));
 
             let link = drove(link, at_raw, want_raw, at_annotated, want_annotated);
-            ui.data_mut(|data| data.insert_temp(scroll_link_id(), link));
+            let reach = PaneReach { raw: Some(at_raw.max), annotated: Some(at_annotated.max) };
+            ui.data_mut(|data| {
+                data.insert_temp(scroll_link_id(), link);
+                data.insert_temp(pane_reach_id(), reach);
+            });
         }
     }
 }
@@ -1165,10 +1269,11 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
 /// behaviour can fire, which is what [`fits_two_columns`] is measuring.
 ///
 /// `at` is where the pane is asked to be scrolled to, and `None` is "wherever
-/// the reader left it". The returned offset is where it actually ended up,
-/// which is how the caller tells a pane that agreed with what it was asked
-/// from a pane the reader scrolled.
-fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
+/// the reader left it". What comes back is where it actually ended up and how
+/// far down it had anything to show, which is how the caller tells a pane
+/// that agreed with what it was asked from a pane the reader scrolled — and
+/// both of those from a pane that simply ran out of command. See [`PaneAt`].
+fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneAt {
     // A pane that cannot wrap needs somewhere to scroll a long line to; one
     // that wraps has nothing to the side and a horizontal bar would only be
     // furniture.
@@ -1183,7 +1288,13 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> f32 {
         scroll = scroll.vertical_scroll_offset(at);
     }
     pane_frame(ui)
-        .show(ui, |ui| scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight)).state.offset.y)
+        .show(ui, |ui| {
+            let drawn = scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight));
+            PaneAt {
+                offset: drawn.state.offset.y,
+                max: (drawn.content_size.y - drawn.inner_rect.height()).max(0.0),
+            }
+        })
         .inner
 }
 
@@ -2867,12 +2978,35 @@ mod tests {
     }
 
     #[test]
-    fn the_follower_is_never_asked_for_more_than_it_can_give() {
-        // A clamped offset is indistinguishable from a reader scrolling, so
-        // the estimate is deliberately short of the pane's real maximum.
+    fn a_pane_that_has_never_been_drawn_still_gets_a_guess_at_its_reach() {
+        // All this is now: the one frame before a pane has reported how far
+        // it really reaches. It was once the whole answer, and the bug is
+        // what that cost -- see `max_offset` and `PaneAt`.
         assert_eq!(max_offset(10, 10.0, 40.0), 60.0);
         assert_eq!(max_offset(3, 10.0, 40.0), 0.0, "a pane that fits does not scroll");
         assert_eq!(max_offset(0, 10.0, 40.0), 0.0);
+    }
+
+    #[test]
+    fn a_pane_that_ran_out_of_command_is_told_apart_from_one_a_reader_moved() {
+        // The distinction the whole fix rests on. Both panes end up at their
+        // maximum; only one of them was asked for something else.
+        let end = PaneAt { offset: 100.0, max: 100.0 };
+
+        assert!(end.clamped(140.0), "a pane asked for more than it has was not read as clamped");
+        assert!(!end.clamped(100.0), "a pane given exactly its maximum had nothing to clamp");
+        assert!(
+            !end.clamped(20.0),
+            "a reader who scrolled a pane to its end was read as the pane running out"
+        );
+        // The epsilon is the same everywhere: a request larger than the
+        // maximum by less than one is the rounding a scroll area does to
+        // itself, not a request it cannot honour.
+        assert!(!end.clamped(100.0 + SCROLL_EPSILON));
+        assert!(end.clamped(100.0 + SCROLL_EPSILON * 1.01));
+        // And a pane that is nowhere near its maximum did not get there by
+        // being clamped to it, whatever it was asked for.
+        assert!(!PaneAt { offset: 40.0, max: 100.0 }.clamped(140.0));
     }
 
     #[test]
@@ -2885,10 +3019,16 @@ mod tests {
 
         assert_eq!(requested_offset(link, Pane::Raw, &raw, &raw, 10.0, 100.0), 13.0);
         // Raw line one is annotated line two, and there is room for it.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 10.0), 20.0);
-        // In a viewport that leaves nowhere to scroll, the follower stays put
-        // rather than being asked for an offset it would have to clamp.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 100.0), 0.0);
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 20.0), 20.0);
+        // A pane with nowhere to scroll stays at its top rather than being
+        // asked for an offset it would draw as blank space.
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 0.0), 0.0);
+    }
+
+    /// A pane at `offset` with room to spare below it, so that nothing it
+    /// hands back can be explained by it running out of command.
+    fn freely(offset: f32) -> PaneAt {
+        PaneAt { offset, max: offset + 1_000.0 }
     }
 
     #[test]
@@ -2896,34 +3036,69 @@ mod tests {
         let link = ScrollLink { driver: Pane::Raw, offset: 10.0 };
 
         // Nobody moved: both handed back what they were given.
-        assert_eq!(drove(link, 10.0, 10.0, 20.0, 20.0), link);
+        assert_eq!(drove(link, freely(10.0), 10.0, freely(20.0), 20.0), link);
         // The follower moved, so it takes over.
         assert_eq!(
-            drove(link, 10.0, 10.0, 55.0, 20.0),
+            drove(link, freely(10.0), 10.0, freely(55.0), 20.0),
             ScrollLink { driver: Pane::Annotated, offset: 55.0 }
         );
         // The driver moved, and stays the driver at its new place.
         assert_eq!(
-            drove(link, 44.0, 10.0, 20.0, 20.0),
+            drove(link, freely(44.0), 10.0, freely(20.0), 20.0),
             ScrollLink { driver: Pane::Raw, offset: 44.0 }
         );
         // Rounding inside a scroll area is not a reader, and half a logical
         // pixel exactly is the line: smaller than anything a hand produces
         // and larger than anything a scroll area rounds by.
-        assert_eq!(drove(link, 10.2, 10.0, 20.0, 20.1), link);
+        assert_eq!(drove(link, freely(10.2), 10.0, freely(20.0), 20.1), link);
         assert_eq!(
-            drove(link, 10.0 + SCROLL_EPSILON, 10.0, 20.0 + SCROLL_EPSILON, 20.0),
+            drove(
+                link,
+                freely(10.0 + SCROLL_EPSILON),
+                10.0,
+                freely(20.0 + SCROLL_EPSILON),
+                20.0
+            ),
             link,
             "a pane that moved by exactly the epsilon was read as a reader"
         );
         assert_eq!(
-            drove(link, 10.0, 10.0, 20.0 + SCROLL_EPSILON * 1.01, 20.0),
+            drove(link, freely(10.0), 10.0, freely(20.0 + SCROLL_EPSILON * 1.01), 20.0),
             ScrollLink { driver: Pane::Annotated, offset: 20.0 + SCROLL_EPSILON * 1.01 },
             "a pane that moved by more than the epsilon was read as rounding"
         );
         assert_eq!(
-            drove(link, 10.0 + SCROLL_EPSILON * 1.01, 10.0, 20.0, 20.0),
+            drove(link, freely(10.0 + SCROLL_EPSILON * 1.01), 10.0, freely(20.0), 20.0),
             ScrollLink { driver: Pane::Raw, offset: 10.0 + SCROLL_EPSILON * 1.01 }
+        );
+    }
+
+    #[test]
+    fn a_follower_with_nothing_further_to_show_does_not_take_the_reader_s_pane() {
+        // The bug, in the three numbers it comes down to. The reader is
+        // holding the raw pane at 40; the annotated pane is asked for 90,
+        // has 70, and says 70. Reading that as a reader scrolling handed the
+        // driver's role to a pane nobody touched.
+        let link = ScrollLink { driver: Pane::Raw, offset: 40.0 };
+        let ran_out = PaneAt { offset: 70.0, max: 70.0 };
+
+        assert_eq!(drove(link, freely(40.0), 40.0, ran_out, 90.0), link);
+        // What must still work: the reader takes a pane over by scrolling it,
+        // including by scrolling it to its very end. The pane is in the same
+        // place as above and the only difference is what it was asked for.
+        assert_eq!(
+            drove(link, freely(40.0), 40.0, ran_out, 20.0),
+            ScrollLink { driver: Pane::Annotated, offset: 70.0 },
+            "a reader who scrolled the follower to its end could not take it over"
+        );
+        // And the driver's own clamp is taken at face value, because it
+        // cannot cost it a role it already has: a window made taller leaves
+        // the link carrying an offset the pane no longer has, and this is
+        // where it is corrected.
+        let stale = ScrollLink { driver: Pane::Annotated, offset: 90.0 };
+        assert_eq!(
+            drove(stale, freely(40.0), 40.0, ran_out, 90.0),
+            ScrollLink { driver: Pane::Annotated, offset: 70.0 }
         );
     }
 
@@ -2934,23 +3109,23 @@ mod tests {
         // further apart every frame. Two frames of the real arithmetic, with
         // the reader scrolling once and then stopping.
         let (raw, annotated) = linked_panes();
-        let (row, viewport) = (10.0, 10.0);
+        let (row, reach) = (10.0, 20.0);
         let mut link = ScrollLink::default();
 
         // Frame one: the reader drags the raw pane to its second line.
-        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, viewport);
-        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, viewport);
-        link = drove(link, 10.0, want_raw, want_annotated, want_annotated);
+        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, reach);
+        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, reach);
+        link = drove(link, freely(10.0), want_raw, freely(want_annotated), want_annotated);
         assert_eq!(link, ScrollLink { driver: Pane::Raw, offset: 10.0 });
 
         // Frame two: nobody touches anything, and both panes hand back what
         // they were asked for.
-        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, viewport);
-        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, viewport);
+        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, reach);
+        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, reach);
         assert_eq!(want_raw, 10.0, "the driver was pulled off its own line");
         assert_eq!(want_annotated, 20.0, "the follower is on the line the driver is on");
         assert_eq!(
-            drove(link, want_raw, want_raw, want_annotated, want_annotated),
+            drove(link, freely(want_raw), want_raw, freely(want_annotated), want_annotated),
             link,
             "a frame nobody scrolled changed the shared position"
         );
@@ -2970,10 +3145,252 @@ mod tests {
 
         // One raw line, so the follower is asked for the top whatever the
         // wrapping below it.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 10.0), 0.0);
+        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 20.0), 0.0);
         // And the wrapping really is counted: the second segment does not
         // start on row one.
         assert!(annotated.lines[1].row > 1, "the wrapped first line took one row");
+    }
+
+    /// One window's two stacked panes, drawn for real, frame by frame.
+    ///
+    /// The scroll link is a conversation between this file's arithmetic and a
+    /// real scroll area, and what a scroll area does with an offset it cannot
+    /// honour is the whole of what the conversation goes wrong over. So the
+    /// test below draws real panes, sends real pointer events at them and
+    /// reads the link back out of egui's own store, rather than asserting
+    /// against numbers this file made up about a layout it did not perform.
+    struct StackedWindow {
+        ctx: egui::Context,
+        raw: Spans,
+        annotated: Spans,
+        longest: usize,
+        size: egui::Vec2,
+        time: f64,
+    }
+
+    impl StackedWindow {
+        /// A window of `size` showing `source` in both panes.
+        fn showing(source: &str, size: egui::Vec2) -> StackedWindow {
+            let ctx = egui::Context::default();
+            crate::prompt_ui::apply_faces(&ctx);
+            crate::prompt_ui::apply_font_size(&ctx, 16.0);
+            let home = BTreeMap::from([("HOME".to_string(), "/home/alex".to_string())]);
+            let annotated = render_command(source, &home);
+            let raw = classify(source);
+            let longest = widest_line(&annotated).max(widest_line(&raw));
+            StackedWindow { ctx, raw, annotated, longest, size, time: 0.0 }
+        }
+
+        /// One frame's worth of input: the window, the clock and the reader.
+        ///
+        /// A clock that advances, because egui animates a scroll bar into
+        /// view: in a window where no time passes it never finishes
+        /// arriving, and the panes are never the ones a reader sees.
+        fn input(&mut self, events: Vec<egui::Event>) -> egui::RawInput {
+            self.time += 1.0 / 60.0;
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            }
+        }
+
+        /// Which arrangement this window's panes are in, measured in the
+        /// window itself: the rule is a question about width, and a test that
+        /// assumed the answer would go on passing after it changed.
+        fn view(&mut self) -> CommandView {
+            let longest = self.longest;
+            let input = self.input(Vec::new());
+            let mut view = None;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                view = Some(command_view(longest, column_chars(pane_chars(ui, 2), 0)));
+            });
+            out.textures_delta.clear();
+            view.expect("the frame ran")
+        }
+
+        /// One frame, with whatever the reader did during it.
+        fn frame(&mut self, events: Vec<egui::Event>) -> Drawn {
+            let input = self.input(events);
+            let (raw, annotated, longest) = (&self.raw, &self.annotated, self.longest);
+            let mut out = self.ctx.run_ui(input, |ui| draw_command(ui, annotated, raw, longest));
+            let text = drawn_text(&out);
+            // epaint refuses to be dropped holding texture deltas nobody
+            // applied.
+            out.textures_delta.clear();
+            let link = self.ctx.data(|data| data.get_temp(scroll_link_id())).unwrap_or_default();
+            Drawn { link, text }
+        }
+
+        /// Press at `at` and keep the button down there for `frames` frames,
+        /// as a reader holding a scroll handle does.
+        fn holding(&mut self, at: egui::Pos2, frames: usize) -> Vec<Drawn> {
+            self.frame(vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            (0..frames).map(|_| self.frame(vec![egui::Event::PointerMoved(at)])).collect()
+        }
+    }
+
+    /// What one frame left behind: where the two panes settled, and what the
+    /// reader could see.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Drawn {
+        /// Which pane the other one is following, and from where.
+        link: ScrollLink,
+        /// Every line of the command a reader could actually see, and the
+        /// height it was drawn at. Two frames that put the same text in the
+        /// same places are two frames a reader cannot tell apart, which is
+        /// the whole of what "it jumps" means.
+        text: Vec<(String, i32)>,
+    }
+
+    /// Every string a frame drew where its own pane could show it.
+    ///
+    /// Clipped by hand, because a scroll area lays its whole content out and
+    /// leaves the clipping to the painter: text scrolled off the end of a
+    /// pane is still in the frame's shapes, at a position outside the pane.
+    /// A pane asked for an offset past its content draws every line of it
+    /// somewhere nobody can see, and that is one of the two things this is
+    /// here to catch.
+    fn drawn_text(out: &egui::FullOutput) -> Vec<(String, i32)> {
+        fn walk(shape: &egui::epaint::Shape, clip: egui::Rect, into: &mut Vec<(String, i32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    let row = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    if clip.intersects(row) {
+                        into.push((text.galley.text().to_string(), text.pos.y.round() as i32));
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, clip, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut into = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, clipped.clip_rect, &mut into);
+        }
+        into
+    }
+
+    /// How many characters of the pane's own font a window of `size` believes
+    /// one full-width pane holds.
+    ///
+    /// The count [`pane_lines`] wraps its estimate at, and the one the real
+    /// pane beats: it subtracts room for a scroll bar, and egui's scroll bars
+    /// float over the content rather than taking a column of it.
+    fn estimated_pane_chars(size: egui::Vec2) -> usize {
+        let ctx = egui::Context::default();
+        crate::prompt_ui::apply_faces(&ctx);
+        crate::prompt_ui::apply_font_size(&ctx, 16.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut chars = 0;
+        let mut out = ctx.run_ui(input, |ui| chars = pane_chars(ui, 1));
+        out.textures_delta.clear();
+        chars
+    }
+
+    #[test]
+    fn a_pane_held_at_its_end_stays_there_for_as_long_as_it_is_held() {
+        // The bug, in the reader's words: "the scroll bar jumps when reaching
+        // the end, so I can never see the final part of the command". With a
+        // handle held at the bottom, the two panes took the driver's role
+        // from each other every other frame, and the pane the reader had hold
+        // of was dragged back up the command on each of them.
+        //
+        // What made it possible: the follower's maximum was estimated from a
+        // character count, the estimate came out a row high, the scroll area
+        // clamped a request it could not honour, and `drove` read the clamp
+        // as the reader scrolling. Every term of that is a real layout's, so
+        // this asserts against a real layout.
+
+        // Every line one character wider than the annotated pane is thought
+        // to hold, and so two rows to the estimate and one row to the pane:
+        // forty lines the estimate believes are eighty. That is the whole
+        // failure, arranged rather than hoped for -- the estimate has the
+        // pane reaching twice as far down the command as it does.
+        let size = egui::vec2(900.0, 700.0);
+        let width = estimated_pane_chars(size);
+        let mut command = String::new();
+        for n in 0..40 {
+            // Exactly as many characters as the estimate believes fit. The
+            // line the pane draws is one wider, because the terminator is
+            // drawn and counted too -- which is the character over.
+            let mut line = format!("cat /tmp/{n:02}/");
+            while line.chars().count() < width {
+                line.push('x');
+            }
+            command.push_str(&line);
+            command.push('\n');
+        }
+        let mut window = StackedWindow::showing(&command, size);
+        assert_eq!(
+            widest_line(&window.annotated),
+            width + 1,
+            "the lines are not the one character over the estimate this is about"
+        );
+        assert_eq!(
+            window.view(),
+            CommandView::Stacked,
+            "side by side panes are not linked, so this would assert nothing"
+        );
+        // Three frames to settle: a pane learns its size from the frame
+        // before, and a reader does not scroll what they have not been shown.
+        for _ in 0..3 {
+            window.frame(Vec::new());
+        }
+
+        // The raw strip's own scroll handle, taken to the bottom of its bar
+        // and held there. The strip is the pane the reader reaches for to
+        // check a line, and it is the one whose follower wraps.
+        let grab = egui::pos2(window.size.x - 9.0, 180.0);
+        let held = window.holding(grab, 8);
+
+        // The grab landed and the strip went somewhere, or the rest of this
+        // asserts nothing about a scroll bar.
+        assert!(
+            held.iter().any(|f| f.link.driver == Pane::Raw && f.link.offset > 0.0),
+            "nothing took hold of the raw strip's scroll bar"
+        );
+        let (first, rest) = held.split_first().expect("the reader held it for some frames");
+        assert_eq!(
+            first.link.driver,
+            Pane::Raw,
+            "the pane the reader is holding lost the link to the pane they are not touching"
+        );
+        // The annotated pane is the lower two thirds of this window, and a
+        // pane asked for an offset it has nothing at draws its whole content
+        // above itself. The reader would be holding the raw strip at the end
+        // of the command with blank space where the annotated form of it
+        // should be.
+        for drawn in &held {
+            assert!(
+                drawn.text.iter().any(|(_, row)| *row as f32 > window.size.y / 2.0),
+                "the annotated pane showed nothing at all: {:?}",
+                drawn.text
+            );
+        }
+        for (frame, drawn) in rest.iter().enumerate() {
+            assert_eq!(
+                drawn.link, first.link,
+                "frame {frame} moved a pane the reader had not let go of"
+            );
+            assert_eq!(drawn.text, first.text, "frame {frame} drew the command somewhere else");
+        }
     }
 
     // ---- layout ------------------------------------------------------------
