@@ -5784,6 +5784,8 @@ later"), "");
             killed_by_user: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            transcript: None,
+            transcript_truncated: false,
         };
         let text = describe_run(&full, Duration::from_millis(12));
         assert!(text.contains("exit code: 0"), "{text}");
@@ -5805,6 +5807,8 @@ later"), "");
             killed_by_user: true,
             stdout_truncated: true,
             stderr_truncated: true,
+            transcript: None,
+            transcript_truncated: false,
         };
         let text = describe_run(&cut, Duration::from_secs(1));
         assert!(text.contains("signal 9"), "{text}");
@@ -5824,6 +5828,8 @@ later"), "");
             killed_by_user: false,
             stdout_truncated: false,
             stderr_truncated: false,
+            transcript: None,
+            transcript_truncated: false,
         };
         assert_eq!(finished_frame(&exited), Some(protocol::Outcome::Exit { code: 7 }));
 

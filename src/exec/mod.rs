@@ -209,6 +209,18 @@ pub struct Output {
     pub stdout: String,
     /// Captured standard error, under the same cap and the same rules.
     pub stderr: String,
+    /// Everything that appeared in the terminal, for a run that had one.
+    ///
+    /// `None` for every run [`run`] itself performed, and `Some` for every one
+    /// [`interactive::run`] performed — the two are exclusive, and the
+    /// difference is not cosmetic. A pty is one stream: what a command wrote
+    /// to standard output and what it wrote to standard error arrive
+    /// interleaved with no mark saying which was which, and so does what the
+    /// person typed. Reporting that as `stdout` would be hatch claiming a
+    /// separation the run did not have, so an interactive run leaves both of
+    /// those empty and puts the one text here, with the escape sequences the
+    /// terminal needed and a reader does not taken out.
+    pub transcript: Option<String>,
     /// The exit status, if the command exited on its own. `None` when a signal
     /// ended it, and also when the wait itself failed — in both cases the
     /// honest answer is that there is no exit code to report.
@@ -224,6 +236,8 @@ pub struct Output {
     pub stdout_truncated: bool,
     /// Standard error reached the cap and the rest was dropped.
     pub stderr_truncated: bool,
+    /// The transcript reached the cap and the rest was dropped.
+    pub transcript_truncated: bool,
 }
 
 /// Why a command never ran.
@@ -255,6 +269,17 @@ pub enum ExecError {
         /// Why it is not usable, as text.
         error: String,
     },
+    /// hatch could not lay out the private directory an interactive run needs.
+    ///
+    /// Its own variant rather than a [`ExecError::Spawn`], because nothing was
+    /// spawned and there is no program to name: the failure is hatch's own
+    /// preparation — a parent directory another user could reach into, a disk
+    /// with nothing left on it — and saying "`konsole` could not be started"
+    /// would send the reader after the wrong thing.
+    Setup {
+        /// What could not be done, as text, beginning with the path.
+        error: String,
+    },
     /// The program could not be started: not on the child's `PATH`, not
     /// executable, or the system refused the fork.
     Spawn {
@@ -275,6 +300,10 @@ impl fmt::Display for ExecError {
                 f,
                 "the working directory {} cannot be used: {error}; nothing was executed",
                 cwd.display()
+            ),
+            ExecError::Setup { error } => write!(
+                f,
+                "hatch could not prepare a terminal for it: {error}; nothing was executed"
             ),
             ExecError::Spawn { program, error } => write!(
                 f,
@@ -509,6 +538,10 @@ pub async fn run(
         stderr_truncated: stderr.truncated,
         stdout: stdout.into_string(),
         stderr: stderr.into_string(),
+        // Two pipes, kept apart. See `Output::transcript` for the path where
+        // they cannot be.
+        transcript: None,
+        transcript_truncated: false,
         exit_code: status.and_then(|s| s.code()),
         signal: status.and_then(|s| s.signal()),
         timed_out,
