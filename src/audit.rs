@@ -170,6 +170,20 @@ pub struct RunDetail {
     pub root: bool,
     /// The working directory it was to run in.
     pub cwd: String,
+    /// Whether it ran in a terminal of its own, once it is known.
+    ///
+    /// Not known when the request arrives, which is what separates it from
+    /// `root`: the agent may ask for a terminal and so may the person at the
+    /// window, so the answer is settled by the verdict rather than by the
+    /// call. `None` on every line for an operation that never ran.
+    ///
+    /// Recorded because it changes what is true of the run afterwards. A
+    /// terminal run's output is one interleaved transcript that includes
+    /// whatever the person typed, and somebody reading this log later to work
+    /// out what reached the agent needs to know which kind of run they are
+    /// looking at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +428,7 @@ mod tests {
                 command: "systemctl restart systemd-resolved".to_string(),
                 root: true,
                 cwd: "/home/user".to_string(),
+                interactive: Some(false),
                 exit_code: Some(0),
                 duration_ms: Some(2140),
                 killed_by_user: Some(false),

@@ -196,8 +196,15 @@ pub struct RunCommandParams {
     /// `HOME`, which is the one the command will actually see.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Whether the command needs a terminal. Accepted because it is part of
-    /// the tool contract; refused for now.
+    /// Whether the command needs a terminal of its own.
+    ///
+    /// A floor and not a choice: a request that asks for one gets one
+    /// whatever the person does at the window, because a command that needs a
+    /// terminal and is denied one hangs rather than failing. The person can
+    /// add a terminal to a request that did not ask for one — they can often
+    /// see a prompt coming that the agent could not — and that is the only
+    /// direction the control moves in. See
+    /// [`crate::protocol::Verdict::Approve`].
     #[serde(default)]
     pub interactive: bool,
 }
@@ -593,7 +600,15 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          - reason: why this is needed now, in a sentence or two.\n\
          - cwd: absolute working directory. Optional.\n\
          - interactive: true if the command needs a terminal — a full-screen program, a pager, a \
-         prompt that expects typing.\n\
+         prompt that expects typing. The person can also give a terminal to a command that did \
+         not ask for one, because they can often see a prompt coming that you could not, so plan \
+         for either answer. A command that runs in a terminal comes back differently: one \
+         `transcript` of everything that appeared in it, with `stdout` and `stderr` empty, \
+         because a terminal is a single stream and hatch will not split it into two it never \
+         had. That transcript includes anything the person typed into the terminal. Nothing in \
+         it is a deadline's business either: a command in a terminal is not cut off at the \
+         {exec}s limit, because the person watching it is the one who decides when it has gone \
+         on long enough.\n\
          - root: true runs it as root. Ask for this only when the work genuinely needs it — a \
          permission error without it is a normal result you may retry with it. It costs the \
          person a second interruption: after they approve in hatch's window, the system asks \
@@ -1066,6 +1081,14 @@ struct RunPlan {
     /// run is *read* — an elevated run's exit status may not be the command's
     /// at all — so getting it wrong is not a cosmetic error.
     elevated: bool,
+    /// Whether the *agent* asked for a terminal.
+    ///
+    /// Kept apart from what the verdict says, because the two are not the same
+    /// claim and only one of them can be overruled. This one is a floor: an
+    /// approval that came back without a terminal cannot take one away from a
+    /// request that asked for it, and the window is built not to try. Holding
+    /// it here means the daemon does not have to trust that it did not.
+    asked_for_a_terminal: bool,
 }
 
 impl Daemon {
@@ -1244,8 +1267,8 @@ impl Daemon {
         // not hold every other agent behind it.
         drop(permit);
 
-        let (stream, note) = match verdict {
-            Verdict::Approve { stream, note } => (stream, note),
+        let (stream, terminal, note) = match verdict {
+            Verdict::Approve { stream, terminal, note } => (stream, terminal, note),
             other => {
                 session.close().await;
                 return declined(other, detail);
@@ -1266,7 +1289,7 @@ impl Daemon {
             false => Phase::Executing,
         });
         let (verdict, result, windup) = match work {
-            Work::Run(run) => self.run_it(&run, stream, &session, &mut detail).await,
+            Work::Run(run) => self.run_it(&run, stream, terminal, &session, &mut detail).await,
             Work::Swap { path, content, plan, root } => {
                 self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
             }
@@ -1411,6 +1434,8 @@ impl Daemon {
                 command: params.command.clone(),
                 root: params.root,
                 cwd: cwd.display().to_string(),
+                // Settled by the verdict, not by the call: see `RunDetail`.
+                interactive: None,
                 exit_code: None,
                 duration_ms: None,
                 killed_by_user: None,
@@ -1422,13 +1447,6 @@ impl Daemon {
             Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(&cwd), message))
         };
 
-        if params.interactive {
-            return refuse(not_yet(
-                "run a command in a terminal",
-                "Ask for a form that does not need a terminal — a non-interactive flag, or a \
-                 command whose output you can read.",
-            ));
-        }
         // Absolute, because a relative directory is resolved against hatch's
         // own working directory, which is not the one the request was written
         // against and is not the one the window would be describing.
@@ -1505,12 +1523,19 @@ impl Daemon {
         let spans = render_command(&line, &render_env);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
-        let payload = Payload::command(&spans, Vec::new(), cwd.clone(), params.root, false)
-            .with_caveat(caveat);
+        let payload =
+            Payload::command(&spans, Vec::new(), cwd.clone(), params.root, params.interactive)
+                .with_caveat(caveat);
         Prepared::Ready(Job {
             detail: detail(&cwd),
             payload,
-            work: Work::Run(RunPlan { argv, env: spawn_env, cwd, elevated: params.root }),
+            work: Work::Run(RunPlan {
+                argv,
+                env: spawn_env,
+                cwd,
+                elevated: params.root,
+                asked_for_a_terminal: params.interactive,
+            }),
         })
     }
 
@@ -1607,11 +1632,22 @@ impl Daemon {
         &self,
         run: &RunPlan,
         stream: bool,
+        terminal: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
     ) -> (LogVerdict, CallToolResult, Windup) {
-        let RunPlan { argv, env, cwd, elevated } = run;
+        let RunPlan { argv, env, cwd, elevated, asked_for_a_terminal } = run;
         let elevated = *elevated;
+        // Either half is enough. The window is built so that a request which
+        // asked for a terminal comes back having been given one, and this is
+        // the daemon declining to depend on that: a command that needs a
+        // terminal and is denied one hangs, so the floor is enforced where the
+        // run is decided rather than only where it is drawn.
+        let terminal = terminal || *asked_for_a_terminal;
+        // Streaming and a terminal are exclusive — the terminal is the stream
+        // — and the window clears the box when it opens one. Recomputed here
+        // for the same reason the line above is.
+        let stream = stream && !terminal;
         // The live view is a display preference and nothing else: execution is
         // identical either way, so the only difference is whether a sink is
         // wired at all.
@@ -1635,18 +1671,44 @@ impl Daemon {
         }
 
         let started = std::time::Instant::now();
-        let ran = exec::run(
-            argv,
-            env,
-            cwd,
-            RunOpts {
-                timeout: Some(Duration::from_secs(self.config.exec_timeout_secs)),
-                cancel: session.kill_requested(),
-                cap_bytes: self.config.output_cap_bytes,
-                chunks,
-            },
-        )
-        .await;
+        let ran = match terminal {
+            // No deadline, and that is the point of the branch rather than an
+            // oversight in it. The execution timeout is a runaway-process
+            // guard, and in a terminal the guard is the person sitting in
+            // front of it: applying the deadline would end their session
+            // mid-keystroke, in the middle of an editor or halfway through a
+            // package upgrade's confirmation. The Kill button is still there
+            // and still reaches the whole tree — see
+            // `crate::exec::interactive`.
+            true => {
+                exec::interactive::run(
+                    argv,
+                    env,
+                    cwd,
+                    exec::interactive::TerminalOpts {
+                        terminal: &self.config.terminal,
+                        parent: &self.stage_dir,
+                        cancel: session.kill_requested(),
+                        cap_bytes: self.config.output_cap_bytes,
+                    },
+                )
+                .await
+            }
+            false => {
+                exec::run(
+                    argv,
+                    env,
+                    cwd,
+                    RunOpts {
+                        timeout: Some(Duration::from_secs(self.config.exec_timeout_secs)),
+                        cancel: session.kill_requested(),
+                        cap_bytes: self.config.output_cap_bytes,
+                        chunks,
+                    },
+                )
+                .await
+            }
+        };
         let elapsed = started.elapsed();
         if let Some(pump) = pump {
             let _ = pump.await;
@@ -1705,6 +1767,7 @@ impl Daemon {
             run.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
             run.killed_by_user = Some(output.killed_by_user);
             run.timed_out = Some(output.timed_out);
+            run.interactive = Some(terminal);
         }
         let (verdict, result, frame) = match root {
             // Unelevated, or elevated and the command demonstrably ran: the
@@ -1736,7 +1799,7 @@ impl Daemon {
                     RootOutcome::Unclear { .. } => {
                         format!("{message}\n\n{}", describe_run(&output, elapsed))
                     }
-                    _ => match first_line(&output.stderr) {
+                    _ => match first_line(diagnostics(&output)) {
                         "" => message,
                         line => format!("{message}\n\n{line}"),
                     },
@@ -1806,7 +1869,7 @@ impl Daemon {
                 ),
             };
         }
-        self.elevation.classify(output.exit_code, &output.stderr, spawned_with)
+        self.elevation.classify(output.exit_code, diagnostics(output), spawned_with)
     }
 
     /// Apply an approved file replacement and describe what happened.
@@ -2240,6 +2303,15 @@ fn finished_frame(output: &Output) -> Option<protocol::Outcome> {
 /// stderr is not part of its answer, and every way the run was cut short is
 /// named: a truncated result that reads as a complete one is the failure this
 /// whole project is built to avoid.
+///
+/// A command that ran in a terminal gets one section instead of two, under a
+/// different name, and the difference is not cosmetic. A pty is a single
+/// stream: standard output, standard error and whatever the person typed
+/// arrive interleaved with nothing marking which was which. Printing that
+/// under `stdout:` would be hatch handing the agent a separation that did not
+/// exist, which is the same class of untruth as a rendering that does not
+/// match the command — so the heading says what it is, and the two stream
+/// headings are absent rather than empty.
 fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
     let mut text = String::new();
     match output.exit_code {
@@ -2256,10 +2328,14 @@ fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
     if output.killed_by_user {
         text.push_str("killed: the user pressed Kill while it ran\n");
     }
-    for (name, body, truncated) in [
-        ("stdout", &output.stdout, output.stdout_truncated),
-        ("stderr", &output.stderr, output.stderr_truncated),
-    ] {
+    let sections = match &output.transcript {
+        Some(transcript) => vec![("transcript", transcript, output.transcript_truncated)],
+        None => vec![
+            ("stdout", &output.stdout, output.stdout_truncated),
+            ("stderr", &output.stderr, output.stderr_truncated),
+        ],
+    };
+    for (name, body, truncated) in sections {
         text.push_str(&format!("\n{name}:\n"));
         if body.is_empty() {
             text.push_str("(empty)\n");
@@ -2274,6 +2350,22 @@ fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
         }
     }
     text
+}
+
+/// Whatever the run left that a diagnostic could be read out of.
+///
+/// The elevation classifier reads `run0`'s own words, and on the ordinary path
+/// those arrive on standard error. In a terminal there is no standard error to
+/// arrive on: everything is one transcript, `run0`'s refusal included. So the
+/// transcript stands in — it is a weaker source, because the command's own
+/// output is mixed into it and could in principle carry the same phrases, and
+/// it is the only source there is. Empty rather than absent when there is
+/// neither, so every caller can treat this as text.
+fn diagnostics(output: &Output) -> &str {
+    match &output.transcript {
+        Some(transcript) => transcript,
+        None => &output.stderr,
+    }
 }
 
 /// Lowercase hex SHA-256, the same form `sha256sum` prints.
@@ -3445,6 +3537,7 @@ later"), "");
                 env: Env::new(),
                 cwd: PathBuf::from("/"),
                 elevated,
+                asked_for_a_terminal: false,
             })
         };
         let swap = |root| Work::Swap {
@@ -5668,6 +5761,7 @@ later"), "");
             command: "true".to_string(),
             root: false,
             cwd: "/".to_string(),
+            interactive: None,
             exit_code: None,
             duration_ms: None,
             killed_by_user: None,

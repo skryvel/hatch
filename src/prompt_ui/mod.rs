@@ -203,6 +203,25 @@ const PRIMARY_BUTTON_ROWS: egui::Vec2 = egui::vec2(10.0, 2.3);
 /// distance on the screen and not a quantity of text.
 const PRIMARY_GAP: f32 = 28.0;
 
+/// The label on the control that gives a command a terminal.
+///
+/// "Run it" rather than "Interactive", because the reader is being asked what
+/// to do with this command and not to classify it. The word the agent's
+/// parameter uses is the agent's business.
+const TERMINAL_LABEL: &str = "Run it in a terminal";
+
+/// What choosing a terminal costs, said where it is chosen.
+///
+/// Two sentences and no hedging. The first states the mechanism, because a
+/// reader who knows *why* it happens can work out the cases this sentence does
+/// not list; the second is the one instruction that follows from it, which is
+/// the part somebody skimming will take away. See
+/// [`PromptApp::terminal_row`] for why it is not a tooltip.
+const TERMINAL_CAPTURE: &str = "Everything in that terminal is sent to the agent, including what      you type into it. Do not type a password there.";
+
+/// Why the control is dead on a request that already asked for a terminal.
+const TERMINAL_ASKED: &str = "The agent asked for one.";
+
 /// The most of the window the live output takes while a command runs, in
 /// lines of the monospace font it is drawn in.
 ///
@@ -936,6 +955,13 @@ struct PromptApp {
     out: Box<dyn Write + Send>,
     /// The Stream output checkbox. A display preference and nothing else.
     stream: bool,
+    /// The Run it in a terminal checkbox.
+    ///
+    /// Not a display preference: this one decides what runs. It is the
+    /// reader's half of a decision the agent also has a half of — see
+    /// [`PromptApp::in_a_terminal`], which is the only thing that should be
+    /// asked whether this run gets one.
+    terminal: bool,
     /// What the user is telling the agent, for every verdict but Approve.
     note: String,
     /// The one thing between a keystroke meant for another window and an
@@ -967,6 +993,9 @@ impl PromptApp {
             // Headless by default: streaming is what the reader opts into
             // when they want to watch, not what they get for asking.
             stream: false,
+            // And a terminal is not opened for a command that did not ask
+            // for one unless the person reading it decides otherwise.
+            terminal: false,
             note: String::new(),
             guard: Guard::new(Instant::now()),
             guard_open: false,
@@ -980,6 +1009,37 @@ impl PromptApp {
     /// started before the window has anything to keep.
     fn kept(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kept)
+    }
+
+    /// Whether this run gets a terminal of its own.
+    ///
+    /// Either half is enough and neither can veto the other, which is the
+    /// whole rule: the control **grants** interactivity, it does not withdraw
+    /// it. An agent that asked for a terminal knows something about its
+    /// command — that it is going to want typing at — and a command that needs
+    /// one and is denied it does not fail, it hangs with nowhere to type. So
+    /// there is no state of this window in which a request that asked for a
+    /// terminal does not get one.
+    ///
+    /// The other direction is what the control is for. A person reading
+    /// `pacman -S foo` can see the confirmation prompt coming when the agent
+    /// that wrote the line could not.
+    fn in_a_terminal(&self) -> bool {
+        self.terminal || self.state.shown().is_some_and(|shown| shown.interactive())
+    }
+
+    /// The approval this window would send, however it was asked for.
+    ///
+    /// One function rather than one expression per button, because there are
+    /// two ways to approve — the button and the chord — and an approval that
+    /// carried the terminal from one of them and not the other would be a
+    /// window whose keyboard and mouse ran different commands.
+    fn approval(&self) -> Verdict {
+        Verdict::Approve {
+            stream: self.stream,
+            terminal: self.in_a_terminal(),
+            note: self.note.clone(),
+        }
     }
 }
 
@@ -1209,9 +1269,7 @@ impl PromptApp {
             // The note goes with an approval as it goes with a denial: the
             // field says "Note to the agent", and which button was pressed
             // afterwards does not change who the words were for.
-            Action::Approve => {
-                Verdict::Approve { stream: self.stream, note: self.note.clone() }
-            }
+            Action::Approve => self.approval(),
             Action::Deny => Verdict::Deny { note: self.note.clone() },
             Action::Ignored | Action::Passthrough => return,
         };
@@ -1425,6 +1483,8 @@ impl PromptApp {
                     // again. See `crate::protocol`.
                     ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
                 });
+        } else if self.in_a_terminal() {
+            ui.label(egui::RichText::new("It is running in a terminal of its own.").small());
         } else {
             ui.label(
                 egui::RichText::new("Its output is not being streamed to this window.").small(),
@@ -1506,26 +1566,41 @@ impl PromptApp {
     ///
     /// Returns the Approve button.
     fn verdict_buttons(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        // Read before the fields below are borrowed to draw.
-        let (streamable, interactive) = match self.state.shown() {
+        // Read before the fields below are borrowed to draw. `streamable` is
+        // "this is a command", asked from the streaming side: a file swap
+        // writes bytes and says nothing, so it has neither output to watch
+        // nor anything a terminal could run.
+        let (streamable, asked_for) = match self.state.shown() {
             Some(shown) => (shown.streamable(), shown.interactive()),
             None => (false, false),
         };
 
+        // Streaming and a terminal are exclusive, and it is not a rule this
+        // window enforces so much as a fact it reports: the terminal *is* the
+        // stream. Cleared rather than merely disabled, because a ticked box
+        // that has been greyed out reads as a promise to stream, and nothing
+        // is going to.
+        if self.in_a_terminal() {
+            self.stream = false;
+        }
         // One name for it, used by the checkbox and by the line that says why
         // it is dead: a control that cannot be ticked and does not say why is
         // a window asking the reader to guess.
-        let can_stream = !interactive;
+        let can_stream = !self.in_a_terminal();
         let note = self.note.clone();
         let mut decided = None;
         let width = cluster_width(ui);
 
+        if streamable {
+            self.terminal_row(ui, asked_for);
+            ui.add_space(2.0);
+        }
         self.note_row(ui, width, streamable, can_stream);
         ui.add_space(6.0);
         let approve = self.decision_row(ui, width, &note, &mut decided);
 
         if approve.clicked() {
-            decided = Some(Verdict::Approve { stream: self.stream, note });
+            decided = Some(self.approval());
         }
 
         if let Some(verdict) = decided {
@@ -1592,6 +1667,75 @@ impl PromptApp {
         }
     }
 
+    /// One row: whether to give the command a terminal, and what that costs.
+    ///
+    /// # Why the warning is here and not in a tooltip
+    ///
+    /// The transcript of that terminal goes back to the agent, and a terminal
+    /// records *everything in it* — including what the person types, because
+    /// the terminal echoes it. Somebody who answers a prompt inside that
+    /// window with a password has put the password in the agent's context, and
+    /// they will have done it while believing they were typing into their own
+    /// terminal, which in every other respect they are.
+    ///
+    /// That is a cost, and a cost belongs next to the control that incurs it,
+    /// before it is incurred. A tooltip is read by people who already suspect
+    /// there is something to read; this sentence has to reach the person who
+    /// does not. So it is drawn beside the box, at every width — when the row
+    /// is too narrow for it to sit alongside, it goes under the box rather
+    /// than away.
+    ///
+    /// # Why the box is dead when the agent asked
+    ///
+    /// See [`PromptApp::in_a_terminal`]. The control grants and never
+    /// withdraws, so for a request that already asked for a terminal there is
+    /// nothing for it to decide — and the row still says what the terminal
+    /// costs, because that is exactly the case where nobody chose it.
+    fn terminal_row(&mut self, ui: &mut egui::Ui, asked_for: bool) {
+        let quiet = ui.visuals().weak_text_color();
+        let warn = ui.visuals().warn_fg_color;
+        let mut ticked = self.in_a_terminal();
+        let width = text_width(ui, TERMINAL_LABEL, egui::TextStyle::Button)
+            + ui.spacing().icon_width
+            + ui.spacing().icon_spacing
+            + text_width(ui, TERMINAL_CAPTURE, egui::TextStyle::Small)
+            + match asked_for {
+                true => text_width(ui, TERMINAL_ASKED, egui::TextStyle::Small),
+                false => 0.0,
+            }
+            + 3.0 * ui.spacing().item_spacing.x;
+
+        let mut controls = |ui: &mut egui::Ui| {
+            ui.add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL));
+            if asked_for {
+                ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
+            }
+            ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn));
+        };
+        if width <= ui.available_width() {
+            centred_row(ui, width, &mut controls);
+        } else {
+            // Under the box rather than beside it. The sentence is the part
+            // that must not be dropped, so the row that cannot hold it gets
+            // taller instead of shorter.
+            ui.vertical_centered(|ui| {
+                ui.add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL));
+                if asked_for {
+                    ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
+                }
+                ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn));
+            });
+        }
+        // Only the reader's half is stored. `ticked` is the *effective*
+        // answer, which is already true for a request the agent asked for, and
+        // writing that back would turn the agent's ask into the reader's
+        // choice — indistinguishable afterwards, and the wrong thing to show
+        // if the payload ever changed under this window.
+        if !asked_for {
+            self.terminal = ticked;
+        }
+    }
+
     /// The stream checkbox, and the reason it is dead when it is.
     fn stream_box(&mut self, ui: &mut egui::Ui, can_stream: bool) {
         ui.add_enabled(
@@ -1622,7 +1766,7 @@ impl PromptApp {
         // `Button` and not `Body`: that is the style a checkbox draws its own
         // label in.
         let label = text_width(ui, "Stream output to this window", egui::TextStyle::Button);
-        let dead = match self.state.shown().is_some_and(|shown| shown.interactive()) {
+        let dead = match self.in_a_terminal() {
             true => {
                 ui.spacing().item_spacing.x
                     + text_width(ui, "It runs in a terminal of its own.", egui::TextStyle::Small)
@@ -2264,12 +2408,17 @@ mod tests {
 
         // With a note in it, because an approval carries one and this is the
         // test that says what the frame looks like.
-        let frame = state.decide(Verdict::Approve { stream: true, note: "go on".to_string() });
+        let frame = state.decide(Verdict::Approve {
+            stream: true,
+            terminal: false,
+            note: "go on".to_string(),
+        });
         answer(&mut wire, &mut state, frame);
 
         assert_eq!(
             String::from_utf8(wire).unwrap(),
-            "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true,\"note\":\"go on\"}\n"
+            "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true,\"terminal\":false,\
+             \"note\":\"go on\"}\n"
         );
         assert_eq!(state.broken(), None, "a written verdict is not a failure");
     }

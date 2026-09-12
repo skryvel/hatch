@@ -632,6 +632,25 @@ pub enum Verdict {
         /// Whether the user ticked Stream output. A display preference and
         /// nothing more: execution is identical either way.
         stream: bool,
+        /// Whether to give it a terminal of its own.
+        ///
+        /// Here rather than in a verdict of its own, because it is not a
+        /// different answer: the person said run it, and this says how. A
+        /// verdict is what the agent is told happened to its request, and
+        /// "approved, in a terminal" and "approved" are the same thing having
+        /// happened to it.
+        ///
+        /// It only ever grants. An agent that asked for `interactive` is
+        /// already getting one and the window cannot take it away — a command
+        /// that needs a terminal and is denied one does not fail, it hangs —
+        /// so this arrives `true` for such a request whatever the person did
+        /// with the control. What it is *for* is the other direction: the
+        /// person at the window can often see that a command will want to be
+        /// typed at when the agent could not.
+        ///
+        /// Unlike `stream`, this changes what runs. See
+        /// [`crate::exec::interactive`].
+        terminal: bool,
         /// What the user typed, returned to the agent.
         ///
         /// The window has always had the field and an approval used to drop
@@ -707,7 +726,7 @@ pub enum ReviseKind {
 /// the verdict out.
 #[cfg(test)]
 pub(crate) fn approved(stream: bool) -> Verdict {
-    Verdict::Approve { stream, note: String::new() }
+    Verdict::Approve { stream, terminal: false, note: String::new() }
 }
 
 /// One of every verdict, for the tests across this crate that must cover the
@@ -723,7 +742,16 @@ pub(crate) fn approved(stream: bool) -> Verdict {
 #[cfg(test)]
 pub(crate) fn every_verdict() -> Vec<Verdict> {
     vec![
-        Verdict::Approve { stream: true, note: "thanks — watch the tail of it".to_string() },
+        Verdict::Approve {
+            stream: true,
+            terminal: false,
+            note: "thanks — watch the tail of it".to_string(),
+        },
+        Verdict::Approve {
+            stream: false,
+            terminal: true,
+            note: "this one is going to ask you things".to_string(),
+        },
         approved(false),
         Verdict::Deny { note: "not now".to_string() },
         Verdict::Revise {
@@ -1175,6 +1203,13 @@ mod tests {
         // The authority test. A prompt answers the window it was given, and
         // there is no field in which it could answer for another one or
         // approve something other than what it was shown.
+        //
+        // The permitted set is what the window is entitled to decide: which
+        // answer (`verdict`, `kind`), what to say about it (`note`), and how
+        // an approved operation should be carried out (`stream`, `terminal`).
+        // What is not in it is the whole point — no request id, no command, no
+        // path, no argv. A window cannot name the thing it is answering about,
+        // so it cannot name a different one.
         for message in
             every_verdict().into_iter().map(PromptMsg::Verdict).chain([PromptMsg::Kill])
         {
@@ -1182,9 +1217,10 @@ mod tests {
                 serde_json::from_str(&encode(&message).expect("encodes")).expect("valid JSON");
             for key in json.as_object().expect("an object").keys() {
                 assert!(
-                    ["type", "verdict", "note", "stream", "kind"].contains(&key.as_str()),
-                    "a prompt message may not carry {key}: identity and the operation are the \
-                     daemon's, not the window's"
+                    ["type", "verdict", "note", "stream", "terminal", "kind"]
+                        .contains(&key.as_str()),
+                    "a prompt message may not carry {key}: which request this is, and what it \
+                     asked for, are the daemon's and not the window's"
                 );
             }
         }
