@@ -89,6 +89,7 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 
 use crate::exec::Stream;
+use crate::prefs::{Prefs, PrefsFile};
 use crate::prompt_ui::guard::{Action, Guard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
@@ -221,6 +222,43 @@ const TERMINAL_CAPTURE: &str = "Everything in that terminal is sent to the agent
 
 /// Why the control is dead on a request that already asked for a terminal.
 const TERMINAL_ASKED: &str = "The agent asked for one.";
+
+/// The label on the control that sends the window away at the verdict.
+///
+/// "When I decide" and not "after approving", although approving is the only
+/// verdict it changes anything about. Every other verdict already closes this
+/// window on the frame it is sent — see [`PromptState::decide`] — so a control
+/// named after the exception would be named after the one case it does not
+/// cover. This one is a promise about the whole row of buttons, and all six of
+/// them keep it.
+const CLOSE_LABEL: &str = "Close when I decide";
+
+/// What ticking it gives up, said where it is ticked.
+///
+/// Beside the box and not in a tooltip, for the reason
+/// [`PromptApp::terminal_row`] gives at length: a cost belongs next to the
+/// control that incurs it, before it is incurred, where the person who does
+/// not already suspect there is something to read will see it.
+///
+/// One short sentence where the terminal's warning gets two, and that is
+/// proportion rather than economy. What is given up here is an affordance the
+/// reader is choosing to do without: for an ordinary run `exec_timeout_secs`
+/// still ends a runaway, and a terminal run — which has no such deadline, by
+/// design — is one the reader is sitting in front of, which is a better stop
+/// than a button behind another window. Nothing about it leaves the machine,
+/// which is what the other sentence is about.
+const CLOSE_COST: &str = "The Kill button goes with it.";
+
+/// Why the control is dead on a run the reader asked to watch.
+///
+/// Ticking Stream wins, and this is the window saying which of two
+/// contradictory instructions it is following rather than quietly dropping
+/// one. The asymmetry is deliberate: Stream is a choice about *this* command,
+/// made in front of it, and a standing preference set some other day must not
+/// silently overrule one. The preference itself is untouched — the box is
+/// drawn unticked because that is what will happen, not because anything was
+/// forgotten — so unticking Stream brings it straight back.
+const CLOSE_WATCHING: &str = "You asked to watch this one.";
 
 /// The most of the window the live output takes while a command runs, in
 /// lines of the monospace font it is drawn in.
@@ -778,6 +816,13 @@ impl PromptState {
             self.streaming = stream;
         }
         self.phase = match verdict {
+            // The reader ticked "Close when I decide", so an approval joins
+            // the five verdicts that were always over on the frame that
+            // carried them. The command is authorised and runs on with no
+            // window, which is a state an approved command could always reach
+            // — the difference is that this time somebody asked for it, and
+            // the frame just written is where they said so.
+            Verdict::Approve { closing: true, .. } => Phase::Closed,
             Verdict::Approve { .. } => Phase::Running,
             Verdict::Deny { .. }
             | Verdict::Revise { .. }
@@ -961,6 +1006,10 @@ pub fn run_prompt() -> anyhow::Result<()> {
     // default size rather than a request that never opens one -- which the
     // daemon would resolve as a denial.
     let (font_size, theme) = crate::config::display_style();
+    // The one file this process owns, held to the same rule: see
+    // `crate::prefs`. A window that would not open over a preference it could
+    // not read would be a denial of a request nobody was ever shown.
+    let prefs = PrefsFile::from_env();
 
     let app_fatal = Arc::clone(&fatal);
     open_window(
@@ -974,7 +1023,7 @@ pub fn run_prompt() -> anyhow::Result<()> {
             // the daemon's first write fits in the pipe.
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
-            let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal));
+            let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal), prefs);
             let kept = app.kept();
             std::thread::spawn(move || {
                 read_frames(io::stdin().lock(), &tx, |noticed| {
@@ -1018,6 +1067,19 @@ pub(crate) struct PromptApp {
     out: Box<dyn Write + Send>,
     /// The Stream output checkbox. A display preference and nothing else.
     stream: bool,
+    /// The Close when I decide checkbox, as the reader last left it.
+    ///
+    /// The *stored* preference rather than the effective answer: it stays as
+    /// it was set while a ticked Stream box overrules it for one request, so
+    /// unticking Stream brings it back instead of asking for it again.
+    /// [`PromptApp::closes_on_decide`] is the only thing that should be asked
+    /// what will actually happen.
+    close_on_decide: bool,
+    /// Where the preference above is remembered between windows.
+    ///
+    /// Held rather than reached for at the moment of writing, so a test and a
+    /// preview can be handed a file that is nowhere. See [`crate::prefs`].
+    prefs: PrefsFile,
     /// The Run it in a terminal checkbox.
     ///
     /// Not a display preference: this one decides what runs. It is the
@@ -1048,7 +1110,12 @@ impl PromptApp {
         inbox: Receiver<Incoming>,
         out: Box<dyn Write + Send>,
         fatal: Arc<OnceLock<String>>,
+        prefs: PrefsFile,
     ) -> PromptApp {
+        // The one thing this window starts with that another window decided.
+        // Read once, here, and not per frame: a file changing under an open
+        // window would move a control somebody is looking at.
+        let close_on_decide = prefs.read().close_on_decide;
         PromptApp {
             state: PromptState::new(),
             inbox,
@@ -1056,6 +1123,8 @@ impl PromptApp {
             // Headless by default: streaming is what the reader opts into
             // when they want to watch, not what they get for asking.
             stream: false,
+            close_on_decide,
+            prefs,
             // And a terminal is not opened for a command that did not ask
             // for one unless the person reading it decides otherwise.
             terminal: false,
@@ -1134,8 +1203,27 @@ impl PromptApp {
         Verdict::Approve {
             stream: self.stream,
             terminal: self.in_a_terminal(),
+            closing: self.closes_on_decide(),
             note: self.note.clone(),
         }
+    }
+
+    /// Whether this window goes as soon as the verdict has been sent.
+    ///
+    /// The reader's standing preference, minus the one thing that overrules
+    /// it. Streaming and closing are a contradiction — the live view exists to
+    /// be watched, and a window that has gone shows nothing — and the tick
+    /// made in front of *this* command wins over the one made some other day.
+    /// See [`CLOSE_WATCHING`], which is the window saying so out loud.
+    ///
+    /// A terminal run is not the same case and is deliberately not excluded.
+    /// The terminal is a window of its own that the reader is about to be
+    /// sitting in front of, so hatch's window standing behind it shows them
+    /// nothing they are not already looking at — and this box is at its most
+    /// useful there. `stream` is already false whenever there is a terminal,
+    /// so a terminal run reads as true here without having to say so twice.
+    fn closes_on_decide(&self) -> bool {
+        self.close_on_decide && !self.stream
     }
 }
 
@@ -1768,7 +1856,12 @@ impl PromptApp {
                 false => 0.0,
             },
         ];
-        let Some([left, centre, right]) = flanked_row(ui, height, width, flanks) else {
+        let places = flanked_row(ui, height, width, flanks);
+        // All of it or none of it, unlike the decision row below: what hangs
+        // off this field is a label naming it and a box about the command in
+        // it, and one of the two moving to a row of its own while the other
+        // stayed would be two rows saying one thing.
+        let [Some(left), Some(right)] = places.flanks else {
             // Too narrow to hang anything off the field. Back to the stack,
             // which is a taller row and a correct one.
             ui.vertical_centered(|ui| {
@@ -1780,6 +1873,7 @@ impl PromptApp {
             });
             return;
         };
+        ui.advance_cursor_after_rect(places.row);
 
         ui.scope_builder(
             egui::UiBuilder::new()
@@ -1789,7 +1883,7 @@ impl PromptApp {
         );
         ui.scope_builder(
             egui::UiBuilder::new()
-                .max_rect(centre)
+                .max_rect(places.centre)
                 .layout(egui::Layout::top_down_justified(egui::Align::Center)),
             |ui| ui.add(egui::TextEdit::singleline(&mut self.note)),
         );
@@ -1912,7 +2006,68 @@ impl PromptApp {
         box_ + label + dead + 2.0 * ui.spacing().item_spacing.x
     }
 
-    /// One row: the two buttons that decide, and the four that do not.
+    /// The Close when I decide checkbox, and what it costs or why it is dead.
+    ///
+    /// Two lines, stacked. The row it belongs to is a primary button tall and
+    /// half of it was empty, so the sentence under the box gets a line of its
+    /// own for nothing — where beside the box it would have been the first
+    /// thing to run out of room, and [`CLOSE_COST`] is not a sentence this
+    /// window may drop for want of width.
+    fn close_box(&mut self, ui: &mut egui::Ui) {
+        // Drawn as the effective answer and stored only when the reader is the
+        // one who settled it, exactly as the terminal box is: the box says
+        // what this window will do, and the field remembers what its reader
+        // asked for. Writing the effective answer back would turn a ticked
+        // Stream box into the reader having unticked this one, and it would
+        // stay unticked after Stream was cleared again.
+        let live = !self.stream;
+        let mut ticked = self.closes_on_decide();
+        if ui.add_enabled(live, egui::Checkbox::new(&mut ticked, CLOSE_LABEL)).changed() {
+            self.close_on_decide = ticked;
+            // On the click, and not on the way out, because there may be no
+            // way out to write it on: this window's ordinary ending is the
+            // daemon killing the process once the operation is over.
+            self.prefs.write(&Prefs { close_on_decide: ticked });
+        }
+        ui.label(
+            egui::RichText::new(match live {
+                true => CLOSE_COST,
+                false => CLOSE_WATCHING,
+            })
+            .small()
+            .color(ui.visuals().weak_text_color()),
+        );
+    }
+
+    /// How much room the close control needs: the wider of its two lines.
+    ///
+    /// The sentence is measured as **whichever of the two is longer** rather
+    /// than as the one about to be drawn. A flank that narrowed when Stream
+    /// was ticked could hand the row back to the fallback under a pointer
+    /// already on its way to Approve, and nothing beside the two buttons that
+    /// decide is allowed to move them.
+    fn close_width(&self, ui: &egui::Ui) -> f32 {
+        let box_ = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        // `Button` and not `Body`: that is the style a checkbox draws its own
+        // label in.
+        let label = box_ + text_width(ui, CLOSE_LABEL, egui::TextStyle::Button);
+        let said = text_width(ui, CLOSE_COST, egui::TextStyle::Small)
+            .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small));
+        label.max(said) + 2.0 * ui.spacing().item_spacing.x
+    }
+
+    /// How tall the close control is: its box, and the sentence under it.
+    fn close_height(&self, ui: &egui::Ui) -> f32 {
+        let box_ = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&egui::TextStyle::Button));
+        box_ + ui.spacing().item_spacing.y + ui.text_style_height(&egui::TextStyle::Small)
+    }
+
+    /// One row: the two buttons that decide, the four that do not, and the one
+    /// that says what deciding is going to do to this window.
     fn decision_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1926,10 +2081,41 @@ impl PromptApp {
         // not the other.
         let needed =
             row_width(ui, Hatch::ALL.iter().map(|hatch| hatch.label()), egui::TextStyle::Small);
-        // Past Deny, with the same gap Approve and Deny keep between them: a
-        // pointer sliding off Deny lands on the panel, never on a button.
-        let flanks = [0.0, needed + PRIMARY_GAP];
+        // Past Deny on one side and short of Approve on the other, each with
+        // the same gap the two of them keep between themselves: a pointer
+        // sliding off either lands on the panel, never on a button and never
+        // on a checkbox. The left flank was empty until the close control
+        // moved into it, and that is why that control costs no row — this
+        // panel is 1280 points wide and the two buttons that matter are 400 of
+        // them in the middle of it.
+        let flanks = [self.close_width(ui) + PRIMARY_GAP, needed + PRIMARY_GAP];
+        // Asked before anything is drawn and then asked again, because a close
+        // control with nowhere to sit beside Approve goes *above* the row —
+        // which moves the row. Both calls only measure; see [`Places`].
+        if flanked_row(ui, height, width, flanks).flanks[0].is_none() {
+            // First, because it says what pressing one of the buttons under it
+            // is going to do to this window.
+            ui.vertical_centered(|ui| self.close_box(ui));
+            ui.add_space(4.0);
+        }
         let places = flanked_row(ui, height, width, flanks);
+        ui.advance_cursor_after_rect(places.row);
+
+        if let Some(left) = places.flanks[0] {
+            // Centred against the buttons rather than hung from the top of the
+            // row: two lines of text level with one tall button, which is what
+            // the eye reads as one row.
+            let place = egui::Rect::from_center_size(
+                left.center(),
+                egui::vec2(left.width(), self.close_height(ui)),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(place)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| self.close_box(ui),
+            );
+        }
 
         let mut verdicts = |ui: &mut egui::Ui| {
             let approve = unfocusable(ui, primary(ui, "Approve", guard::APPROVE_CHORD));
@@ -1940,18 +2126,15 @@ impl PromptApp {
             }
             approve
         };
-        let approve = match places {
-            Some([_, centre, _]) => ui
-                .scope_builder(
-                    egui::UiBuilder::new().max_rect(centre).layout(
-                        egui::Layout::left_to_right(egui::Align::Center)
-                            .with_main_align(egui::Align::Center),
-                    ),
-                    &mut verdicts,
-                )
-                .inner,
-            None => ui.vertical_centered(|ui| centred_row(ui, width, &mut verdicts)).inner,
-        };
+        let approve = ui
+            .scope_builder(
+                egui::UiBuilder::new().max_rect(places.centre).layout(
+                    egui::Layout::left_to_right(egui::Align::Center)
+                        .with_main_align(egui::Align::Center),
+                ),
+                &mut verdicts,
+            )
+            .inner;
 
         let mut hatch_row = |ui: &mut egui::Ui, reversed: bool| {
             let mut order = Hatch::ALL;
@@ -1964,12 +2147,12 @@ impl PromptApp {
                 }
             }
         };
-        match places {
+        match places.flanks[1] {
             // Right to left, so the row is built from the window's edge
             // inwards and they end where they started however wide the
             // labels turn out to be. Reversed, so that reading order is the
             // same as it is in the fallback below.
-            Some([_, _, right]) => {
+            Some(right) => {
                 ui.scope_builder(
                     egui::UiBuilder::new()
                         .max_rect(right)
@@ -1988,24 +2171,42 @@ impl PromptApp {
     }
 }
 
-/// A row with something `width` wide centred in it and a flank on each side.
+/// Where a `width`-wide centre and a flank on each side of it would go, in the
+/// row that starts at the cursor.
 ///
-/// Returns the three rects — left, centre, right — or `None` when a flank
-/// would reach into the centre. That answer is the whole point: the centre of
-/// this panel is where Approve and Deny are, and a control allowed to overlap
-/// them is a control that can be pressed instead of them. A caller that gets
-/// `None` puts its flanks somewhere else; nothing is ever moved or shrunk to
-/// make room.
+/// Returned by [`flanked_row`], which measures and does not take: a caller
+/// that uses the row takes it with [`egui::Ui::advance_cursor_after_rect`],
+/// and one that cannot starts its own layout where this row would have been,
+/// so a refusal still costs no space.
 ///
-/// The centre is placed from the row's own width rather than from what the
-/// flanks turned out to need, so the two verdict buttons sit in exactly the
-/// same place whether or not anything is beside them.
-fn flanked_row(
-    ui: &mut egui::Ui,
-    height: f32,
-    width: f32,
-    flanks: [f32; 2],
-) -> Option<[egui::Rect; 3]> {
+/// Measuring and taking used to be the same call, which was right while a row
+/// had one flank that could fail: the answer was "all three places, or none".
+/// The decision row has two, and they are separate questions — the escape
+/// hatches not fitting beside Deny is no reason for the close control on the
+/// other side of the same row to lose its place — so the answer is now one per
+/// flank and the taking is the caller's.
+struct Places {
+    /// The whole row, for the caller that takes it.
+    row: egui::Rect,
+    /// Where the `width`-wide centre goes.
+    ///
+    /// Placed from the row's own width rather than from what the flanks turned
+    /// out to need, so the two verdict buttons sit in exactly the same place
+    /// whether or not anything is beside them.
+    centre: egui::Rect,
+    /// Each flank, or `None` where it would reach into the centre.
+    ///
+    /// That refusal is the whole point: the centre of this panel is where
+    /// Approve and Deny are, and a control allowed to overlap them is a
+    /// control that can be pressed instead of them. A caller holding a `None`
+    /// puts that flank somewhere else; nothing is ever moved or shrunk to make
+    /// room.
+    flanks: [Option<egui::Rect>; 2],
+}
+
+/// Measure a row with something `width` wide centred in it and a flank on each
+/// side. See [`Places`]; nothing is drawn or allocated here.
+fn flanked_row(ui: &egui::Ui, height: f32, width: f32, flanks: [f32; 2]) -> Places {
     let gap = ui.spacing().item_spacing.x;
     let row = egui::Rect::from_min_size(
         ui.available_rect_before_wrap().min,
@@ -2018,13 +2219,14 @@ fn flanked_row(
     let left = egui::Rect::from_min_max(row.min, egui::pos2(centre.left() - gap, row.bottom()));
     let right =
         egui::Rect::from_min_max(egui::pos2(centre.right() + gap, row.top()), row.max);
-    if flanks[0] > left.width() || flanks[1] > right.width() {
-        // Nothing has been allocated, so the caller's fallback starts where
-        // this row would have: a refusal costs no space.
-        return None;
+    Places {
+        row,
+        centre,
+        flanks: [
+            (flanks[0] <= left.width()).then_some(left),
+            (flanks[1] <= right.width()).then_some(right),
+        ],
     }
-    ui.advance_cursor_after_rect(row);
-    Some([left, centre, right])
 }
 
 /// How wide one string is in the style it will be drawn in.
@@ -2492,7 +2694,7 @@ mod tests {
         // opt-in. Defaulting it on means every approval silently chooses the
         // mode the reader never picked.
         let (_tx, rx) = std::sync::mpsc::channel();
-        let app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         assert!(!app.stream, "streaming is opted into, not defaulted on");
     }
 
@@ -2547,6 +2749,7 @@ mod tests {
         let frame = state.decide(Verdict::Approve {
             stream: true,
             terminal: false,
+            closing: false,
             note: "go on".to_string(),
         });
         answer(&mut wire, &mut state, frame);
@@ -2554,7 +2757,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(wire).unwrap(),
             "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true,\"terminal\":false,\
-             \"note\":\"go on\"}\n"
+             \"closing\":false,\"note\":\"go on\"}\n"
         );
         assert_eq!(state.broken(), None, "a written verdict is not a failure");
     }
@@ -3246,7 +3449,12 @@ mod tests {
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut app =
-            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()));
+            PromptApp::new(
+                rx,
+                Box::new(Sink(Arc::clone(&sink))),
+                Arc::new(OnceLock::new()),
+                PrefsFile::none(),
+            );
         app.state.handle(DaemonMsg::Request(a_request(90)));
         (app, sink)
     }
@@ -3498,7 +3706,7 @@ mod tests {
     /// A window awaiting a verdict on `command`.
     fn a_window_showing(command: &str) -> PromptApp {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command(command, &BTreeMap::from([("HOME".into(), "/home/u".into())])),
@@ -3632,7 +3840,7 @@ mod tests {
     #[test]
     fn the_window_draws_the_clock_and_the_queue_behind_it() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(45);
         request.queue_depth = 2;
         app.state.handle(DaemonMsg::Request(request));
@@ -3668,7 +3876,7 @@ mod tests {
     #[test]
     fn the_window_says_who_it_runs_as_and_where() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("id", &BTreeMap::new()),
@@ -3731,7 +3939,7 @@ mod tests {
     #[test]
     fn a_danger_marker_is_drawn_where_the_reader_will_see_it() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("rm -rf /", &BTreeMap::new()),
@@ -3753,7 +3961,7 @@ mod tests {
     #[test]
     fn a_swap_never_draws_an_empty_pane_that_reads_as_nothing_changing() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/conf.toml"),
@@ -3780,7 +3988,7 @@ mod tests {
     #[test]
     fn a_command_in_its_own_terminal_says_why_it_cannot_be_streamed_here() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("vim /etc/hosts", &BTreeMap::new()),
@@ -3873,7 +4081,7 @@ mod tests {
     #[test]
     fn a_swap_offers_no_checkbox_for_output_it_will_never_produce() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/f"),
@@ -4124,29 +4332,42 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 let width = 400.0;
                 let room = ui.available_width();
-                let fits = flanked_row(ui, 20.0, width, [10.0, 10.0]).expect("ten points fit");
-                assert!(fits[0].right() < fits[1].left(), "the left flank touched the centre");
-                assert!(fits[2].left() > fits[1].right(), "the right flank touched the centre");
+                let fits = flanked_row(ui, 20.0, width, [10.0, 10.0]);
+                let [Some(left), Some(right)] = fits.flanks else {
+                    panic!("ten points fit on either side of a 400-point centre")
+                };
+                assert!(left.right() < fits.centre.left(), "the left flank touched the centre");
+                assert!(right.left() > fits.centre.right(), "the right flank touched the centre");
                 assert!(
-                    (fits[1].center().x - ui.min_rect().center().x).abs() < 1.0,
+                    (fits.centre.center().x - ui.min_rect().center().x).abs() < 1.0,
                     "the centre is not centred"
                 );
-                assert!(flanked_row(ui, 20.0, width, [room, 0.0]).is_none());
-                assert!(flanked_row(ui, 20.0, width, [0.0, room]).is_none());
+                assert!(flanked_row(ui, 20.0, width, [room, 0.0]).flanks[0].is_none());
+                assert!(flanked_row(ui, 20.0, width, [0.0, room]).flanks[1].is_none());
+                // Each side is its own question. A row whose right-hand flank
+                // has outgrown its place must not take the left-hand one's
+                // place away with it: that coupling cost the close control its
+                // seat beside Approve for as long as the two were one answer.
+                let crowded = flanked_row(ui, 20.0, width, [10.0, room]);
+                assert!(
+                    crowded.flanks[0].is_some(),
+                    "a flank lost its place because the one opposite it had"
+                );
+                assert!(crowded.flanks[1].is_none());
                 // The boundary is inclusive on the fitting side: a flank that
                 // exactly fills its side is a flank that fits, and the extra
                 // row a refusal costs is not worth a fraction of a point.
-                let exact = fits[0].width();
+                let exact = left.width();
                 assert!(
-                    flanked_row(ui, 20.0, width, [exact, exact]).is_some(),
+                    flanked_row(ui, 20.0, width, [exact, exact]).flanks.iter().all(Option::is_some),
                     "a flank that exactly fits was sent to its own row"
                 );
                 assert!(
-                    flanked_row(ui, 20.0, width, [exact + 1.0, 0.0]).is_none(),
+                    flanked_row(ui, 20.0, width, [exact + 1.0, 0.0]).flanks[0].is_none(),
                     "a point over was allowed to reach the centre"
                 );
                 assert!(
-                    flanked_row(ui, 20.0, width, [0.0, exact + 1.0]).is_none(),
+                    flanked_row(ui, 20.0, width, [0.0, exact + 1.0]).flanks[1].is_none(),
                     "a point over was allowed to reach the centre from the right"
                 );
             });
@@ -4480,7 +4701,7 @@ mod tests {
         // frame around it would be a second claim about the same thing in a
         // second vocabulary.
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/conf.toml"),
@@ -4638,7 +4859,15 @@ mod tests {
     }
 
     /// The verdict row's buttons at a given window width: the two that decide
-    /// and, if they are sharing the row, the ones that do not.
+    /// and, if they are sharing the row, the escape hatches.
+    ///
+    /// Everything left of Approve is left out, and that is not a convenience.
+    /// The other half of this row is the close control, whose box egui draws
+    /// with the fill a button has, so it arrives here looking like one — and
+    /// the distance *it* keeps is a claim of its own, made by
+    /// `the_close_control_keeps_the_whole_gap_from_approve`. A hatch has never
+    /// been drawn on that side and could not be: they are laid out from the
+    /// window's right edge inwards.
     fn verdict_row(app: &mut PromptApp, width: f32) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
         let shapes = window_shapes(app, egui::vec2(width, 700.0));
         let mut buttons = button_rects(&shapes);
@@ -4649,10 +4878,13 @@ mod tests {
         let (primary, rest): (Vec<egui::Rect>, Vec<egui::Rect>) =
             buttons.into_iter().partition(|r| r.height() >= tallest - 0.5);
         let row = primary.first().map_or(0.0, |r| r.center().y);
+        let approve = primary.first().map_or(0.0, |r| r.left());
         // On the same row means level with the verdicts, not merely near
         // them: the fallback draws its row directly underneath.
-        let sharing =
-            rest.into_iter().filter(|r| (r.center().y - row).abs() < 0.5 * tallest).collect();
+        let sharing = rest
+            .into_iter()
+            .filter(|r| (r.center().y - row).abs() < 0.5 * tallest && r.left() >= approve)
+            .collect();
         (primary, sharing)
     }
 
@@ -4673,6 +4905,7 @@ mod tests {
             stream: false,
             note: String::new(),
             terminal: false,
+            closing: false,
         });
         let running = window_text_sized(&mut app, opening_size());
         assert!(
@@ -4759,6 +4992,59 @@ mod tests {
         }
         assert!(ever_shared, "the hatches never shared the row at any width");
         assert!(ever_alone, "the hatches shared the row even where they cannot fit");
+    }
+
+    #[test]
+    fn the_close_control_keeps_the_whole_gap_from_approve() {
+        // The mirror of the claim above, on the other side of the same row.
+        // The close control is a checkbox and not a verdict, but it sits where
+        // a pointer travelling to Approve passes, so the distance that makes a
+        // misclick harmless is the same distance — and it is asserted at every
+        // width where the two share a row rather than at the one this window
+        // opens at.
+        let mut app = a_window_showing("rm -rf /var/tmp/build");
+        let mut ever_beside = false;
+        let mut ever_above = false;
+        let mut width = 700.0;
+        while width <= 1400.0 {
+            let shapes = window_shapes(&mut app, egui::vec2(width, 700.0));
+            let close = text_rects(&shapes)
+                .into_iter()
+                .find(|(text, _)| text == CLOSE_LABEL)
+                .map(|(_, rect)| rect)
+                .unwrap_or_else(|| panic!("at {width} points the close control is not drawn"));
+            let mut buttons = button_rects(&shapes);
+            buttons.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            let tallest = buttons.iter().map(|r| r.height()).fold(0.0_f32, f32::max);
+            let approve = *buttons
+                .iter()
+                .find(|r| r.height() >= tallest - 0.5)
+                .unwrap_or_else(|| panic!("at {width} points Approve is not drawn"));
+
+            match (close.center().y - approve.center().y).abs() < 0.5 * approve.height() {
+                true => {
+                    ever_beside = true;
+                    assert!(
+                        approve.left() - close.right() >= PRIMARY_GAP,
+                        "at {width} points the close control is {} from Approve",
+                        approve.left() - close.right()
+                    );
+                }
+                // Above the buttons rather than squeezed beside them. The
+                // sentence under the box is never dropped for width, so the
+                // row gets taller instead.
+                false => {
+                    ever_above = true;
+                    assert!(
+                        close.bottom() <= approve.top(),
+                        "at {width} points the close control is neither beside nor above Approve"
+                    );
+                }
+            }
+            width += 10.0;
+        }
+        assert!(ever_beside, "the close control never shared the row at any width");
+        assert!(ever_above, "the close control fitted beside Approve even at 700 points");
     }
 
     /// How tall the note row comes out at a given window width.

@@ -36,12 +36,13 @@
 //!   field a confused or hostile prompt could fill in. Adding an id here
 //!   would be adding the ability to answer for someone else's window.
 //! * **It cannot approve more than the operation it was shown.** The verdict
-//!   set is closed, and the two things an [`Verdict::Approve`] carries besides
-//!   itself are `stream`, a display preference, and `note`, the words the
-//!   person typed for the agent. Neither is read by anything that decides
-//!   what runs: the note is text the daemon relays and never interprets, and
-//!   there is still no field in which a command, an argument, a path or a
-//!   mode could ride back.
+//!   set is closed, and what an [`Verdict::Approve`] carries besides itself is
+//!   four things that cannot widen it: `stream` and `closing`, two display
+//!   preferences about what this window does with itself; `terminal`, which
+//!   says how the operation runs and can only ever *grant* a terminal to the
+//!   command already on screen; and `note`, the words the person typed, which
+//!   the daemon relays and never interprets. There is no field in which a
+//!   command, an argument, a path or a mode could ride back.
 //! * **[`PromptMsg::Kill`] is safe by direction.** A prompt that sends it
 //!   early, twice, or for no reason can only stop a command. Everything a
 //!   prompt can say unprompted fails towards deny, which is invariant 2.
@@ -651,6 +652,28 @@ pub enum Verdict {
         /// Unlike `stream`, this changes what runs. See
         /// [`crate::exec::interactive`].
         terminal: bool,
+        /// Whether this window is closing itself the moment it has sent this.
+        ///
+        /// The reader ticked "Close when I decide", so there will be no
+        /// running indicator, no Kill button and no result held up: the window
+        /// goes and the approved command runs on without it, exactly as an
+        /// approved command already runs on when a window dies.
+        ///
+        /// It is on the verdict rather than inferred from the window's
+        /// disappearance because those two are **different facts and the
+        /// audit log has to keep saying which is which**. Without it, the
+        /// daemon reaches the end of a run, sees a window that is not there
+        /// and records `prompt died while it ran` — a line that means
+        /// "something went wrong and nobody was watching" — on every single
+        /// approved command of a person who ticked a box asking for exactly
+        /// this. The one line that means a real failure would become the line
+        /// that appears on all of them. See [`crate::audit::PromptEnd`].
+        ///
+        /// Like `stream` and unlike `terminal` it changes nothing about what
+        /// runs. It cannot arrive `true` alongside `stream`: streaming exists
+        /// to be watched, and the window clears one when the other is asked
+        /// for.
+        closing: bool,
         /// What the user typed, returned to the agent.
         ///
         /// The window has always had the field and an approval used to drop
@@ -726,7 +749,7 @@ pub enum ReviseKind {
 /// the verdict out.
 #[cfg(test)]
 pub(crate) fn approved(stream: bool) -> Verdict {
-    Verdict::Approve { stream, terminal: false, note: String::new() }
+    Verdict::Approve { stream, terminal: false, closing: false, note: String::new() }
 }
 
 /// One of every verdict, for the tests across this crate that must cover the
@@ -745,12 +768,20 @@ pub(crate) fn every_verdict() -> Vec<Verdict> {
         Verdict::Approve {
             stream: true,
             terminal: false,
+            closing: false,
             note: "thanks — watch the tail of it".to_string(),
         },
         Verdict::Approve {
             stream: false,
             terminal: true,
+            closing: false,
             note: "this one is going to ask you things".to_string(),
+        },
+        Verdict::Approve {
+            stream: false,
+            terminal: false,
+            closing: true,
+            note: "get on with it, I am going back to what I was doing".to_string(),
         },
         approved(false),
         Verdict::Deny { note: "not now".to_string() },
@@ -1205,11 +1236,12 @@ mod tests {
         // approve something other than what it was shown.
         //
         // The permitted set is what the window is entitled to decide: which
-        // answer (`verdict`, `kind`), what to say about it (`note`), and how
-        // an approved operation should be carried out (`stream`, `terminal`).
-        // What is not in it is the whole point — no request id, no command, no
-        // path, no argv. A window cannot name the thing it is answering about,
-        // so it cannot name a different one.
+        // answer (`verdict`, `kind`), what to say about it (`note`), what this
+        // window then does with itself (`stream`, `closing`), and how an
+        // approved operation should be carried out (`terminal`). What is not
+        // in it is the whole point — no request id, no command, no path, no
+        // argv. A window cannot name the thing it is answering about, so it
+        // cannot name a different one.
         for message in
             every_verdict().into_iter().map(PromptMsg::Verdict).chain([PromptMsg::Kill])
         {
@@ -1217,7 +1249,7 @@ mod tests {
                 serde_json::from_str(&encode(&message).expect("encodes")).expect("valid JSON");
             for key in json.as_object().expect("an object").keys() {
                 assert!(
-                    ["type", "verdict", "note", "stream", "terminal", "kind"]
+                    ["type", "verdict", "note", "stream", "terminal", "closing", "kind"]
                         .contains(&key.as_str()),
                     "a prompt message may not carry {key}: which request this is, and what it \
                      asked for, are the daemon's and not the window's"

@@ -98,8 +98,8 @@ pub struct Prefs {
     /// Whether the window should close as soon as a verdict is given, rather
     /// than staying to show the run and the result.
     ///
-    /// See [`crate::prompt_ui::CLOSE_LABEL`] for what the control says and
-    /// what ticking it gives up.
+    /// Written by the "Close when I decide" checkbox in the window's
+    /// decision row, which is also where what ticking it gives up is said.
     pub close_on_decide: bool,
 }
 
@@ -138,13 +138,17 @@ impl PrefsFile {
         }
     }
 
-    /// The real file, read but never written.
+    /// The same file, read but never written.
     ///
-    /// What `hatch preview` gets. The window it draws is the window a request
-    /// would get, preference included — that is what makes a preview evidence
-    /// — but nothing a person clicks in a sample outlives it.
-    pub fn read_only(paths: &Paths) -> PrefsFile {
-        PrefsFile { path: Some(paths.prefs_file()), writable: false }
+    /// What `hatch preview` asks for. The window it draws is the window a
+    /// request would get, preference included — that is what makes a preview
+    /// evidence about the real one — but nothing a person clicks in a sample
+    /// outlives the sample. A method rather than a fourth constructor, so
+    /// that giving up the right to write is visible at the call site as a
+    /// thing that was decided.
+    #[must_use]
+    pub fn read_only(self) -> PrefsFile {
+        PrefsFile { writable: false, ..self }
     }
 
     /// No file: defaults on every read, and a write that goes nowhere.
@@ -295,7 +299,7 @@ mod tests {
         let (_root, paths) = a_layout();
         PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
 
-        let preview = PrefsFile::read_only(&paths);
+        let preview = PrefsFile::at(&paths).read_only();
         assert!(preview.read().close_on_decide, "a preview must show the window as it is");
         preview.write(&Prefs { close_on_decide: false });
         assert!(

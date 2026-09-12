@@ -722,6 +722,11 @@ pub fn run(scenario: Scenario, shot: Option<PathBuf>, theme: Option<Theme>) -> a
                     // report: the channel it would report about is this
                     // process's own channel to itself.
                     Arc::new(OnceLock::new()),
+                    // Read, so the sample is drawn with the preference a real
+                    // request would be drawn with; never written, because a
+                    // documentation tool that changed somebody's settings
+                    // would be a surprising thing for a screenshot to do.
+                    crate::prefs::PrefsFile::from_env().read_only(),
                 ),
                 pending: Some(sample),
                 to_window,
@@ -786,7 +791,12 @@ mod tests {
         // and a window whose channel has ended is a window the daemon has
         // gone from, which is the truth here.
         drop(to_window);
-        let mut app = PromptApp::new(inbox, Box::new(nobody), Arc::new(OnceLock::new()));
+        let mut app = PromptApp::new(
+            inbox,
+            Box::new(nobody),
+            Arc::new(OnceLock::new()),
+            crate::prefs::PrefsFile::none(),
+        );
         app.take_arrivals();
         (app, swallowed, staging)
     }

@@ -139,7 +139,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::{AuditLog, AuditRecord, LogDetail, LogVerdict, RunDetail, SwapDetail};
+use crate::audit::{AuditLog, AuditRecord, LogDetail, LogVerdict, PromptEnd, RunDetail, SwapDetail};
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
 use crate::exec::elevate::{Elevation, RootOutcome};
@@ -1267,8 +1267,10 @@ impl Daemon {
         // not hold every other agent behind it.
         drop(permit);
 
-        let (stream, terminal, note) = match verdict {
-            Verdict::Approve { stream, terminal, note } => (stream, terminal, note),
+        let (stream, terminal, closing, note) = match verdict {
+            Verdict::Approve { stream, terminal, closing, note } => {
+                (stream, terminal, closing, note)
+            }
             other => {
                 session.close().await;
                 return declined(other, detail);
@@ -1289,13 +1291,15 @@ impl Daemon {
             false => Phase::Executing,
         });
         let (verdict, result, windup) = match work {
-            Work::Run(run) => self.run_it(&run, stream, terminal, &session, &mut detail).await,
+            Work::Run(run) => {
+                self.run_it(&run, stream, terminal, closing, &session, &mut detail).await
+            }
             Work::Swap { path, content, plan, root } => {
                 self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
             }
         };
 
-        note_prompt_death(&session, &mut detail);
+        note_prompt_death(&session, closing, &mut detail);
         match windup {
             Windup::Close => {
                 // The window closes on the frame that was just sent; this
@@ -1440,7 +1444,7 @@ impl Daemon {
                 duration_ms: None,
                 killed_by_user: None,
                 timed_out: None,
-                prompt_died_after_approve: None,
+                prompt: None,
             })
         };
         let refuse = |message: String| {
@@ -1641,6 +1645,7 @@ impl Daemon {
         run: &RunPlan,
         stream: bool,
         terminal: bool,
+        closing: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
     ) -> (LogVerdict, CallToolResult, Windup) {
@@ -1653,9 +1658,12 @@ impl Daemon {
         // run is decided rather than only where it is drawn.
         let terminal = terminal || *asked_for_a_terminal;
         // Streaming and a terminal are exclusive — the terminal is the stream
-        // — and the window clears the box when it opens one. Recomputed here
-        // for the same reason the line above is.
-        let stream = stream && !terminal;
+        // — and so are streaming and a window that is closing itself, which
+        // has nowhere to put a live view. The window clears the box in both
+        // cases; recomputed here for the same reason the line above is, and
+        // because what it decides is whether a forwarding task is wired to a
+        // reader that is already gone.
+        let stream = stream && !terminal && !closing;
         // The live view is a display preference and nothing else: execution is
         // identical either way, so the only difference is whether a sink is
         // wired at all.
@@ -2504,14 +2512,27 @@ fn declined(verdict: Verdict, detail: LogDetail) -> Outcome {
     Outcome::refusing(log_verdict, Some(note), detail, message)
 }
 
-/// Record whether the window died while the approved operation ran.
+/// Record where the window was while the approved operation ran.
 ///
-/// Not a verdict of its own: the verdict was already given, and what was lost
-/// is the Kill button and the live view rather than the authorisation.
-fn note_prompt_death(session: &PromptSession, detail: &mut LogDetail) {
-    let died = session.window_gone().is_cancelled();
+/// Not a verdict of its own: the verdict was already given, and what a missing
+/// window costs is the Kill button and the live view rather than the
+/// authorisation.
+///
+/// `closing` is the whole reason this is not simply "is the window still
+/// there". A window whose reader ticked "Close when I decide" is gone by the
+/// time this is asked, *every time*, and reading that absence as a death would
+/// write `(prompt died while it ran)` under every approved command that person
+/// ever runs. So the window says on its way out that it is leaving, and the
+/// two are filed apart: what is asked here is not whether the window is there
+/// but whether its absence is news.
+fn note_prompt_death(session: &PromptSession, closing: bool, detail: &mut LogDetail) {
+    let end = match (closing, session.window_gone().is_cancelled()) {
+        (true, _) => PromptEnd::Dismissed,
+        (false, true) => PromptEnd::Died,
+        (false, false) => PromptEnd::Held,
+    };
     if let LogDetail::RunCommand(run) = detail {
-        run.prompt_died_after_approve = Some(died);
+        run.prompt = Some(end);
     }
 }
 
@@ -3764,6 +3785,7 @@ later"), "");
                 || Reply::verdict(Verdict::Approve {
                     stream: false,
                     terminal: false,
+                    closing: false,
                     note: typed.to_string(),
                 });
             let tail = format!("{USER_NOTE_PREFIX}{typed}");
@@ -3899,6 +3921,7 @@ later"), "");
             let harness = Harness::new(vec![Reply::verdict(Verdict::Approve {
                 stream: false,
                 terminal: true,
+                closing: false,
                 note: String::new(),
             })]);
             let result =
@@ -4005,8 +4028,7 @@ later"), "");
             let record = harness.only_record();
             assert_eq!(record["verdict"], "approve");
             assert_eq!(
-                record["prompt_died_after_approve"],
-                serde_json::Value::Bool(true),
+                record["prompt"], "died",
                 "the lost live view is recorded: {record}"
             );
             assert_eq!(record["exit_code"], 0);
@@ -4016,10 +4038,36 @@ later"), "");
         async fn a_window_that_lives_records_that_it_did() {
             let harness = Harness::new(vec![approve()]);
             within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
-            assert_eq!(
-                harness.only_record()["prompt_died_after_approve"],
-                serde_json::Value::Bool(false)
-            );
+            assert_eq!(harness.only_record()["prompt"], "held");
+        }
+
+        #[tokio::test]
+        async fn a_window_that_was_asked_to_go_is_not_a_window_that_died() {
+            // The trap under the whole "close when I decide" control. From
+            // here the two look identical — the verdict arrives and the child
+            // is gone — so the window says which it is on its way out, and
+            // this is the claim that the daemon believes it. Filed as a death
+            // instead, `(prompt died while it ran)` would appear under every
+            // approved command belonging to anyone who ticked that box, and
+            // the one line that means something went wrong would be the line
+            // that means nothing.
+            let harness = Harness::new(vec![
+                Reply::verdict(Verdict::Approve {
+                    stream: false,
+                    terminal: false,
+                    closing: true,
+                    note: String::new(),
+                })
+                .then_dies(),
+            ]);
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            assert_ne!(result.is_error, Some(true), "the approved command still ran");
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["prompt"], "dismissed", "a deliberate close was filed as a death");
+            assert_eq!(record["exit_code"], 0);
         }
 
         #[tokio::test]
@@ -6075,7 +6123,7 @@ later"), "");
             duration_ms: None,
             killed_by_user: None,
             timed_out: None,
-            prompt_died_after_approve: None,
+            prompt: None,
         })
     }
 

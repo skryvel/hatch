@@ -194,10 +194,40 @@ pub struct RunDetail {
     /// The command outlived `exec_timeout_secs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
-    /// The prompt window died after the approval, while the command ran, so
-    /// nobody was watching the output it produced.
+    /// Where the approval window was while the command ran.
+    ///
+    /// `None` on every line for an operation that never ran, for the same
+    /// reason `exit_code` is: there was no run for a window to be absent from.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_died_after_approve: Option<bool>,
+    pub prompt: Option<PromptEnd>,
+}
+
+/// Where the approval window was while the operation it authorised ran.
+///
+/// Three facts and not a boolean, because a window that went away on purpose
+/// and a window that died are not the same news and the log is the one place
+/// that has to keep saying which. This was `prompt_died_after_approve: bool`,
+/// which had exactly two states and therefore had to file a deliberate close
+/// under "died" — putting `(prompt died while it ran)` on every approved
+/// command belonging to anybody who had ticked the box asking for one. The
+/// single line that means *something went wrong* would then have appeared on
+/// every line, which is strictly worse than not recording it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptEnd {
+    /// It was there for the whole run: the live view and the Kill button
+    /// existed for as long as there was something to use them on.
+    Held,
+    /// It closed itself the instant the verdict was given, because the reader
+    /// had ticked "Close when I decide". Nobody watched the run and nobody
+    /// could have killed it — and both of those are what was asked for, which
+    /// is why this prints nothing.
+    Dismissed,
+    /// It went away while the command ran without being asked to. The command
+    /// was authorised and ran to completion regardless; what was lost is the
+    /// Kill button and the live view, and losing them unasked is worth a
+    /// reader's attention.
+    Died,
 }
 
 /// A `swap_file` request. `path` and `root` are known when the request
@@ -361,7 +391,12 @@ impl LogDetail {
                 if run.killed_by_user == Some(true) {
                     s.push_str("  (killed)");
                 }
-                if run.prompt_died_after_approve == Some(true) {
+                // Only the one that is news. A window that was there is the
+                // ordinary case and a window that was asked to go is what its
+                // reader chose; a suffix on either would be a note on every
+                // line, and a note on every line is read by nobody — which
+                // would take the one that matters down with it.
+                if run.prompt == Some(PromptEnd::Died) {
                     s.push_str("  (prompt died while it ran)");
                 }
                 s
@@ -433,7 +468,7 @@ mod tests {
                 duration_ms: Some(2140),
                 killed_by_user: Some(false),
                 timed_out: Some(false),
-                prompt_died_after_approve: None,
+                prompt: None,
             }),
         }
     }
