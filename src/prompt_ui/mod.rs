@@ -500,6 +500,18 @@ impl PromptState {
         self.shown.as_ref()
     }
 
+    /// Whether what this window is showing runs, or ran, as root.
+    ///
+    /// Read off the payload and not off the phase, because it is not a phase:
+    /// it is true from the moment the request arrives until the window goes,
+    /// and every phase in between draws the mark that says so. A `swap_file`
+    /// request answers `false` here whatever its plan says — it states its
+    /// own ownership in its own header, and a second claim about the same
+    /// thing in a second vocabulary is how the two come to disagree.
+    pub fn runs_as_root(&self) -> bool {
+        self.shown().and_then(panes::RunContext::of).is_some_and(|context| context.root)
+    }
+
     /// The last depth the daemon published, whether or not it is drawn.
     pub fn queue_depth(&self) -> u32 {
         self.queue_depth
@@ -1166,6 +1178,9 @@ impl PromptApp {
         // first thing about it a reader takes in, and for a long time three
         // different things looked like one.
         theme::wear(ui, mood(self.state.phase()));
+        // Taken before the panels divide it up, because that is what it is:
+        // the whole window, which is what the root edge is painted around.
+        let window = ui.max_rect();
         // Agent-controlled text, defanged by the daemon. Drawn as text and
         // not interpreted; nothing here undoes the defanging. Copied out so
         // the panels below can still borrow the state machine.
@@ -1204,6 +1219,14 @@ impl PromptApp {
                 panes::draw_payload(ui, shown);
             }
         });
+
+        // Last, so it is over the panels rather than under them, and outside
+        // the `if` above so that it reaches the finished window too: a root
+        // command that has already run is still the thing that ran as root.
+        // It is painted, not laid out, so it takes nothing from the panes.
+        if self.state.runs_as_root() {
+            theme::mark_root(ui, window);
+        }
     }
 
     /// What a finished streamed run shows: its command, named once, and all
@@ -1215,7 +1238,17 @@ impl PromptApp {
     /// because output with nothing naming it is output the reader has to
     /// remember the provenance of.
     fn viewer(&self, ui: &mut egui::Ui, title: &str) {
-        ui.label(egui::RichText::new(title).strong());
+        // The headline and its corner are gone with the question they
+        // belonged to, so this row is the only place left that can say what
+        // just ran, and what just ran was root. Wrapped rather than
+        // horizontal: the mark leads the title, and a title long enough to
+        // need a second line still gets one.
+        ui.horizontal_wrapped(|ui| {
+            if self.state.runs_as_root() {
+                panes::draw_root_mark(ui);
+            }
+            ui.label(egui::RichText::new(title).strong());
+        });
         if let Some(Shown::Command { raw, .. }) = self.state.shown() {
             ui.label(
                 egui::RichText::new(protocol::display_line(raw)).monospace().small().weak(),
@@ -3344,6 +3377,23 @@ mod tests {
         text
     }
 
+    /// A window awaiting a verdict on `command`, which the agent asked to run
+    /// as root.
+    fn a_root_window_showing(command: &str) -> PromptApp {
+        let mut app = a_window_showing(command);
+        let mut request = a_request(90);
+        request.payload = Payload::command(
+            &render_command(command, &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            true,
+            false,
+        );
+        app.state = PromptState::new();
+        app.state.handle(DaemonMsg::Request(request));
+        app
+    }
+
     /// A window awaiting a verdict on `command`, which runs in a terminal of
     /// its own and so cannot be streamed to this one.
     fn an_interactive_window_showing(command: &str) -> PromptApp {
@@ -4178,6 +4228,161 @@ mod tests {
         assert_eq!(asking, theme::DARK.chrome, "a window with a question on it moved ground");
         assert_eq!(running, theme::DARK.running, "a running window looks like one that is asking");
         assert_eq!(finished, theme::DARK.finished, "a finished window looks like a running one");
+    }
+
+    /// Every rectangle the frame filled, with the colour it filled it with.
+    fn filled_rects(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(egui::Rect, egui::Color32)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill.a() > 0 => {
+                    out.push((rect.rect, rect.fill));
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Every rectangle the frame drew an outline around, with that outline.
+    ///
+    /// The root edge is one of these and nothing else in the window is: the
+    /// panes are filled and framed by egui's own group stroke, which is the
+    /// border colour and a single point wide.
+    fn stroked_rects(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(egui::Rect, egui::epaint::Stroke)> {
+        fn walk(
+            shape: &egui::epaint::Shape,
+            out: &mut Vec<(egui::Rect, egui::epaint::Stroke)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                    out.push((rect.rect, rect.stroke));
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Where this window drew the root edge, if it drew one.
+    fn root_edge(shapes: &[egui::epaint::ClippedShape]) -> Option<egui::Rect> {
+        stroked_rects(shapes)
+            .into_iter()
+            .find(|(_, stroke)| {
+                stroke.color == theme::DARK.danger && stroke.width == theme::ROOT_EDGE
+            })
+            .map(|(rect, _)| rect)
+    }
+
+    #[test]
+    fn a_root_command_is_marked_for_as_long_as_its_window_is_open() {
+        // Root is not a phase. It is true while the window asks, true while
+        // the command runs, and true while the result sits on screen — and
+        // the finished window is a different layout with a different header,
+        // which is exactly where a mark that lived in the header alone was
+        // lost. So the claim is made once per phase, on the frame each phase
+        // actually draws.
+        //
+        // Two marks, because one of them is a word and the other is a shape
+        // that does not depend on where the reader has scrolled to: the block
+        // `ROOT` is reversed out of, and the edge around the whole window. A
+        // reader who cannot tell this red from this grey has the rectangle
+        // and the frame either way.
+        let asking = &mut a_root_window_showing("rm -rf /var/lib/thing");
+
+        let mut running = a_root_window_showing("rm -rf /var/lib/thing");
+        running.state.decide(approved(true));
+        assert_eq!(running.state.phase(), Phase::Running);
+
+        let mut finished = a_root_window_showing("rm -rf /var/lib/thing");
+        finished.state.decide(approved(true));
+        finished.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(finished.state.phase(), Phase::Lingering);
+
+        let windows =
+            [("asking", asking), ("running", &mut running), ("finished", &mut finished)];
+        for (phase, app) in windows {
+            let shapes = window_shapes(app, opening_size());
+            let edge = root_edge(&shapes)
+                .unwrap_or_else(|| panic!("{phase}: the window is not framed as a root window"));
+            assert!(
+                edge.width() >= WINDOW_SIZE[0] - 1.0 && edge.height() >= WINDOW_SIZE[1] - 1.0,
+                "{phase}: the frame covers {edge:?} of a {WINDOW_SIZE:?} window"
+            );
+            let word = text_rects(&shapes)
+                .into_iter()
+                .find(|(text, _)| text == panes::principal(true))
+                .unwrap_or_else(|| panic!("{phase}: nothing on screen says ROOT"));
+            let block = filled_rects(&shapes)
+                .into_iter()
+                .find(|(rect, fill)| *fill == theme::DARK.danger && rect.contains_rect(word.1))
+                .map(|(rect, _)| rect);
+            assert!(
+                block.is_some(),
+                "{phase}: ROOT at {:?} is a word in a colour and not a mark",
+                word.1
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_runs_as_the_reader_is_not_framed() {
+        // The frame is the loudest thing this window can say without taking a
+        // row, and it says one thing. A window that drew it around every
+        // request would be saying nothing.
+        let mut app = a_window_showing("rm -rf target");
+        let shapes = window_shapes(&mut app, opening_size());
+
+        assert!(!app.state.runs_as_root(), "the fixture asked for root");
+        assert_eq!(root_edge(&shapes), None, "an unprivileged command was framed as root");
+    }
+
+    #[test]
+    fn a_swap_states_its_own_ownership_and_is_not_framed() {
+        // A `swap_file` request has no run context — it names an absolute
+        // path and the owner the plan lands on, in its own header — and a
+        // frame around it would be a second claim about the same thing in a
+        // second vocabulary.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()));
+        let mut request = a_request(90);
+        request.payload = Payload::swap(
+            PathBuf::from("/tmp/conf.toml"),
+            crate::swap::SwapPlan {
+                kind: crate::swap::PlanKind::Replace,
+                landing_mode: 0o644,
+                landing_owner: crate::swap::Principal { id: 0, name: Some("root".into()) },
+                landing_group: crate::swap::Principal { id: 0, name: Some("root".into()) },
+                hash_before: Some("aa".into()),
+                size_delta: 4,
+            },
+            &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
+        );
+        app.state.handle(DaemonMsg::Request(request));
+
+        assert!(!app.state.runs_as_root(), "a swap answered the command's question");
+        assert_eq!(root_edge(&window_shapes(&mut app, opening_size())), None);
     }
 
     #[test]

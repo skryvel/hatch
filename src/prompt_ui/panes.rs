@@ -597,8 +597,11 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
 /// what each colour *means*, which is a fact about this window rather than
 /// about a theme:
 ///
-/// * `danger` — red — is the one colour that means *be careful*: `ROOT`, a
-///   danger marker, and the `-` side of a diff.
+/// * `danger` — red — is the one colour that means *be careful*: a danger
+///   marker, the `-` side of a diff, and the block the word `ROOT` is
+///   reversed out of. That last one is the only place in the window where the
+///   colour is a fill rather than ink, and it is deliberate — see
+///   [`draw_root_mark`].
 /// * `warn` — orange — is hatch substituting for a character it will not draw
 ///   as itself: the loud chip, and the unusual-character count above the
 ///   panes.
@@ -829,13 +832,71 @@ fn draw_title_row(ui: &mut Ui, title: &str, aside: &RunContext, width: f32) {
     ));
 }
 
-/// "Runs as you in /some/path", as three labels.
+/// The air the root mark keeps between its word and its own edge.
+///
+/// Sideways, enough that the block reads as a block rather than as text with
+/// a background accident. Downwards, one point: the mark sits on a row whose
+/// height is set by text a size larger than the word in it — see
+/// [`draw_title_row`] — so this much padding is taken out of room the row
+/// already has, and the mark costs no part of a line.
+const ROOT_MARK_PAD: egui::Vec2 = egui::vec2(5.0, 1.0);
+
+/// How round the root mark's corners are.
+///
+/// Barely: a pill reads as a decoration and a sharp rectangle reads as a
+/// stamp, and this is a stamp.
+const ROOT_MARK_RADIUS: u8 = 2;
+
+/// The word inside the root mark, laid out in the ink it is drawn in.
+///
+/// One function for the drawing and for the measuring, because the mark is
+/// placed by subtracting a width from the right edge of the window and two
+/// measurements of the same word are how a thing ends up off the side of it.
+fn root_mark_galley(ui: &Ui) -> std::sync::Arc<egui::Galley> {
+    let (_, ink) = palette(ui).root_mark();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.ctx().fonts_mut(|fonts| fonts.layout_no_wrap(principal(true).to_string(), font, ink))
+}
+
+/// How much room the root mark takes.
+fn root_mark_size(ui: &Ui) -> egui::Vec2 {
+    root_mark_galley(ui).size() + 2.0 * ROOT_MARK_PAD
+}
+
+/// `ROOT`, reversed out of a filled block.
+///
+/// The word is unchanged — capitals already do their share — and what is
+/// added is a shape. The old treatment was the same word tinted red, which is
+/// a channel a reader who cannot tell red from grey does not have; this is a
+/// solid rectangle where the rest of the header has none, with its text
+/// knocked out of it, so the mark is there at a glance and there in a
+/// screenshot somebody prints in black and white. See
+/// [`crate::prompt_ui::theme::Palette::root_mark`] for the two colours and
+/// why neither of them moves with the phase.
+///
+/// It costs no row: the block is the height of one line of body text plus two
+/// points, drawn on a row that is already as tall as the heading beside it.
+pub fn draw_root_mark(ui: &mut Ui) {
+    let (fill, ink) = palette(ui).root_mark();
+    let galley = root_mark_galley(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(galley.size() + 2.0 * ROOT_MARK_PAD, egui::Sense::hover());
+    ui.painter().rect_filled(rect, ROOT_MARK_RADIUS, fill);
+    ui.painter().galley(rect.min + ROOT_MARK_PAD, galley, ink);
+}
+
+/// "Runs as you in /some/path", as three labels — or as two and a mark, when
+/// the answer to *as who* is root.
 fn draw_run_context(ui: &mut Ui, aside: &RunContext) {
     let palette = palette(ui);
     ui.spacing_mut().item_spacing.x = ui.spacing().item_spacing.x.min(4.0);
     ui.label(RichText::new("Runs as").small().color(palette.quiet));
-    let who = RichText::new(principal(aside.root)).strong();
-    ui.label(if aside.root { who.color(palette.danger) } else { who });
+    match aside.root {
+        true => draw_root_mark(ui),
+        false => {
+            ui.label(RichText::new(principal(false)).strong());
+        }
+    }
     ui.label(RichText::new("in").small().color(palette.quiet));
     ui.label(RichText::new(&aside.cwd).monospace());
 }
@@ -855,11 +916,11 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
             fonts.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x
         })
     };
-    text(&small, "Runs as")
-        + text(&body, principal(aside.root))
-        + text(&small, "in")
-        + text(&mono, &aside.cwd)
-        + 3.0 * gap
+    let who = match aside.root {
+        true => root_mark_size(ui).x,
+        false => text(&body, principal(false)),
+    };
+    text(&small, "Runs as") + who + text(&small, "in") + text(&mono, &aside.cwd) + 3.0 * gap
 }
 
 /// Everything below the headline and above the buttons.
@@ -2401,10 +2462,15 @@ mod tests {
                 run_context_width(ui, &long) > run_context_width(ui, &short),
                 "a longer path measured no wider"
             );
-            // Root is a longer word than the ordinary one and is measured as
-            // one: the header draws it in red, not in a different size.
+            // Root is a longer word than the ordinary one and is drawn in a
+            // block wider still, and the block is measured the way it is
+            // drawn -- both go through `root_mark_size`.
             let rooted = RunContext { cwd: short.cwd.clone(), root: true };
             assert!(run_context_width(ui, &rooted) > run_context_width(ui, &short));
+            assert!(
+                root_mark_size(ui).x > root_mark_galley(ui).size().x,
+                "the mark measured no wider than the word inside it"
+            );
         });
     }
 
@@ -2426,6 +2492,132 @@ mod tests {
     fn the_header_says_root_in_words() {
         assert_eq!(principal(true), "ROOT");
         assert_eq!(principal(false), "you");
+    }
+
+    /// One frame of a run context, as the shapes it painted.
+    fn a_drawn_run_context(root: bool) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        crate::prompt_ui::apply_font_size(&ctx, 16.0);
+        let aside = RunContext { cwd: "/tmp".to_string(), root };
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                ui.horizontal(|ui| draw_run_context(ui, &aside));
+            },
+        );
+        out.textures_delta.clear();
+        out
+    }
+
+    /// Every rectangle a frame filled, with the colour it filled it with.
+    fn filled_rects(out: &egui::FullOutput) -> Vec<(egui::Rect, Color32)> {
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<(egui::Rect, Color32)>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill.a() > 0 => {
+                    into.push((rect.rect, rect.fill));
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut into = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut into);
+        }
+        into
+    }
+
+    /// Every galley a frame drew, with where it put it and the ink it asked
+    /// for.
+    fn drawn_galleys(out: &egui::FullOutput) -> Vec<(String, egui::Rect, Color32)> {
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<(String, egui::Rect, Color32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => into.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    text.fallback_color,
+                )),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut into = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut into);
+        }
+        into
+    }
+
+    #[test]
+    fn root_is_a_filled_block_with_the_word_knocked_out_of_it() {
+        // The old treatment was the same word tinted red, and red is a
+        // channel some readers do not have: to them it was the word `ROOT` in
+        // ordinary text, in the corner of the header, which is the least
+        // looked-at part of the window. So the word is now inside a shape,
+        // and the shape is what this asserts -- a solid block where the rest
+        // of the header has none, with the word reversed out of it. Both
+        // colours come from the palette, and the ratios between them are
+        // `crate::prompt_ui::theme`'s business.
+        let out = a_drawn_run_context(true);
+        let (fill, ink) = theme::DARK.root_mark();
+
+        let block = filled_rects(&out)
+            .into_iter()
+            .find(|(_, colour)| *colour == fill)
+            .map(|(rect, _)| rect)
+            .expect("nothing on screen is a block at all");
+        let word = drawn_galleys(&out)
+            .into_iter()
+            .find(|(text, ..)| text == principal(true))
+            .expect("the word is not on screen");
+
+        assert_eq!(word.2, ink, "the word is drawn in a colour that is not the mark's ink");
+        assert!(
+            block.contains_rect(word.1),
+            "the word at {:?} is not inside the block at {block:?}",
+            word.1
+        );
+        // And the block is padding around the word rather than a stripe
+        // across the header: it is the width of the word plus its own air.
+        assert!(
+            block.width() < word.1.width() + 4.0 * ROOT_MARK_PAD.x,
+            "the block is {} wide around a {} word",
+            block.width(),
+            word.1.width()
+        );
+    }
+
+    #[test]
+    fn an_unprivileged_command_gets_no_mark_to_learn_to_ignore() {
+        // A mark on every window is a mark nobody sees on the one that
+        // matters -- the same argument that keeps a structural chip quiet and
+        // leaves the scan line off an ordinary command.
+        let out = a_drawn_run_context(false);
+        let (fill, _) = theme::DARK.root_mark();
+
+        assert!(
+            !filled_rects(&out).iter().any(|(_, colour)| *colour == fill),
+            "a command that runs as the reader was marked as root"
+        );
+        assert!(
+            drawn_galleys(&out).iter().any(|(text, ..)| text == principal(false)),
+            "it did not say who it runs as at all"
+        );
     }
 
     #[test]

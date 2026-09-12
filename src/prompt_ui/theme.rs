@@ -70,6 +70,27 @@
 //! words, and in the danger and warn colours, by the row that reports the
 //! outcome. A green ground over "Failed — exit 1" is exactly the kind of
 //! second voice this window does not have.
+//!
+//! # Root is not a fourth ground
+//!
+//! A command that will run as root is the one loud fact about this window
+//! that is not a phase. It is true while the window asks, true while the
+//! command runs, and true while the result sits on screen — which is exactly
+//! the axis [`Mood`] moves along, so the two are orthogonal and root cannot
+//! be a fourth [`Mood`]. It would not be one ground but three, and there are
+//! no three left: the grounds are held at one luminance because several
+//! meanings clear their floor on them by a tenth, and a fourth hue at that
+//! luminance would also have to be told apart from the other three by
+//! `the_three_grounds_are_told_apart`.
+//!
+//! So root is said the other way round, in the two places the window has that
+//! cost it no rows: a filled block where the header had tinted text, and an
+//! edge the window does not otherwise have. Both are [`Palette::root_mark`],
+//! and both are a change of *shape* — a block where there was none, a line
+//! where there was none — which is the point of them. A reader who cannot
+//! tell this red from this grey still sees a solid rectangle, and still sees
+//! that the window is framed. Colour *and* shape, never colour alone, which
+//! is the same promise the countdown keeps with size.
 
 use eframe::egui::{self, Color32, Stroke};
 use serde::{Deserialize, Serialize};
@@ -242,6 +263,25 @@ impl Palette {
         }
     }
 
+    /// The two colours a root mark is drawn in: what it is filled with, and
+    /// the ink reversed out of that fill.
+    ///
+    /// The fill is `danger`, which is the colour that already means *be
+    /// careful*. The ink is `surface` — the pane colour — and not `chrome`,
+    /// which is the colour actually behind the mark: the chrome is the one
+    /// thing in this palette that moves, and a mark whose ink changed at the
+    /// moment the command started running would be saying something about the
+    /// phase. It says nothing about the phase. `surface` is the far end of
+    /// the palette from `danger` in both themes, so the word inside the block
+    /// is read at body contrast against it.
+    ///
+    /// Returned as a pair rather than as two fields because they are only
+    /// ever a relation: the claim worth testing is that the second is legible
+    /// on the first.
+    pub fn root_mark(self) -> (Color32, Color32) {
+        (self.danger, self.surface)
+    }
+
     /// The same palette with `mood`'s ground as its chrome.
     ///
     /// A substitution and not a second palette: every other colour is a
@@ -340,6 +380,37 @@ pub fn of(ui: &egui::Ui) -> Palette {
 pub fn wear(ui: &mut egui::Ui, mood: Mood) {
     let theme = Theme::of(ui.visuals());
     ui.style_mut().visuals = theme.palette().in_mood(mood).visuals(theme);
+}
+
+/// How thick the root edge is drawn, in points.
+///
+/// Thick enough to be a frame rather than a hairline somebody takes for the
+/// compositor's own border, and thin enough to sit inside the margin every
+/// panel already leaves around its contents — so it covers no text and costs
+/// no row. Three points is about a third of that margin.
+pub const ROOT_EDGE: f32 = 3.0;
+
+/// Frame `window` in the colour that says the command in it runs as root.
+///
+/// Painted rather than laid out, and painted last: it takes nothing from the
+/// space the panels divided up, which is the whole reason it is an edge and
+/// not a banner. The window has no border of its own — a maximised viewport
+/// is drawn to its edges — so the line is new geometry and not a recolouring
+/// of something already there, and that is what a reader who cannot see the
+/// hue is left with.
+///
+/// Every phase, because a root command that is *running* is still root and so
+/// is one that has finished; the caller is the window itself rather than any
+/// of the panels, so no phase can forget to ask. See [`Palette::root_mark`]
+/// for why this is not a [`Mood`].
+pub fn mark_root(ui: &egui::Ui, window: egui::Rect) {
+    let (fill, _) = of(ui).root_mark();
+    ui.painter().with_clip_rect(window).rect_stroke(
+        window,
+        egui::CornerRadius::ZERO,
+        Stroke::new(ROOT_EDGE, fill),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// Apply a theme to a whole context.
@@ -488,6 +559,58 @@ mod tests {
                 ] {
                     assert_ne!(ground, colour, "{name}/{mood}: the ground is the {role} colour");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_root_mark_is_read_out_of_its_fill_and_is_seen_against_every_ground() {
+        // The mark is the one place in this window where the colours run the
+        // other way round: a block of `danger` with the pane colour reversed
+        // out of it, rather than `danger` written on something. So it has two
+        // ratios and they are different claims. The word inside gets AA for
+        // body text, because it is a word somebody reads. The block itself
+        // gets what WCAG 1.4.11 asks of the boundary of a component, on each
+        // of the three grounds, because the shape is the half of the mark
+        // that survives a reader who cannot see the hue at all.
+        for (name, palette) in palettes() {
+            let (fill, ink) = palette.root_mark();
+            let word = contrast(ink, fill);
+            assert!(word >= 4.5, "{name}: ROOT is {word:.2}:1 inside its own block");
+            for (mood, ground) in grounds(palette) {
+                let block = contrast(fill, ground);
+                assert!(
+                    block >= 3.0,
+                    "{name}/{mood}: the root block is {block:.2}:1 on the window"
+                );
+            }
+            // And it is a reversal, not a second red on a red: the ink is the
+            // far end of the palette, which is also what the command is read
+            // on.
+            assert_eq!(ink, palette.surface, "{name}: the mark's ink is not the pane colour");
+            assert_eq!(fill, palette.danger, "{name}: the mark is filled with something new");
+        }
+    }
+
+    #[test]
+    fn the_root_mark_says_the_same_thing_in_every_phase() {
+        // Root is not a phase — it is true while the window asks, while the
+        // command runs and while the result sits there — so neither half of
+        // the mark may move when the ground does. An ink that followed the
+        // chrome would be a mark that said something about the phase, and the
+        // phase is already the ground's job.
+        for (name, palette) in palettes() {
+            for (mood, _) in grounds(palette) {
+                let worn = palette.in_mood(match mood {
+                    "asking" => Mood::Asking,
+                    "running" => Mood::Running,
+                    _ => Mood::Finished,
+                });
+                assert_eq!(
+                    worn.root_mark(),
+                    palette.root_mark(),
+                    "{name}/{mood}: the root mark changed with the window's mood"
+                );
             }
         }
     }
