@@ -49,7 +49,7 @@
 //! tests below exercise is the code that ships, and there is no second path
 //! that ships untested.
 //!
-//! Three things have to be true for that to hold, and all three are here:
+//! Four things have to be true for that to hold, and all four are here:
 //!
 //! * **Enter and Escape are the guard's alone.** They are taken out of the
 //!   frame whether or not the guard is open, so egui's "Space or Enter
