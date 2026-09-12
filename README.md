@@ -80,9 +80,10 @@ same thing.*
 - **One keystroke, and the window gets out of the way.** `Ctrl+Enter` or
   `Shift+Enter` approves, `Esc` denies, `Alt+S` and `Alt+C` work the two boxes.
   Tick *Close when I decide* once and it is remembered, along with whether you
-  stream and whether you want a terminal. Once the command is over the note
+  stream and whether you want a terminal. Once the command is running the note
   field is gone and bare letters are free, so `e`, `o` or Space keeps the
-  window you are reading, `Alt+C` takes its output and `Esc` closes it.
+  window — during the run or after it — `Alt+C` takes the output and `Esc`
+  closes the window when there is nothing left running in it.
 - **Answers other than yes and no.** Ask the agent to explain itself, ask for a
   version you can actually read, take the job and run it yourself, or stop the
   whole line of work to talk. Each returns your own words to the agent rather
@@ -438,7 +439,8 @@ saying why instead.
 **After Approve the window stays.** It becomes a running indicator with elapsed
 time and a Kill button, and the output pane if streaming was ticked. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
-children actually stops.
+children actually stops. **Keep this window** is beside it while you are
+streaming, and what it does is below.
 
 **Unless you have told it not to.** Tick **Close when I decide**, left of the
 buttons, and the window goes as soon as you answer instead of staying to show
@@ -477,15 +479,31 @@ so, and **Keep this window** stops the countdown for good: no verdict, no
 deadline, just the output, a way to copy it and a way to close it. A run nobody
 asked to watch is unchanged and closes on the outcome as it always did.
 
+**Keep is pressable before the command has finished, too.** A long run is
+exactly when you have gone to do something else, and asking you to be back at
+the keyboard for the ten seconds after it stops is asking you to wait for it.
+Pressed during the run, the window never starts a countdown at all: it goes
+from running straight to *Kept. It stays when this ends.* It is the same
+action one phase earlier and not a second setting — nothing is written down,
+and the next window opens exactly as it would have. It is offered only while
+you are streaming, because a run nobody watched has sent the window nothing to
+be kept for.
+
+Keeping does not toggle, in either phase. A key that means *keep* once and
+*stop keeping* twice is two meanings decided by a count nobody is keeping, and
+what somebody who changes their mind actually wants is the window gone — which
+is Close, on the window from the moment the command ends.
+
 Keeping is the only control in hatch with a clock running against it, so it has
-the widest target: `e`, `o` and Space all do it. `Esc` closes the window,
-`Alt+C` copies the output. These are bare letters where approving is a chord,
-and the difference is the note field — it holds the keyboard while the window
-is asking, and it is gone by the time these mean anything. `Alt+C` means the
-close box while there is a box and the output afterwards; the two windows look
-nothing alike and neither meaning can be regretted. Enter is deliberately
-unbound: the reflex is that it confirms, and somebody hammering it at an
-approval must not close the window that opened under it.
+the widest target: `e`, `o` and Space all do it, in both phases. `Esc` closes
+the finished window, `Alt+C` copies the output. These are bare letters where
+approving is a chord, and the difference is the note field — it holds the
+keyboard while the window is asking, and it is gone by the time these mean
+anything. `Alt+C` means the close box while there is a box and the output
+afterwards; the two windows look nothing alike and neither meaning can be
+regretted. Enter is deliberately unbound: the reflex is that it confirms, and
+somebody hammering it at an approval must not close the window that opened
+under it.
 
 **Asking, running and finished do not look alike.** The ground the panels are
 drawn on changes with what the window is doing — grey while it has a question

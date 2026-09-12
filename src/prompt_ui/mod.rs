@@ -329,6 +329,14 @@ const CLOSE_WATCHING: &str = "You asked to watch this one.";
 /// is unchanged and a third sentence cannot move the two buttons that decide.
 const CLOSE_WATCHING_ALWAYS: &str = "You stream every run.";
 
+/// What the running window says once the reader has kept it.
+///
+/// It is said where the button was, because a keypress has no click to be
+/// seen and a control that simply vanished would leave the reader wondering
+/// whether the key had worked. The countdown it is about never starts: see
+/// [`PromptState::keep`].
+const KEPT_RUNNING: &str = "Kept. It stays when this ends.";
+
 /// What the window says while the typing guard has the buttons disabled.
 ///
 /// Painted across the two buttons it is about rather than laid out under
@@ -580,6 +588,7 @@ pub struct PromptState {
     output_dropped: bool,
     streaming: bool,
     elevating: bool,
+    keeping: bool,
     linger_until: Option<Instant>,
     broken: Option<String>,
     close_taken: bool,
@@ -606,6 +615,7 @@ impl PromptState {
             output_dropped: false,
             streaming: false,
             elevating: false,
+            keeping: false,
             linger_until: None,
             broken: None,
             close_taken: false,
@@ -698,6 +708,16 @@ impl PromptState {
     /// frame as Approve must not change what happens afterwards.
     pub fn streaming(&self) -> bool {
         self.streaming
+    }
+
+    /// Whether the reader has already said they want this window kept.
+    ///
+    /// True from the moment Keep is pressed, which can be while the command
+    /// is still running. What it changes there is the ending: a run that
+    /// finishes under this never starts a countdown at all. See
+    /// [`PromptState::keep`].
+    pub fn keeping(&self) -> bool {
+        self.keeping
     }
 
     /// Whether the window is showing a result rather than asking anything.
@@ -834,12 +854,18 @@ impl PromptState {
                 // Nothing else changes. A run nobody asked to watch has no
                 // result to hold up and closes here as it always did, and the
                 // daemon still waits its own grace for that.
-                self.phase = match self.streaming {
-                    true => {
+                // Three endings, and which one this is was settled before
+                // the command stopped. A reader who pressed Keep during the
+                // run has already said what they want to happen now, so the
+                // countdown is not started and then immediately stopped --
+                // this window goes straight to being theirs.
+                self.phase = match (self.streaming, self.keeping) {
+                    (true, true) => Phase::Detached,
+                    (true, false) => {
                         self.linger_until = Some(Instant::now() + LINGER);
                         Phase::Lingering
                     }
-                    false => Phase::Closed,
+                    (false, _) => Phase::Closed,
                 };
             }
         }
@@ -891,19 +917,58 @@ impl PromptState {
         Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
     }
 
-    /// Keep the window: stop the countdown and become a viewer.
+    /// Keep the window: no countdown, now or later.
     ///
     /// Returns whether it did anything, which is how the drawing half knows
-    /// not to arm anything twice. Only from [`Phase::Lingering`], and the
-    /// phase it moves to has no way back to a question: [`PromptState::decide`]
-    /// answers in [`Phase::AwaitingVerdict`] alone, and no phase returns there.
+    /// not to arm anything twice. The phase it leads to has no way back to a
+    /// question: [`PromptState::decide`] answers in [`Phase::AwaitingVerdict`]
+    /// alone, and no phase returns there.
+    ///
+    /// # Two phases, one meaning
+    ///
+    /// From [`Phase::Lingering`] it stops the countdown that is already
+    /// running. From [`Phase::Running`] there is no countdown yet, and what
+    /// it does is decide that there will not be one: the reader has said *I
+    /// already know I want a look at the end*, which is exactly the case
+    /// where they have gone to do something else and will not be at the
+    /// keyboard for the ten seconds after the command stops. The window then
+    /// goes from running straight to being theirs. It is the same action
+    /// offered one phase earlier and not a second setting; nothing about it
+    /// is written down, and it says nothing about the next window.
+    ///
+    /// # Why it does not toggle
+    ///
+    /// It is a latch in both phases, and that is the answer to "a reader has
+    /// a whole run to change their mind". The alternative is a key that means
+    /// *keep* the first time and *stop keeping* the second, which is two
+    /// meanings for one key decided by a count nobody is keeping -- and to be
+    /// one action in both phases it would have to un-keep in the viewer too,
+    /// where the countdown it would be handing the window back to has been
+    /// gone for some time and cannot honestly be restarted. What a reader who
+    /// changes their mind actually wants is the window gone, and that is
+    /// Close, which is on the window from the moment the command ends and is
+    /// a key of its own.
+    ///
+    /// # Only for a run that is being watched
+    ///
+    /// A run nobody asked to stream has nothing to keep: no output was ever
+    /// sent to this window, so a kept one would be an empty viewer claiming
+    /// the command printed nothing. The drawing half does not offer the
+    /// control there, and this refuses it in any case.
     pub fn keep(&mut self) -> bool {
-        if self.phase != Phase::Lingering {
-            return false;
+        match self.phase {
+            Phase::Lingering => {
+                self.phase = Phase::Detached;
+                self.linger_until = None;
+                self.keeping = true;
+                true
+            }
+            Phase::Running if self.streaming && !self.keeping => {
+                self.keeping = true;
+                true
+            }
+            _ => false,
         }
-        self.phase = Phase::Detached;
-        self.linger_until = None;
-        true
     }
 
     /// End the window because the reader asked to, or because the desktop did.
@@ -1398,11 +1463,14 @@ impl PromptApp {
     /// gives one.
     fn keyboard(&self) -> Keyboard {
         match self.state.phase() {
-            Phase::Lingering | Phase::Detached => Keyboard::Watching,
-            Phase::WaitingForRequest
-            | Phase::AwaitingVerdict
-            | Phase::Running
-            | Phase::Closed => Keyboard::Asking,
+            // A running window has no text field either -- the note went with
+            // the question -- and `e`, `o` and Space mean there what they mean
+            // afterwards: keep this window. One key, one meaning, two phases,
+            // which is the opposite of a collision.
+            Phase::Running | Phase::Lingering | Phase::Detached => Keyboard::Watching,
+            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => {
+                Keyboard::Asking
+            }
         }
     }
 
@@ -1684,6 +1752,23 @@ impl PromptApp {
                 | Action::Toggle(_)
                 | Action::Ignored
                 | Action::Passthrough => {}
+            }
+            return;
+        }
+        // A window whose command is running. It cannot decide anything -- the
+        // verdict has been sent and `decide` answers in `AwaitingVerdict`
+        // alone -- and the one thing it can be told is that the reader wants
+        // it afterwards. Escape is deliberately not a close here: the command
+        // is still going, and a window that vanished on a keypress would take
+        // the Kill button with it.
+        //
+        // Copy is inert, and silently: there is no copy control on a running
+        // window for a chord to be refused *by*, which is the case the box
+        // chords already have on a payload that offers no box. A window
+        // cannot flash a sentence it is not drawing.
+        if self.state.phase() == Phase::Running {
+            if action == Action::Keep {
+                self.keep_window();
             }
             return;
         }
@@ -2003,13 +2088,59 @@ impl PromptApp {
                 egui::RichText::new("Its output is not being streamed to this window.").small(),
             );
         }
-        // Centred with the verdict buttons it replaces. The output above it
-        // is not: it is monospace text being read, and a column of it down
-        // the middle of a 1280-point window is harder to follow than one that
-        // starts where every other line of text in this window starts.
+        // Centred with the verdict buttons they replace. The output above
+        // them is not: it is monospace text being read, and a column of it
+        // down the middle of a 1280-point window is harder to follow than one
+        // that starts where every other line of text in this window starts.
+        //
+        // Keep is here as well as at the end of the run, and it is the same
+        // action rather than a new setting: a long command is exactly when
+        // the reader has gone to do something else, and asking them to be at
+        // the keyboard for the ten seconds after it stops is asking them to
+        // wait for it. Only for a run they asked to watch -- see
+        // [`PromptState::keep`] -- which is also the only kind that has
+        // anything to show at the end.
+        let offer_keep = self.state.streaming();
+        let kept = self.state.keeping();
+        let mut keep = false;
+        let width = cluster_width(ui);
         let killed = ui
-            .vertical_centered(|ui| unfocusable(ui, egui::Button::new("Kill")).clicked())
+            .vertical_centered(|ui| {
+                centred_row(ui, width, |ui| {
+                    if offer_keep {
+                        match kept {
+                            // In the place the button was and at the size it
+                            // was, so that pressing it moves nothing on a
+                            // window somebody is in the middle of reading.
+                            true => {
+                                ui.allocate_ui_with_layout(
+                                    primary_button(ui),
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::TopDown,
+                                    ),
+                                    |ui| ui.label(egui::RichText::new(KEPT_RUNNING).small()),
+                                );
+                            }
+                            false => {
+                                keep = unfocusable(
+                                    ui,
+                                    primary(ui, "Keep this window", guard::KEEP_KEYS),
+                                )
+                                .clicked();
+                            }
+                        }
+                        // The gap the verdict buttons keep, for the reason
+                        // the viewer's row keeps it: a pointer on its way to
+                        // Keep must not find Kill under it.
+                        ui.add_space(PRIMARY_GAP);
+                    }
+                    unfocusable(ui, egui::Button::new("Kill")).clicked()
+                })
+            })
             .inner;
+        if keep {
+            self.keep_window();
+        }
         if killed {
             let kill = self.state.request_kill();
             answer(&mut self.out, &mut self.state, kill);
@@ -3547,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn keeping_is_only_possible_from_the_phase_that_is_counting_down() {
+    fn keeping_is_only_possible_where_there_is_something_to_keep() {
         let mut fresh = PromptState::new();
         assert!(!fresh.keep());
         assert_eq!(fresh.phase(), Phase::WaitingForRequest);
@@ -3557,16 +3688,65 @@ mod tests {
         assert!(!awaiting.keep(), "a window with a question open is not a viewer");
         assert_eq!(awaiting.phase(), Phase::AwaitingVerdict);
 
-        let mut running = PromptState::new();
-        running.handle(DaemonMsg::Request(Box::new(a_request(90))));
-        running.decide(approved(true));
-        assert!(!running.keep(), "there is nothing to keep until it has finished");
-        assert_eq!(running.phase(), Phase::Running);
+        // A run nobody asked to watch has sent this window nothing, so a kept
+        // one would be an empty viewer saying the command printed nothing.
+        let mut unwatched = PromptState::new();
+        unwatched.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        unwatched.decide(approved(false));
+        assert!(!unwatched.keep(), "a run with no output to show was kept anyway");
+        assert_eq!(unwatched.phase(), Phase::Running);
 
         let mut kept = a_lingering_state();
         assert!(kept.keep());
         assert!(!kept.keep(), "keeping twice is not keeping");
         assert_eq!(kept.phase(), Phase::Detached);
+    }
+
+    #[test]
+    fn a_streamed_run_can_be_kept_before_it_has_finished_and_then_never_counts_down() {
+        // "I already know I want a look at the end." A long run is exactly
+        // when the reader has gone elsewhere, and the ten seconds after it
+        // stops are ten seconds they are not at the keyboard for. So the
+        // window never starts the countdown at all: it goes from running
+        // straight to being theirs.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.decide(approved(true));
+
+        assert!(state.keep(), "a streamed run could not be kept while it ran");
+        assert!(state.keeping());
+        assert_eq!(state.phase(), Phase::Running, "keeping is not an ending");
+        assert!(!state.keep(), "keeping twice is not keeping, in either phase");
+
+        state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "hello\n".to_string() });
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+
+        assert_eq!(state.phase(), Phase::Detached, "a kept window still lingered first");
+        assert_eq!(
+            state.linger_seconds_remaining(Instant::now()),
+            None,
+            "a window that was already kept started counting down anyway"
+        );
+        state.tick(Instant::now() + LINGER * 100);
+        assert_eq!(state.phase(), Phase::Detached, "the clock took a window somebody kept");
+        assert_eq!(state.output_text(), "hello\n", "the output it was kept for is gone");
+    }
+
+    #[test]
+    fn keeping_a_run_that_is_never_watched_changes_none_of_the_three_endings() {
+        // The control is not drawn for an unwatched run and the state machine
+        // refuses it in any case, so nothing about the other two endings
+        // moves: a streamed run still lingers, and a run nobody watched still
+        // closes on the outcome.
+        for (stream, ending) in [(true, Phase::Lingering), (false, Phase::Closed)] {
+            let mut state = PromptState::new();
+            state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+            state.decide(approved(stream));
+            state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+
+            assert_eq!(state.phase(), ending, "streaming {stream} ended as {:?}", state.phase());
+            assert!(!state.keeping(), "a window nobody kept says it was kept");
+        }
     }
 
     #[test]
@@ -5097,6 +5277,107 @@ mod tests {
             "the pair spans {} against the {cluster} the row is given",
             keep.union(close).width()
         );
+    }
+
+    // ---- keeping a window before its command has finished -----------------
+
+    /// A window whose streamed command is still running.
+    fn a_running_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (mut app, sink) = an_awaiting_window();
+        app.state.decide(approved(true));
+        assert_eq!(app.state.phase(), Phase::Running);
+        (app, sink)
+    }
+
+    /// A window showing `command`, approved and streaming.
+    fn a_running_window_showing(command: &str, stream: bool) -> PromptApp {
+        let mut app = a_window_showing(command);
+        app.state.decide(approved(stream));
+        app
+    }
+
+    #[test]
+    fn the_same_three_keys_keep_a_window_whose_command_is_still_running() {
+        // The same action offered one phase earlier, so the same keys do it.
+        // One key meaning one thing in two phases is the opposite of a
+        // collision.
+        for key in [egui::Key::E, egui::Key::O, egui::Key::Space] {
+            let (mut app, sink) = a_running_window();
+            press_key(&mut app, key, egui::Modifiers::NONE);
+
+            assert!(app.state.keeping(), "{key:?} did not keep the running window");
+            assert_eq!(app.state.phase(), Phase::Running, "{key:?} ended the run");
+            assert!(
+                app.kept.load(Ordering::SeqCst),
+                "{key:?} kept a window the backstop will kill anyway"
+            );
+
+            app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+            assert_eq!(app.state.phase(), Phase::Detached, "{key:?} left a countdown behind");
+            assert!(sink.lock().expect("sink").is_empty(), "{key:?} wrote to the daemon");
+        }
+    }
+
+    #[test]
+    fn escape_does_not_take_away_a_running_window_or_the_kill_button_on_it() {
+        // The command is still going. A window that vanished on a keypress
+        // would take the only way to stop it with it.
+        let (mut app, sink) = a_running_window();
+
+        press_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+
+        assert_eq!(app.state.phase(), Phase::Running, "Escape closed a window mid-run");
+        assert!(sink.lock().expect("sink").is_empty(), "Escape answered something");
+        assert!(window_text(&mut app, true).contains("Kill"), "the Kill button went");
+    }
+
+    #[test]
+    fn a_running_window_offers_to_be_kept_only_while_somebody_is_watching_it() {
+        // A run nobody asked to stream has sent this window nothing, so the
+        // window it would be kept as is an empty one claiming the command
+        // printed nothing.
+        let watched = window_text(&mut a_running_window_showing("sleep 30", true), true);
+        assert!(watched.contains("Keep this window"), "a watched run cannot be kept: {watched}");
+        assert!(watched.contains("Kill"), "{watched}");
+
+        let unwatched = window_text(&mut a_running_window_showing("sleep 30", false), true);
+        assert!(
+            !unwatched.contains("Keep this window"),
+            "a run with nothing to show offered to be kept: {unwatched}"
+        );
+        assert!(unwatched.contains("Kill"), "the Kill button went with it: {unwatched}");
+    }
+
+    #[test]
+    fn a_kept_running_window_says_so_where_the_button_was_and_moves_nothing_else() {
+        // A keypress has no click to be seen, so a control that simply
+        // vanished would leave the reader wondering whether the key worked.
+        // It is said in the place the button was and at the size it was,
+        // because the window is being read while this happens.
+        let mut app = a_running_window_showing("sleep 30", true);
+        let before = text_rects(&window_shapes(&mut app, opening_size()));
+        let at = |rects: &[(String, egui::Rect)], want: &str| {
+            rects
+                .iter()
+                .find(|(text, _)| text == want)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{want} is not on screen"))
+        };
+        let (keep, kill) = (at(&before, "Keep this window"), at(&before, "Kill"));
+
+        assert!(app.state.keep());
+        let after = text_rects(&window_shapes(&mut app, opening_size()));
+
+        assert!(
+            !after.iter().any(|(text, _)| text == "Keep this window"),
+            "a window that has been kept still offers to be kept"
+        );
+        let said = at(&after, KEPT_RUNNING);
+        assert!(
+            (said.center().y - keep.center().y).abs() < 2.0,
+            "the sentence is at {said:?} and the button was at {keep:?}"
+        );
+        assert_eq!(at(&after, "Kill"), kill, "keeping the window moved the Kill button");
     }
 
     // ---- what the guard says, and what saying it costs --------------------
