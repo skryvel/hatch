@@ -1455,15 +1455,26 @@ impl PromptApp {
         // thing they approved has happened. A password dialog from another
         // process is about to cover this window, and a reader who has just
         // been told "it is running" would have no reason to link the two.
+        //
+        // Neither sentence asserts that a dialog is on screen, and neither
+        // says nothing has run — because this window cannot see either. It is
+        // told that elevation was spawned, and `elevating` stays true until
+        // the first byte of output or the outcome; a command that is silent
+        // for its first few seconds is indistinguishable here from a dialog
+        // nobody has answered. These two therefore have to read as true from
+        // the spawn until the first evidence, which is the span they are
+        // shown over. An earlier pair claimed the dialog was being waited on
+        // and that nothing had run, and went on saying both after the
+        // password had been typed.
         if self.state.elevating() {
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("Approved. Waiting for the system password dialog.")
+                    egui::RichText::new("Approved. Waiting for the system to authorise this.")
                         .strong(),
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Nothing has run yet. Dismissing that dialog cancels this.",
+                        "If a password dialog is up, dismissing it cancels this.",
                     )
                     .small(),
                 );
