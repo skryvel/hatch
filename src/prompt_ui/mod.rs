@@ -1423,11 +1423,19 @@ impl PromptApp {
             ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(align))
         };
 
-        // Nothing once the operation has ended. The number measures the time
-        // somebody had to decide, and after an outcome that time is not left:
-        // a window on its way out would flash a stale "N s left to decide"
-        // under a result that has already arrived.
-        if self.state.outcome().is_none()
+        // Only while there is something to decide. The number measures the
+        // time somebody has to answer *this question*, so it stops meaning
+        // anything the moment they answer: an approved command ran on its own
+        // clock, `exec_timeout_secs`, which this deadline knows nothing about
+        // and is not counting down to. Gating on the outcome instead was not
+        // enough, because an outcome arrives when the command *ends* — so an
+        // approved command spent its whole run under a countdown that had
+        // already been beaten, ticking towards a moment at which nothing
+        // would now happen.
+        //
+        // `Lingering` and `Detached` say the same thing in `panel`, where the
+        // approval clock is left out for the reason this condition encodes.
+        if self.state.phase() == Phase::AwaitingVerdict
             && let Some(left) = self.state.seconds_remaining(Utc::now())
         {
             let text = egui::RichText::new(countdown_text(left));
@@ -4326,6 +4334,35 @@ mod tests {
         let sharing =
             rest.into_iter().filter(|r| (r.center().y - row).abs() < 0.5 * tallest).collect();
         (primary, sharing)
+    }
+
+    #[test]
+    fn the_decide_countdown_belongs_to_the_decision_and_stops_with_it() {
+        // The deadline bounds how long someone has to answer the question. An
+        // approved command is not that question any more: it runs under
+        // `exec_timeout_secs`, a clock this number is not counting down to. A
+        // countdown left running beside it is a wrong number in the one part
+        // of the window whose whole job is to be a right one.
+        let mut app = a_window_showing("sleep 30");
+        assert!(
+            window_text_sized(&mut app, opening_size()).contains("left to decide"),
+            "there is a decision open, so the clock on it is missing"
+        );
+
+        app.state.decide(Verdict::Approve {
+            stream: false,
+            note: String::new(),
+            terminal: false,
+        });
+        let running = window_text_sized(&mut app, opening_size());
+        assert!(
+            !running.contains("left to decide"),
+            "the approval beat the clock and it kept counting: {running}"
+        );
+        assert!(
+            running.contains("running"),
+            "the row that replaces it says nothing about the command: {running}"
+        );
     }
 
     #[test]
