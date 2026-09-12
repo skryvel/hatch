@@ -93,7 +93,31 @@ pub struct Config {
     pub output_cap_bytes: usize,
     /// `PATH` handed to approved commands.
     pub exec_path: String,
-    /// Terminal command used for interactive runs; argv, program first.
+    /// The terminal an interactive run opens, as argv with the program first.
+    ///
+    /// **The approved command's runner is appended to this list**, so what is
+    /// written here is everything up to but not including the program the
+    /// terminal is being asked to start. That is the whole contract, and the
+    /// two terminals this has been tested against want different things from
+    /// it:
+    ///
+    /// | Terminal | Value | Why |
+    /// |---|---|---|
+    /// | konsole | `["konsole", "--nofork", "-e"]` | `-e` takes the command and every argument after it |
+    /// | kitty | `["kitty"]` | the program is a positional argument; kitty has no `-e`, and passing one makes it parse the line as something else entirely |
+    ///
+    /// `--nofork` on konsole is not decoration. Without it a konsole started
+    /// while the "run all Konsole windows in a single process" setting is on
+    /// hands its arguments to the konsole that is already running and returns
+    /// immediately, which puts the command in a process hatch did not start
+    /// and cannot reach: the Kill button would stop nothing, and hatch would
+    /// have to give up on the run and say it could not tell how it ended. The
+    /// flag says "run in a separate process", which is the arrangement
+    /// everything on this path depends on.
+    ///
+    /// Nothing here is asked for the command's exit status, so a terminal that
+    /// does not report one — kitty exits `0` whatever its program did — is
+    /// still a usable terminal. See [`crate::exec::interactive`].
     pub terminal: Vec<String>,
     /// Extra denylist patterns, appended to the built-in ones. Each entry must
     /// be an **absolute, literal path prefix**: `~` is not expanded and a
@@ -145,7 +169,7 @@ impl Default for Config {
             exec_timeout_secs: DEFAULT_EXEC_TIMEOUT_SECS,
             output_cap_bytes: 262144,
             exec_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
-            terminal: vec!["konsole".to_string(), "-e".to_string()],
+            terminal: ["konsole", "--nofork", "-e"].map(str::to_string).to_vec(),
             denylist_extra: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),
@@ -729,6 +753,19 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "{} must be 0700", dir.display());
         }
+    }
+
+    #[test]
+    fn the_default_terminal_starts_a_process_hatch_can_reach() {
+        // `--nofork` is the whole of it. A konsole started without it, on a
+        // desktop where "run all Konsole windows in a single process" is on,
+        // hands the command to a konsole that is already running and returns:
+        // the command is then in a process hatch never started, the Kill
+        // button reaches nothing, and the run has to be reported as one hatch
+        // could not follow. The flag is what makes the default a terminal
+        // rather than a message to one.
+        let terminal = Config::default().terminal;
+        assert_eq!(terminal, ["konsole", "--nofork", "-e"]);
     }
 
     #[test]
