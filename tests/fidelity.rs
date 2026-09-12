@@ -168,6 +168,26 @@ fn a_comment_cannot_swallow_what_runs_beside_it() {
 }
 
 #[test]
+fn a_redirection_cannot_hide_where_the_output_goes() {
+    // The mirror of the test above, for the kind that is drawn *louder*
+    // rather than quieter. A rendering that let the arrow or the path it
+    // points at be replaced by anything -- a label, a summary, a shortened
+    // path -- would be a window showing one destination while the shell
+    // opens another, and the destination is the single thing this
+    // highlight exists to make visible. So every byte of it reaches the
+    // reader's eye, drawn as itself.
+    let command = "echo x >| /etc/passwd 2>&1";
+    let spans = render_command(command);
+    let shown: String = spans.iter().map(|s| s.display_text()).collect();
+    assert_eq!(shown, command, "every byte of a redirecting line reaches the reader's eye");
+    assert_eq!(unrender(&spans), command);
+    assert!(
+        spans.iter().all(|s| s.kind() != &SpanKind::Separator),
+        "and the `|` inside the `>|` is not a boundary the shell has"
+    );
+}
+
+#[test]
 fn semicolon_survives_segmentation() {
     let spans = render_command("a; b");
     let text: String = spans.iter().map(|s| s.display_text()).collect();
