@@ -1317,6 +1317,7 @@ mod tests {
             "printf '\u{202E}gnp.exe'",
             "ünïcödé — ✓",
             "make -j4   # then && rm -rf /tmp",
+            "make 2>&1 >| /etc/passwd",
         ] {
             let spans = rendering(command);
             let payload = Payload::command(
@@ -1356,6 +1357,32 @@ mod tests {
             .map(Span::text)
             .collect();
         assert_eq!(comments, vec!["# not && this"], "the comment did not survive the trip");
+    }
+
+    #[test]
+    fn a_redirection_crosses_the_pipe_as_the_kind_it_is() {
+        // Here for the reason the comment above it is: the round trip would
+        // be satisfied by a redirection that arrived as `plain`, because the
+        // text is identical either way, and a kind the window does not
+        // receive is a kind the window cannot draw. Both halves are asserted,
+        // since the destination is the half a reader is scanning for.
+        let spans = rendering("echo x > /etc/passwd");
+        let payload = Payload::command(&spans, Vec::new(), PathBuf::from("/"), false, false);
+        let encoded = encode(&payload).expect("encodes");
+        assert!(encoded.contains("\"kind\":\"redirect\""), "{encoded}");
+
+        let back: Payload = read_message(&encoded).expect("decodes");
+        let rebuilt = back.rendering().expect("rebuilds");
+        let redirects: Vec<&str> = rebuilt
+            .iter()
+            .filter(|span| span.kind() == &SpanKind::Redirect)
+            .map(Span::text)
+            .collect();
+        assert_eq!(
+            redirects,
+            vec![">", "/etc/passwd"],
+            "the redirection did not survive the trip"
+        );
     }
 
     #[test]

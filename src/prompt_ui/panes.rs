@@ -4624,6 +4624,34 @@ mod tests {
     }
 
     #[test]
+    fn a_redirection_is_drawn_in_one_colour_from_the_arrow_to_the_destination() {
+        // Both halves in the same colour, because they are one fact: this is
+        // where the effects of the command land. The blank between them is
+        // neither, and the `/etc/passwd` is the half the reader is scanning
+        // for, so a test that only looked at the arrow would pass on half the
+        // feature.
+        let palette = a_palette();
+        let command = "echo x > /etc/passwd";
+        let spans = render_command(command, &BTreeMap::new());
+        let job = job_of(&spans);
+        let arrow = command.find('>').expect("the sample redirects");
+
+        assert_eq!(job.text, command, "the redirection changed the text");
+        assert_eq!(format_at(&job, arrow).color, palette.redirect, "the arrow is not marked");
+        assert_eq!(
+            format_at(&job, command.len() - 1).color,
+            palette.redirect,
+            "the destination is not marked"
+        );
+        assert_eq!(format_at(&job, arrow + 1).color, palette.text, "the blank took a colour");
+        assert_eq!(format_at(&job, 0).color, palette.command, "and `echo` still runs");
+        // Structure, not alarm and not a separator: no block behind it, and
+        // never the colour that means somebody should be frightened.
+        assert_eq!(format_at(&job, arrow).background, Color32::TRANSPARENT);
+        assert_ne!(palette.redirect, palette.danger, "a redirection is not a verdict");
+    }
+
+    #[test]
     fn highlighting_only_ever_adds_contrast() {
         // The rule that keeps decoration from becoming load-bearing: a
         // highlighted span is drawn as its own text, in the pane's own font,
@@ -4658,6 +4686,7 @@ mod tests {
                 ("command", palette.command),
                 ("quoted", palette.quoted),
                 ("comment", palette.comment),
+                ("redirect", palette.redirect),
             ];
             for (i, (a, colour)) in named.iter().enumerate() {
                 for (b, other) in &named[i + 1..] {

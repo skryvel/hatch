@@ -2517,6 +2517,344 @@ mod tests {
         assert!(separators(&spans).is_empty());
     }
 
+    // --- redirections: where the effects land -----------------------------
+
+    fn redirects(spans: &Spans) -> Vec<&str> {
+        of_kind(spans, &SpanKind::Redirect)
+    }
+
+    #[test]
+    fn every_redirection_operator_bash_has_is_recognised() {
+        // The set is the manual's, not a memory of it, and this is the list
+        // that would notice one going missing. Each is given a target so that
+        // the operator is the first of the two marked runs.
+        for (command, operator) in [
+            ("echo x > out", ">"),
+            ("echo x >> out", ">>"),
+            ("cat < in", "<"),
+            ("cat << EOF", "<<"),
+            ("cat <<- EOF", "<<-"),
+            ("cat <<< word", "<<<"),
+            ("cat <> both", "<>"),
+            ("echo x >| out", ">|"),
+            ("echo x &> out", "&>"),
+            ("echo x &>> out", "&>>"),
+            ("echo x >& 2", ">&"),
+            ("cat <& 0", "<&"),
+        ] {
+            let spans = render_command(command);
+            assert_eq!(
+                redirects(&spans).first().copied(),
+                Some(operator),
+                "{command:?} did not yield {operator:?}"
+            );
+            assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn a_file_descriptor_in_front_of_an_operator_is_part_of_it() {
+        // bash reads the number and the operator as one token, so hatch draws
+        // them as one run: a `2` left plain beside a marked `>` would be
+        // drawing a boundary the shell does not have, in the small.
+        assert_eq!(redirects(&render_command("make 2> log")), vec!["2>", "log"]);
+        assert_eq!(redirects(&render_command("make 2>> log")), vec!["2>>", "log"]);
+        assert_eq!(redirects(&render_command("make 2>&1")), vec!["2>&", "1"]);
+        assert_eq!(redirects(&render_command("make 1>&2")), vec!["1>&", "2"]);
+        assert_eq!(redirects(&render_command("make 22> log")), vec!["22>", "log"]);
+    }
+
+    #[test]
+    fn a_number_that_is_not_the_whole_token_is_not_a_file_descriptor() {
+        // `echo a2>log` writes `a2` to `log`, which is bash's own answer: the
+        // token so far is `a2`, and that is not a number, so the `>` starts a
+        // fresh one. Marking the `2` would claim a descriptor the shell never
+        // reads and take a character off the argument beside it.
+        assert_eq!(redirects(&render_command("echo a2>log")), vec![">", "log"]);
+        assert_eq!(redirects(&render_command("echo 1 > 2")), vec![">", "2"]);
+        assert_eq!(commands(&render_command("echo a2>log")), vec!["echo"]);
+    }
+
+    #[test]
+    fn the_ampersand_forms_take_no_descriptor() {
+        // The `&` of `&>` is part of the operator rather than a number, so a
+        // number in front of it is a word. `echo 2&>x` is the word `2` and
+        // then an `&>`, which is what bash reads too.
+        assert_eq!(redirects(&render_command("echo 2&>x")), vec!["&>", "x"]);
+    }
+
+    #[test]
+    fn the_longest_redirection_operator_wins() {
+        // The table is full of prefixes -- `>` starts `>>`, `>|` and `>&` --
+        // so a shortest-first table would read `2>>log` as `2>` and an
+        // argument called `>log`.
+        assert_eq!(redirects(&render_command("echo x >>out")), vec![">>", "out"]);
+        assert_eq!(redirects(&render_command("cat <<<in")), vec!["<<<", "in"]);
+        assert_eq!(redirects(&render_command("echo x &>>out")), vec!["&>>", "out"]);
+    }
+
+    #[test]
+    fn redirection_table_is_longest_first() {
+        // The whole of the longest-match rule, held the way `SEPARATORS` is
+        // held: the first entry that matches wins, so nothing may be listed
+        // before a token it is a prefix of.
+        for (index, token) in REDIRECTIONS.iter().enumerate() {
+            for longer in &REDIRECTIONS[index + 1..] {
+                assert!(
+                    !longer.starts_with(*token),
+                    "{token:?} is listed before the longer {longer:?}, so it would match first"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_target_is_marked_as_well_as_the_operator() {
+        // The point of the whole pass. In `echo x > /etc/passwd` the word a
+        // reader is scanning for is the path, so the arrow alone would be
+        // half an answer -- and both halves are one kind, because they are
+        // one fact.
+        let spans = render_command("echo x > /etc/passwd");
+        assert_eq!(redirects(&spans), vec![">", "/etc/passwd"]);
+        // The blank between them belongs to neither and is left alone.
+        let between = spans.iter().find(|s| s.text() == " ").expect("the space survives");
+        assert_eq!(between.kind(), &SpanKind::Plain);
+        assert_eq!(unrender(&spans), "echo x > /etc/passwd");
+    }
+
+    #[test]
+    fn a_target_with_no_space_in_front_of_it_is_still_a_target() {
+        assert_eq!(redirects(&render_command("echo x >/etc/passwd")), vec![">", "/etc/passwd"]);
+        assert_eq!(redirects(&render_command("echo x >   out")), vec![">", "out"]);
+    }
+
+    #[test]
+    fn a_target_ends_where_a_word_ends() {
+        // Unquoted whitespace or an unquoted metacharacter, which is bash's
+        // own rule. A target that ran to the end of the line would swallow
+        // the command after the `;` and colour it as a destination.
+        assert_eq!(redirects(&render_command("echo x >out; ls")), vec![">", "out"]);
+        assert_eq!(redirects(&render_command("echo x >out ls")), vec![">", "out"]);
+        assert_eq!(redirects(&render_command("echo x >out|wc")), vec![">", "out"]);
+        assert_eq!(separators(&render_command("echo x >out; ls")), vec![";"]);
+        assert_eq!(separators(&render_command("echo x >out|wc")), vec!["|"]);
+    }
+
+    #[test]
+    fn a_second_operator_ends_the_first_ones_target() {
+        // `>a>b` is two redirections and not one pointing at `a>b`, which is
+        // again what bash does with it.
+        assert_eq!(redirects(&render_command("echo x >a>b")), vec![">", "a", ">", "b"]);
+    }
+
+    #[test]
+    fn an_operator_with_nothing_after_it_has_no_target() {
+        // Every one of these is a syntax error in bash. Marking a target that
+        // is not there would be the window inventing a destination.
+        assert_eq!(redirects(&render_command("echo x >")), vec![">"]);
+        assert_eq!(redirects(&render_command("echo x > ")), vec![">"]);
+        assert_eq!(redirects(&render_command("echo x >\nls")), vec![">"]);
+        assert_eq!(redirects(&render_command("echo x > ; ls")), vec![">"]);
+    }
+
+    #[test]
+    fn a_comment_ends_a_redirection_that_was_waiting_for_its_word() {
+        // `echo z >#f` is a syntax error in bash: the `#` is at the start of
+        // a word, so the comment swallows the line and the redirection never
+        // gets its target. The operator is still an operator.
+        let spans = render_command("echo z >#f");
+        assert_eq!(redirects(&spans), vec![">"]);
+        assert_eq!(comments(&spans), vec!["#f"]);
+    }
+
+    #[test]
+    fn nothing_in_a_comment_is_a_redirection() {
+        // The same answer a separator and a `$NAME` get there, from the same
+        // flag: the shell does not read the line, so there is nothing on it
+        // to redirect.
+        let spans = render_command("ls   # writes to > /etc/passwd");
+        assert!(redirects(&spans).is_empty(), "a comment contains a redirection");
+        assert_eq!(comments(&spans), vec!["# writes to > /etc/passwd"]);
+    }
+
+    #[test]
+    fn nothing_inside_quotes_or_behind_a_backslash_is_a_redirection() {
+        // The mirror of `echo 'a; b'` being one segment. An arrow inside a
+        // string is an argument, and colouring it as structure would tell the
+        // reader the shell is about to open a file it will not open.
+        assert!(redirects(&render_command("echo '> /etc/passwd'")).is_empty());
+        assert!(redirects(&render_command("echo \"> /etc/passwd\"")).is_empty());
+        assert!(redirects(&render_command(r"echo \> /etc/passwd")).is_empty());
+        assert!(redirects(&render_command(r"grep -e '2>&1' log")).is_empty());
+    }
+
+    #[test]
+    fn a_quoted_target_keeps_its_operator_and_is_left_to_the_string_colour() {
+        // A quoted word extends to include its quotes, so claiming this
+        // target would put a `Redirect` region exactly on top of a `Quoted`
+        // one, and two overlapping regions have no honest drawing. The same
+        // refusal `claimable` makes for a command word, and it costs the same
+        // thing: a colour on a word that is still on screen, drawn as itself,
+        // with its operator still marked in front of it.
+        let spans = render_command("echo x > \"my file\"");
+        assert_eq!(redirects(&spans), vec![">"]);
+        assert_eq!(quotes(&spans), vec!["\"my file\""]);
+        assert_eq!(unrender(&spans), "echo x > \"my file\"");
+    }
+
+    #[test]
+    fn a_target_with_a_variable_in_it_keeps_the_value_beside_it() {
+        // Annotation runs before highlighting and a claimed span is left
+        // alone, so the `$HOME` keeps the value the child will see and the
+        // rest of the path is still drawn as a destination. A value is
+        // information; a colour is decoration, and the decoration yields.
+        let spans = rendered("echo x > $HOME/out", &env(&[("HOME", "/home/user")]));
+        assert_eq!(variables(&spans), vec![("$HOME", Some("/home/user"))]);
+        assert_eq!(redirects(&spans), vec![">", "/out"]);
+        assert_eq!(unrender(&spans), "echo x > $HOME/out");
+    }
+
+    #[test]
+    fn the_pipe_of_a_redirection_operator_is_not_a_pipe() {
+        // The correctness half, and the entry this change takes off the
+        // over-segmentation list. `>|` is one token; hatch used to draw a
+        // segment boundary inside it, which is a boundary the shell does not
+        // have.
+        let spans = render_command("echo x >| out.txt");
+        assert!(separators(&spans).is_empty(), "the `|` of a `>|` was read as a pipe");
+        assert_eq!(redirects(&spans), vec![">|", "out.txt"]);
+        assert_eq!(commands(&spans), vec!["echo"], "and only one segment has a command word");
+    }
+
+    #[test]
+    fn a_real_pipe_beside_a_redirection_is_still_a_pipe() {
+        // The other direction of the same claim: skipping an operator's bytes
+        // must not skip a separator that merely stands next to one.
+        let spans = render_command("make 2>&1 | tee log");
+        assert_eq!(separators(&spans), vec!["|"]);
+        assert_eq!(redirects(&spans), vec!["2>&", "1"]);
+        assert_eq!(commands(&spans), vec!["make", "tee"]);
+    }
+
+    #[test]
+    fn an_ampersand_pair_next_to_a_redirection_is_still_a_separator() {
+        // `&>` and `&&` both begin with an `&`, and the first is looked for
+        // at every byte the second is. A `&&` read as an `&>` would cost the
+        // reader a segment boundary that really is one.
+        assert_eq!(separators(&render_command("a &> out && b")), vec!["&&"]);
+        assert_eq!(redirects(&render_command("a &> out && b")), vec!["&>", "out"]);
+        assert_eq!(separators(&render_command("a && b")), vec!["&&"]);
+    }
+
+    #[test]
+    fn a_redirection_ends_the_word_in_front_of_it() {
+        // `<` and `>` are metacharacters, so bash reads `cat<file` as the
+        // command `cat` with its input redirected. This pass used to
+        // underline the whole of `cat<file` as the word that names what runs.
+        let spans = render_command("cat<file");
+        assert_eq!(commands(&spans), vec!["cat"]);
+        assert_eq!(redirects(&spans), vec!["<", "file"]);
+    }
+
+    #[test]
+    fn a_redirection_in_front_of_a_command_is_not_the_command() {
+        // A redirection may precede the command it belongs to, so the word
+        // that names what runs is the one after it. `>out.txt cat` runs
+        // `cat`, and hatch used to underline `>out.txt`.
+        let spans = render_command(">out.txt cat");
+        assert_eq!(commands(&spans), vec!["cat"]);
+        assert_eq!(redirects(&spans), vec![">", "out.txt"]);
+        assert_eq!(commands(&render_command("2>&1 make")), vec!["make"]);
+    }
+
+    #[test]
+    fn a_redirection_is_not_a_danger_marker() {
+        // The line this pass does not cross. `/dev/null` and `/etc/passwd`
+        // are the same construct and get the same colour; which of them
+        // should alarm a reader is a question about the path, and answering
+        // it is `render::danger`'s job. A window that shouted at `/dev/null`
+        // would be teaching a reader to ignore it.
+        let harmless = render_command("make > /dev/null");
+        let alarming = render_command("make > /etc/passwd");
+        assert_eq!(redirects(&harmless), vec![">", "/dev/null"]);
+        assert_eq!(redirects(&alarming), vec![">", "/etc/passwd"]);
+        for spans in [&harmless, &alarming] {
+            assert!(
+                spans.iter().all(|s| s.kind() != &SpanKind::Danger),
+                "this pass reached a verdict it has no business reaching"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_operator_points_at_its_delimiter_and_the_body_is_unchanged() {
+        // What this pass does and does not move. `<<EOF` is an operator and
+        // `EOF` is the word it points at, which is right; hatch still does
+        // not know that what follows is a body rather than shell, so the
+        // separator in it is still reported. The known gap is unchanged, and
+        // this is what pins that.
+        let command = "cat <<EOF\na; b\nEOF";
+        let spans = render_command(command);
+        assert_eq!(redirects(&spans), vec!["<<", "EOF"]);
+        assert_eq!(separators(&spans), vec![";"], "the body is still read as shell");
+        assert_eq!(unrender(&spans), command);
+    }
+
+    #[test]
+    fn a_redirection_is_drawn_as_its_own_text_and_the_spans_still_tile_it() {
+        // The bound on every decoration in this module, restated for the kind
+        // that is most tempting to treat as a claim. Nothing is replaced,
+        // nothing is hidden, and a chip inside a target is still a chip.
+        let command = "echo x > /tmp/\u{202E}gnp.exe";
+        let spans = render_command(command);
+        assert_eq!(unrender(&spans), command);
+        assert!(spans.covers_source());
+        let shown: String = spans.iter().map(|s| s.display_text()).collect();
+        assert_eq!(shown, "echo x > /tmp/[RLO]gnp.exe", "the chip is the only substitution");
+        assert_eq!(chips(&spans), vec!['\u{202E}']);
+    }
+
+    #[test]
+    fn redirections_add_and_remove_nothing() {
+        // The property the rest of this section is worth nothing without, on
+        // the shapes most likely to trip the state machine: an operator at
+        // either end of the input, one with no target, one whose target is
+        // quoted, and one inside every construct that must suppress it.
+        for command in [
+            ">",
+            "<",
+            ">>>",
+            ">|",
+            "&>",
+            "2>",
+            "2",
+            "22",
+            "echo x >",
+            "echo x > ",
+            ">a>b>c",
+            "echo x > 'out'",
+            "echo x > \"out",
+            r"echo x > a\ b",
+            "echo '>' out",
+            "# > out",
+            "a >| b || c",
+            "cat <<EOF\n> not a redirection\nEOF",
+            "ünïcödé > ✓",
+        ] {
+            let spans = render_command(command);
+            assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
+            assert!(spans.covers_source(), "{command:?} is not tiled by its spans");
+        }
+    }
+
+    #[test]
+    fn an_escaped_space_keeps_a_target_in_one_piece() {
+        // A quoted or escaped space is not a word break, so `a\ b` is one
+        // word to the shell and one destination on screen.
+        let spans = render_command(r"echo x > a\ b");
+        assert_eq!(redirects(&spans), vec![">", r"a\ b"]);
+    }
+
     #[test]
     fn highlighting_adds_and_removes_nothing() {
         let env = env(&[("HOME", "/home/user"), ("A", "; rm -rf /")]);
