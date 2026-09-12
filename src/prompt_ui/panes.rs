@@ -1232,6 +1232,250 @@ fn moved(link: ScrollLink, pane: Pane, at: PaneAt, want: f32) -> bool {
     (at.offset - want).abs() > SCROLL_EPSILON && (link.driver == pane || !at.clamped(want))
 }
 
+// ---- saying how much of a pane is out of sight -----------------------------
+
+/// Where each command pane's account of how much of itself it showed is kept.
+fn pane_rows_id() -> egui::Id {
+    egui::Id::new("hatch-command-showing")
+}
+
+/// Where the swap window's diff pane keeps the same thing.
+fn diff_rows_id() -> egui::Id {
+    egui::Id::new("hatch-diff-showing")
+}
+
+/// How many rows a pane laid out, and how many of them it had room to show.
+///
+/// Measured off a pane that has been drawn, for the reason [`PaneAt`] gives:
+/// how many rows a rendering takes depends on the width the pane really
+/// wrapped at and on what its own furniture took out of its height, and
+/// neither is settled until it has been drawn. The two counts are rounded
+/// apart — laid out rounds up, shown rounds down — so a row with half of it
+/// under the bottom edge counts as a row that exists and not as a row that
+/// was seen. Both errors point the same way, which is the way that tells a
+/// reader there is more when there is barely any rather than the other way
+/// round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Rows {
+    /// Rows the pane laid out.
+    of: usize,
+    /// Rows of them the pane showed.
+    shown: usize,
+}
+
+impl Rows {
+    /// What a drawn pane's content height and viewport height come to, in
+    /// rows of `row` points.
+    fn measured(content: f32, viewport: f32, row: f32) -> Rows {
+        if row <= 0.0 {
+            return Rows::default();
+        }
+        Rows {
+            of: (content / row - ROW_EPSILON).ceil().max(0.0) as usize,
+            shown: (viewport / row + ROW_EPSILON).floor().max(0.0) as usize,
+        }
+    }
+
+    /// Whether the reader was shown all of it.
+    fn whole(self) -> bool {
+        self.shown >= self.of
+    }
+
+    /// How many rows are not on screen.
+    fn hidden(self) -> usize {
+        self.of.saturating_sub(self.shown)
+    }
+}
+
+/// How much of a row is allowed to be rounding rather than content.
+///
+/// A pane draws `n` lines in `n` text heights and `n - 1` gaps, and a row is a
+/// text height *plus* a gap — see [`row_height`] — so a pane that fits its
+/// content exactly comes out a fraction of a row short of a whole number in
+/// one direction and a fraction over in the other. A twentieth of a row is
+/// far more than that fraction and far less than the sliver of a real row
+/// that this has to go on reporting.
+const ROW_EPSILON: f32 = 0.05;
+
+/// The sentence that says a pane is showing only some of the rows it has.
+///
+/// # Why this is said in words at all
+///
+/// Everything else this window does assumes the reader saw the text. The
+/// chips, the raw pane beside the annotated one, the round-trip invariant
+/// that refuses a payload whose spans do not tile their source — all of it is
+/// about what is *on screen* being honest, and none of it says anything about
+/// the part that is not. A pane showing twenty-four rows of a sixty-three-row
+/// command used to say so through its scroll bar alone, and that bar floated
+/// over the content and faded to nothing whenever the pointer was elsewhere.
+/// A command can be written for that: blank lines to the height of a pane,
+/// and the payload under them.
+///
+/// The bar is solid now — see [`theme::scroll_bars`] — and this is the other
+/// half. Words beat an affordance on every axis that matters here: they are
+/// unambiguous, they survive a reader who has never learned what a scroll bar
+/// means, they survive a screenshot with no colour in it, and they can be
+/// asserted in a test, which a fading rectangle cannot.
+///
+/// # Why it is a proportion and not a distance
+///
+/// It says how much there is against how much fits, and deliberately not how
+/// far the reader still has to go. A sentence that counted down as they
+/// scrolled would be a sentence that changes length, and this one is drawn
+/// *above* the panes, so its length is part of how tall they are. A caption
+/// that grew or shrank with the scroll position would move the panes under
+/// the reader's hand — which is the exact shape of the bug `306c834` was
+/// about, arriving through the caption instead of through the link. Content
+/// against viewport does not move while anybody scrolls.
+///
+/// It also keeps saying it after they have reached the end, which is right:
+/// "this pane holds twenty-four of sixty-three rows" is as true at the bottom
+/// as at the top, and a notice that vanished the moment they got there would
+/// be telling them they had seen everything on the evidence of where their
+/// scroll bar is.
+///
+/// # Why there is no sentence for the case where it all fits
+///
+/// Because it would be a claim of completeness, and this measurement is one
+/// frame old — it is read off the pane that was drawn last frame, which is
+/// the only pane that has been drawn. One frame is nothing while a reader
+/// scrolls and it is a real window while one is being resized, and "all of it
+/// is on screen" is precisely the sentence a reader would stop reading on.
+/// Saying only *there is more* puts every staleness in the direction that
+/// costs them nothing. What carries the all-clear instead is the scroll bar,
+/// which is drawn from this frame's own layout and is now always there to be
+/// looked at.
+fn rows_out_of_sight(rows: Rows, of: &str, pane: &str) -> Option<String> {
+    (!rows.whole()).then(|| {
+        format!(
+            "Only {} of {of}'s {} rows fit {pane}, so {} of them are out of sight; scroll \
+             for the rest.",
+            rows.shown,
+            rows.of,
+            rows.hidden(),
+        )
+    })
+}
+
+/// The sentence that says a pane's lines run off its right edge.
+///
+/// The same gap sideways, and the raw pane is where it bites: it deliberately
+/// does not reflow — that is the promise the caption makes for it — so a long
+/// line runs past the right edge and stops, with the scroll bar along the
+/// bottom as the only sign that it did not end there. In a root request the
+/// strip ends part-way through `run0`'s argument list.
+///
+/// Unlike the rows this needs no measurement and is not a frame old.
+/// `longest` is counted off the rendering when the payload is read, `across`
+/// is [`pane_chars`] for the box being drawn, and the pane's characters are
+/// all one advance wide — `every_glyph_the_panes_draw_is_one_monospace_advance`
+/// is what holds that — so the comparison is exact in the frame it is made.
+fn width_out_of_sight(longest: usize, across: usize, pane: &str) -> Option<String> {
+    (longest > across).then(|| {
+        format!(
+            "Lines run to {longest} characters and {pane} shows {across}; scroll sideways \
+             for the rest."
+        )
+    })
+}
+
+/// The two sentences above, joined into the line that is drawn.
+///
+/// Empty when there is nothing to say, which is what the caller draws no row
+/// for.
+fn out_of_sight(rows: Option<String>, width: Option<String>) -> String {
+    [rows, width].into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+/// How much of itself each command pane showed, the last time they were
+/// drawn.
+///
+/// Kept in egui's own per-frame store beside [`ScrollLink`] and [`PaneReach`],
+/// for the same reason and with the same shape: it is a fact about a layout
+/// rather than about what the window is deciding, and the default is a pair
+/// of panes that have never been drawn, which say nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CommandRows {
+    raw: Rows,
+    annotated: Rows,
+}
+
+impl CommandRows {
+    /// The worse of the two, for an arrangement that draws them level.
+    ///
+    /// The larger row count against the smaller viewport: side by side the
+    /// two panes are the same height and hold two renderings of one command,
+    /// and which of them has the most rows is not something a reader should
+    /// have to be told. Taking the worst of each figure makes the one
+    /// sentence true of both panes.
+    fn worst(self) -> Rows {
+        Rows {
+            of: self.raw.of.max(self.annotated.of),
+            shown: self.raw.shown.min(self.annotated.shown),
+        }
+    }
+}
+
+/// The out-of-sight line for the command panes, in whichever arrangement.
+///
+/// # Which pane each axis is reported off
+///
+/// Side by side, the two panes are level and the same height, so one sentence
+/// covers both — see [`CommandRows::worst`] — and neither can run off to the
+/// side, because the arrangement is only offered when every line fits its
+/// column whole. That is what [`fits_two_columns`] is for, and it is why
+/// there is no sideways sentence here.
+///
+/// Stacked, the rows are reported off the annotated pane alone. The raw pane
+/// is a strip of [`RAW_STRIP_ROWS`] rows by deliberate choice — see
+/// [`raw_ceiling`] — so "only six of sixty-three rows fit the strip" would be
+/// hatch reporting its own layout decision back to the reader as news, every
+/// time, which is the fastest way to teach somebody to stop reading a line.
+/// The strip is also dragged to wherever the annotated pane is looking, so a
+/// reader who scrolls that pane to the end has been past all of the raw text
+/// six rows at a time.
+///
+/// Sideways is the strip's alone, and it is the one that surprises: the raw
+/// pane does not reflow, so a long line runs off the right edge of a
+/// full-width strip and stops there. `longest` is the command's longest line
+/// as either rendering would draw it, which is the figure the caption above
+/// already quotes, and `across` is what one full-width box holds.
+fn command_note(view: CommandView, seen: CommandRows, longest: usize, across: usize) -> String {
+    match view {
+        CommandView::SideBySide => {
+            out_of_sight(rows_out_of_sight(seen.worst(), "the command", "the panes"), None)
+        }
+        CommandView::Stacked => out_of_sight(
+            rows_out_of_sight(seen.annotated, "the command", "the pane below"),
+            width_out_of_sight(longest, across, "the strip"),
+        ),
+    }
+}
+
+/// Draw the out-of-sight line, if there is one.
+///
+/// In [`Palette::warn`] and not in the caption's quiet grey, and that is the
+/// point of giving it a row of its own. The caption says how to read the
+/// panes; this says the reader has not been shown all of what is in them,
+/// which is a fact about the thing they are about to approve rather than a
+/// note about the furniture. It is the same colour, and the same small size,
+/// as the caveat that says a root command may behave differently — the other
+/// line in this window that is a warning about the request rather than a mark
+/// on the text.
+///
+/// The row it costs is a row the panes do not get, and it is spent in exactly
+/// the case where they are already short of rows. That is the right way
+/// round: a row that says "there are thirty-nine more" is worth more than the
+/// thirty-ninth row would have been. It cannot flicker, either — taking the
+/// row can only ever make the panes shorter, so a notice that has appeared
+/// cannot make itself untrue.
+fn draw_out_of_sight(ui: &mut Ui, note: &str) {
+    if note.is_empty() {
+        return;
+    }
+    ui.label(RichText::new(note).small().color(palette(ui).warn));
+}
+
 /// The two panes.
 ///
 /// # Side by side, when they fit
@@ -1276,13 +1520,24 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
     // `command_caption` for why the promise is not furniture.
     ui.label(RichText::new(command_caption(view, longest, column)).small().color(palette.quiet));
 
-    match view {
+    // And, under it, how much of the command the panes are not showing. The
+    // row counts are last frame's, because a pane is the only thing that
+    // knows how many rows it laid out and it does not know until it has —
+    // see `rows_out_of_sight`. A window that has drawn no frame yet has a
+    // pair of panes that showed nothing of nothing, which says nothing.
+    let seen = ui.data(|data| data.get_temp::<CommandRows>(pane_rows_id()).unwrap_or_default());
+    draw_out_of_sight(ui, &command_note(view, seen, longest, pane_chars(ui, 1)));
+
+    let shown = match view {
         CommandView::SideBySide => {
             let height = ui.available_height();
             ui.columns(2, |columns| {
-                draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None));
-                draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None));
-            });
+                let raw =
+                    draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None));
+                let annotated =
+                    draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None));
+                CommandRows { raw: raw.rows, annotated: annotated.rows }
+            })
         }
         CommandView::Stacked => {
             let row = row_height(ui);
@@ -1304,7 +1559,8 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
             let ceiling = raw_ceiling(ui.available_height(), row);
             let raw_reach = reach.raw.unwrap_or_else(|| max_offset(raw_rows.rows, row, ceiling));
             let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, raw_reach);
-            let at_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
+            let drawn_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
+            let at_raw = drawn_raw.at;
 
             ui.add_space(4.0);
             let rest = ui.available_height();
@@ -1318,8 +1574,9 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
                 row,
                 annotated_reach,
             );
-            let at_annotated =
+            let drawn_annotated =
                 draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)));
+            let at_annotated = drawn_annotated.at;
 
             let link = drove(link, at_raw, want_raw, at_annotated, want_annotated);
             let reach = PaneReach { raw: Some(at_raw.max), annotated: Some(at_annotated.max) };
@@ -1327,8 +1584,19 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
                 data.insert_temp(scroll_link_id(), link);
                 data.insert_temp(pane_reach_id(), reach);
             });
+            CommandRows { raw: drawn_raw.rows, annotated: drawn_annotated.rows }
         }
+    };
+
+    // The line above the panes was built from the frame before this one, and
+    // this is the first frame that knows better. Asking for another is what
+    // makes "one frame old" the whole of the staleness: without it the notice
+    // would wait for whatever else wakes the window next, which on a window
+    // that is only counting down a deadline is as much as a second.
+    if shown != seen {
+        ui.ctx().request_repaint();
     }
+    ui.data_mut(|data| data.insert_temp(pane_rows_id(), shown));
 }
 
 /// One command pane: the rendering in a framed, scrolling box.
@@ -1347,7 +1615,9 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
 /// far down it had anything to show, which is how the caller tells a pane
 /// that agreed with what it was asked from a pane the reader scrolled — and
 /// both of those from a pane that simply ran out of command. See [`PaneAt`].
-fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneAt {
+/// The same two numbers, in rows rather than in pixels, are what the caption
+/// says out loud on the next frame: see [`Rows`].
+fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneShown {
     // A pane that cannot wrap needs somewhere to scroll a long line to; one
     // that wraps has nothing to the side and a horizontal bar would only be
     // furniture.
@@ -1361,15 +1631,27 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneAt {
     if let Some(at) = pane.at {
         scroll = scroll.vertical_scroll_offset(at);
     }
+    let row = row_height(ui);
     pane_frame(ui)
         .show(ui, |ui| {
             let drawn = scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight));
-            PaneAt {
-                offset: drawn.state.offset.y,
-                max: (drawn.content_size.y - drawn.inner_rect.height()).max(0.0),
+            PaneShown {
+                at: PaneAt {
+                    offset: drawn.state.offset.y,
+                    max: (drawn.content_size.y - drawn.inner_rect.height()).max(0.0),
+                },
+                rows: Rows::measured(drawn.content_size.y, drawn.inner_rect.height(), row),
             }
         })
         .inner
+}
+
+/// What one drawn pane reports about itself: where it is, and how much of
+/// itself the reader was shown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneShown {
+    at: PaneAt,
+    rows: Rows,
 }
 
 /// One command pane's box: everything about it except what is in it.
@@ -1482,10 +1764,33 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     ui.separator();
 
     let advance = advance(ui);
-    let column = column_chars(pane_chars(ui, 1), GUTTER_CHARS);
+    let across = pane_chars(ui, 1);
+    let column = column_chars(across, GUTTER_CHARS);
     let view = diff_view(longest, column);
     ui.label(
         RichText::new(diff_caption(view, rows, longest, column)).small().color(palette.quiet),
+    );
+
+    // The same notice the command panes carry, for the same reason: a diff is
+    // a list of lines somebody is about to let be written, and a pane showing
+    // forty of two hundred of them said so through its scroll bar alone. Side
+    // by side has nothing off to the side — every line fits its column, which
+    // is what chose the view — so only the unified view can run off the right
+    // edge, and it does so past a `-`/`+` gutter that is not text.
+    let seen = ui.data(|data| data.get_temp::<Rows>(diff_rows_id()).unwrap_or_default());
+    draw_out_of_sight(
+        ui,
+        &out_of_sight(
+            rows_out_of_sight(seen, "the diff", "the pane"),
+            match view {
+                DiffView::SideBySide => None,
+                DiffView::Unified => width_out_of_sight(
+                    longest,
+                    across.saturating_sub(GUTTER_CHARS),
+                    "the pane",
+                ),
+            },
+        ),
     );
 
     if rows.is_empty() {
@@ -1507,41 +1812,53 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     // it is a fact in both views: side by side never wraps a cell, because a
     // diff that would have to wrap one is drawn unified instead.
     let row_height = row_height(ui);
-    pane_frame(ui).show(ui, |ui| match view {
-        DiffView::SideBySide => {
-            let size = Cells {
-                gutter: advance * GUTTER_CHARS as f32,
-                cell: advance * column as f32,
-                gap: advance * GAP_CHARS as f32,
-                height: row_height,
+    let shown = pane_frame(ui)
+        .show(ui, |ui| {
+            let drawn = match view {
+                DiffView::SideBySide => {
+                    let size = Cells {
+                        gutter: advance * GUTTER_CHARS as f32,
+                        cell: advance * column as f32,
+                        gap: advance * GAP_CHARS as f32,
+                        height: row_height,
+                    };
+                    // Vertical only. Every line fits, so there is nothing to
+                    // the side to scroll to, and a horizontal bar that moved
+                    // one column out from under the other would break the
+                    // alignment the view is for.
+                    egui::ScrollArea::vertical()
+                        .id_salt("hatch-diff-columns")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, rows.len(), |ui, range| {
+                            for row in &rows[range] {
+                                draw_row(ui, row, &palette, size);
+                            }
+                        })
+                }
+                DiffView::Unified => {
+                    let lines = diff_lines(rows);
+                    egui::ScrollArea::both()
+                        .id_salt("hatch-diff")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, lines.len(), |ui, range| {
+                            for line in &lines[range] {
+                                draw_diff_line(ui, line, palette.danger, palette.warn);
+                            }
+                        })
+                }
             };
-            // Vertical only. Every line fits, so there is nothing to the
-            // side to scroll to, and a horizontal bar that moved one column
-            // out from under the other would break the alignment the view is
-            // for.
-            egui::ScrollArea::vertical()
-                .id_salt("hatch-diff-columns")
-                .max_height(ui.available_height())
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, rows.len(), |ui, range| {
-                    for row in &rows[range] {
-                        draw_row(ui, row, &palette, size);
-                    }
-                });
-        }
-        DiffView::Unified => {
-            let lines = diff_lines(rows);
-            egui::ScrollArea::both()
-                .id_salt("hatch-diff")
-                .max_height(ui.available_height())
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, lines.len(), |ui, range| {
-                    for line in &lines[range] {
-                        draw_diff_line(ui, line, palette.danger, palette.warn);
-                    }
-                });
-        }
-    });
+            Rows::measured(drawn.content_size.y, drawn.inner_rect.height(), row_height)
+        })
+        .inner;
+
+    // As above the command panes: the caption was built from the frame
+    // before, and this is the first frame that knows better.
+    if shown != seen {
+        ui.ctx().request_repaint();
+    }
+    ui.data_mut(|data| data.insert_temp(diff_rows_id(), shown));
 }
 
 /// The box a pane is drawn in: a fill that is not the chrome, and an edge
@@ -1569,12 +1886,24 @@ fn pane_frame(ui: &Ui) -> egui::Frame {
 /// frame, border and padding on both sides, and each box's vertical scroll
 /// bar, which anything long enough to matter grows.
 ///
+/// The bar's term is asked of the style — `ScrollStyle::allocated_width` is
+/// egui's own answer to "how much of a box does a bar take" — and not added
+/// up out of its fields here. It used to be `bar_width + bar_inner_margin`,
+/// which is the right sum for a solid bar and the wrong one for the floating
+/// bar egui defaults to: a floating bar draws over the content and allocates
+/// nothing, so the subtraction took fourteen points a pane still had. That
+/// over-count is what made [`pane_lines`] fit a line in more rows than the
+/// real pane does, which is the row of slack that inverted the scroll link's
+/// guard — see [`max_offset`]. This window's bars are solid, by
+/// [`theme::scroll_bars`], so the column is real; asking the style is what
+/// keeps the two from disagreeing again if it ever stops being.
+///
 /// `boxes` is one for a diff, which is drawn in a single frame, and two for
 /// the command panes side by side.
 fn text_width(ui: &Ui, boxes: usize) -> f32 {
     let frame = pane_frame(ui);
     let border = (frame.inner_margin.sum() + frame.outer_margin.sum()).x + 2.0 * frame.stroke.width;
-    let scroll = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+    let scroll = ui.spacing().scroll.allocated_width();
     (ui.available_width() - boxes as f32 * (border + scroll)).max(0.0)
 }
 
@@ -2922,6 +3251,11 @@ mod tests {
     fn at_font_size<T>(points: f32, mut measure: impl FnMut(&Ui) -> T) -> T {
         let ctx = egui::Context::default();
         crate::prompt_ui::apply_font_size(&ctx, points);
+        // And the window's own scroll bars, which are a column of the style
+        // rather than egui's floating default: `text_width` subtracts that
+        // column, so a measurement taken against egui's style would be a
+        // measurement of a window nobody is shown. See `theme::scroll_bars`.
+        theme::apply(&ctx, theme::Theme::Dark);
         let mut measured = None;
         let mut out = ctx.run_ui(
             egui::RawInput {
@@ -3391,6 +3725,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::prompt_ui::apply_faces(&ctx);
             crate::prompt_ui::apply_font_size(&ctx, 16.0);
+            theme::apply(&ctx, theme::Theme::Dark);
             let home = BTreeMap::from([("HOME".to_string(), "/home/alex".to_string())]);
             let annotated = render_command(source, &home);
             let raw = classify(source);
@@ -3504,13 +3839,18 @@ mod tests {
     /// How many characters of the pane's own font a window of `size` believes
     /// one full-width pane holds.
     ///
-    /// The count [`pane_lines`] wraps its estimate at, and the one the real
-    /// pane beats: it subtracts room for a scroll bar, and egui's scroll bars
-    /// float over the content rather than taking a column of it.
+    /// The count [`pane_lines`] wraps its estimate at. It is still an
+    /// under-count of what the real pane fits — [`pane_chars`] floors, and
+    /// the scroll bar's column is subtracted whether or not the pane grows
+    /// one — so the estimate still reaches more rows than the pane does, and
+    /// the guard that tells a clamp from a reader is still load-bearing. What
+    /// it no longer is is a whole bar out: the bars take the column this
+    /// subtracts. See [`text_width`].
     fn estimated_pane_chars(size: egui::Vec2) -> usize {
         let ctx = egui::Context::default();
         crate::prompt_ui::apply_faces(&ctx);
         crate::prompt_ui::apply_font_size(&ctx, 16.0);
+        theme::apply(&ctx, theme::Theme::Dark);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             ..Default::default()
@@ -3565,9 +3905,14 @@ mod tests {
             CommandView::Stacked,
             "side by side panes are not linked, so this would assert nothing"
         );
-        // Three frames to settle: a pane learns its size from the frame
-        // before, and a reader does not scroll what they have not been shown.
-        for _ in 0..3 {
+        // Frames enough to settle: a pane learns its size from the frame
+        // before, a reader does not scroll what they have not been shown, and
+        // a solid scroll bar animates its column in rather than appearing
+        // with it — so for the eighth of a second that takes, the viewport is
+        // still narrowing and a pane's maximum offset is still growing. The
+        // clock advances a sixtieth per frame; this is three times the
+        // animation.
+        for _ in 0..16 {
             window.frame(Vec::new());
         }
 

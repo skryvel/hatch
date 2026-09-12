@@ -420,6 +420,59 @@ pub fn mark_root(ui: &egui::Ui, window: egui::Rect) {
     );
 }
 
+/// How wide this window draws a scroll bar, in points.
+///
+/// egui's solid preset is six, which is the figure the report behind
+/// [`scroll_bars`] calls tiny. Ten is wide enough to be an object the eye
+/// finds without looking for it, and it is still under one percent of the
+/// window's width -- see [`crate::prompt_ui::panes::text_width`] for who pays
+/// for it, which is the pane's own text.
+const SCROLL_BAR_WIDTH: f32 = 10.0;
+
+/// The scroll bars this window draws, and why they are not egui's.
+///
+/// egui's default is [`egui::style::ScrollStyle::floating`]: a bar whose
+/// `floating_allocated_width` is zero, so it takes no column at all, draws
+/// over the content, and fades away entirely while the pointer is somewhere
+/// else. Two separate things are wrong with that here.
+///
+/// The first belongs to the reader. This window's whole claim is that nothing
+/// runs which was not seen rendered, and a pane showing twenty rows of a
+/// sixty-row command says so through its scroll bar and nothing else. A bar
+/// that is invisible for as long as nobody is pointing at it leaves moments
+/// where there is no sign at all that the command continues -- and a command
+/// can be written to put its payload below the fold, with blank lines above
+/// it, for exactly those moments. Words are the better answer to that and
+/// [`crate::prompt_ui::panes::rows_out_of_sight`] is where they are said; a
+/// bar that is always on screen is the answer that costs no sentence.
+///
+/// The second belongs to the arithmetic. [`crate::prompt_ui::panes::text_width`]
+/// takes a scroll bar's column off the width a pane has for text, because the
+/// view has to be chosen before the pane that would report its own width
+/// exists. Against a floating bar that subtraction is simply false -- the bar
+/// takes nothing -- and the row over-count it produced is what inverted the
+/// guard behind the stacked panes' scroll link and set them oscillating. A
+/// solid bar is what makes the subtraction true. The subtraction itself now
+/// asks the style rather than adding two of its fields up, so the two cannot
+/// disagree again.
+///
+/// Two deviations from [`egui::style::ScrollStyle::solid`]:
+///
+/// * [`SCROLL_BAR_WIDTH`] in place of six points.
+/// * `foreground_color`, so the handle is drawn in an inactive widget's *ink*
+///   rather than its face. Solid bars are painted at full opacity, so the
+///   face would be visible at all -- but the face is the button colour, which
+///   is 1.1:1 against a light pane and 2.7:1 against a dark one, and a bar a
+///   reader has to hunt for is the bar this is replacing. The ink is above
+///   15:1 on both. See `the_scroll_handle_is_seen_against_the_pane_it_is_on`.
+pub fn scroll_bars() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        bar_width: SCROLL_BAR_WIDTH,
+        foreground_color: true,
+        ..egui::style::ScrollStyle::solid()
+    }
+}
+
 /// Apply a theme to a whole context.
 pub fn apply(ctx: &egui::Context, theme: Theme) {
     let visuals = theme.palette().visuals(theme);
@@ -431,7 +484,16 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
     // of its own on the next frame, and a window that repainted itself in
     // egui's colours because the desktop said "light" would be the reading
     // problem this palette exists to fix, arriving a frame late.
-    ctx.all_styles_mut(|style| style.visuals = visuals.clone());
+    //
+    // The scroll bars ride along here rather than in a setup call of their
+    // own. They are not a theme -- both palettes get the same ones -- but
+    // they are how this window looks, and a second call that a caller could
+    // forget is how a pane comes to be drawn with egui's bars and measured
+    // with hatch's. See [`scroll_bars`].
+    ctx.all_styles_mut(|style| {
+        style.visuals = visuals.clone();
+        style.spacing.scroll = scroll_bars();
+    });
 }
 
 #[cfg(test)]
@@ -676,6 +738,38 @@ mod tests {
             }
             let inner = contrast(palette.border, palette.surface);
             assert!(inner >= 3.0, "{name}: a pane's border is {inner:.2}:1 against the pane");
+        }
+    }
+
+    #[test]
+    fn the_scroll_handle_is_seen_against_the_pane_it_is_on() {
+        // The reader's report was "scrollbar is tiny, easy to think it ends".
+        // Half of the answer is that the bar now takes a column of its own
+        // instead of floating and fading; the other half is that what is
+        // drawn in that column can be seen. egui picks the handle's colour
+        // out of an inactive widget -- its face by default, its ink when
+        // `foreground_color` is set -- and this window's button face is 1.1:1
+        // against a white pane, which is a handle that is there and cannot be
+        // found.
+        let style = scroll_bars();
+        assert!(!style.floating, "a floating bar takes no column and fades to nothing");
+        assert!(style.allocated_width() > 0.0, "a bar that takes no column is not solid");
+        for (name, palette) in palettes() {
+            let theme = match name {
+                "dark" => Theme::Dark,
+                _ => Theme::Light,
+            };
+            let widget = palette.visuals(theme).widgets.inactive;
+            let handle = match style.foreground_color {
+                true => widget.fg_stroke.color,
+                false => widget.bg_fill,
+            };
+            let ratio = contrast(handle, palette.surface);
+            assert!(ratio >= 3.0, "{name}: a scroll handle is {ratio:.2}:1 on a pane");
+            // And the face egui would have used without `foreground_color`
+            // is the reason the flag is set, rather than a preference.
+            let face = contrast(widget.bg_fill, palette.surface);
+            assert!(face < ratio, "{name}: the ink is no better than the face it replaced");
         }
     }
 

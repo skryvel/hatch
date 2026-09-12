@@ -4410,7 +4410,10 @@ mod tests {
             walk(&clipped.shape, fill, &mut out);
         }
         // The note field is drawn on the same surface, and it is not a pane.
-        out.retain(|rect| rect.height() > 60.0);
+        // Neither is a scroll bar's track, which egui paints in the same
+        // `extreme_bg_color` — it is as tall as the pane it belongs to and
+        // ten points wide, so width is what tells the two apart.
+        out.retain(|rect| rect.height() > 60.0 && rect.width() > 60.0);
         out
     }
 
