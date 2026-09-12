@@ -1316,6 +1316,7 @@ mod tests {
             "echo $HOME | tee /tmp/x && rm -rf ~/.cache",
             "printf '\u{202E}gnp.exe'",
             "ünïcödé — ✓",
+            "make -j4   # then && rm -rf /tmp",
         ] {
             let spans = rendering(command);
             let payload = Payload::command(
@@ -1332,6 +1333,29 @@ mod tests {
             assert!(rebuilt.covers_source(), "and it still tiles its source");
             assert_eq!(unrender(&rebuilt), command, "and it is still the command");
         }
+    }
+
+    #[test]
+    fn a_comment_crosses_the_pipe_as_the_kind_it_is() {
+        // A kind the window does not receive is a kind the window cannot
+        // draw, and the round trip above would be satisfied by a comment that
+        // arrived as `plain`: the text would be identical either way. So the
+        // tag itself is asserted, and by the name a reader would grep the
+        // frame for.
+        let spans = rendering("make -j4 # not && this");
+        let payload =
+            Payload::command(&spans, Vec::new(), PathBuf::from("/"), false, false);
+        let encoded = encode(&payload).expect("encodes");
+        assert!(encoded.contains("\"kind\":\"comment\""), "{encoded}");
+
+        let back: Payload = read_message(&encoded).expect("decodes");
+        let rebuilt = back.rendering().expect("rebuilds");
+        let comments: Vec<&str> = rebuilt
+            .iter()
+            .filter(|span| span.kind() == &SpanKind::Comment)
+            .map(Span::text)
+            .collect();
+        assert_eq!(comments, vec!["# not && this"], "the comment did not survive the trip");
     }
 
     #[test]

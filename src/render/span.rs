@@ -171,6 +171,28 @@ pub enum SpanKind {
     /// wrong in the same direction and at the same bounded cost: the text is
     /// still on screen, drawn as itself.
     Quoted,
+    /// A comment: the `#` that begins it and everything after it up to, but
+    /// not including, the newline that ends it.
+    ///
+    /// The one part of a line that will not run, which is why it is a kind of
+    /// its own rather than a colour the highlighter picks. Recognising it is
+    /// a correctness fix before it is a decoration: a `#` the scanner did not
+    /// know about left `echo hi   # then && rm -rf /tmp` drawn with a segment
+    /// boundary at an `&&` the shell does not have, and the module docs
+    /// listed that among the boundaries hatch reports falsely. See
+    /// [`super::command`] for the rules -- what a comment is, where one
+    /// begins, and which shell they are the rules of.
+    ///
+    /// Decoration, on the same terms as [`SpanKind::Command`] and
+    /// [`SpanKind::Quoted`]: drawn as its own text, nothing hidden, nothing
+    /// replaced. It is drawn *quieter* than the text around it, which is the
+    /// one place in this window where less contrast is the honest answer --
+    /// the reader is being told this part does not run -- and it is held at
+    /// the same floor as the rest of the vocabulary so that quieter never
+    /// becomes invisible. What the scanner cannot see it is wrong about in
+    /// the direction of finding no comment, so text that will run is never
+    /// drawn as text that will not.
+    Comment,
     Danger,
     /// A character that must not be drawn as itself. `text` is still the
     /// original character, and stays exactly one codepoint long; `name` is

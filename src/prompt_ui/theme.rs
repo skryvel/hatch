@@ -185,6 +185,22 @@ pub struct Palette {
     pub command: Color32,
     /// A quoted string, delimiters included.
     pub quoted: Color32,
+    /// A comment: the one part of the command that will not run.
+    ///
+    /// The one colour in this palette that is deliberately *quieter* than
+    /// body text, and the only place in this window where taking contrast
+    /// away is the honest answer: everything else on a pane either runs or is
+    /// hatch talking, and a comment is neither. It is held to the same floor
+    /// as [`Palette::quiet`] all the same — quieter is a shade, not a
+    /// disappearance — so the reader can still read the thing they are being
+    /// told not to worry about.
+    ///
+    /// Green, which is the one hue this window had not spent. Nothing here
+    /// says *this worked* in colour — an outcome is words, and a finished
+    /// window is violet whether it exited zero or not — so there is no
+    /// success signal for a green to be confused with, and every editor a
+    /// reader has ever used has already taught them this one.
+    pub comment: Color32,
     /// Behind a chip.
     pub chip_bg: Color32,
     /// Behind a separator's own characters.
@@ -209,7 +225,9 @@ pub struct Palette {
 ///
 /// Body text is 15.3:1 on a pane and 8.9:1 on the chrome; the pane surface is
 /// 1.7:1 against the chrome and its border is 3.0:1 against it. egui's own
-/// dark theme is 5.1:1 and 1.00:1 for the first and third of those.
+/// dark theme is 5.1:1 and 1.00:1 for the first and third of those. A comment
+/// is 7.3:1 on a pane, against body text's 15.3:1: half the contrast and
+/// still above AAA.
 pub const DARK: Palette = Palette {
     chrome: Color32::from_rgb(58, 58, 58),
     running: Color32::from_rgb(38, 58, 82),
@@ -222,6 +240,7 @@ pub const DARK: Palette = Palette {
     warn: Color32::from_rgb(255, 170, 45),
     command: Color32::from_rgb(255, 255, 255),
     quoted: Color32::from_rgb(110, 185, 255),
+    comment: Color32::from_rgb(122, 170, 122),
     chip_bg: Color32::from_rgb(72, 72, 72),
     separator_bg: Color32::from_rgb(60, 60, 60),
     value_bg: Color32::from_rgb(52, 52, 52),
@@ -236,7 +255,9 @@ pub const DARK: Palette = Palette {
 /// The same shape as [`DARK`] rather than its inverse in every particular:
 /// orange on white is the one colour that cannot simply be lightened, so warn
 /// here is a dark amber, and it is still the *lighter* of the danger/warn
-/// pair — which is the relation a reader learns, in either theme.
+/// pair — which is the relation a reader learns, in either theme. A comment
+/// is 7.3:1 against this pane as it is against the dark one, and body text is
+/// 17.4:1, so the relation a reader learns there holds here too.
 pub const LIGHT: Palette = Palette {
     chrome: Color32::from_rgb(201, 201, 201),
     running: Color32::from_rgb(184, 204, 224),
@@ -249,6 +270,7 @@ pub const LIGHT: Palette = Palette {
     warn: Color32::from_rgb(166, 92, 0),
     command: Color32::from_rgb(0, 0, 0),
     quoted: Color32::from_rgb(0, 90, 180),
+    comment: Color32::from_rgb(0, 100, 50),
     chip_bg: Color32::from_rgb(224, 224, 224),
     separator_bg: Color32::from_rgb(232, 232, 232),
     value_bg: Color32::from_rgb(238, 238, 238),
@@ -560,6 +582,7 @@ mod tests {
                 ("warn", palette.warn),
                 ("command", palette.command),
                 ("quoted", palette.quoted),
+                ("comment", palette.comment),
             ] {
                 let ratio = contrast(colour, palette.surface);
                 assert!(ratio >= 4.5, "{name}: {role} is {ratio:.2}:1 on a pane");
@@ -623,6 +646,7 @@ mod tests {
                     ("danger", palette.danger),
                     ("warn", palette.warn),
                     ("quoted", palette.quoted),
+                    ("comment", palette.comment),
                     ("surface", palette.surface),
                     ("gap", palette.gap_bg),
                 ] {
@@ -718,6 +742,28 @@ mod tests {
         for (name, palette) in palettes() {
             let ratio = contrast(palette.quiet, palette.surface);
             assert!(ratio >= 7.0, "{name}: quiet text is {ratio:.2}:1 on a pane");
+        }
+    }
+
+    #[test]
+    fn a_comment_is_quieter_than_the_command_around_it_and_still_read_at_aaa() {
+        // Both halves are the claim. Quieter, because a comment is the one
+        // part of the line that will not run and the reader is being told so
+        // with the only channel that costs no row — and this is the only
+        // place in the window where less contrast is the honest answer, which
+        // is why it is asserted rather than left to whoever picks the next
+        // green. Still above the floor `quiet` is held to, because the other
+        // way this goes wrong is a comment nobody can read, and a comment can
+        // hold the sentence that explains the command.
+        for (name, palette) in palettes() {
+            let comment = contrast(palette.comment, palette.surface);
+            let text = contrast(palette.text, palette.surface);
+            assert!(
+                comment < text,
+                "{name}: a comment is {comment:.2}:1 and body text is {text:.2}:1 -- a comment \
+                 that shouts as loudly as the command is not saying it will not run"
+            );
+            assert!(comment >= 7.0, "{name}: a comment is {comment:.2}:1 on a pane");
         }
     }
 
@@ -828,6 +874,7 @@ mod tests {
                 assert_eq!(worn.danger, palette.danger, "{name}/{mood}");
                 assert_eq!(worn.warn, palette.warn, "{name}/{mood}");
                 assert_eq!(worn.quoted, palette.quoted, "{name}/{mood}");
+                assert_eq!(worn.comment, palette.comment, "{name}/{mood}");
                 assert_eq!(worn.command, palette.command, "{name}/{mood}");
                 assert_eq!(worn.surface, palette.surface, "{name}/{mood}");
             }

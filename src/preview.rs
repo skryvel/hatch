@@ -158,7 +158,7 @@ fn staging_dir() -> PathBuf {
 
 /// Which sample window to draw.
 ///
-/// The four the README documents. Adding one is a variant here and an arm in
+/// The ones the README documents. Adding one is a variant here and an arm in
 /// [`build`], and the agreement test in [`crate::server`] then covers it
 /// without being edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -175,14 +175,29 @@ pub enum Scenario {
     /// A command longer and wider than the window: the stacked panes, and the
     /// line that says how much of it is out of sight.
     Long,
+    /// A command with comments in it, including one that contains every
+    /// separator hatch knows.
+    ///
+    /// Its own sample rather than a comment added to [`Scenario::Command`],
+    /// because the thing to look at is a comparison: the `&&` on the second
+    /// line starts a new segment and the `&&` inside the comment does not,
+    /// and both are on screen at once.
+    Comment,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 5] {
-        [Scenario::Command, Scenario::Chips, Scenario::Swap, Scenario::Root, Scenario::Long]
+    pub(crate) fn all() -> [Scenario; 6] {
+        [
+            Scenario::Command,
+            Scenario::Chips,
+            Scenario::Swap,
+            Scenario::Root,
+            Scenario::Long,
+            Scenario::Comment,
+        ]
     }
 }
 
@@ -375,6 +390,32 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Comment => {
+            let asked = Asked::Command {
+                // Three things to look at, in the order they appear. The
+                // first comment holds every separator hatch knows and not one
+                // of them starts a segment -- while the `&&` on the line
+                // below it does, two rows away, in the same colours. The `#`
+                // in `service#2` is not at the start of a word and is not a
+                // comment, which is the rule that keeps a URL fragment out of
+                // this. And the `$HOME` in the last comment is drawn without
+                // a value while the one above it has one, because the shell
+                // expands one of them and never reads the other.
+                command: COMMENT_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Build the service and install it".to_string(),
+                reason: "The notes in the command are the author's; hatch draws them as the \
+                         one part of the line that will not run."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
         Scenario::Chips => {
             let asked = Asked::Command {
                 // The second line is the whole argument for the rendering.
@@ -461,6 +502,23 @@ pub(crate) fn build(
     };
     Ok(sample)
 }
+
+/// The command behind [`Scenario::Comment`].
+///
+/// Written as a block rather than as one escaped line, because what the
+/// scenario is for is the comparison between two `&&`s two rows apart, and a
+/// sample whose line breaks are `\n` escapes in a source file is a sample
+/// nobody can see the shape of while they are editing it.
+///
+/// Every separator hatch knows is in the first comment -- `&&`, `||`, `;`,
+/// `|`, and a bare `&` for good measure -- and none of them is a boundary,
+/// because the shell stops reading at the `#`. The `#` in `service#2` is not
+/// at the start of a word, so it is not a comment; and `$HOME` appears twice,
+/// once where the shell will expand it and once where it will not.
+const COMMENT_SAMPLE: &str = "\
+cargo build --release   # then && rm -rf /tmp || true ; ls | wc & done
+cp target/release/service $HOME/bin/service#2 &&
+systemctl --user restart service   # leaves $HOME alone";
 
 /// The command behind [`Scenario::Long`].
 ///

@@ -314,6 +314,20 @@ never in place of it. A reader can use whichever they trust in the moment, and
 a disagreement between them is visible at a glance because the two sit at the
 same height.
 
+**A comment is not a command, and is not drawn as one.** A `#` at the start of
+a word begins a comment, and everything from it to the end of the line is drawn
+in a colour of its own, quieter than the text around it and still held above
+the contrast floor everything else in the window is held to. That is a
+correctness fix before it is a colour: hatch used to segment
+`echo hi   # then && rm -rf /tmp` at that `&&`, drawing a boundary the shell
+does not have, and a `$HOME` in a comment used to be resolved to a value the
+shell never substitutes. Neither happens now. The rules are bash's own, for the
+non-interactive shell hatch actually runs — `echo a#b`, `curl http://x/#frag`,
+`${#var}` and a `#` inside quotes are not comments — and where the scanner
+cannot tell, it finds no comment rather than inventing one, because a quiet
+colour over text that *will* run is the only way this could mislead a reader.
+`hatch preview comment` is a sample with one of each.
+
 **What is off the end of a pane is said in words.** Everything else here
 assumes the reader saw the text, and a pane showing twenty-four rows of a
 sixty-three-row command used to say so through its scroll bar alone — a bar
@@ -468,16 +482,19 @@ is the same violet as a clean one, and what happened is said in words.
 hatch preview                     # the window above, from your own config
 hatch preview root                # the root window: the ROOT block and the frame
 hatch preview long                # a command taller and wider than the window
+hatch preview comment             # comments, beside the separators they are not
 hatch preview --theme light       # the other palette, for this window only
 ```
 
-`hatch preview [command|chips|swap|root|long]` opens the real approval window
-on a sample request, reading the same config `hatch prompt` reads. It is how
-you see what your `font_size`, `theme` and `terminal` settings actually render
-as without having to get an agent to knock on the door. The `long` sample is
+`hatch preview [command|chips|swap|root|long|comment]` opens the real approval
+window on a sample request, reading the same config `hatch prompt` reads. It is
+how you see what your `font_size`, `theme` and `terminal` settings actually
+render as without having to get an agent to knock on the door. The `long` sample is
 the one that does not fit: it is there so the stacked panes, the strip that
 scrolls sideways and the line that says how many rows are out of sight are
-something you can look at rather than read about.
+something you can look at rather than read about. The `comment` sample puts an
+`&&` inside a comment two rows above an `&&` that really is a boundary, so the
+difference is something you can see rather than take on trust.
 
 **It cannot run anything.** There is no daemon behind a preview, and that is
 structural rather than circumstantial: the window's one way to act on a

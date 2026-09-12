@@ -69,6 +69,7 @@ proptest! {
                 Just("$HOME".to_string()),      // a reference that resolves
                 Just("${a}".to_string()),       // one whose value is a command
                 Just("$".to_string()),          // and one that is not a reference
+                Just("#".to_string()),          // which begins a comment, or does not
                 Just("'".to_string()),
                 Just("\"".to_string()),
             ], 1..20)
@@ -125,6 +126,7 @@ proptest! {
                 Just("\u{0301}".to_string()),   // combining acute
                 Just("$HOME".to_string()),      // a reference that resolves
                 Just("${b}".to_string()),       // to a value full of controls
+                Just("#".to_string()),          // which begins a comment, or does not
                 Just("'".to_string()),
                 Just("\"".to_string()),
             ], 1..20)
@@ -143,6 +145,25 @@ fn a_chip_cannot_cover_the_rest_of_the_command() {
     assert!(
         shown.contains("rm -rf /"),
         "the command must reach the reader's eye, not just survive round-tripping"
+    );
+}
+
+#[test]
+fn a_comment_cannot_swallow_what_runs_beside_it() {
+    // A comment is the one span drawn at less than full contrast, so the
+    // hazard it brings is the mirror of a chip's: not a label over text the
+    // reader never sees, but a quiet colour over text that is going to run.
+    // The text itself is untouched either way, and that is what is checked
+    // here -- the colour is the theme's business and the contrast floor is
+    // asserted there.
+    let command = "echo hi   # then && rm -rf /tmp";
+    let spans = render_command(command);
+    let shown: String = spans.iter().map(|s| s.display_text()).collect();
+    assert_eq!(shown, command, "every byte of a commented line reaches the reader's eye");
+    assert_eq!(unrender(&spans), command);
+    assert!(
+        spans.iter().all(|s| s.kind() != &SpanKind::Separator),
+        "and the `&&` inside the comment is not a boundary the shell has"
     );
 }
 

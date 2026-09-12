@@ -46,9 +46,9 @@
 //!
 //! # Where the model stops, and what it costs
 //!
-//! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting
-//! and backslash escaping around them. The rest of shell grammar is outside
-//! the model, and the cost falls in both directions.
+//! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting,
+//! backslash escaping and comments around them. The rest of shell grammar is
+//! outside the model, and the cost falls in both directions.
 //!
 //! ## Under-segmentation: structure the shell has that the screen does not
 //!
@@ -65,7 +65,6 @@
 //! A separator character that some unmodelled construct gives another meaning
 //! to is split on anyway. Each of these was checked against a real shell:
 //!
-//! * `echo a # b; c` — `; c` is inside a comment.
 //! * `echo $((1 || 0))` — arithmetic OR.
 //! * `[[ -n x || -n y ]]` — conditional OR.
 //! * `echo x >| out.txt` — `>|` is one redirection operator.
@@ -88,6 +87,44 @@
 //! Both lists are pinned by tests — `structure_outside_the_five_separators_
 //! is_left_unsegmented` and `over_segmentation_where_the_model_stops` — so a
 //! change in either direction has to be a deliberate one.
+//!
+//! # Comments, and why they are a correctness fix before they are a colour
+//!
+//! A comment is the one part of a command that will not run, and until it had
+//! a pass of its own every other pass read it as if it would.
+//! `echo hi   # then && rm -rf /tmp` was drawn with a segment boundary at
+//! that `&&` — a boundary the shell does not have — and this page listed the
+//! case among the ones where segmentation over-reports. So recognising a
+//! comment retires a claim hatch was making falsely; the colour falls out of
+//! it.
+//!
+//! The rules are bash's, and they are written out on [`Scan`] with the cases
+//! each of them decides. The short of it: a `#` begins a comment only at the
+//! start of a word — at the start of the input or after an unquoted
+//! metacharacter — never inside quotes, never after a backslash, and never in
+//! `$#` or `${#var}`; and it runs to the end of the line, the newline
+//! excluded. The shell in question is the non-interactive one, because
+//! commands reach it as `bash -c '<command>'`, where comments are on.
+//!
+//! One [`Scan`] answers it, exactly as one [`Scan`] answers quoting, and for
+//! the same reason: [`boundaries`], [`references`], [`quoted_strings`] and
+//! [`comments`] all have to agree about the same byte. What the scanner
+//! cannot see it is wrong about in the direction of finding *no* comment,
+//! which is the direction that leaves today's behaviour rather than hiding
+//! live text behind a quiet colour — see [`is_metacharacter`], which is
+//! deliberately stricter than the whitespace rule the rest of this module
+//! uses.
+//!
+//! The heredoc gap is the case worth naming. hatch does not know where a
+//! heredoc body starts, so it reads one as ordinary shell — that is recorded
+//! below, and this change does not fix it. It does move it, in both
+//! directions and unequally: a body line beginning with `#` now has its
+//! separators and its `$NAME`s left alone, which is right, and is drawn in
+//! the colour that says *this will not run*, which is a new claim about a
+//! line that is data on some command's stdin. That is the same direction the
+//! old rendering was already wrong in for the whole body, and no larger.
+//! `a_heredoc_body_line_that_starts_with_a_hash_is_drawn_as_a_comment` pins
+//! it so that changing it has to be deliberate.
 //!
 //! # Variables: the window resolves against the environment that will run
 //!
@@ -147,7 +184,6 @@
 //!
 //! * `$'a\'$HOME'` — ANSI-C quoting, where `\'` does not close the string, so
 //!   the whole of `a'$HOME` is literal.
-//! * `echo # $HOME` — inside a comment.
 //! * A heredoc with a quoted delimiter (`<<'EOF'`), whose body never expands.
 //!
 //! The cost is bounded the same way, and more tightly than for segmentation:
@@ -159,9 +195,9 @@
 //!
 //! # Highlighting: the same scanner again, and why not `syntect`
 //!
-//! [`highlight`] is the last pass. It marks the word that names what runs and
-//! the quoted strings, so the annotated pane shows *structure* rather than
-//! being the raw pane with line breaks in it.
+//! [`highlight`] is the last pass. It marks the word that names what runs,
+//! the quoted strings and the comments, so the annotated pane shows
+//! *structure* rather than being the raw pane with line breaks in it.
 //!
 //! The spec called for `syntect` with the bash grammar and this does not use
 //! it, for three reasons in descending order of weight:
@@ -185,17 +221,23 @@
 //!    ones ordinary.
 //!
 //! What it costs is scope, and the scope is deliberately small: the first
-//! word and the quoted strings, and nothing else. There is no keyword list,
-//! no builtin table and no flag rule, because each one is another colour, and
-//! a pane where six things are coloured is a pane where the two that matter
-//! are not.
+//! word, the quoted strings and the comments, and nothing else. There is no
+//! keyword list, no builtin table and no flag rule, because each one is
+//! another colour, and a pane where six things are coloured is a pane where
+//! the ones that matter are not. A comment earns its place on different
+//! grounds from the other two: it is not a hint about what the line means,
+//! it is the one region of the line that will not happen, and the pass that
+//! finds it is the pass that stops segmentation lying about the same bytes.
 //!
 //! **Highlighting is decoration and is never load-bearing.** Every span it
-//! marks is still drawn as its own text at full contrast — nothing is faded,
-//! nothing is replaced, nothing is hidden — so a reader who ignores colour
-//! entirely reads the same characters in the same order. The raw pane beside
-//! it carries no highlighting at all and remains the thing the approval
-//! covers. And the model gaps above are inherited unchanged: where the
+//! marks is still drawn as its own text — nothing is replaced and nothing is
+//! hidden — so a reader who ignores colour entirely reads the same characters
+//! in the same order. A comment is the one span drawn at less than full
+//! contrast, and it is the one span that will not run; it is held at the same
+//! legibility floor as the rest of the vocabulary, so quieter is a shade and
+//! not a disappearance. See [`crate::prompt_ui::theme`] for the two ratios.
+//! The raw pane beside it carries no highlighting at all and remains the
+//! thing the approval covers. And the model gaps above are inherited unchanged: where the
 //! scanner is wrong about a quote, the highlight is wrong in the same
 //! direction, and `highlighting_where_the_model_stops` pins those cases.
 
@@ -279,20 +321,82 @@ struct Scanned {
     /// True when the preceding character was a live backslash, so this one is
     /// literal: it neither changes `quoting` nor begins a token.
     escaped: bool,
+    /// True when this character is inside a comment, the `#` that opens one
+    /// included -- see [`Scan`] for the rules and for why the `#` is reported
+    /// as being inside the thing it starts, where an opening quote is
+    /// reported as being outside it.
+    ///
+    /// Nothing inside a comment is anything else: not a separator, not a
+    /// quote, not a reference, not a word. Every pass below asks this first.
+    comment: bool,
 }
 
-/// One left-to-right pass over the command, tracking quoting and one
-/// backslash-escape flag. No backtracking, no nesting, no recursion: the
-/// input is agent-controlled and this runs before a human is asked to approve
-/// anything, so it is bounded by the length of the string and nothing else.
+/// True for one of bash's metacharacters: a character that, unquoted,
+/// separates words -- so the character after it begins a new one.
 ///
-/// This is shared state, not a shared convenience. Two passes ask questions
-/// of the same 25-line state machine — [`boundaries`] asks *is this byte a
-/// command separator?* and [`references`] asks *does this `$` expand?* — and
-/// the two answers have to come from one model or they can disagree with each
-/// other about the same character. `'a; $HOME'` is the case that shows why:
-/// both questions must answer no, for the same reason, and a second
-/// hand-rolled quote tracker is exactly how one of them comes to answer yes.
+/// `| & ; ( ) < >`, space, tab and newline, which is the manual's list. It is
+/// here for one question only: whether a `#` is at the start of a word, which
+/// is the whole of what makes it a comment. It is not segmentation. `(`, `)`,
+/// `<` and `>` are outside the five separators and stay outside them;
+/// recognising them here says nothing about where a command begins or ends,
+/// only about where a word does.
+///
+/// Whitespace is the three ASCII characters the shell names and not
+/// [`char::is_whitespace`], which is Unicode-aware and would make a
+/// non-breaking space a word break. The looser predicate is what
+/// [`is_word_break`] uses, where being wrong costs a highlight; being wrong
+/// here would cost a *comment*, and a comment invented over text that is
+/// going to run is the one error in this module that hides something from a
+/// reader rather than merely mislabelling it. So this is the conservative
+/// list, and where it is wrong it is wrong in the direction of finding no
+/// comment at all.
+fn is_metacharacter(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '|' | '&' | ';' | '(' | ')' | '<' | '>')
+}
+
+/// One left-to-right pass over the command, tracking quoting, one
+/// backslash-escape flag and whether it is inside a comment. No backtracking,
+/// no nesting, no recursion: the input is agent-controlled and this runs
+/// before a human is asked to approve anything, so it is bounded by the
+/// length of the string and nothing else.
+///
+/// This is shared state, not a shared convenience. Four passes ask questions
+/// of the same state machine — [`boundaries`] asks *is this byte a command
+/// separator?*, [`references`] asks *does this `$` expand?*, [`comments`]
+/// asks *does this run?* and [`quoted_strings`] asks *where does this string
+/// end?* — and the answers have to come from one model or they can disagree
+/// with each other about the same character. `'a; $HOME'` is the case that
+/// shows why: both of the first two questions must answer no, for the same
+/// reason, and a second hand-rolled quote tracker is exactly how one of them
+/// comes to answer yes. A comment is the same argument again, one level up:
+/// it was the pass that nobody had written, so every other pass answered
+/// `echo hi # then && rm -rf /tmp` as if the `&&` were a boundary.
+///
+/// # Where a comment begins
+///
+/// These are bash's rules, read off its manual and checked against a real
+/// shell. Commands reach hatch's shell as `bash -c '<command>'`, which is
+/// **non-interactive**, and comments are enabled there. (Interactive bash
+/// without `interactive_comments` is the case where they are not, and it is
+/// not the case here.)
+///
+/// * A `#` begins a comment only at the **start of a word**: at the start of
+///   the input, or after an unquoted metacharacter — whitespace, `|`, `&`,
+///   `;`, `(`, `)`, `<`, `>`. So `echo a#b`, `curl http://x/#frag` and
+///   `echo 'q'#b` contain no comment, and `echo a;#b`, `echo a|#b` and
+///   `echo x >#f` all do. [`is_metacharacter`] is that rule.
+/// * It is not a comment inside quotes. `'…'` and `"…"` both hold it, and so
+///   does `$'…'` — which this scanner reads as an ordinary `'…'`, and which
+///   for this question is the same answer.
+/// * `${#var}` and `$#` are not comments: the `#` follows a `{` or a `$`, and
+///   neither is a metacharacter.
+/// * An escaped `#` is not a comment: `echo \#b` prints `#b`.
+/// * A comment runs to the end of the line. The newline is **not** part of
+///   it, and still ends the segment it ends.
+///
+/// A heredoc body is not shell and hatch does not know where one starts, so a
+/// body line beginning with `#` is drawn as a comment though it is data — see
+/// the module docs, which say what that costs and in which direction.
 ///
 /// # Backslash inside double quotes
 ///
@@ -311,6 +415,11 @@ struct Scan<'a> {
     cursor: usize,
     quoting: Quoting,
     escaped: bool,
+    comment: bool,
+    /// Whether the next character would be the first of a word. True at the
+    /// start of the input and after every unquoted metacharacter; see
+    /// [`is_metacharacter`], which is the whole of the rule.
+    word_start: bool,
 }
 
 fn scan(command: &str) -> Scan<'_> {
@@ -319,6 +428,10 @@ fn scan(command: &str) -> Scan<'_> {
         cursor: 0,
         quoting: Quoting::Normal,
         escaped: false,
+        comment: false,
+        // The very first character of the command is the first character of
+        // a word, so `#ls` is a comment and the whole command is inert.
+        word_start: true,
     }
 }
 
@@ -327,17 +440,43 @@ impl Iterator for Scan<'_> {
 
     fn next(&mut self) -> Option<Scanned> {
         let ch = self.command[self.cursor..].chars().next()?;
+        // Both edges of a comment are crossed before the character is
+        // reported, so each of them belongs to the state it creates: the `#`
+        // is the first character of the comment, and the newline is the first
+        // character that is not. A quote is reported the other way round --
+        // see `Scanned::quoting` -- because a quote is a delimiter a caller
+        // has to be able to recognise, and the `#` is not: everything from it
+        // to the end of the line is the same inert run, the `#` included.
+        if self.comment {
+            if ch == '\n' {
+                self.comment = false;
+            }
+        } else if ch == '#'
+            && !self.escaped
+            && self.quoting == Quoting::Normal
+            && self.word_start
+        {
+            self.comment = true;
+        }
+
         let current = Scanned {
             offset: self.cursor,
             ch,
             quoting: self.quoting,
             escaped: self.escaped,
+            comment: self.comment,
         };
 
-        if self.escaped {
-            self.escaped = false;
-        } else {
-            match self.quoting {
+        match (current.comment, self.escaped) {
+            // A comment is not shell. A quote in one opens nothing and a
+            // backslash in one escapes nothing, so the state machine simply
+            // stops for the rest of the line: the quoting the scanner was in
+            // when the `#` arrived is the quoting it is still in when the
+            // newline ends it, which is always `Normal`, because a `#` inside
+            // quotes is not a comment in the first place.
+            (true, _) => {}
+            (false, true) => self.escaped = false,
+            (false, false) => match self.quoting {
                 Quoting::Single => {
                     if ch == '\'' {
                         self.quoting = Quoting::Normal;
@@ -354,8 +493,16 @@ impl Iterator for Scan<'_> {
                     '"' => self.quoting = Quoting::Double,
                     _ => {}
                 },
-            }
+            },
         }
+
+        // What the *next* character would be the start of. A metacharacter
+        // that is quoted, escaped or inside a comment is just a character and
+        // ends no word.
+        self.word_start = !current.comment
+            && !current.escaped
+            && current.quoting == Quoting::Normal
+            && is_metacharacter(ch);
 
         // `len_utf8` on the character the cursor is actually at, so the cursor
         // never lands inside one and no offset this yields can split a
@@ -374,7 +521,11 @@ fn boundaries(command: &str) -> Vec<Boundary> {
     let mut consumed = 0;
 
     for c in scan(command) {
-        if c.offset < consumed || c.escaped || c.quoting != Quoting::Normal {
+        // A comment first, because nothing in one is a boundary: the `&&` in
+        // `echo hi # then && rm -rf /tmp` is text, and a break drawn there
+        // claims a boundary the shell does not have. The newline that ends a
+        // comment is reported outside it and still lands below.
+        if c.comment || c.offset < consumed || c.escaped || c.quoting != Quoting::Normal {
             continue;
         }
         if c.ch == '\n' {
@@ -443,12 +594,24 @@ fn dollar_extent(rest: &str) -> usize {
 /// literal `$`. Annotating those would tell the reader a substitution happens
 /// where none does — the same class of lie as splitting `echo 'a; b'` in two,
 /// and the reason both questions are asked of one [`Scan`].
+///
+/// A comment is the same answer for a different reason: the shell does not
+/// expand `$HOME` in `echo # $HOME` because it does not read the line at all.
+/// Resolving it on screen would put this machine's home directory beside a
+/// reference that is never substituted — a small lie, and one told in the
+/// window's most authoritative voice, which is the value it promises comes
+/// out of the environment the command will really run in.
 fn references(command: &str) -> Vec<Range<usize>> {
     let mut found = Vec::new();
     let mut consumed = 0;
 
     for c in scan(command) {
-        if c.offset < consumed || c.ch != '$' || c.escaped || c.quoting == Quoting::Single {
+        if c.comment
+            || c.offset < consumed
+            || c.ch != '$'
+            || c.escaped
+            || c.quoting == Quoting::Single
+        {
             continue;
         }
         let rest = &command[c.offset..];
@@ -748,14 +911,22 @@ fn segments(command: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// True where a word ends: unescaped whitespace outside quotes.
+/// True where a word ends: unescaped whitespace outside quotes, or anywhere
+/// inside a comment.
 ///
 /// Quoting is the whole of it, and it is the scanner's answer rather than a
 /// second one. `echo "a b"` is two words to the shell, so it has to be two
 /// words here — a highlight that called `"a` a word would draw a boundary the
 /// shell does not have.
+///
+/// A comment has no words in it, so every character of one breaks: `a; # ls`
+/// has a command word in its first segment and none in its second. Saying it
+/// this way rather than with a check in [`command_word`] is what keeps a
+/// `Command` region from ever overlapping a `Comment` one — two regions that
+/// overlap have no honest drawing — and it is the same move [`claimable`]
+/// makes for a quoted word.
 fn is_word_break(c: &Scanned) -> bool {
-    !c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace()
+    c.comment || (!c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace())
 }
 
 /// True for `NAME=…`, the form a leading word takes when it is an assignment
@@ -848,7 +1019,11 @@ fn quoted_strings(command: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut open: Option<usize> = None;
     for c in scan(command) {
-        if c.escaped {
+        // A quote inside a comment opens nothing, because the shell never
+        // reads it. Without this, `echo # it's fine` would open a string at
+        // the apostrophe and run it to the end of the command, and the
+        // highlight would cross a comment it has no business being inside.
+        if c.escaped || c.comment {
             continue;
         }
         match (open, c.quoting, c.ch) {
@@ -866,6 +1041,33 @@ fn quoted_strings(command: &str) -> Vec<Range<usize>> {
     out
 }
 
+/// The byte range of every comment in `command`, the `#` included and the
+/// newline excluded, in source order.
+///
+/// Read straight off the scanner's own flag rather than searched for a second
+/// time: [`Scan`] has to know where a comment is anyway, because [`boundaries`]
+/// and [`references`] both have to stop at one, and a second definition here
+/// is how the colour on screen comes to disagree with the boundaries drawn
+/// under it.
+///
+/// A run rather than a search for the terminating newline: the flag is false
+/// on the newline itself — see [`Scan`] — so the run ends exactly where the
+/// comment does, with no offset arithmetic to get wrong at either end.
+fn comments(command: &str) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for c in scan(command) {
+        if !c.comment {
+            continue;
+        }
+        let end = c.offset + c.ch.len_utf8();
+        match out.last_mut() {
+            Some(last) if last.end == c.offset => last.end = end,
+            _ => out.push(c.offset..end),
+        }
+    }
+    out
+}
+
 /// Every region [`highlight`] wants to mark, in source order and never
 /// overlapping.
 fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
@@ -877,6 +1079,7 @@ fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
         .map(|word| (word, SpanKind::Command))
         .collect();
     out.extend(quoted_strings(command).into_iter().map(|range| (range, SpanKind::Quoted)));
+    out.extend(comments(command).into_iter().map(|range| (range, SpanKind::Comment)));
     out.sort_by_key(|(range, _)| range.start);
     out
 }
@@ -1416,7 +1619,6 @@ mod tests {
         // A separator character that some unmodelled construct gives another
         // meaning to is split on anyway. Each case was checked against a real
         // shell; this test is what stops the list drifting from the docs.
-        assert_eq!(separators(&render_command("echo a # b; c")), vec![";"], "comment");
         assert_eq!(separators(&render_command("echo $((1 || 0))")), vec!["||"], "arithmetic");
         assert_eq!(separators(&render_command("[[ -n x || -n y ]]")), vec!["||"], "conditional");
         assert_eq!(separators(&render_command("echo x >| out.txt")), vec!["|"], "redirection");
@@ -1434,7 +1636,7 @@ mod tests {
         // The reason this is a docs bug and not a fidelity bug: what is wrong
         // is the layout, and layout is metadata. Every byte is still on
         // screen, drawn as itself.
-        for command in ["echo a # b; c", "case x in a) echo 1;; esac", "echo $((1 || 0))"] {
+        for command in [r"$'a\'b; c'", "case x in a) echo 1;; esac", "echo $((1 || 0))"] {
             let spans = render_command(command);
             assert_eq!(unrender(&spans), command);
             let shown: String = spans.iter().map(|s| s.display_text()).collect();
@@ -1698,6 +1900,10 @@ mod tests {
         of_kind(spans, &SpanKind::Quoted)
     }
 
+    fn comments(spans: &Spans) -> Vec<&str> {
+        of_kind(spans, &SpanKind::Comment)
+    }
+
     #[test]
     fn the_first_word_of_a_segment_is_the_one_that_names_what_runs() {
         assert_eq!(commands(&render_command("ls -la /etc")), vec!["ls"]);
@@ -1822,10 +2028,8 @@ mod tests {
         // the same gaps, and the cost is bounded the same way -- the text is
         // still on screen, drawn as itself.
         //
-        // A comment's `#` is just a word, so the word after `;` inside one is
-        // marked as a command that will never run; an ANSI-C string's `$` is
-        // outside the region the ordinary single-quote rule finds.
-        assert_eq!(commands(&render_command("echo a # b; c")), vec!["echo", "c"], "comment");
+        // An ANSI-C string's `$` is outside the region the ordinary
+        // single-quote rule finds.
         assert_eq!(quotes(&render_command("echo $'a b'")), vec!["'a b'"], "ANSI-C quoting");
         assert_eq!(
             commands(&render_command("cat <<EOF\nls\nEOF")),
@@ -1836,13 +2040,181 @@ mod tests {
         // And in every one of them the text is untouched. The two without a
         // newline in them are checked character for character as well: what
         // the highlight got wrong is a colour, and nothing else moved.
-        for command in ["echo a # b; c", "echo $'a b'"] {
+        for command in [r"echo $'a\'b'", "echo $'a b'"] {
             let spans = render_command(command);
             assert_eq!(unrender(&spans), command);
             let shown: String = spans.iter().map(|s| s.display_text()).collect();
             assert_eq!(shown, command, "{command:?} is not drawn as itself throughout");
         }
         assert_eq!(unrender(&render_command("cat <<EOF\nls\nEOF")), "cat <<EOF\nls\nEOF");
+    }
+
+
+    // --- comments: the part of the line that will not run -----------------
+
+    #[test]
+    fn a_comment_contains_no_separator_however_many_it_is_written_with() {
+        // The correctness half, and the reason this is not only a colour.
+        // Every separator hatch knows, inside one comment: none of them is a
+        // boundary, because the shell never reads any of them. The old
+        // rendering drew a segment break at that `&&` and told the reader
+        // the line ran something after it.
+        let command = "echo hi   # then && rm -rf /tmp || true ; ls | wc & done";
+        let spans = render_command(command);
+
+        assert!(separators(&spans).is_empty(), "a comment is not a command line");
+        assert!(!spans.iter().any(Span::break_before), "and it is not laid out as one");
+        assert_eq!(
+            comments(&spans),
+            vec!["# then && rm -rf /tmp || true ; ls | wc & done"],
+            "the comment is one run, from its own `#` to the end of the line"
+        );
+        assert_eq!(commands(&spans), vec!["echo"], "the only word that runs");
+        assert_eq!(unrender(&spans), command);
+    }
+
+    #[test]
+    fn a_comment_begins_only_at_the_start_of_a_word() {
+        // Bash's own rule, checked against bash: a `#` is a comment at the
+        // start of the input or after an unquoted metacharacter, and is an
+        // ordinary character everywhere else. The second list is the one that
+        // matters -- a comment invented over text that is going to run is the
+        // only error here that hides something rather than mislabelling it.
+        for (command, comment) in [
+            ("#ls", "#ls"),
+            ("ls #x", "#x"),
+            ("ls\t#x", "#x"),
+            ("echo a;#b", "#b"),
+            ("echo a|#b", "#b"),
+            ("echo a&&#b", "#b"),
+            ("echo x >#f", "#f"),
+            ("(echo a)#b", "#b"),
+        ] {
+            assert_eq!(comments(&render_command(command)), vec![comment], "{command:?}");
+        }
+        for command in [
+            "echo a#b",
+            "curl http://x/#frag",
+            r"echo \#b",
+            "echo $#",
+            "echo ${#PATH}",
+            "echo 'q'#b",
+            "echo \"q\"#b",
+        ] {
+            assert!(
+                comments(&render_command(command)).is_empty(),
+                "{command:?} has no comment in it and the shell agrees"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_is_text_and_the_quotes_still_close() {
+        // Both halves: the `#` starts nothing, and the scanner is still in
+        // the string afterwards -- a comment that swallowed the closing quote
+        // would take the rest of the command with it.
+        for command in ["echo 'a # b'", "echo \"a # b\""] {
+            let spans = render_command(command);
+            assert!(comments(&spans).is_empty(), "{command:?}");
+            assert_eq!(quotes(&spans).len(), 1, "{command:?}: the string did not close");
+        }
+        // And a separator after the string is still found, which is the proof
+        // that the scanner came back out of it.
+        assert_eq!(separators(&render_command("echo 'a # b'; ls")), vec![";"]);
+    }
+
+    #[test]
+    fn a_comment_ends_at_the_newline_and_the_newline_still_ends_the_segment() {
+        // The newline is not part of the comment -- it is the character that
+        // is not -- and it is still a boundary, so the line after a comment
+        // is a segment of its own with its own command word in it.
+        let command = "echo hi # and && this\nrm -rf /tmp";
+        let spans = render_command(command);
+
+        assert_eq!(comments(&spans), vec!["# and && this"], "the newline was eaten");
+        assert_eq!(chips(&spans), vec!['\n'], "and it is still drawn as the character it is");
+        assert_eq!(commands(&spans), vec!["echo", "rm"], "the second line is a second segment");
+        assert_eq!(unrender(&spans), command);
+    }
+
+    #[test]
+    fn a_reference_inside_a_comment_is_left_plain() {
+        // The shell does not expand `$HOME` in a comment because it does not
+        // read the line at all, so a value beside it would be this machine's
+        // home directory dressed as something the command is about to do.
+        let env = env(&[("HOME", "/home/user")]);
+        let spans = rendered("echo $HOME # not $HOME", &env);
+
+        assert_eq!(
+            variables(&spans),
+            vec![("$HOME", Some("/home/user"))],
+            "the live reference lost its value, or the dead one gained one"
+        );
+        assert_eq!(comments(&spans), vec!["# not $HOME"]);
+        assert_eq!(unrender(&spans), "echo $HOME # not $HOME");
+    }
+
+    #[test]
+    fn a_comment_has_no_command_word_and_no_string_in_it() {
+        // Two regions that overlapped would have no honest drawing, so a
+        // comment is the whole of what is marked over its own text: the word
+        // after the `#` is not a command, and an apostrophe in it opens no
+        // string that would then run to the end of the line.
+        let spans = render_command("ls; # it's rm -rf / that would hurt");
+        assert_eq!(commands(&spans), vec!["ls"]);
+        assert!(quotes(&spans).is_empty(), "an apostrophe in a comment opened a string");
+        assert_eq!(comments(&spans), vec!["# it's rm -rf / that would hurt"]);
+        assert_eq!(separators(&spans), vec![";"], "the separator before it is still one");
+    }
+
+    #[test]
+    fn a_comment_is_drawn_as_its_own_text_and_the_spans_still_tile_it() {
+        // The bound on every decoration in this module, restated for the one
+        // kind that is drawn at less than full contrast: quieter is a colour,
+        // not an edit. Nothing is replaced, and a chip inside a comment is
+        // still a chip -- the classifier ran before the highlight did, and a
+        // bidi override in a comment reorders the line it sits on just as
+        // well as one anywhere else.
+        let command = "ls # \u{202E}gnp.exe";
+        let spans = render_command(command);
+
+        assert_eq!(unrender(&spans), command);
+        assert!(spans.covers_source());
+        let shown: String = spans.iter().map(|s| s.display_text()).collect();
+        assert_eq!(shown, "ls # [RLO]gnp.exe", "the chip is the only substitution");
+        assert_eq!(chips(&spans), vec!['\u{202E}'], "a comment swallowed a chip");
+    }
+
+    #[test]
+    fn a_heredoc_body_line_that_starts_with_a_hash_is_drawn_as_a_comment() {
+        // A known gap, pinned so that changing it is deliberate. hatch does
+        // not know where a heredoc body starts, so it reads one as ordinary
+        // shell -- and a body line beginning with `#` is therefore drawn as a
+        // comment though it is data on the command's stdin.
+        //
+        // It moves in both directions and the sizes are not equal. What it
+        // buys is that the separators and references on that line stop being
+        // reported: a `&&` in the body is not a boundary and a `$HOME` in a
+        // quoted heredoc does not expand, and both of those were wrong
+        // before. What it costs is a colour saying *this will not run* over a
+        // line that will be read by something -- which is the same direction
+        // the old rendering was wrong in for the whole body, and no larger.
+        let env = env(&[("HOME", "/home/user")]);
+        let command = "cat <<'EOF'\n# $HOME && ls\nEOF";
+        let spans = rendered(command, &env);
+
+        assert_eq!(comments(&spans), vec!["# $HOME && ls"]);
+        assert!(separators(&spans).is_empty(), "the body's `&&` is not a boundary");
+        assert!(variables(&spans).is_empty(), "and a quoted heredoc expands nothing");
+        assert_eq!(unrender(&spans), command);
+    }
+
+    #[test]
+    fn a_command_that_is_nothing_but_a_comment_runs_nothing_and_says_so() {
+        let spans = render_command("# rm -rf / ; echo done");
+        assert_eq!(comments(&spans), vec!["# rm -rf / ; echo done"]);
+        assert!(commands(&spans).is_empty(), "nothing in this line is a command");
+        assert!(separators(&spans).is_empty());
     }
 
     #[test]
@@ -1988,7 +2360,6 @@ mod tests {
         let env = env(&[("HOME", "/home/user")]);
         for (command, why) in [
             (r"echo $'a\'$HOME'", "ANSI-C quoting: `\\'` does not close the string"),
-            ("echo # $HOME", "inside a comment"),
             ("cat <<'EOF'\n$HOME\nEOF", "a quoted heredoc delimiter never expands"),
         ] {
             let spans = rendered(command, &env);

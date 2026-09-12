@@ -2511,6 +2511,15 @@ fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text
                 ..plain.clone()
             },
             SpanKind::Quoted => egui::TextFormat { color: palette.quoted, ..plain.clone() },
+            // The one span this window draws at less than full contrast, and
+            // the only one where that is not the historical bug: a comment
+            // does not run, so a reader who skips it has skipped nothing that
+            // will happen. It is a colour and a luminance and nothing else --
+            // no box, no fade to nothing, no italic. Italic in this window
+            // means *hatch is talking*, and the caption over the pane says as
+            // much; a comment is the command's own text, so it is drawn with
+            // the same tools the other two highlights are.
+            SpanKind::Comment => egui::TextFormat { color: palette.comment, ..plain.clone() },
             SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
         job.append(&span.display_text(), 0.0, format);
@@ -4425,6 +4434,7 @@ mod tests {
             warn: Color32::from_rgb(4, 0, 0),
             command: Color32::from_rgb(5, 0, 0),
             quoted: Color32::from_rgb(6, 0, 0),
+            comment: Color32::from_rgb(19, 0, 0),
             chip_bg: Color32::from_rgb(7, 0, 0),
             separator_bg: Color32::from_rgb(8, 0, 0),
             value_bg: Color32::from_rgb(9, 0, 0),
@@ -4576,6 +4586,32 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_is_drawn_in_the_one_colour_that_says_this_will_not_run() {
+        // A colour of its own and not the grey hatch talks in: a comment is
+        // the command's own text, written by whoever wrote the command, and
+        // the reader is being told it will not run rather than that hatch
+        // wrote it. Nothing else about it changes -- the box, the lean and
+        // the substitution are all somebody else's vocabulary.
+        let palette = a_palette();
+        let command = "make -j4   # then && rm -rf /tmp";
+        let spans = render_command(command, &BTreeMap::new());
+        let job = job_of(&spans);
+        let comment = command.find('#').expect("the sample has a comment in it");
+
+        assert_eq!(job.text, command, "the comment changed the text");
+        assert_eq!(format_at(&job, comment).color, palette.comment, "the `#` is not marked");
+        assert_eq!(
+            format_at(&job, command.len() - 1).color,
+            palette.comment,
+            "the comment stops short of the end of the line"
+        );
+        assert_eq!(format_at(&job, 0).color, palette.command, "and `make` still runs");
+        assert_eq!(format_at(&job, comment).background, Color32::TRANSPARENT);
+        assert!(!format_at(&job, comment).italics, "italic in this window is hatch's own voice");
+        assert_ne!(palette.comment, palette.quiet, "a comment is not hatch talking");
+    }
+
+    #[test]
     fn highlighting_only_ever_adds_contrast() {
         // The rule that keeps decoration from becoming load-bearing: a
         // highlighted span is drawn as its own text, in the pane's own font,
@@ -4609,6 +4645,7 @@ mod tests {
                 ("warn", palette.warn),
                 ("command", palette.command),
                 ("quoted", palette.quoted),
+                ("comment", palette.comment),
             ];
             for (i, (a, colour)) in named.iter().enumerate() {
                 for (b, other) in &named[i + 1..] {
