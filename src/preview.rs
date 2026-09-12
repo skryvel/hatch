@@ -686,6 +686,15 @@ pub fn run(scenario: Scenario, shot: Option<PathBuf>, theme: Option<Theme>) -> a
 
     let sample = build(scenario, &config, elevation.as_ref(), &staging_dir())?;
 
+    // Before a window is opened rather than after it has been drawn. A
+    // screenshot that fails on the write is a window somebody watched appear
+    // and disappear for nothing, and the commonest way for it to fail is a
+    // directory that is not there.
+    if let Some(dir) = shot.as_deref().and_then(Path::parent).filter(|d| !d.as_os_str().is_empty())
+    {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+
     let failure: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
     let captured: Arc<OnceLock<PathBuf>> = Arc::new(OnceLock::new());
     let (font_size, theme) = (config.font_size_points(), palette(config.theme, theme));
