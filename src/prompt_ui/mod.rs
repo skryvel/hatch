@@ -30,6 +30,22 @@
 //!
 //! # After the command
 //!
+//! There are three things this window can do once it has been answered, and
+//! which one it does is settled before the answer leaves:
+//!
+//! * **Go.** The reader ticked "Close when I decide" — see [`CLOSE_LABEL`] —
+//!   so the approval joins the five verdicts that always ended the window on
+//!   the frame that carried them. The command is authorised and runs on with
+//!   nothing watching it, which is a state an approved command could always
+//!   reach; the difference is that the frame just sent says the window meant
+//!   to. Nothing downstream may guess at that, because a deliberate close and
+//!   a crash are indistinguishable from the daemon's side and are different
+//!   facts in the audit log: see [`crate::audit::PromptEnd`].
+//! * **Stay and show the result.** The reader ticked the stream box, so the
+//!   window lingers; the rest of this section is about that.
+//! * **Stay until the outcome.** Neither box, so the window is a running
+//!   indicator with a Kill button and closes on [`DaemonMsg::Finished`].
+//!
 //! A window whose reader ticked "Stream output to this window" does not close
 //! on [`DaemonMsg::Finished`]. The whole life of an ordinary command is
 //! milliseconds, so closing there took the output away at the instant it
@@ -2694,7 +2710,8 @@ mod tests {
         // opt-in. Defaulting it on means every approval silently chooses the
         // mode the reader never picked.
         let (_tx, rx) = std::sync::mpsc::channel();
-        let app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         assert!(!app.stream, "streaming is opted into, not defaulted on");
     }
 
@@ -3888,7 +3905,8 @@ mod tests {
     /// A window awaiting a verdict on `command`.
     fn a_window_showing(command: &str) -> PromptApp {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command(command, &BTreeMap::from([("HOME".into(), "/home/u".into())])),
@@ -4022,7 +4040,8 @@ mod tests {
     #[test]
     fn the_window_draws_the_clock_and_the_queue_behind_it() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(45);
         request.queue_depth = 2;
         app.state.handle(DaemonMsg::Request(request));
@@ -4058,7 +4077,8 @@ mod tests {
     #[test]
     fn the_window_says_who_it_runs_as_and_where() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("id", &BTreeMap::new()),
@@ -4121,7 +4141,8 @@ mod tests {
     #[test]
     fn a_danger_marker_is_drawn_where_the_reader_will_see_it() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("rm -rf /", &BTreeMap::new()),
@@ -4143,7 +4164,8 @@ mod tests {
     #[test]
     fn a_swap_never_draws_an_empty_pane_that_reads_as_nothing_changing() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/conf.toml"),
@@ -4170,7 +4192,8 @@ mod tests {
     #[test]
     fn a_command_in_its_own_terminal_says_why_it_cannot_be_streamed_here() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::command(
             &render_command("vim /etc/hosts", &BTreeMap::new()),
@@ -4263,7 +4286,8 @@ mod tests {
     #[test]
     fn a_swap_offers_no_checkbox_for_output_it_will_never_produce() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/f"),
@@ -4883,7 +4907,8 @@ mod tests {
         // frame around it would be a second claim about the same thing in a
         // second vocabulary.
         let (_tx, rx) = std::sync::mpsc::channel();
-        let mut app = PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
         request.payload = Payload::swap(
             PathBuf::from("/tmp/conf.toml"),

@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! let mut session = prompter.prompt(request, queue.subscribe_depth()).await?;
-//! let Ok(Verdict::Approve { stream, note }) = session.verdict().await else { .. };
+//! let Ok(Verdict::Approve { stream, .. }) = session.verdict().await else { .. };
 //! // The approval is now held; the window is a running indicator.
 //! let outbox = session.outbox();
 //! let (tx, rx) = mpsc::channel(..);
@@ -269,7 +269,13 @@ impl PromptSession {
     /// Before a verdict this is the same news as [`PromptGone`] and resolves to
     /// a denial. After an approval it is not: the command is authorised and
     /// runs to completion, and this only records that the Kill affordance and
-    /// the live view are gone — `prompt_died_after_approve` in the audit log.
+    /// the live view are gone.
+    ///
+    /// It does not say **why** they are gone, and cannot: a window that closed
+    /// because its reader ticked "Close when I decide" and one that crashed
+    /// look identical from here. The verdict is what separates them — see
+    /// `closing` on [`crate::protocol::Verdict::Approve`] — and
+    /// [`crate::audit::PromptEnd`] is where the difference is kept.
     pub fn window_gone(&self) -> CancellationToken {
         self.gone.clone()
     }
