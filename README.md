@@ -347,6 +347,35 @@ time and a Kill button, and the output pane if streaming was ticked. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops.
 
+**Unless you have told it not to.** Tick **Close when I decide**, left of the
+buttons, and the window goes as soon as you answer instead of staying to show
+the run — because the point of answering is getting back to what you were
+doing, and a window you have to dismiss every time is a window you alt-tab away
+from every time. It is a preference rather than a per-request tick: it is
+remembered in `prefs.toml`, and the next window opens with it already set.
+
+The control says what it costs, because it costs something real: **the Kill
+button goes with it**. Nothing can stop an approved command from a window that
+is not there, so `exec_timeout_secs` becomes the only backstop — and a terminal
+run, which deliberately has no execution deadline at all, has only the terminal
+itself. That is a choice worth making once rather than a reason to refuse it.
+
+It is named for deciding and not for approving because five of the six verdicts
+already closed the window on the spot; approving is the only one it changes.
+And it loses to **Stream output to this window**: streaming exists to be
+watched, so ticking it greys the close box out and says why, without disturbing
+the preference — untick Stream and it comes straight back. A terminal run is
+not a conflict at all. The terminal is a window of its own that you are about
+to be sitting in front of, and hatch's window standing behind it is showing you
+nothing.
+
+In the audit log a window that was asked to go is recorded as `dismissed` and a
+window that died unasked as `died`, and only the second prints
+`(prompt died while it ran)`. They used to be one boolean, which would have put
+that suffix under every approved command belonging to anyone who ticked the
+box — and the one line that means something went wrong would have become the
+line that appears on all of them.
+
 **Asking, running and finished do not look alike.** The ground the panels are
 drawn on changes with what the window is doing — grey while it has a question
 on it, blue while the command runs, violet once it is over — so a glance says
@@ -375,7 +404,10 @@ decision is to write a verdict down a channel, and the only channel a preview
 ever gives it discards what it is handed. Pressing Approve closes the window
 and runs nothing. The one thing a preview writes to disk is its own sample file
 under `$TMPDIR/hatch-preview`, because a file replacement is planned against a
-file that exists.
+file that exists. It reads `prefs.toml` so the sample is drawn with the
+preferences a real request would be drawn with, and never writes it: a
+documentation tool that changed your settings would be a surprising thing for a
+screenshot to do.
 
 Each sample is built through the calls the daemon makes — the same renderer,
 the same payload constructors, the same plan — and handed to the same window
@@ -572,7 +604,11 @@ is not a failure to retry; something may have run. Check the machine.
 **The config file is trusted.** It is created 0600 and re-tightened on every
 load, but anything that can write it can change the child `PATH`, add
 `denylist_extra` entries or remove them, and read the bearer token. `swap_file`
-refuses to touch it; `run_command` is shown to you in full.
+refuses to touch it; `run_command` is shown to you in full. `prefs.toml` is
+trusted on much narrower terms — it holds display choices and no secret — but
+it is worth knowing that something able to write it could set
+`close_on_decide` and take the Kill button off every window. Both files sit in
+directories held at 0700, and `swap_file` refuses both.
 
 ## Configuration
 
@@ -689,12 +725,40 @@ buttons.](media/approval-command-light.png)
 writing anything: the config file says what it said before, and the next real
 request is drawn in whatever that is.
 
+### `prefs.toml`, which hatch writes and you do not
+
+`$XDG_STATE_HOME/hatch/prefs.toml`, by default
+`~/.local/state/hatch/prefs.toml`. One file, one job: the display choices the
+window writes down because you ticked them in it. Today that is
+`close_on_decide`, and there is nothing to hand-edit — ticking the box in the
+window is how it is set.
+
+It is a separate file from `config.toml`, in a separate directory, and the
+separation is the point rather than tidiness. `config.toml` is what you wrote
+and hatch reads: it holds your comments, your key order and your token, and
+nothing has ever rewritten it but the one line that puts a generated token in
+it on a first run. A checkbox that persists has to be written every time it is
+clicked, and doing that to `config.toml` would eventually eat a comment or
+reorder your keys. So what you write and what hatch writes down live apart,
+which is also what the XDG spec asks for: state that persists between restarts
+belongs under the state directory.
+
+Nothing about it can stop a window opening. A missing, unreadable or malformed
+`prefs.toml` is a window with the preference at its default — refusing to open
+one would resolve as a denial of a request nobody was ever shown — and the next
+tick rewrites the file. Several windows can be open at once and two of them
+saving in the same instant is ordinary; each write lands by renaming a complete
+file over the old one, so a reader sees one or the other and never a torn one,
+and the later click wins.
+
+### Where everything lives
+
 Three directories, in three places, following the XDG base directory spec:
 
 | What | Where | Default |
 |---|---|---|
 | `config.toml` | `$XDG_CONFIG_HOME/hatch` | `~/.config/hatch` |
-| `log/` | `$XDG_STATE_HOME/hatch` | `~/.local/state/hatch` |
+| `log/`, `prefs.toml` | `$XDG_STATE_HOME/hatch` | `~/.local/state/hatch` |
 | `stage/` | `$XDG_RUNTIME_DIR/hatch` | the state directory |
 
 All three are held at 0700. The staging directory is the one placed carefully:
