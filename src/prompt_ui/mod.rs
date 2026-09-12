@@ -4320,8 +4320,18 @@ mod tests {
         finished.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
         assert_eq!(finished.state.phase(), Phase::Lingering);
 
-        let windows =
-            [("asking", asking), ("running", &mut running), ("finished", &mut finished)];
+        let mut kept = a_root_window_showing("rm -rf /var/lib/thing");
+        kept.state.decide(approved(true));
+        kept.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert!(kept.state.keep(), "the window would not be kept");
+        assert_eq!(kept.state.phase(), Phase::Detached);
+
+        let windows = [
+            ("asking", asking),
+            ("running", &mut running),
+            ("finished", &mut finished),
+            ("kept", &mut kept),
+        ];
         for (phase, app) in windows {
             let shapes = window_shapes(app, opening_size());
             let edge = root_edge(&shapes)
