@@ -12,6 +12,7 @@ pub mod config;
 pub mod denylist;
 pub mod exec;
 pub mod paths;
+pub mod prefs;
 pub mod preview;
 pub mod prompt_ui;
 pub mod prompter;

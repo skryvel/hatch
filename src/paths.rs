@@ -3,8 +3,17 @@
 //! | what | variable | default |
 //! |---|---|---|
 //! | `config.toml` | `$XDG_CONFIG_HOME/hatch` | `~/.config/hatch` |
-//! | `log/` | `$XDG_STATE_HOME/hatch` | `~/.local/state/hatch` |
+//! | `log/`, `prefs.toml` | `$XDG_STATE_HOME/hatch` | `~/.local/state/hatch` |
 //! | `stage/` | `$XDG_RUNTIME_DIR/hatch` | the state directory |
+//!
+//! # Why `prefs.toml` is in the state directory and not beside the config
+//!
+//! Because of who writes it. `config.toml` is what the user wrote and hatch
+//! reads; `prefs.toml` is what the window wrote down because the user ticked
+//! something in it, which is what the spec means by state that persists
+//! between restarts. Putting the two side by side would be two files of the
+//! same shape in the same place, one of which silently loses hand edits. See
+//! [`crate::prefs`].
 //!
 //! # Why the staging directory is the one worth placing carefully
 //!
@@ -191,6 +200,15 @@ impl Paths {
         self.state_dir.join("log")
     }
 
+    /// The file the window writes its display preferences to.
+    ///
+    /// In the state directory rather than the config one — see the module
+    /// docs — and at the top of it rather than inside `log/`, which is an
+    /// append-only history and not a place anything is replaced.
+    pub fn prefs_file(&self) -> PathBuf {
+        self.state_dir.join("prefs.toml")
+    }
+
     /// The directory approved file content is staged in.
     pub fn stage_dir(&self) -> PathBuf {
         self.runtime_dir.join("stage")
@@ -352,6 +370,7 @@ mod tests {
         let p = defaults();
         assert_eq!(p.config_file(), Path::new("/home/user/.config/hatch/config.toml"));
         assert_eq!(p.log_dir(), Path::new("/home/user/.local/state/hatch/log"));
+        assert_eq!(p.prefs_file(), Path::new("/home/user/.local/state/hatch/prefs.toml"));
         assert_eq!(p.home(), Path::new("/home/user"));
         assert!(p.notes.is_empty(), "the ordinary case says nothing: {:?}", p.notes);
     }
@@ -512,6 +531,7 @@ mod tests {
         assert!(d.is_denied(&p.config_file()), "the token must be protected");
         assert!(d.is_denied(&p.log_dir().join("hatch-2026-09.jsonl")), "so must the history");
         assert!(d.is_denied(&p.stage_dir().join("pending")), "so must approved bytes");
+        assert!(d.is_denied(&p.prefs_file()), "and the file the window writes itself");
         assert!(d.is_denied(&p.legacy_dir().join("log/hatch-2026-01.jsonl")), "and the old one");
         // Home-derived entries come from `home`, which is none of the above.
         assert!(d.is_denied(Path::new("/home/user/.claude.json")));
