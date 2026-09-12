@@ -348,13 +348,24 @@ has no line for, which is not the same as a blank line.*
 **The typing guard.** Every input is inert for 750 ms after the window gains
 focus, and events delivered during that interval are dropped rather than
 buffered and replayed. Enter is never a default-activate: approving takes a
-click or Ctrl+Enter, and Esc is guarded on the same terms. Both are printed on
-the buttons, and printed exactly: `Ctrl+Shift+Enter` is deliberately inert, so
-a label loose enough for a reader to expect it to work would be the window
-promising something it refuses. A person mid-burst at another window cannot
-approve something that appeared under their hands. The 750 ms is hardcoded and
+click, Ctrl+Enter or Shift+Enter, and Esc is guarded on the same terms. All of
+them are printed on the buttons, and printed exactly: `Ctrl+Shift+Enter` is
+deliberately inert although each of its halves approves on its own, so a label
+loose enough for a reader to expect it to work would be the window promising
+something it refuses. A person mid-burst at another window cannot approve
+something that appeared under their hands. The 750 ms is hardcoded and
 deliberately not a config key — it is a safety property, and a setting inviting
 it to be lowered to zero is a liability.
+
+**Alt+S and Alt+C** tick **Stream output to this window** and **Close when I
+decide**. Chords rather than bare letters, because the note field has the
+keyboard and a window where `s` means something other than the letter `s` eats
+what you type into it. They wait out the same guard as Approve does, which is
+not because a checkbox is dangerous but because these two are remembered: what
+they write outlives the window, and the undo for a file is a box in a request
+nobody has made yet. Aimed at a box that is dead — Alt+S on a command that is
+getting a terminal of its own — they tick nothing and flash the sentence
+saying why instead.
 
 **After Approve the window stays.** It becomes a running indicator with elapsed
 time and a Kill button, and the output pane if streaming was ticked. Kill
@@ -623,10 +634,15 @@ is not a failure to retry; something may have run. Check the machine.
 load, but anything that can write it can change the child `PATH`, add
 `denylist_extra` entries or remove them, and read the bearer token. `swap_file`
 refuses to touch it; `run_command` is shown to you in full. `prefs.toml` is
-trusted on much narrower terms — it holds display choices and no secret — but
-it is worth knowing that something able to write it could set
-`close_on_decide` and take the Kill button off every window. Both files sit in
-directories held at 0700, and `swap_file` refuses both.
+trusted on much narrower terms — it holds three checkboxes and no secret — but
+it is worth knowing what something able to write it could do: set
+`close_on_decide` and take the Kill button off every window, or set `terminal`
+so that the next command opens with a tty ticked, which is the one of the three
+that changes how a command runs rather than what you see. Neither is silent —
+both boxes are on screen in the window that is asking, and the terminal's
+capture warning is drawn whether or not its box is ticked — but a preference
+is a standing answer, and this file is where the standing answers live. Both
+files sit in directories held at 0700, and `swap_file` refuses both.
 
 ## Configuration
 
@@ -746,10 +762,32 @@ request is drawn in whatever that is.
 ### `prefs.toml`, which hatch writes and you do not
 
 `$XDG_STATE_HOME/hatch/prefs.toml`, by default
-`~/.local/state/hatch/prefs.toml`. One file, one job: the display choices the
-window writes down because you ticked them in it. Today that is
-`close_on_decide`, and there is nothing to hand-edit — ticking the box in the
-window is how it is set.
+`~/.local/state/hatch/prefs.toml`. One file, one job: the choices the window
+writes down because you ticked them in it. Three keys —
+
+| Key | What ticking it remembers |
+|---|---|
+| `close_on_decide` | The window goes as soon as you answer, instead of staying to show the run |
+| `stream` | The window shows the output as it arrives |
+| `terminal` | The command gets a terminal of its own |
+
+— and there is nothing to hand-edit: ticking the box in the window is how each
+one is set, and Alt+C and Alt+S are how the first two are set without the
+mouse. Every default is off, so a first run and a file hatch cannot read are
+the same window.
+
+The first two change what you see. `terminal` does not: it changes how the
+command runs, and everything in that terminal — including what you type into
+it — goes back to the agent. A tick made today therefore decides how a request
+next week executes. It is still one box, on screen, in the window that is
+asking, and the capture warning is drawn beside it whether or not it is
+ticked; it is worth knowing which of the three it is.
+
+`stream` beats `close_on_decide` when both are on, because a window that has
+gone shows nothing. The close box is then greyed with *You stream every run.*
+under it, which is the window naming the standing choice that is winning
+rather than claiming you asked for it about this command. Unticking Stream
+gives the close box straight back.
 
 It is a separate file from `config.toml`, in a separate directory, and the
 separation is the point rather than tidiness. `config.toml` is what you wrote
@@ -762,12 +800,13 @@ which is also what the XDG spec asks for: state that persists between restarts
 belongs under the state directory.
 
 Nothing about it can stop a window opening. A missing, unreadable or malformed
-`prefs.toml` is a window with the preference at its default — refusing to open
-one would resolve as a denial of a request nobody was ever shown — and the next
-tick rewrites the file. Several windows can be open at once and two of them
-saving in the same instant is ordinary; each write lands by renaming a complete
-file over the old one, so a reader sees one or the other and never a torn one,
-and the later click wins.
+`prefs.toml` is a window with all three at their defaults — refusing to open one
+would resolve as a denial of a request nobody was ever shown — and the next tick
+rewrites the file. Several windows can be open at once and two of them saving in
+the same instant is ordinary; each write reads the file, changes the one box
+that was clicked and renames a complete file over the old one, so a reader sees
+one whole file or the other and never a torn one, ticking one box never undoes
+another, and the later click on the same box wins.
 
 ### Where everything lives
 
