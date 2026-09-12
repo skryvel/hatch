@@ -65,6 +65,9 @@
 //!   still waits the whole guard. They are chords rather than bare letters
 //!   because the note field holds the text focus, and the letters themselves
 //!   are left alone: what is taken out of the frame is `Alt+S`, never `s`.
+//!   Once the note field is gone -- see [`Keyboard::Watching`] -- bare
+//!   letters are available and are used, because there is nothing left on
+//!   the window for them to be typed into.
 //! * **The verdict buttons are not focusable.** egui only fakes a click on a
 //!   focused widget, so a button that never holds focus cannot be activated
 //!   by Space either — which is the hole that stripping Enter alone leaves
@@ -73,6 +76,32 @@
 //!   disabled.** egui computes pointer clicks before the frame's events reach
 //!   us, so emptying the queue does not stop a mouse; a disabled widget
 //!   reports neither a real click nor a fake one.
+//!
+//! # The same key in two phases
+//!
+//! A window is not one thing. It asks, then it runs, then it sits there with
+//! a result on it while a person reads it, and the keyboard means different
+//! things in each. Two rules keep that from becoming a trap, and every key
+//! added to this module has to be held to both:
+//!
+//! * **A key bound in one phase must not mean something dangerous in
+//!   another.** The window moves between phases while somebody is looking at
+//!   it, and a reader who has learned that a key is harmless here must not
+//!   find it approving something there. What makes that cheap to keep is that
+//!   only one phase can approve at all: [`crate::prompt_ui::PromptState::decide`]
+//!   answers in `AwaitingVerdict` alone and no phase returns to it, so a key
+//!   that means nothing while the window is asking can be given a meaning
+//!   afterwards without ever being able to acquire that one.
+//! * **A key that means one thing must not mean another thing elsewhere
+//!   unless the two phases look nothing alike and neither meaning is
+//!   destructive.** [`COPY_CHORD`] and [`CLOSE_CHORD`] are the same two keys,
+//!   and that is a decision rather than an accident: a window with Approve
+//!   and Deny on it and a window showing what a finished command printed are
+//!   not mistakable for each other, and neither ticking a box nor putting
+//!   text on the clipboard can be regretted for long.
+//!
+//! [`Keyboard`] is where a phase says which set it is in, and it is asked
+//! once per frame by the caller that knows the phase.
 //!
 //! # Once, not maybe
 //!
@@ -159,6 +188,38 @@ pub const STREAM_CHORD: &str = "Alt+S";
 /// What toggles "close when I decide". Alt, for [`STREAM_CHORD`]'s reasons.
 pub const CLOSE_CHORD: &str = "Alt+C";
 
+/// What keeps the window, printed on the button that does the same thing.
+///
+/// Three keys for one action, which is more than anything else here gets, and
+/// deliberately so: keeping is the only control in hatch with a deadline on
+/// it. Ten seconds of countdown mid-read, and until now the only way to stop
+/// it was to find the mouse. So it is given a target wide enough to be hit
+/// without looking -- a letter under either hand, and the largest key on the
+/// keyboard.
+///
+/// Bare letters, which nothing in the verdict phase may be: this button
+/// exists only on a window with no text field left on it. See [`Keyboard`].
+///
+/// Two lines for the same reason [`APPROVE_CHORD`] has two: the hint may not
+/// widen the button, and three keys on one line does not fit the width the
+/// button already had at every font size a reader may configure.
+pub const KEEP_KEYS: &str = "E, O\nSpace";
+
+/// What copies the output, printed on the button that does the same thing.
+///
+/// The same two keys as [`CLOSE_CHORD`], which is a collision and an accepted
+/// one: see "The same key in two phases" above. The phases look nothing
+/// alike, nothing on either side is destructive, and the alternative is a
+/// third chord for a window that has two.
+///
+/// It takes the output and not the command, although the finished window
+/// offers both. The output is the thing the reader is looking at and the
+/// thing they stayed for; the command is a line they can also read on the
+/// screen, and a shortcut that copied the wrong one of the two would be
+/// worse than no shortcut. One meaning per chord, so only one of the two
+/// buttons names it.
+pub const COPY_CHORD: &str = "Alt+C";
+
 /// What the window should do about one input event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -173,6 +234,35 @@ pub enum Action {
     Deny,
     /// A human asked to flip one of the boxes. Decides nothing by itself.
     Toggle(Toggle),
+    /// A human asked to keep the window: no countdown, no closing on its own.
+    ///
+    /// Only ever produced in [`Keyboard::Watching`], so it cannot arrive at a
+    /// window that still has a question on it.
+    Keep,
+    /// A human asked for what the window is showing, on the clipboard.
+    Copy,
+}
+
+/// What the window has on it this frame, as far as the keyboard is concerned.
+///
+/// The phase is the drawing half's business and this is the one thing about it
+/// the guard has to know: whether there is somewhere on the window for a
+/// letter to be typed. It is a parameter rather than something read from a
+/// state machine because this module owns no state of the window's -- see
+/// "One door" -- and because a test then says which kind of window it is
+/// asking about out loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keyboard {
+    /// A window that is asking. The note field holds the text focus, so `s`
+    /// is the letter `s`, `e` is the letter `e`, and only chords can mean
+    /// anything else.
+    Asking,
+    /// A window that is showing rather than asking: the command is running,
+    /// or it has finished and the result is on screen. There is no text
+    /// field on it -- the note went with the question -- so bare letters are
+    /// free, and the things they do are keeping the window, putting its
+    /// output on the clipboard and closing it.
+    Watching,
 }
 
 /// Which of the window's boxes a chord flips.
@@ -301,8 +391,16 @@ impl Guard {
     ///
     /// `modifiers` is the state to judge the chord by; the caller passes the
     /// event's own modifiers for a key press, which is the same source egui
-    /// matches its own shortcuts against.
-    pub fn classify(&self, event: &egui::Event, modifiers: Modifiers, now: Instant) -> Action {
+    /// matches its own shortcuts against. `keyboard` is what the window has
+    /// on it -- see [`Keyboard`] -- which is the only thing about the phase
+    /// this module is told.
+    pub fn classify(
+        &self,
+        event: &egui::Event,
+        modifiers: Modifiers,
+        keyboard: Keyboard,
+        now: Instant,
+    ) -> Action {
         let open = self.is_open(now);
         let key = match event {
             // Key repeats included: a held-down key is exactly the thing this
@@ -314,11 +412,17 @@ impl Guard {
             // Never a passthrough, open or closed. If Enter reached a widget,
             // egui would activate whatever holds focus with it, and the guard
             // would be advice rather than a rule.
+            //
+            // An approval is not even built for a window that is past asking
+            // for one. `PromptApp::act` refuses it there as well and
+            // `PromptState::decide` refuses it again behind that, so this is
+            // the outermost of three locks on one door rather than the only
+            // one; it is here because an `Action` that cannot be carried out
+            // is a thing for a later reader to wonder about.
             Some(Key::Enter) => {
-                if open && is_approve_chord(modifiers) {
-                    Action::Approve
-                } else {
-                    Action::Ignored
+                match open && keyboard == Keyboard::Asking && is_approve_chord(modifiers) {
+                    true => Action::Approve,
+                    false => Action::Ignored,
                 }
             }
             Some(Key::Escape) => {
@@ -326,6 +430,20 @@ impl Guard {
                     Action::Deny
                 } else {
                     Action::Ignored
+                }
+            }
+            // A window with nothing to type into. Judged before the box
+            // chords, because Alt+C is on both lists and this is the phase
+            // where it means the other one — see [`COPY_CHORD`]. Every key
+            // here is on the same clock as everything else: these three
+            // decide nothing and none of them can be regretted, so the guard
+            // is not what makes them safe, but an exemption would be a second
+            // door in a module whose whole claim is that there is one.
+            Some(key) if keyboard == Keyboard::Watching => {
+                match (open, watching(key, modifiers)) {
+                    (true, Some(action)) => action,
+                    (true, None) => Action::Passthrough,
+                    (false, _) => Action::Ignored,
                 }
             }
             // The two boxes. Judged on the same clock as the two verdicts and
@@ -423,6 +541,27 @@ fn toggle_chord(key: Key, m: Modifiers) -> Option<Toggle> {
     }
 }
 
+/// What this key and these modifiers mean to a window that is only being
+/// watched.
+///
+/// `None` is "not one of ours", which a widget then gets: a lingering window
+/// has a scroll area in it, and the keys that move it are the reader's.
+///
+/// Bare, and exactly bare. `Ctrl+E` is a shell's line editor and `Alt+O` is
+/// halfway into somebody's window-manager chord; neither is a person asking
+/// to keep this window, and a phase that took a letter under any modifier at
+/// all would be the loose matching [`is_approve_chord`] refuses for the same
+/// reason. The copy chord is exact in the other direction: Alt and nothing
+/// else, like the two it shares its keys with.
+fn watching(key: Key, m: Modifiers) -> Option<Action> {
+    let control = m.ctrl || m.command || m.mac_cmd;
+    match key {
+        Key::E | Key::O | Key::Space if m.is_none() => Some(Action::Keep),
+        Key::C if m.alt && !m.shift && !control => Some(Action::Copy),
+        _ => None,
+    }
+}
+
 /// Run every event of this frame past the guard, and leave in egui's queue
 /// only what a widget may see.
 ///
@@ -431,7 +570,16 @@ fn toggle_chord(key: Key, m: Modifiers) -> Option<Toggle> {
 /// same frame cannot judge it twice.
 ///
 /// Returns the decisions, in the order they were made.
-pub fn intercept(guard: &mut Guard, ctx: &egui::Context, now: Instant) -> Vec<Action> {
+///
+/// `keyboard` is the caller's answer to the one question this module cannot
+/// ask for itself: whether the window it is drawing has a text field on it.
+/// See [`Keyboard`].
+pub fn intercept(
+    guard: &mut Guard,
+    ctx: &egui::Context,
+    keyboard: Keyboard,
+    now: Instant,
+) -> Vec<Action> {
     // What the window actually is, rather than only what it was told. This
     // is how a window the compositor never focuses learns that it is
     // unfocused at all — and so gets the longer grace rather than the short
@@ -466,7 +614,7 @@ pub fn intercept(guard: &mut Guard, ctx: &egui::Context, now: Instant) -> Vec<Ac
             egui::Event::Key { modifiers, .. } => *modifiers,
             _ => frame_modifiers,
         };
-        match guard.classify(&event, modifiers, now) {
+        match guard.classify(&event, modifiers, keyboard, now) {
             Action::Passthrough => kept.push(event),
             Action::Ignored => {}
             decided => actions.push(decided),
@@ -493,6 +641,19 @@ mod tests {
         }
     }
 
+    /// [`Guard::classify`] on a window that is still asking, which is what
+    /// most of the claims here are about: the one with the note field on it.
+    /// The window that is only being watched has a section of its own.
+    fn asking(guard: &Guard, event: &egui::Event, m: Modifiers, now: Instant) -> Action {
+        guard.classify(event, m, Keyboard::Asking, now)
+    }
+
+    /// The same, on a window that is only being watched: the command has run,
+    /// and the note field went with the question.
+    fn watched(guard: &Guard, event: &egui::Event, m: Modifiers, now: Instant) -> Action {
+        guard.classify(event, m, Keyboard::Watching, now)
+    }
+
     fn press(key: Key, modifiers: Modifiers) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
     }
@@ -502,7 +663,7 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(749)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(749)), Action::Ignored);
     }
 
     #[test]
@@ -510,7 +671,7 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(751)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(751)), Action::Approve);
     }
 
     #[test]
@@ -519,7 +680,7 @@ mod tests {
         let guard = Guard::new(clock.at(0));
         let event = press(Key::Enter, Modifiers::CTRL);
         for _ in 0..20 {
-            assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(100)), Action::Ignored);
+            assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(100)), Action::Ignored);
         }
         assert_eq!(guard.pending_count(), 0);
     }
@@ -531,7 +692,7 @@ mod tests {
         guard.focus_lost(clock.at(1000));
         guard.focus_gained(clock.at(2000));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2100)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2100)), Action::Ignored);
     }
 
     #[test]
@@ -539,9 +700,9 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let plain = press(Key::Enter, Modifiers::NONE);
-        assert_eq!(guard.classify(&plain, Modifiers::NONE, clock.at(5000)), Action::Ignored);
+        assert_eq!(asking(&guard, &plain, Modifiers::NONE, clock.at(5000)), Action::Ignored);
         let chord = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&chord, Modifiers::CTRL, clock.at(5000)), Action::Approve);
+        assert_eq!(asking(&guard, &chord, Modifiers::CTRL, clock.at(5000)), Action::Approve);
     }
 
     #[test]
@@ -549,7 +710,7 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let event = press(Key::Escape, Modifiers::NONE);
-        assert_eq!(guard.classify(&event, Modifiers::NONE, clock.at(100)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::NONE, clock.at(100)), Action::Ignored);
     }
 
     #[test]
@@ -557,7 +718,7 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let event = press(Key::Escape, Modifiers::NONE);
-        assert_eq!(guard.classify(&event, Modifiers::NONE, clock.at(800)), Action::Deny);
+        assert_eq!(asking(&guard, &event, Modifiers::NONE, clock.at(800)), Action::Deny);
     }
 
     // ---- the two ways a focus rule fails --------------------------------
@@ -569,7 +730,7 @@ mod tests {
         guard.focus_lost(clock.at(1000));
         guard.focus_gained(clock.at(2000));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2800)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2800)), Action::Approve);
     }
 
     #[test]
@@ -579,8 +740,8 @@ mod tests {
         // The compositor's answer to "am I taking the keyboard": no.
         guard.focus_lost(clock.at(0));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2900)), Action::Ignored);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(3100)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2900)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(3100)), Action::Approve);
     }
 
     #[test]
@@ -589,8 +750,8 @@ mod tests {
         let mut guard = Guard::new(clock.at(0));
         guard.focus_gained(clock.at(1000));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(1500)), Action::Ignored);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(1800)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(1500)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(1800)), Action::Approve);
     }
 
     #[test]
@@ -600,9 +761,9 @@ mod tests {
         guard.focus_lost(clock.at(1000));
         let event = press(Key::Enter, Modifiers::CTRL);
         // 750 ms after the loss, and still shut: the loss started nothing.
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(1800)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(1800)), Action::Ignored);
         // And still shut right up to the grace, which runs from creation.
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2900)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2900)), Action::Ignored);
     }
 
     #[test]
@@ -610,9 +771,9 @@ mod tests {
         let clock = Clock::new();
         let mut shut = Guard::new(clock.at(0));
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(shut.classify(&event, Modifiers::CTRL, clock.at(750)), Action::Ignored);
+        assert_eq!(asking(&shut, &event, Modifiers::CTRL, clock.at(750)), Action::Ignored);
         shut.focus_lost(clock.at(0));
-        assert_eq!(shut.classify(&event, Modifiers::CTRL, clock.at(3000)), Action::Ignored);
+        assert_eq!(asking(&shut, &event, Modifiers::CTRL, clock.at(3000)), Action::Ignored);
     }
 
     #[test]
@@ -667,7 +828,7 @@ mod tests {
 
         let approving: Vec<Modifiers> = every_modifier_combination()
             .into_iter()
-            .filter(|m| guard.classify(&press(Key::Enter, *m), *m, now) == Action::Approve)
+            .filter(|m| asking(&guard, &press(Key::Enter, *m), *m, now) == Action::Approve)
             .collect();
 
         assert!(!approving.is_empty(), "there is no way to approve at all");
@@ -695,7 +856,7 @@ mod tests {
             Modifiers::SHIFT | Modifiers::ALT,
         ] {
             assert_eq!(
-                guard.classify(&press(Key::Enter, m), m, now),
+                asking(&guard, &press(Key::Enter, m), m, now),
                 Action::Ignored,
                 "Enter with {m:?}"
             );
@@ -713,21 +874,21 @@ mod tests {
         for (key, toggle) in [(Key::S, Toggle::Stream), (Key::C, Toggle::Close)] {
             let event = press(key, Modifiers::ALT);
             let focused = Guard::new(clock.at(0));
-            assert_eq!(focused.classify(&event, Modifiers::ALT, clock.at(749)), Action::Ignored);
+            assert_eq!(asking(&focused, &event, Modifiers::ALT, clock.at(749)), Action::Ignored);
             assert_eq!(
-                focused.classify(&event, Modifiers::ALT, clock.at(751)),
+                asking(&focused, &event, Modifiers::ALT, clock.at(751)),
                 Action::Toggle(toggle)
             );
 
             let mut unfocused = Guard::new(clock.at(0));
             unfocused.focus_lost(clock.at(0));
             assert_eq!(
-                unfocused.classify(&event, Modifiers::ALT, clock.at(2900)),
+                asking(&unfocused, &event, Modifiers::ALT, clock.at(2900)),
                 Action::Ignored,
                 "a window nobody is looking at ticked a box that outlives it"
             );
             assert_eq!(
-                unfocused.classify(&event, Modifiers::ALT, clock.at(3100)),
+                asking(&unfocused, &event, Modifiers::ALT, clock.at(3100)),
                 Action::Toggle(toggle)
             );
         }
@@ -743,14 +904,14 @@ mod tests {
         let now = clock.at(5000);
         for key in [Key::S, Key::C] {
             let bare = press(key, Modifiers::NONE);
-            assert_eq!(guard.classify(&bare, Modifiers::NONE, now), Action::Passthrough);
+            assert_eq!(asking(&guard, &bare, Modifiers::NONE, now), Action::Passthrough);
             let shifted = press(key, Modifiers::SHIFT);
-            assert_eq!(guard.classify(&shifted, Modifiers::SHIFT, now), Action::Passthrough);
+            assert_eq!(asking(&guard, &shifted, Modifiers::SHIFT, now), Action::Passthrough);
         }
         // And the text itself, which is a different event and never the
         // guard's business at all.
         let typed = egui::Event::Text("sc".to_string());
-        assert_eq!(guard.classify(&typed, Modifiers::NONE, now), Action::Passthrough);
+        assert_eq!(asking(&guard, &typed, Modifiers::NONE, now), Action::Passthrough);
     }
 
     #[test]
@@ -768,7 +929,7 @@ mod tests {
         ] {
             for key in [Key::S, Key::C] {
                 assert_eq!(
-                    guard.classify(&press(key, m), m, now),
+                    asking(&guard, &press(key, m), m, now),
                     Action::Passthrough,
                     "{key:?} with {m:?} flipped a box",
                 );
@@ -867,7 +1028,7 @@ mod tests {
                     control == wanted.ctrl && m.shift == wanted.shift && m.alt == wanted.alt
                 });
                 assert_eq!(
-                    guard.classify(&press(key, m), m, now) == decides,
+                    asking(&guard, &press(key, m), m, now) == decides,
                     is_named,
                     "{label:?} and the guard disagree about {m:?}"
                 );
@@ -894,11 +1055,151 @@ mod tests {
 
         let denying: Vec<Modifiers> = every_modifier_combination()
             .into_iter()
-            .filter(|m| guard.classify(&press(Key::Escape, *m), *m, now) == Action::Deny)
+            .filter(|m| asking(&guard, &press(Key::Escape, *m), *m, now) == Action::Deny)
             .collect();
 
         // A denial nobody chose still spends the one decision this window has.
         assert_eq!(denying, vec![Modifiers::NONE]);
+    }
+
+    // ---- the window that is only being watched ---------------------------
+
+    #[test]
+    fn the_three_keys_that_keep_a_window_are_bare_and_are_only_bare_there() {
+        // Bare letters, because the note field went with the question. The
+        // same letters while a question is on screen are letters, which is
+        // what the reader is typing into the field that is still there.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        for key in [Key::E, Key::O, Key::Space] {
+            let bare = press(key, Modifiers::NONE);
+            assert_eq!(
+                watched(&guard, &bare, Modifiers::NONE, now),
+                Action::Keep,
+                "{key:?} does not keep a window with nothing to decide"
+            );
+            assert_eq!(
+                asking(&guard, &bare, Modifiers::NONE, now),
+                Action::Passthrough,
+                "{key:?} was taken from a window whose note field is on screen"
+            );
+        }
+    }
+
+    #[test]
+    fn nearly_the_keep_key_is_not_the_keep_key() {
+        // Exact, for the reason `is_approve_chord` is: `Ctrl+E` is a line
+        // editor and `Alt+O` is halfway into somebody's window-manager chord,
+        // and neither of them is a person asking to keep this window.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        for m in every_modifier_combination().into_iter().filter(|m| !m.is_none()) {
+            for key in [Key::E, Key::O, Key::Space] {
+                assert_ne!(
+                    watched(&guard, &press(key, m), m, now),
+                    Action::Keep,
+                    "{key:?} with {m:?} kept the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alt_c_means_the_copy_on_a_window_that_has_nothing_left_to_tick() {
+        // One chord, two meanings, decided by which kind of window it lands
+        // on -- and the two are not mistakable for each other. See "The same
+        // key in two phases".
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        let chord = press(Key::C, Modifiers::ALT);
+
+        assert_eq!(
+            watched(&guard, &chord, Modifiers::ALT, now),
+            Action::Copy
+        );
+        assert_eq!(
+            asking(&guard, &chord, Modifiers::ALT, now),
+            Action::Toggle(Toggle::Close),
+            "the box chord stopped working on the window that has the box"
+        );
+        // And the other box chord is inert where there is no box: a window
+        // showing a finished command has nothing left to stream.
+        let stream = press(Key::S, Modifiers::ALT);
+        assert_eq!(
+            watched(&guard, &stream, Modifiers::ALT, now),
+            Action::Passthrough,
+            "a chord for a control that is not on the window was taken anyway"
+        );
+    }
+
+    #[test]
+    fn a_watched_windows_keys_wait_out_the_guard_like_everything_else() {
+        // None of them can be regretted -- a kept window is closed with the
+        // key beside it, and a clipboard is overwritten by the next copy --
+        // so the clock is not what makes them safe. They are on it because
+        // `classify` is the one door, and an exemption would be a second.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        for (event, m) in [
+            (press(Key::E, Modifiers::NONE), Modifiers::NONE),
+            (press(Key::C, Modifiers::ALT), Modifiers::ALT),
+        ] {
+            assert_eq!(
+                watched(&guard, &event, m, clock.at(749)),
+                Action::Ignored,
+                "{event:?} was acted on during the guard"
+            );
+        }
+    }
+
+    #[test]
+    fn a_watched_window_still_gives_a_widget_the_keys_that_are_not_ours() {
+        // There is a scroll area on a finished window, and the keys that move
+        // it belong to the reader. Taking every key because three of them
+        // mean something would be a window that cannot be read.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        for key in [Key::PageDown, Key::ArrowDown, Key::Home] {
+            assert_eq!(
+                watched(&guard, &press(key, Modifiers::NONE), Modifiers::NONE, now),
+                Action::Passthrough,
+                "{key:?} was taken out of the frame"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_decides_nothing_on_a_watched_window_either() {
+        // Deliberately unbound. Bare Enter means nothing anywhere in hatch,
+        // and the reflex is that it confirms: somebody hammering it at an
+        // approval must not find that they have closed the window that opened
+        // under it.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        for m in every_modifier_combination() {
+            assert_eq!(
+                watched(&guard, &press(Key::Enter, m), m, now),
+                Action::Ignored,
+                "Enter with {m:?} did something to a window that is only being watched"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_a_watched_window_and_says_so_in_one_word() {
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(5000);
+        assert_eq!(
+            watched(&guard, &press(Key::Escape, Modifiers::NONE), Modifiers::NONE, now),
+            Action::Deny,
+            "Escape stopped meaning the one thing it means on every window"
+        );
     }
 
     // ---- what else is in flight -----------------------------------------
@@ -913,8 +1214,8 @@ mod tests {
             pressed: true,
             modifiers: Modifiers::NONE,
         };
-        assert_eq!(guard.classify(&click, Modifiers::NONE, clock.at(100)), Action::Ignored);
-        assert_eq!(guard.classify(&click, Modifiers::NONE, clock.at(800)), Action::Passthrough);
+        assert_eq!(asking(&guard, &click, Modifiers::NONE, clock.at(100)), Action::Ignored);
+        assert_eq!(asking(&guard, &click, Modifiers::NONE, clock.at(800)), Action::Passthrough);
     }
 
     #[test]
@@ -928,7 +1229,7 @@ mod tests {
             Modifiers::ALT,
         ] {
             let event = press(Key::Enter, m);
-            assert_eq!(guard.classify(&event, m, clock.at(5000)), Action::Ignored, "{m:?}");
+            assert_eq!(asking(&guard, &event, m, clock.at(5000)), Action::Ignored, "{m:?}");
         }
     }
 
@@ -943,7 +1244,7 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::CTRL,
         };
-        assert_eq!(guard.classify(&release, Modifiers::CTRL, clock.at(5000)), Action::Passthrough);
+        assert_eq!(asking(&guard, &release, Modifiers::CTRL, clock.at(5000)), Action::Passthrough);
     }
 
     // ---- the wiring, against a real egui context -------------------------
@@ -966,7 +1267,7 @@ mod tests {
     ) -> (Vec<Action>, Vec<egui::Event>, bool) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput { events, ..Default::default() });
-        let actions = intercept(guard, &ctx, now);
+        let actions = intercept(guard, &ctx, Keyboard::Asking, now);
         let left = ctx.input(|i| i.events.clone());
         // egui's own "Space or Enter activates the focused widget" test.
         let would_activate = ctx.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Space));
@@ -1025,8 +1326,8 @@ mod tests {
             events: vec![press(Key::Enter, Modifiers::CTRL)],
             ..Default::default()
         });
-        let first = intercept(&mut guard, &ctx, clock.at(5000));
-        let second = intercept(&mut guard, &ctx, clock.at(5000));
+        let first = intercept(&mut guard, &ctx, Keyboard::Asking, clock.at(5000));
+        let second = intercept(&mut guard, &ctx, Keyboard::Asking, clock.at(5000));
         end_pass(&ctx);
         assert_eq!(first, vec![Action::Approve]);
         assert!(second.is_empty(), "the same keypress was judged twice: {second:?}");
@@ -1044,7 +1345,7 @@ mod tests {
         raw.viewports.get_mut(&raw.viewport_id).expect("root viewport").focused = Some(false);
         ctx.begin_pass(raw);
         // Well past the ordinary guard, well inside the unfocused grace.
-        let actions = intercept(&mut guard, &ctx, clock.at(2000));
+        let actions = intercept(&mut guard, &ctx, Keyboard::Asking, clock.at(2000));
         end_pass(&ctx);
         assert!(actions.is_empty(), "{actions:?}");
     }
@@ -1062,11 +1363,11 @@ mod tests {
             let mut raw = egui::RawInput::default();
             raw.viewports.get_mut(&raw.viewport_id).expect("root viewport").focused = Some(true);
             ctx.begin_pass(raw);
-            intercept(&mut guard, &ctx, clock.at(ms));
+            intercept(&mut guard, &ctx, Keyboard::Asking, clock.at(ms));
             end_pass(&ctx);
         }
         let event = press(Key::Enter, Modifiers::CTRL);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(900)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(900)), Action::Approve);
     }
 
     #[test]
@@ -1079,11 +1380,11 @@ mod tests {
         let mut raw = egui::RawInput::default();
         raw.viewports.get_mut(&raw.viewport_id).expect("root viewport").focused = Some(true);
         ctx.begin_pass(raw);
-        intercept(&mut guard, &ctx, clock.at(2000));
+        intercept(&mut guard, &ctx, Keyboard::Asking, clock.at(2000));
         end_pass(&ctx);
         let event = press(Key::Enter, Modifiers::CTRL);
         // Re-armed at 2000: shut just after, open well after. Never stuck shut.
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2100)), Action::Ignored);
-        assert_eq!(guard.classify(&event, Modifiers::CTRL, clock.at(2800)), Action::Approve);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2100)), Action::Ignored);
+        assert_eq!(asking(&guard, &event, Modifiers::CTRL, clock.at(2800)), Action::Approve);
     }
 }

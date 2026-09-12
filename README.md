@@ -80,7 +80,9 @@ same thing.*
 - **One keystroke, and the window gets out of the way.** `Ctrl+Enter` or
   `Shift+Enter` approves, `Esc` denies, `Alt+S` and `Alt+C` work the two boxes.
   Tick *Close when I decide* once and it is remembered, along with whether you
-  stream and whether you want a terminal.
+  stream and whether you want a terminal. Once the command is over the note
+  field is gone and bare letters are free, so `e`, `o` or Space keeps the
+  window you are reading, `Alt+C` takes its output and `Esc` closes it.
 - **Answers other than yes and no.** Ask the agent to explain itself, ask for a
   version you can actually read, take the job and run it yourself, or stop the
   whole line of work to talk. Each returns your own words to the agent rather
@@ -466,6 +468,24 @@ window that died unasked as `died`, and only the second prints
 that suffix under every approved command belonging to anyone who ticked the
 box — and the one line that means something went wrong would have become the
 line that appears on all of them.
+
+**A streamed window stays when the command ends, and you can keep it.** The
+whole life of an ordinary command is milliseconds, so a window that closed on
+the outcome closed at the moment the output it was asked to show arrived. It
+lingers for ten seconds instead, with the result on it and a countdown saying
+so, and **Keep this window** stops the countdown for good: no verdict, no
+deadline, just the output, a way to copy it and a way to close it. A run nobody
+asked to watch is unchanged and closes on the outcome as it always did.
+
+Keeping is the only control in hatch with a clock running against it, so it has
+the widest target: `e`, `o` and Space all do it. `Esc` closes the window,
+`Alt+C` copies the output. These are bare letters where approving is a chord,
+and the difference is the note field — it holds the keyboard while the window
+is asking, and it is gone by the time these mean anything. `Alt+C` means the
+close box while there is a box and the output afterwards; the two windows look
+nothing alike and neither meaning can be regretted. Enter is deliberately
+unbound: the reflex is that it confirms, and somebody hammering it at an
+approval must not close the window that opened under it.
 
 **Asking, running and finished do not look alike.** The ground the panels are
 drawn on changes with what the window is doing — grey while it has a question

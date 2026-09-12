@@ -1034,7 +1034,7 @@ mod tests {
         let (mut app, swallowed, _staging) = a_preview_window(Scenario::Command);
         assert_eq!(app.state().phase(), Phase::AwaitingVerdict, "the sample never arrived");
 
-        app.act(Action::Approve);
+        app.act(&egui::Context::default(), Action::Approve);
 
         assert_eq!(
             app.state().phase(),
@@ -1079,7 +1079,7 @@ mod tests {
             "a preview that has not been decided must stay open to be looked at"
         );
 
-        app.act(Action::Deny);
+        app.act(&egui::Context::default(), Action::Deny);
 
         assert!(
             !matches!(app.state().phase(), Phase::WaitingForRequest | Phase::AwaitingVerdict),

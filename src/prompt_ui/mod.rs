@@ -106,7 +106,7 @@ use eframe::egui;
 
 use crate::exec::Stream;
 use crate::prefs::PrefsFile;
-use crate::prompt_ui::guard::{Action, Guard, intercept};
+use crate::prompt_ui::guard::{Action, Guard, Keyboard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
 
@@ -1385,6 +1385,27 @@ impl PromptApp {
         self.close_on_decide && !self.streams()
     }
 
+    /// Which set of keys this window is willing to hear, this frame.
+    ///
+    /// The phase, reduced to the one thing [`guard`] has to know: whether
+    /// there is anywhere on the window for a letter to be typed. A window
+    /// that is asking has the note field, so its shortcuts are chords; a
+    /// window that is only showing a result has nothing to type into, so
+    /// bare letters are free and are used.
+    ///
+    /// Matched exhaustively on purpose. A new phase is a new answer to this
+    /// question, and the compiler is the only thing that will insist somebody
+    /// gives one.
+    fn keyboard(&self) -> Keyboard {
+        match self.state.phase() {
+            Phase::Lingering | Phase::Detached => Keyboard::Watching,
+            Phase::WaitingForRequest
+            | Phase::AwaitingVerdict
+            | Phase::Running
+            | Phase::Closed => Keyboard::Asking,
+        }
+    }
+
     /// Whether a control is pointing at the reason it could not do what a
     /// chord asked of it.
     fn refusing(&self, toggle: guard::Toggle) -> bool {
@@ -1479,8 +1500,9 @@ impl eframe::App for PromptApp {
         // Before anything is drawn, and before any widget sees the frame.
         // Whatever the guard did not hand back is gone from this frame.
         let now = Instant::now();
-        for action in intercept(&mut self.guard, ctx, now) {
-            self.act(action);
+        let keyboard = self.keyboard();
+        for action in intercept(&mut self.guard, ctx, keyboard, now) {
+            self.act(ctx, action);
         }
         self.guard_open = self.guard.is_open(now);
         // The linger's own clock. What enforces it when this loop is not the
@@ -1646,15 +1668,22 @@ impl PromptApp {
     /// state machine is what makes a doubled one harmless — it answers only
     /// while the window awaits a verdict, and it leaves that phase on the way
     /// out.
-    pub(crate) fn act(&mut self, action: Action) {
-        // A window that is only showing a result has nothing to decide, so the
-        // two keys the guard owns mean the only things left: Escape puts the
-        // window away, and Enter means nothing at all. Neither reaches
-        // `decide`, which is a second lock on the same door rather than the
-        // first — `decide` answers in `AwaitingVerdict` alone.
+    pub(crate) fn act(&mut self, ctx: &egui::Context, action: Action) {
+        // A window that is only showing a result has nothing to decide, so
+        // the keys mean the three things that are left: keep it, take what is
+        // on it, or put it away. Enter still means nothing at all, and
+        // nothing here reaches `decide` — which is a second lock on the same
+        // door rather than the first, since `decide` answers in
+        // `AwaitingVerdict` alone and no phase returns there.
         if self.state.is_viewer() {
-            if action == Action::Deny {
-                self.state.dismiss();
+            match action {
+                Action::Deny => self.state.dismiss(),
+                Action::Keep => self.keep_window(),
+                Action::Copy => self.copy_output(ctx),
+                Action::Approve
+                | Action::Toggle(_)
+                | Action::Ignored
+                | Action::Passthrough => {}
             }
             return;
         }
@@ -1665,7 +1694,10 @@ impl PromptApp {
             Action::Approve => self.approval(),
             Action::Deny => Verdict::Deny { note: self.note.clone() },
             Action::Toggle(toggle) => return self.flip(toggle),
-            Action::Ignored | Action::Passthrough => return,
+            // Neither is produced outside the phases above -- see
+            // [`Keyboard`] -- and a window that is still asking has neither a
+            // countdown to stop nor any output to take.
+            Action::Keep | Action::Copy | Action::Ignored | Action::Passthrough => return,
         };
         let frame = self.state.decide(verdict);
         answer(&mut self.out, &mut self.state, frame);
@@ -1714,6 +1746,32 @@ impl PromptApp {
                 true => self.refused = Some((toggle, Instant::now())),
             },
         }
+    }
+
+    /// Keep this window: stop whatever was going to take it away.
+    ///
+    /// One method rather than the button doing it and the key doing it again,
+    /// because the second thing it has to do is easy to leave out. The flag
+    /// is read by the thread in [`arm_linger_backstop`], which is the only
+    /// thing still holding a deadline over this window and is not running the
+    /// state machine; a keep the state machine knew about and that thread did
+    /// not is a window that would be kept for twelve seconds.
+    fn keep_window(&mut self) {
+        if self.state.keep() {
+            // Set before anything else, so a stall between here and the next
+            // frame cannot lose it.
+            self.kept.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Put the output on the clipboard, and leave the window able to say so.
+    ///
+    /// The output as it is on screen. The command is copied elsewhere and
+    /// deliberately not from here: see [`guard::COPY_CHORD`] for why only one
+    /// of the two buttons has a key on it.
+    fn copy_output(&mut self, ctx: &egui::Context) {
+        ctx.copy_text(self.state.output_text());
+        self.copied = Some(Instant::now());
     }
 
     /// Everything below the panes: what the clock says, and what can be
@@ -1787,22 +1845,23 @@ impl PromptApp {
         ui.vertical_centered(|ui| {
             centred_row(ui, width, |ui| {
                 if closing.is_some() {
-                    keep = unfocusable(
-                        ui,
-                        egui::Button::new(strong("Keep this window"))
-                            .min_size(primary_button(ui)),
-                    )
-                    .clicked();
+                    keep = unfocusable(ui, primary(ui, "Keep this window", guard::KEEP_KEYS))
+                        .clicked();
                     // The same gap the verdict buttons keep, for a weaker
                     // reason: nothing here is dangerous, but a pointer on its
                     // way to Keep must not find Close under it.
                     ui.add_space(PRIMARY_GAP);
                 }
-                close = unfocusable(ui, egui::Button::new("Close")).clicked();
+                close = unfocusable(ui, keyed(egui::RichText::new("Close"), guard::DENY_CHORD))
+                    .clicked();
             });
             ui.add_space(4.0);
             centred_row(ui, width, |ui| {
-                copy_output = secondary(ui, "Copy output").clicked();
+                copy_output = unfocusable(
+                    ui,
+                    keyed(egui::RichText::new("Copy output").small(), guard::COPY_CHORD),
+                )
+                .clicked();
                 if has_command {
                     copy_command = secondary(ui, "Copy command").clicked();
                 }
@@ -1812,11 +1871,8 @@ impl PromptApp {
             });
         });
 
-        if keep && self.state.keep() {
-            // Read by the backstop thread, which is the one thing still
-            // holding a deadline over this window. Set before anything else
-            // so a stall between here and the next frame cannot lose it.
-            self.kept.store(true, Ordering::SeqCst);
+        if keep {
+            self.keep_window();
         }
         if close {
             self.state.dismiss();
@@ -1826,8 +1882,7 @@ impl PromptApp {
         // and newlines, and pasting those into a shell would be pasting a
         // different command from the one that ran.
         if copy_output {
-            ui.ctx().copy_text(self.state.output_text());
-            self.copied = Some(Instant::now());
+            self.copy_output(ui.ctx());
         }
         if copy_command && let Some(Shown::Command { raw, .. }) = self.state.shown() {
             ui.ctx().copy_text(raw.source().to_string());
@@ -2741,8 +2796,18 @@ fn strong(label: &str) -> egui::RichText {
 /// why neither is abbreviated. That it fits is
 /// `the_shortcut_hints_fit_the_buttons_that_were_already_there`.
 fn primary(ui: &egui::Ui, label: &str, chord: &str) -> egui::Button<'static> {
-    egui::Button::new((strong(label), egui::RichText::new(chord).small().weak()))
-        .min_size(primary_button(ui))
+    keyed(strong(label), chord).min_size(primary_button(ui))
+}
+
+/// A button with the key that does the same thing printed beside what it
+/// does, at whatever size the button already was.
+///
+/// The one place a shortcut is put on a button, so a control cannot acquire a
+/// key and be left saying nothing about it. What [`primary`] adds on top is
+/// the size: the two that decide, and the one with a countdown on it, are
+/// drawn at a minimum the cluster around them is measured from.
+fn keyed(label: egui::RichText, chord: &str) -> egui::Button<'static> {
+    egui::Button::new((label, egui::RichText::new(chord).small().weak()))
 }
 
 #[cfg(test)]
@@ -3554,16 +3619,16 @@ mod tests {
             [(Action::Approve, Phase::Lingering), (Action::Deny, Phase::Closed)]
         {
             let (mut app, sink) = a_finished_window();
-            app.act(action);
+            app.act(&egui::Context::default(), action);
             assert_eq!(app.state.phase(), after, "{action:?}");
             assert!(sink.lock().unwrap().is_empty(), "{action:?} answered a request that is over");
         }
 
         let (mut app, sink) = a_finished_window();
         assert!(app.state.keep());
-        app.act(Action::Approve);
+        app.act(&egui::Context::default(), Action::Approve);
         assert_eq!(app.state.phase(), Phase::Detached);
-        app.act(Action::Deny);
+        app.act(&egui::Context::default(), Action::Deny);
         assert_eq!(app.state.phase(), Phase::Closed);
         assert!(sink.lock().unwrap().is_empty(), "a detached viewer wrote to the daemon");
     }
@@ -4168,7 +4233,7 @@ mod tests {
 
         let (mut app, sink) = an_awaiting_window();
         app.note = typed.to_string();
-        app.act(Action::Approve);
+        app.act(&egui::Context::default(), Action::Approve);
         let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
         assert!(out.contains("\"verdict\":\"approve\""), "the key did not approve: {out}");
         assert!(out.contains(typed), "the key dropped the note: {out}");
@@ -4888,6 +4953,150 @@ mod tests {
         );
         // And the raw text is on screen without anyone asking for it.
         assert!(strip > 0.0, "the raw pane is not drawn at all when stacked");
+    }
+
+    // ---- the keys a finished window answers to ----------------------------
+
+    /// Press one key on a window in the phase it is in, through the real
+    /// door: [`intercept`] classifies it, [`PromptApp::act`] carries it out.
+    ///
+    /// Not [`PromptApp::act`] on its own, because the claim being made is
+    /// about a keypress: a key the guard hands back as `Passthrough` and
+    /// nothing acts on would pass every test that started at an [`Action`].
+    fn press_key(app: &mut PromptApp, key: egui::Key, modifiers: egui::Modifiers) {
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+        a_live_frame(app, &ctx, vec![chord(key, modifiers)], now);
+    }
+
+    #[test]
+    fn three_keys_keep_the_window_and_each_of_them_stops_the_countdown() {
+        // Three for one action, which nothing else here gets. It is the only
+        // control in hatch with a deadline on it: ten seconds, mid-read, and
+        // until now the only way to stop it was to find the mouse.
+        for key in [egui::Key::E, egui::Key::O, egui::Key::Space] {
+            let (mut app, sink) = a_finished_window();
+            press_key(&mut app, key, egui::Modifiers::NONE);
+
+            assert_eq!(app.state.phase(), Phase::Detached, "{key:?} did not keep the window");
+            assert!(app.state.linger_seconds_remaining(Instant::now()).is_none());
+            // And the thread that would otherwise end this process in twelve
+            // seconds has been told, which the button is not the only way to
+            // reach.
+            assert!(
+                app.kept.load(Ordering::SeqCst),
+                "{key:?} kept a window the backstop will kill anyway"
+            );
+            assert!(
+                sink.lock().expect("sink").is_empty(),
+                "{key:?} wrote to a daemon that has gone"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_the_finished_window_and_enter_still_means_nothing() {
+        // Enter is deliberately unbound. Nothing in hatch answers a bare
+        // Enter, and the reflex is that it confirms -- so somebody hammering
+        // it at an approval would otherwise close the viewer at the instant
+        // it appeared.
+        let (mut app, _sink) = a_finished_window();
+        press_key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.state.phase(), Phase::Lingering, "bare Enter did something");
+
+        press_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!(app.state.phase(), Phase::Closed, "Escape did not put the window away");
+    }
+
+    #[test]
+    fn alt_c_on_a_finished_window_takes_the_output_and_says_it_did() {
+        // The output and not the command: it is what the reader stayed for,
+        // and one chord may mean one thing. See `guard::COPY_CHORD`.
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+        press_key(&mut app, egui::Key::C, egui::Modifiers::ALT);
+
+        assert!(app.copied.is_some(), "the window said nothing about having copied anything");
+        assert_eq!(app.state.phase(), Phase::Lingering, "a copy moved the window on");
+    }
+
+    #[test]
+    fn the_letters_that_keep_a_finished_window_are_still_letters_while_one_is_asked() {
+        // The whole reason the verdict phase is on chords: the note field
+        // holds the text focus there, and a window where `e` means something
+        // other than the letter `e` eats what you type into it. The keys
+        // below are free afterwards only because that field has gone with the
+        // question.
+        let (mut app, _sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+        click_into_the_note_field(&mut app, &ctx, now);
+
+        let typed = vec![
+            chord(egui::Key::E, egui::Modifiers::NONE),
+            egui::Event::Text("e".to_string()),
+            chord(egui::Key::O, egui::Modifiers::NONE),
+            egui::Event::Text("o".to_string()),
+            chord(egui::Key::Space, egui::Modifiers::NONE),
+            egui::Event::Text(" ".to_string()),
+        ];
+        a_live_frame(&mut app, &ctx, typed, now);
+
+        assert_eq!(app.note, "eo ", "the viewer's keys ate what was typed into the note");
+        assert_eq!(app.state.phase(), Phase::AwaitingVerdict, "a letter answered the window");
+    }
+
+    #[test]
+    fn a_finished_window_says_which_keys_keep_it_take_it_and_close_it() {
+        // A shortcut nobody can see is a shortcut nobody has, and these are
+        // drawn from the guard's own strings, so this cannot pass against a
+        // label the rule does not accept.
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains(guard::KEEP_KEYS), "no key is offered for Keep: {drawn}");
+        assert!(drawn.contains(guard::COPY_CHORD), "no key is offered for the output: {drawn}");
+        assert!(drawn.contains(guard::DENY_CHORD), "no key is offered for Close: {drawn}");
+    }
+
+    #[test]
+    fn the_keys_on_the_finished_window_did_not_widen_the_row_they_are_on() {
+        // Keep and Close share one centred row exactly as wide as the cluster
+        // the verdict buttons were centred in, and the hints are drawn inside
+        // the buttons. A pair that outgrew that row would push Close out of
+        // the middle of a window the reader is looking at the middle of.
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+        let drawn = window_shapes(&mut app, opening_size());
+        let rects = text_rects(&drawn);
+        let at = |want: &str| {
+            rects
+                .iter()
+                .find(|(text, _)| text == want)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{want} is not on screen: {}", shapes_text(&drawn)))
+        };
+        let (keep, close) = (at("Keep this window"), at("Close"));
+
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let mut cluster = 0.0;
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), opening_size()), |ui| {
+            cluster = cluster_width(ui);
+        });
+        out.textures_delta.clear();
+
+        assert!(
+            (keep.center().y - close.center().y).abs() < 2.0,
+            "Keep is at {keep:?} and Close at {close:?}: not one row"
+        );
+        assert!(
+            keep.union(close).width() <= cluster,
+            "the pair spans {} against the {cluster} the row is given",
+            keep.union(close).width()
+        );
     }
 
     // ---- what the guard says, and what saying it costs --------------------
@@ -5832,9 +6041,10 @@ mod tests {
         let mut out = ctx.run_ui(raw_sized(events, opening_size()), |ui| {
             // The order `logic` runs them in: the guard takes what it is
             // owed out of the frame before any widget is built.
-            let decided = intercept(&mut app.guard, ui.ctx(), at);
+            let keyboard = app.keyboard();
+            let decided = intercept(&mut app.guard, ui.ctx(), keyboard, at);
             for action in decided {
-                app.act(action);
+                app.act(ui.ctx(), action);
             }
             let open = app.guard.is_open(at);
             app.window(ui, open);
