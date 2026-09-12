@@ -1378,9 +1378,10 @@ fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
     // a `Quoted` one, and two overlapping regions have no honest drawing. The
     // operator in front of it is marked either way, so what the refusal costs
     // is a colour on the path and never the sight of the arrow.
-    out.extend(redirections(command).into_iter().filter(|(range, half)| {
+    let marked = redirections(command).into_iter().filter(|(range, half)| {
         *half == Redirect::Operator || !command[range.clone()].contains(['\'', '"'])
-    }).map(|(range, _)| (range, SpanKind::Redirect)));
+    });
+    out.extend(marked.map(|(range, _)| (range, SpanKind::Redirect)));
     out.sort_by_key(|(range, _)| range.start);
     out
 }

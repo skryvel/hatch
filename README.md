@@ -331,6 +331,19 @@ cannot tell, it finds no comment rather than inventing one, because a quiet
 colour over text that *will* run is the only way this could mislead a reader.
 `hatch preview comment` is a sample with one of each.
 
+**A redirection is drawn as structure, and so is the word it points at.**
+`> /etc/passwd` changes where a command's effects land, and it used to be drawn
+with exactly the emphasis `-l` was drawn with. Both halves are marked now, in a
+violet of their own: the operator — `>`, `2>>`, `&>`, `>|`, `2>&1` — and the
+word it points at, because the thing a reader is scanning for is the
+destination and not the arrow. The rules are bash's, from the redirection
+section of its manual, including the file descriptor that belongs to the
+operator when it is written against it. It is a **lexical** claim and not a
+verdict: `> /dev/null` and `> /etc/passwd` get the same colour, because which
+of them should alarm you is a question about the path. Recognising them fixed a
+segmentation bug on the way — `>|` is one operator, and hatch used to split the
+command at the `|` inside it. `hatch preview redirect` is the sample.
+
 **What is off the end of a pane is said in words.** Everything else here
 assumes the reader saw the text, and a pane showing twenty-four rows of a
 sixty-three-row command used to say so through its scroll bar alone — a bar
@@ -521,10 +534,11 @@ hatch preview                     # the window above, from your own config
 hatch preview root                # the root window: the ROOT block and the frame
 hatch preview long                # a command taller and wider than the window
 hatch preview comment             # comments, beside the separators they are not
+hatch preview redirect            # redirections, and the two things that look like one
 hatch preview --theme light       # the other palette, for this window only
 ```
 
-`hatch preview [command|chips|swap|root|long|comment]` opens the real approval
+`hatch preview [command|chips|swap|root|long|comment|redirect]` opens the real approval
 window on a sample request, reading the same config `hatch prompt` reads. It is
 how you see what your `font_size`, `theme` and `terminal` settings actually
 render as without having to get an agent to knock on the door. The `long` sample is
@@ -532,7 +546,9 @@ the one that does not fit: it is there so the stacked panes, the strip that
 scrolls sideways and the line that says how many rows are out of sight are
 something you can look at rather than read about. The `comment` sample puts an
 `&&` inside a comment two rows above an `&&` that really is a boundary, so the
-difference is something you can see rather than take on trust.
+difference is something you can see rather than take on trust. The `redirect`
+sample does the same for a `>|`, which is one operator, and the `|` three rows
+above it, which is a boundary.
 
 **It cannot run anything.** There is no daemon behind a preview, and that is
 structural rather than circumstantial: the window's one way to act on a
@@ -676,8 +692,9 @@ It **under-reports** where real structure is not one of those: `&`
 backgrounding, subshells, command substitution — `sleep 60 & wait` draws as one
 segment, and `(cd /tmp; rm -rf x)` splits at the `;` without showing what nests
 it. It **over-reports** where unmodelled syntax puts a separator character in
-data: comments, `$(( ))`, `[[ ]]`, the `>|` operator, `$'…\'…'`, here-document
-bodies, and `;;` in a `case` — each draws a boundary the shell does not have.
+data: `$(( ))`, `[[ ]]`, `$'…\'…'`, here-document bodies, and `;;` in a
+`case` — each draws a boundary the shell does not have. Comments and the `>|`
+operator used to be on that list and are not any more.
 Neither direction breaks an invariant: every byte is still on screen, drawn as
 itself. **Segment numbering is a reading aid, not an execution plan.** A fuller
 answer needs a real shell grammar.

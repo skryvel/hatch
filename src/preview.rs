@@ -183,13 +183,22 @@ pub enum Scenario {
     /// line starts a new segment and the `&&` inside the comment does not,
     /// and both are on screen at once.
     Comment,
+    /// A command whose lines redirect: the operators, the words they point
+    /// at, and the two things that look like them and are not.
+    ///
+    /// Its own sample for the reason [`Scenario::Comment`] is, and it is the
+    /// same kind of comparison. A `>|` and a real `|` are two rows apart, a
+    /// `>` inside quotes sits between them and is an argument, and a
+    /// destination that resolves out of the environment is directly below one
+    /// that does not.
+    Redirect,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 6] {
+    pub(crate) fn all() -> [Scenario; 7] {
         [
             Scenario::Command,
             Scenario::Chips,
@@ -197,6 +206,7 @@ impl Scenario {
             Scenario::Root,
             Scenario::Long,
             Scenario::Comment,
+            Scenario::Redirect,
         ]
     }
 }
@@ -416,6 +426,31 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Redirect => {
+            let asked = Asked::Command {
+                // Four things to look at. The `>|` on the last line is one
+                // operator and the `|` two rows above it is a segment
+                // boundary, in the same colours and three rows apart. The
+                // `' > '` between them is quoted and is an argument to
+                // `grep`, not a redirection. The `2>&1` and the `2>>` carry
+                // the file descriptor bash reads as part of the operator. And
+                // every destination is marked as loudly as the arrow in front
+                // of it, which is the half of a redirection a reader is
+                // actually scanning for.
+                command: REDIRECT_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Rebuild the service and file the warnings".to_string(),
+                reason: "The nightly build has been failing since Tuesday and the log is                          the only copy of why. The report generator reads the two files                          this writes."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
         Scenario::Chips => {
             let asked = Asked::Command {
                 // The second line is the whole argument for the rendering.
@@ -519,6 +554,37 @@ const COMMENT_SAMPLE: &str = "\
 cargo build --release   # then && rm -rf /tmp || true ; ls | wc & done
 cp target/release/service $HOME/bin/service#2 &&
 systemctl --user restart service   # leaves $HOME alone";
+
+/// The command behind [`Scenario::Redirect`].
+///
+/// Written as a block for the reason [`COMMENT_SAMPLE`] is: the scenario is a
+/// comparison between rows, and a sample whose line breaks are `\n` escapes
+/// in a source file is a sample nobody can see the shape of while they are
+/// editing it.
+///
+/// Five operators, and each is there for a case. `>` and `2>&1` on the first
+/// line are the pair everybody writes, and the `2>&` is the one whose file
+/// descriptor bash reads as part of the operator. The `' > '` on the second
+/// line is an argument to `grep` and not a redirection, which is the rule
+/// that keeps an arrow inside a string out of this -- and the `|` beside it
+/// really is a segment boundary. The `2>>` appends. The `>|` on the last line
+/// is one operator, so the `|` in it is not the boundary the `|` two rows
+/// above it is, and that pair is the whole reason the sample is four lines
+/// rather than two.
+///
+/// The destinations are the point. `$HOME/reports/service.txt` resolves out
+/// of the environment the command will really run in and `build.log` does
+/// not, and both are drawn as loudly as the arrow in front of them, because
+/// in `> /etc/passwd` the word a reader is scanning for is never the arrow.
+///
+/// It is still a script somebody might really write. hatch says nothing about
+/// whether any of these destinations is a good idea -- that is a question
+/// about the path, and a different pass's to answer.
+const REDIRECT_SAMPLE: &str = "\
+make -j4 > build.log 2>&1
+grep -F ' > ' build.log | tee warnings.txt
+install -m 0644 warnings.txt /srv/reports/ 2>> install.log
+printf 'done\\n' >| $HOME/reports/service.txt";
 
 /// The command behind [`Scenario::Long`].
 ///
@@ -977,6 +1043,38 @@ mod tests {
             Shown::of(&sample.payload)
                 .unwrap_or_else(|e| panic!("{scenario:?} cannot be drawn: {e}"));
         }
+    }
+
+    #[test]
+    fn the_redirect_sample_puts_the_two_pipes_on_screen_together() {
+        // The point of that scenario. A `>|` that is one operator and a `|`
+        // that is a segment boundary, both drawn, three rows apart -- a
+        // sample missing either of them would demonstrate nothing, and would
+        // go on looking like a perfectly good sample while doing so. The
+        // descriptor form and a destination are asserted beside them, because
+        // the destination is the half of a redirection a reader is scanning
+        // for.
+        let staging = tempfile::tempdir().unwrap();
+        let sample = build(Scenario::Redirect, &a_config(), platform().as_ref(), staging.path())
+            .expect("the redirect sample builds");
+        let rendering = sample.payload.rendering().expect("the sample is a drawable command");
+        let of_kind = |kind: &crate::render::SpanKind| -> Vec<&str> {
+            rendering.iter().filter(|span| span.kind() == kind).map(|s| s.text()).collect()
+        };
+
+        assert_eq!(
+            of_kind(&crate::render::SpanKind::Separator),
+            vec!["|"],
+            "the sample has one boundary in it, and it is not the `|` inside the `>|`"
+        );
+        let redirects = of_kind(&crate::render::SpanKind::Redirect);
+        for wanted in [">|", "2>&", "2>>", "build.log"] {
+            assert!(redirects.contains(&wanted), "{wanted:?} is not marked: {redirects:?}");
+        }
+        assert!(
+            of_kind(&crate::render::SpanKind::Quoted).contains(&"' > '"),
+            "the arrow inside the quotes was read as a redirection"
+        );
     }
 
     #[test]
