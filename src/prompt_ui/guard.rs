@@ -251,6 +251,31 @@ impl Guard {
         }
     }
 
+    /// How long until the window starts acting on input, at `now`.
+    ///
+    /// `None` once it already does. This is what an event loop asks for so
+    /// that it can wake at the instant the guard opens rather than at
+    /// whatever repaint happens to come along next. That matters because the
+    /// window says out loud that it is waiting — see
+    /// [`crate::prompt_ui::GUARD_NOTICE`] — and a sentence that outlived the
+    /// wait would be over buttons that had started working, which is worse
+    /// than not saying it at all.
+    ///
+    /// A millisecond past the boundary rather than on it, because the
+    /// boundary belongs to the closed side: a frame drawn at exactly the
+    /// guard's length would find [`Guard::is_open`] still false and ask to be
+    /// woken again for nothing.
+    pub fn opens_in(&self, now: Instant) -> Option<Duration> {
+        if self.is_open(now) {
+            return None;
+        }
+        let (from, wait) = match self.armed_at {
+            Some(armed) => (armed, GUARD),
+            None => (self.created_at, UNFOCUSED_GRACE),
+        };
+        Some(wait.saturating_sub(now.duration_since(from)) + Duration::from_millis(1))
+    }
+
     /// Whether the guard currently believes the window holds focus.
     ///
     /// For reconciling with what the window actually is; a focus change is
@@ -588,6 +613,32 @@ mod tests {
         assert_eq!(shut.classify(&event, Modifiers::CTRL, clock.at(750)), Action::Ignored);
         shut.focus_lost(clock.at(0));
         assert_eq!(shut.classify(&event, Modifiers::CTRL, clock.at(3000)), Action::Ignored);
+    }
+
+    #[test]
+    fn the_window_is_told_to_come_back_at_the_moment_the_guard_opens() {
+        // The window draws a sentence over the dead buttons for exactly as
+        // long as they are dead, and nothing else wakes the event loop sooner
+        // than a second. So the answer has to land on the open side of the
+        // boundary the test above pins to the closed one: a wake-up at
+        // exactly the guard's length would find the guard still shut and buy
+        // nothing.
+        let clock = Clock::new();
+        let mut guard = Guard::new(clock.at(0));
+        for at in [clock.at(0), clock.at(400)] {
+            let wait = guard.opens_in(at).expect("a shut guard says when it opens");
+            // A millisecond past the guard at the very most: the wake-up is
+            // for the frame that stops saying this, not a nap of its own.
+            assert!(wait <= GUARD + Duration::from_millis(1), "{wait:?} outlasts the guard");
+            assert!(guard.is_open(at + wait), "the window came back to a guard still shut");
+        }
+        assert_eq!(guard.opens_in(clock.at(751)), None, "an open guard asked to be woken");
+
+        // The unfocused window waits on the other clock, and is told so.
+        guard.focus_lost(clock.at(0));
+        let wait = guard.opens_in(clock.at(0)).expect("an unfocused window opens too");
+        assert!(wait > GUARD, "the long grace was measured as the short guard: {wait:?}");
+        assert!(guard.is_open(clock.at(0) + wait));
     }
 
     // ---- exactly one way to say each thing -------------------------------

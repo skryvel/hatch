@@ -329,6 +329,15 @@ const CLOSE_WATCHING: &str = "You asked to watch this one.";
 /// is unchanged and a third sentence cannot move the two buttons that decide.
 const CLOSE_WATCHING_ALWAYS: &str = "You stream every run.";
 
+/// What the window says while the typing guard has the buttons disabled.
+///
+/// Painted across the two buttons it is about rather than laid out under
+/// them; [`PromptApp::verdict_area`] is where that is argued. A constant so
+/// that the window which draws it and the test which reads it off a real
+/// frame cannot drift apart.
+const GUARD_NOTICE: &str =
+    "Waiting a moment, so a keystroke meant for another window cannot answer this one…";
+
 /// How long a refused chord is pointed at.
 ///
 /// Alt+S on a command that is going to run in a terminal of its own has
@@ -1490,13 +1499,22 @@ impl eframe::App for PromptApp {
             arm_exit_backstop(Arc::clone(&self.fatal));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // The clock, or the end of a refusal flash, whichever is sooner: a
-        // colour that only faded when the countdown next ticked would be up
-        // for as much as a second longer than it says it is.
-        let next = match self.refused {
-            Some((_, at)) => CLOCK_TICK.min(REFUSAL_NOTICE.saturating_sub(at.elapsed())),
-            None => CLOCK_TICK,
-        };
+        // The soonest of the three things this window has to be redrawn for.
+        // Two of them are shorter than a clock tick and neither can wait for
+        // one: a refusal colour that faded only when the countdown next
+        // ticked would be up for as much as a second longer than it says it
+        // is, and the sentence painted over the disabled buttons would
+        // outlive the guard it is about and sit there over buttons that had
+        // started working.
+        let next = [
+            Some(CLOCK_TICK),
+            self.refused.map(|(_, at)| REFUSAL_NOTICE.saturating_sub(at.elapsed())),
+            self.guard.opens_in(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(CLOCK_TICK);
         ctx.request_repaint_after(next);
     }
 
@@ -1954,13 +1972,45 @@ impl PromptApp {
     ///
     /// Returns the Approve button, so a test can ask egui itself what it
     /// would do with it.
+    ///
+    /// # Why the sentence is painted and not laid out
+    ///
+    /// It used to be an [`egui::Ui::label`] under the buttons, and a label is
+    /// a row. This is a bottom panel, and a bottom panel takes its height out
+    /// of the window *before* the panes above it are laid out -- so while the
+    /// guard was shut the panel was a row taller and the command a row
+    /// shorter, and 750 ms later the text above it jumped up by that row. It
+    /// happened on every focus gain rather than once, because that is when
+    /// the clock restarts, and what it costs a reader is a moment spent
+    /// looking for what moved.
+    ///
+    /// Reserving the row permanently is the other way out and is worse: it
+    /// spends a row of every request on a sentence most requests never show.
+    /// So the sentence is painted across the two buttons it is about. That
+    /// costs no layout at all, and it puts the explanation where the reader
+    /// is already looking -- on the controls that are not answering -- rather
+    /// than below them.
+    ///
+    /// Three things fall out of painting rather than adding:
+    ///
+    /// * **It cannot take a click.** A painted shape has no [`egui::Sense`]
+    ///   and allocates nothing, so there is no widget over Approve for a
+    ///   pointer to find once the guard opens. What stops a click while it is
+    ///   up is what stopped one before: the buttons under it are disabled,
+    ///   which is the second layer described in [`guard`].
+    /// * **It goes when the guard does.** It is painted only on the frames
+    ///   this is called with `guard_open` false, and the event loop asks to
+    ///   be woken at the instant the guard opens -- see
+    ///   [`guard::Guard::opens_in`] -- rather than leaving it up until
+    ///   whatever repaint comes along next, which is otherwise as much as a
+    ///   second later.
+    /// * **It is over the buttons and not merely near them.** The rect comes
+    ///   from the row that placed them, so the two cannot drift apart.
     fn verdict_area(&mut self, ui: &mut egui::Ui, guard_open: bool) -> egui::Response {
-        let approve = ui.add_enabled_ui(guard_open, |ui| self.verdict_buttons(ui)).inner;
+        let (approve, buttons) =
+            ui.add_enabled_ui(guard_open, |ui| self.verdict_buttons(ui)).inner;
         if !guard_open {
-            ui.label(
-                "Waiting a moment, so a keystroke meant for another window \
-                 cannot answer this one…",
-            );
+            paint_guard_notice(ui, buttons);
         }
         approve
     }
@@ -2004,8 +2054,9 @@ impl PromptApp {
     /// has to reach the note field. [`unfocusable`] is the one door: do not
     /// swap these back to `ui.button`.
     ///
-    /// Returns the Approve button.
-    fn verdict_buttons(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    /// Returns the Approve button, and the rect the two that decide share --
+    /// which is what [`PromptApp::verdict_area`] paints its sentence across.
+    fn verdict_buttons(&mut self, ui: &mut egui::Ui) -> (egui::Response, egui::Rect) {
         // Read before the fields below are borrowed to draw. `streamable` is
         // "this is a command", asked from the streaming side: a file swap
         // writes bytes and says nothing, so it has neither output to watch
@@ -2037,7 +2088,7 @@ impl PromptApp {
         }
         self.note_row(ui, width, streamable, can_stream);
         ui.add_space(6.0);
-        let approve = self.decision_row(ui, width, &note, &mut decided);
+        let (approve, buttons) = self.decision_row(ui, width, &note, &mut decided);
 
         if approve.clicked() {
             decided = Some(self.approval());
@@ -2047,7 +2098,7 @@ impl PromptApp {
             let frame = self.state.decide(verdict);
             answer(&mut self.out, &mut self.state, frame);
         }
-        approve
+        (approve, buttons)
     }
 
     /// One row: what to tell the agent, and whether to watch the output.
@@ -2335,13 +2386,19 @@ impl PromptApp {
 
     /// One row: the two buttons that decide, the four that do not, and the one
     /// that says what deciding is going to do to this window.
+    ///
+    /// Hands back the Approve button, and the place the two that decide were
+    /// put: the sentence the guard paints has to land on that place and
+    /// nowhere else. It is the row's own centre -- see [`Places`] -- so it is
+    /// where the buttons are by construction, rather than by a second
+    /// measurement that could come out disagreeing with the first.
     fn decision_row(
         &mut self,
         ui: &mut egui::Ui,
         width: f32,
         note: &str,
         decided: &mut Option<Verdict>,
-    ) -> egui::Response {
+    ) -> (egui::Response, egui::Rect) {
         let height = primary_button(ui).y;
         // `Hatch::ALL`, measured and then drawn: one list, in one order or
         // the other. Two lists is how a button ends up in one arrangement and
@@ -2434,7 +2491,7 @@ impl PromptApp {
                 ui.vertical_centered(|ui| centred_row(ui, width, |ui| hatch_row(ui, false)));
             }
         }
-        approve
+        (approve, places.centre)
     }
 }
 
@@ -2522,6 +2579,49 @@ fn row_width<'a>(
         count += 1.0;
     }
     total + (count - 1.0).max(0.0) * ui.spacing().item_spacing.x
+}
+
+/// Paint [`GUARD_NOTICE`] across the buttons the guard has disabled.
+///
+/// Painted, so it takes no room: `over` is where the two buttons already are,
+/// and nothing here allocates, senses or advances a cursor. See
+/// [`PromptApp::verdict_area`] for why that is the whole point.
+///
+/// Drawn small and on a ground of its own. The sentence is hatch's aside
+/// about why nothing is answering, in the same quiet voice as the chord hints
+/// on the buttons underneath it; the ground is the panel's own colour at very
+/// nearly full opacity, so the buttons are still there behind it rather than
+/// replaced by it, and the words are legible against one thing rather than
+/// against whatever they happen to cross.
+fn paint_guard_notice(ui: &egui::Ui, over: egui::Rect) {
+    let pad = ui.spacing().button_padding;
+    let galley = ui.painter().layout(
+        GUARD_NOTICE.to_string(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().text_color(),
+        // Wrapped inside the buttons rather than across the panel: this is a
+        // note about those two controls, and a line of it running out past
+        // them would read as a note about the window.
+        over.width() - 2.0 * pad.x,
+    );
+    // As wide as the pair of buttons and no wider: a band across the two
+    // controls that are not answering, rather than a box floating over them.
+    // Only the height is measured from the words.
+    let ground = egui::Rect::from_center_size(
+        over.center(),
+        egui::vec2(over.width(), galley.size().y + 2.0 * pad.y),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        ground,
+        ui.visuals().widgets.inactive.corner_radius,
+        ui.visuals().panel_fill.gamma_multiply(0.94),
+    );
+    painter.galley(
+        egui::pos2(ground.left() + pad.x, ground.center().y - 0.5 * galley.size().y),
+        galley,
+        ui.visuals().text_color(),
+    );
 }
 
 /// A button a mouse can press and a keyboard cannot reach.
@@ -4672,6 +4772,19 @@ mod tests {
     /// The whole window, drawn at `size`, as the shapes egui would send to a
     /// GPU.
     fn window_shapes(app: &mut PromptApp, size: egui::Vec2) -> Vec<egui::epaint::ClippedShape> {
+        window_shapes_while(app, size, true)
+    }
+
+    /// The same, drawn with the typing guard in a given state.
+    ///
+    /// `false` is what every window looks like for the first 750 ms of every
+    /// focus it gains, which is a state two claims below are about: what the
+    /// window says then, and what it costs the panes to say it.
+    fn window_shapes_while(
+        app: &mut PromptApp,
+        size: egui::Vec2,
+        open: bool,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         theme::apply(&ctx, theme::Theme::Dark);
         apply_faces(&ctx);
@@ -4680,10 +4793,10 @@ mod tests {
         // pane measured against the first frame's guess is not the pane a
         // reader sees.
         for _ in 0..2 {
-            let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+            let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, open));
             out.textures_delta.clear();
         }
-        let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, true));
+        let mut out = ctx.run_ui(raw_sized(Vec::new(), size), |ui| app.window(ui, open));
         out.textures_delta.clear();
         out.shapes
     }
@@ -4717,7 +4830,12 @@ mod tests {
 
     /// How many points of the window's height the panes cover.
     fn pane_height(app: &mut PromptApp, size: egui::Vec2) -> f32 {
-        let shapes = window_shapes(app, size);
+        pane_height_while(app, size, true)
+    }
+
+    /// The same, with the guard open or shut.
+    fn pane_height_while(app: &mut PromptApp, size: egui::Vec2, open: bool) -> f32 {
+        let shapes = window_shapes_while(app, size, open);
         let boxes = pane_boxes(&shapes);
         assert!(!boxes.is_empty(), "no pane was drawn at all");
         let top = boxes.iter().map(|r| r.top()).fold(f32::INFINITY, f32::min);
@@ -4772,6 +4890,106 @@ mod tests {
         assert!(strip > 0.0, "the raw pane is not drawn at all when stacked");
     }
 
+    // ---- what the guard says, and what saying it costs --------------------
+
+    #[test]
+    fn the_sentence_the_guard_draws_costs_the_command_no_row() {
+        // The bug. The sentence was a label in the bottom panel, a bottom
+        // panel takes its height out of the window before the panes above it
+        // are laid out, and so the command was a row shorter for as long as
+        // the guard was shut -- then jumped up by that row when it opened, on
+        // every focus gain rather than once. Painted, it costs nothing, and
+        // the two heights are the same number.
+        let mut app = a_window_showing("rm -rf /var/tmp/build && echo 'cleared'");
+        let shut = pane_height_while(&mut app, opening_size(), false);
+        let open = pane_height_while(&mut app, opening_size(), true);
+
+        assert!(
+            (shut - open).abs() < 1.0,
+            "the panes are {shut} points while the guard is shut and {open} after it opens, \
+             so the command moves under the reader"
+        );
+    }
+
+    #[test]
+    fn the_sentence_is_painted_across_the_buttons_that_are_not_answering() {
+        // Where the reader is already looking -- on the controls that are not
+        // responding -- rather than on a line below them. Asked of the
+        // rectangles egui laid out, because "over the buttons" is a claim
+        // about position and not about the order two calls are made in.
+        let mut app = a_window_showing("sleep 1");
+        let drawn = window_shapes_while(&mut app, opening_size(), false);
+        let rects = text_rects(&drawn);
+        let notice = rects
+            .iter()
+            .find(|(text, _)| text == GUARD_NOTICE)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("the window said nothing: {}", shapes_text(&drawn)));
+        let approve = rects
+            .iter()
+            .find(|(text, _)| text == "Approve")
+            .map(|(_, rect)| *rect)
+            .expect("Approve is not on screen at all");
+
+        assert!(
+            notice.intersects(approve),
+            "the sentence is at {notice:?} and Approve is at {approve:?}: not over it"
+        );
+    }
+
+    #[test]
+    fn the_sentence_is_gone_the_moment_the_buttons_are_live() {
+        let mut app = a_window_showing("sleep 1");
+        let said = window_text(&mut app, true);
+
+        assert!(
+            !said.contains(GUARD_NOTICE),
+            "the window is still saying it is waiting for the guard: {said}"
+        );
+    }
+
+    #[test]
+    fn a_pointer_where_the_sentence_was_painted_approves_once_the_guard_opens() {
+        // Painted is why it cannot eat the click: there is no widget over
+        // Approve to find the pointer first, and nothing to become stale
+        // either. The point pressed is inside both rectangles, which is what
+        // makes this a test of the sentence rather than of the button.
+        let (mut app, sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let inside = Instant::now();
+
+        a_settled_frame(&mut app, &ctx, inside);
+        let drawn = a_live_frame(&mut app, &ctx, Vec::new(), inside);
+        let rects = text_rects(&drawn);
+        let notice = rects
+            .iter()
+            .find(|(text, _)| text == GUARD_NOTICE)
+            .map(|(_, rect)| *rect)
+            .expect("the sentence is not on screen while the guard is shut");
+        let at = rects
+            .iter()
+            .find(|(text, _)| text == "Approve")
+            .map(|(_, rect)| rect.center())
+            .expect("Approve is not on screen");
+        assert!(notice.contains(at), "the sentence is not over the point about to be pressed");
+
+        let now = past_the_guard();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        a_live_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)], now);
+        a_live_frame(&mut app, &ctx, vec![button(true)], now);
+        a_live_frame(&mut app, &ctx, vec![button(false)], now);
+
+        let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
+        assert!(out.contains("approve"), "the click did not reach Approve at all: {out:?}");
+    }
+
     // ---- the controls, bundled --------------------------------------------
 
     #[test]
@@ -4793,7 +5011,7 @@ mod tests {
             });
         });
         out.textures_delta.clear();
-        let approve = approve.expect("the row drew");
+        let (approve, _) = approve.expect("the row drew");
         let row = hatch.expect("the row drew");
 
         assert!(approve.rect.width() > 0.0, "Approve was not laid out");
@@ -4821,7 +5039,7 @@ mod tests {
             });
         });
         out.textures_delta.clear();
-        let approve = approve.expect("the row drew");
+        let (approve, _) = approve.expect("the row drew");
         let row = row.expect("the row drew");
 
         assert!(
