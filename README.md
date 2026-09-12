@@ -262,6 +262,20 @@ never in place of it. A reader can use whichever they trust in the moment, and
 a disagreement between them is visible at a glance because the two sit at the
 same height.
 
+**What is off the end of a pane is said in words.** Everything else here
+assumes the reader saw the text, and a pane showing twenty-four rows of a
+sixty-three-row command used to say so through its scroll bar alone — a bar
+that took no column and faded to nothing whenever the pointer was elsewhere. A
+command can be written for that: blank lines to the height of the pane, and the
+payload under them. So the bars take a column and stay on screen, and the line
+under the caption says it outright — *"Only 24 of the command's 63 rows fit the
+pane below, so 39 of them are out of sight; scroll for the rest."* — along with
+how far the lines run past the right edge of the raw pane, which deliberately
+does not reflow. Both figures are the pane's own measurements. Words and not an
+affordance alone: they survive a reader who has never learned what a scroll bar
+means, and a screenshot printed in black and white. `hatch preview long` is a
+sample that does not fit, so this is something you can look at.
+
 **The face is part of the argument.** The panes are set in Hack, chosen rather
 than inherited, for three reasons that are requirements and not preferences: it
 has **no ligatures**, so `&&` is never drawn as one glyph and `!=` never as
@@ -390,13 +404,17 @@ is the same violet as a clean one, and what happened is said in words.
 ```sh
 hatch preview                     # the window above, from your own config
 hatch preview root                # the root window: the ROOT block and the frame
+hatch preview long                # a command taller and wider than the window
 hatch preview --theme light       # the other palette, for this window only
 ```
 
-`hatch preview [command|chips|swap|root]` opens the real approval window on a
-sample request, reading the same config `hatch prompt` reads. It is how you see
-what your `font_size`, `theme` and `terminal` settings actually render as
-without having to get an agent to knock on the door.
+`hatch preview [command|chips|swap|root|long]` opens the real approval window
+on a sample request, reading the same config `hatch prompt` reads. It is how
+you see what your `font_size`, `theme` and `terminal` settings actually render
+as without having to get an agent to knock on the door. The `long` sample is
+the one that does not fit: it is there so the stacked panes, the strip that
+scrolls sideways and the line that says how many rows are out of sight are
+something you can look at rather than read about.
 
 **It cannot run anything.** There is no daemon behind a preview, and that is
 structural rather than circumstantial: the window's one way to act on a

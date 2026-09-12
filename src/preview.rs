@@ -159,14 +159,17 @@ pub enum Scenario {
     Swap,
     /// A command that runs as root: the `ROOT` block and the danger frame.
     Root,
+    /// A command longer and wider than the window: the stacked panes, and the
+    /// line that says how much of it is out of sight.
+    Long,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 4] {
-        [Scenario::Command, Scenario::Chips, Scenario::Swap, Scenario::Root]
+    pub(crate) fn all() -> [Scenario; 5] {
+        [Scenario::Command, Scenario::Chips, Scenario::Swap, Scenario::Root, Scenario::Long]
     }
 }
 
@@ -421,9 +424,82 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Long => {
+            let asked = Asked::Command {
+                command: LONG_COMMAND.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Cut the 0.9.2 release and push it".to_string(),
+                reason: "Everything in the milestone is merged and the tag has to go out \
+                         before the freeze tonight."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
     };
     Ok(sample)
 }
+
+/// The command behind [`Scenario::Long`].
+///
+/// This scenario exists because the ones above it all fit. A sample that fits
+/// its panes exercises nothing about the window's account of what is off the
+/// end of them — the stacked arrangement, the strip that scrolls sideways,
+/// and the line under the caption that says how many rows are out of sight —
+/// and those are the parts a reader most needs to be able to look at, because
+/// they are the parts that exist for a command written to hide something.
+///
+/// So it is long in both directions on purpose. More lines than a window of
+/// any ordinary height can show, and one line — the `rsync` — far wider than
+/// a full-width pane, which is what sends the panes into the stacked
+/// arrangement and runs the raw strip off its right edge.
+///
+/// It is still a command somebody might really write. A sample of padding
+/// would demonstrate the same rectangles and teach nobody what the window is
+/// for.
+///
+/// The backslashes in the `rsync` are Rust's line continuations and not the
+/// shell's: they are folded here so this file stays readable, and what the
+/// window is handed is one line of some two hundred and thirty characters.
+/// A sample that really carried a `\` and a newline would be a sample of the
+/// shell's own folding, which is a different thing to look at and not this
+/// one.
+const LONG_COMMAND: &str = "\
+set -euo pipefail
+
+cd $HOME/src/service
+git fetch --all --tags --prune
+git switch main
+git pull --ff-only
+
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --locked
+cargo build --release --locked
+
+target/release/service --version
+sha256sum target/release/service | tee dist/service-0.9.2.sha256
+
+git tag -a v0.9.2 -m 'release 0.9.2'
+git push origin v0.9.2
+
+rsync -avz --delete --checksum --partial --human-readable --exclude '*.tmp' --exclude '.git/' \
+--rsh 'ssh -o StrictHostKeyChecking=yes -o ConnectTimeout=10' target/release/service \
+deploy@build.internal:/srv/releases/service/0.9.2/service
+
+ssh deploy@build.internal 'systemctl --user restart service'
+sleep 5
+ssh deploy@build.internal 'systemctl --user is-active service'
+
+curl -fsS https://service.internal/healthz
+curl -fsS https://service.internal/version
+
+echo 'released 0.9.2'";
 
 // ---- where a preview's verdicts go -----------------------------------------
 
@@ -819,6 +895,28 @@ mod tests {
     }
 
     #[test]
+    fn the_long_sample_really_is_longer_and_wider_than_a_pane() {
+        // The point of the scenario. A sample that fitted its panes would
+        // exercise none of what it is there for -- the stacked arrangement,
+        // a strip with text off to the right of it, and the line that says
+        // how many rows are out of sight -- and it would go on looking like
+        // a perfectly good sample while doing so.
+        let staging = tempfile::tempdir().unwrap();
+        let sample = build(Scenario::Long, &a_config(), platform().as_ref(), staging.path())
+            .expect("the long sample builds");
+        let Shown::Command { longest, .. } = Shown::of(&sample.payload).expect("drawable") else {
+            panic!("the long sample is not a command")
+        };
+        // Wider than any full-width pane a 1280-point window has: a column of
+        // that window holds about sixty characters and the whole of it about
+        // a hundred and thirty.
+        assert!(longest >= 200, "the longest line is {longest} characters, which a pane holds");
+        // And taller than the panes of a window of any ordinary height.
+        let rows = LONG_COMMAND.lines().count();
+        assert!(rows >= 25, "the sample is {rows} rows, which a 700-point window shows");
+    }
+
+    #[test]
     fn the_root_sample_is_the_root_window_and_names_the_mechanism() {
         // That the root scenario really is elevated -- the flag the `ROOT`
         // block and the danger frame are read off -- and that the line is the
@@ -1001,3 +1099,4 @@ mod tests {
         assert!(!rows.is_empty(), "there is no diff to draw");
     }
 }
+

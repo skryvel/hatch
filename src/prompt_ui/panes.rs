@@ -1345,6 +1345,50 @@ const ROW_EPSILON: f32 = 0.05;
 /// costs them nothing. What carries the all-clear instead is the scroll bar,
 /// which is drawn from this frame's own layout and is now always there to be
 /// looked at.
+///
+/// # The stronger rule, and why it is not here
+///
+/// There is an honest version of this: **Approve stays disabled until the
+/// command has actually been scrolled to the end.** For a program whose whole
+/// premise is "you saw what you approved", telling the reader there is more
+/// and then letting them approve anyway is the weaker thing to do, and it is
+/// worth writing down why it is nonetheless the thing that is here.
+///
+/// * **It would check scrolling, not reading.** The gesture that satisfies it
+///   is dragging a handle to the bottom, which takes a quarter of a second
+///   and reads nothing. So the rule would not make the guarantee true; it
+///   would make the window *assert* the guarantee on the evidence of a scroll
+///   offset. A check that is cheaper to perform than to mean is worse than no
+///   check, because the sentence above is honest about what it knows and a
+///   greyed-out button would not be.
+/// * **The cost lands entirely on the honest case.** Most requests fit and
+///   the gate would never fire; the ones where it fires are the long ones,
+///   which are already the slow ones to read. A window that is not answered
+///   is resolved as a denial, so friction on a long command is not only
+///   irritating — it is a new way for a request to be refused, and the reader
+///   who is being made to hurry is the one who was reading.
+/// * **"The end" is not one place.** The two panes are two renderings, and
+///   the end of one is not the end of the other; a window resized while it is
+///   being read moves both. A rule enforced against a number that ambiguous
+///   would fire when it should not, and the reader would learn to work around
+///   it rather than with it.
+/// * **It needs state this window deliberately does not keep.** A high-water
+///   mark per pane, surviving resizes and arrangement changes, would have to
+///   live in [`crate::prompt_ui::PromptState`], which knows nothing about how
+///   anything is drawn and is better for it.
+///
+/// What makes it acceptable to stop here: the reader is not being asked to
+/// certify that they read everything, they are being asked whether to let
+/// something run, and the window's own default is no. A reader who has been
+/// told there are thirty-nine rows they have not seen and approves anyway has
+/// made a decision, which is what this program is for.
+///
+/// What would change the answer is a narrower signal. A command padded with
+/// blank lines to the height of a pane is a *shape*, and a shape can be
+/// scanned for and marked in the danger tier, on the requests that have it
+/// and no others — which is the register the rest of this window already
+/// works in. That is a better use of the reader's attention than a rule
+/// applied to every request they ever answer.
 fn rows_out_of_sight(rows: Rows, of: &str, pane: &str) -> Option<String> {
     (!rows.whole()).then(|| {
         format!(
