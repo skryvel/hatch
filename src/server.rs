@@ -593,6 +593,15 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          is easier to read, or decide to run it themselves. You get back what actually \
          happened, which is not always what you asked for.\n\
          \n\
+         **To change a file, use `swap_file` instead.** Reading one here is exactly what this \
+         tool is for — `cat` it, `grep` it, list a directory. Writing one is not. The difference \
+         is what the person is asked to check: `swap_file` shows them a diff, the mode and owner \
+         the file will land at, and a target hatch has confirmed is not a symlink and has not \
+         changed since you read it. A `cat > file` here-document, a `sed -i`, a `tee` or a `>>` \
+         shows them a shell command whose effect on the file they have to work out in their \
+         head, and none of those checks happen at all. This holds even when the shell one-liner \
+         is shorter, and even for a single line in a config.\n\
+         \n\
          Fields:\n\
          - title: the intent in one plain line. It is the first thing the person reads, so write \
          \"Install ripgrep\", not \"pacman -S ripgrep\". The point, not the syntax.\n\
@@ -629,6 +638,13 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          Use this only when the file has to live on the host: a config under /etc, a dotfile in \
          the person's home directory, a service unit. For files inside your own workspace, write \
          them directly — never through this tool.\n\
+         \n\
+         **This is the tool for editing configuration.** Whenever what you want is \"this file \
+         should now say X\" — a unit, a dotfile, something under /etc — come here, and not to \
+         `run_command` with a redirect or a `sed -i`. It is the form a person can actually \
+         check: they read a diff rather than reconstructing what a shell line would do, and the \
+         write is refused outright if the file changed after you read it, so an edit someone \
+         else made in the meantime is reported to you instead of being overwritten.\n\
          \n\
          The person sees a diff of the change before anything is written, and approves or \
          rejects it. One call can block for up to {total} seconds while they read and decide, so \
@@ -3334,6 +3350,27 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn each_tool_sends_a_file_edit_to_the_other_one() {
+        // An agent that writes a config with `cat > file` or `sed -i` has not
+        // done anything hatch forbids — but it has swapped a diff, a landing
+        // mode, a symlink check and a drift check for a shell line the reader
+        // has to simulate in their head. The descriptions are the only place
+        // that choice is made, so both sides name the other tool: one says
+        // where a file edit belongs, the other says it is the place.
+        let descriptions = tool_descriptions(&test_config());
+        let run = descriptions.for_tool("run_command").expect("run_command is described");
+        let swap = descriptions.for_tool("swap_file").expect("swap_file is described");
+
+        assert!(run.contains("use `swap_file` instead"), "run_command does not send a file edit on: {run}");
+        assert!(swap.contains("tool for editing configuration"), "swap_file does not claim configs: {swap}");
+        // The shapes an agent actually reaches for, named rather than implied.
+        for reach in ["sed -i", "here-document", "tee"] {
+            assert!(run.contains(reach), "run_command does not name {reach:?}: {run}");
+        }
+        assert!(swap.contains("sed -i"), "swap_file does not name the habit it replaces: {swap}");
     }
 
     #[test]
