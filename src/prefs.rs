@@ -57,18 +57,22 @@
 //! so a reader sees either the whole of the old file or the whole of the new
 //! one and never a truncated one.
 //!
-//! What the rename does not do is merge. The later of two writes wins the
-//! file, and today that costs nothing at all: there is one preference in it,
-//! each window writes the value its own reader just clicked, and "the last
-//! click wins" is the same answer two clicks in one window would get.
+//! What the rename does not do is merge, and there are three preferences in
+//! the file now rather than one — which is the case an earlier version of
+//! this paragraph left a note about. A window that serialized its own struct
+//! would write back its own stale copy of the other two, undoing a change the
+//! window beside it made a moment earlier: a reader who ticks Stream in one
+//! window and Close in another would end with whichever they ticked second
+//! and no record of the first.
 //!
-//! **A second preference changes that**, and this is the note for whoever
-//! adds one: window A saving its checkbox would then also write back its own
-//! stale copy of B's, undoing a change B made a moment earlier. Re-reading
-//! the file immediately before writing narrows that to the width of a rename
-//! and does not close it. Closing it properly means a lock, and a lock means
-//! a stale one can leave a window unable to save — which is why there is not
-//! one here for a single boolean.
+//! So nothing writes the whole struct. [`PrefsFile::update`] is the only way
+//! in: it reads the file, changes the one field that was clicked, and renames
+//! the result over. That narrows the race to the width of a rename — two
+//! windows whose read-modify-write overlap *exactly* still lose one change —
+//! and it is where this stops. Closing it properly means a lock, and a stale
+//! lock leaves a window unable to save a checkbox, which is a worse failure
+//! than the one it prevents: three booleans are not worth a window that
+//! cannot be ticked.
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -78,20 +82,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::Paths;
 
-/// The display choices a window remembers between requests.
+/// The choices a window remembers between requests.
 ///
 /// Every field has a default and the struct carries `#[serde(default)]`, so a
 /// file written by an older build keeps loading unchanged after a new
 /// preference is added — and, just as importantly, a file written by a *newer*
-/// build loads here without its unknown keys stopping anything.
+/// build loads here without its unknown keys stopping anything. Every default
+/// is `false`, which is not an accident of the derive: the file's absence and
+/// the file saying "no to all three" have to be the same window, because a
+/// first run and an unreadable file both produce the absence.
 ///
-/// What may go in here is narrow: a preference the window writes down because
-/// a person ticked it, which changes what the window does with itself and
-/// nothing about what runs. `stream` is deliberately absent — watching a
-/// command is a choice about one command, and a standing "always stream"
-/// would be a window that starts every request already committed to a view of
-/// it. `terminal` is absent for a much harder reason: it decides what runs,
-/// and a remembered one would be a standing grant nobody re-reads.
+/// # What may go in here, and the one that nearly may not
+///
+/// Two of these are display choices — they change what the person *sees* — and
+/// they are the easy case: a remembered one costs a glance to notice and a
+/// click to undo, and the worst a wrong one does is show too much or too
+/// little of something that was going to happen anyway.
+///
+/// `terminal` is not that, and an earlier version of this struct refused it on
+/// exactly that ground. It decides how the command *executes*: the command
+/// gets a real tty, and everything in that terminal — including what the
+/// person types into it — is captured and returned to the agent. A tick made
+/// today is therefore a standing decision that a request next week runs that
+/// way, and the person answering that request did not make it for that
+/// request.
+///
+/// It is here anyway, and the reasons it is are narrow enough to be worth
+/// naming rather than assuming:
+///
+/// * The box is **on screen, ticked, in the window**, every time. This is not
+///   a hidden grant; it is a visible default, and undoing it is one click in
+///   the window that is already asking.
+/// * The warning that everything in the terminal goes to the agent is drawn
+///   **whether or not the box is ticked** — `PromptApp::terminal_row` draws
+///   it beside the control and not in a tooltip — so a remembered tick never
+///   arrives without the sentence that says what it costs.
+/// * It cannot take a terminal away. An agent that asked for one gets one,
+///   and a remembered `false` changes nothing about that.
+///
+/// What it still is, and what nothing here makes it stop being: the one
+/// preference in this file that a person can set once and then be surprised
+/// by. Treat any change to how it is drawn as a change to a security control,
+/// not to a checkbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -101,6 +133,26 @@ pub struct Prefs {
     /// Written by the "Close when I decide" checkbox in the window's
     /// decision row, which is also where what ticking it gives up is said.
     pub close_on_decide: bool,
+    /// Whether the window should show the command's output as it arrives.
+    ///
+    /// Written by the "Stream output to this window" checkbox. A display
+    /// choice and nothing more: the daemon captures the output either way and
+    /// returns it either way, and this decides only whether the person
+    /// watching gets to see it happen.
+    ///
+    /// It is the one of the three that can leave the window in a state that
+    /// reads like a fault: streaming beats closing, so a remembered `true`
+    /// here greys the close box on every window from now on. The window says
+    /// so out loud, and in words that are true of a standing choice rather
+    /// than of a tick made in front of this command — see
+    /// `CLOSE_WATCHING_ALWAYS` in `crate::prompt_ui`.
+    pub stream: bool,
+    /// Whether the command should be given a terminal of its own.
+    ///
+    /// Written by the "Run it in a terminal" checkbox. **Not a display
+    /// choice** — see this struct's own documentation, which is where the
+    /// difference is set out and where anyone changing this should start.
+    pub terminal: bool,
 }
 
 /// The file [`Prefs`] are kept in, and the only thing that writes it.
@@ -170,13 +222,40 @@ impl PrefsFile {
             .unwrap_or_default()
     }
 
-    /// Write `prefs`, replacing whatever was there. Best effort, and silent.
+    /// Change one thing in the file and put it back. Best effort, and silent.
+    ///
+    /// Read-modify-write rather than a plain write, and that is the whole
+    /// reason this is a closure and not a value: several windows are open at
+    /// once by design, and a window that serialized its own struct would
+    /// write back its stale copy of everything it did not touch. See the
+    /// module documentation for what that leaves and why it stops there.
+    ///
+    /// The closure is handed what is on disk *now*, not what the window was
+    /// opened with, so it must change only the field it was called for and
+    /// leave the rest alone.
     ///
     /// Silent because of where it is called from: the frame in which somebody
     /// ticked a checkbox, in the window they are about to approve a command
     /// in. A preference that did not stick is worth none of that window's
     /// room, and a reader who sees the box ticked has been told the truth
     /// about this request whatever the disk did.
+    pub fn update(&self, change: impl FnOnce(&mut Prefs)) {
+        if !self.writable {
+            return;
+        }
+        let Some(path) = self.path.as_deref() else { return };
+        let mut prefs = self.read();
+        change(&mut prefs);
+        let _ = replace(path, &prefs);
+    }
+
+    /// Write `prefs` whole, replacing whatever was there.
+    ///
+    /// For a caller that owns the whole file — which is a test setting up a
+    /// state, and nothing in the window. Every write a window does goes
+    /// through [`PrefsFile::update`], because a window only ever knows about
+    /// the one box that was clicked in it.
+    #[cfg(test)]
     pub fn write(&self, prefs: &Prefs) {
         if !self.writable {
             return;
@@ -189,8 +268,8 @@ impl PrefsFile {
 /// Serialize `prefs` into a 0600 file beside `path` and rename it over.
 ///
 /// 0600 because that is the mode everything hatch creates has, not because
-/// there is a secret in it: the file sits in a 0700 directory and holds one
-/// boolean. What the mode is really for is that it is the same discipline as
+/// there is a secret in it: the file sits in a 0700 directory and holds three
+/// booleans. What the mode is really for is that it is the same discipline as
 /// `config.toml`'s, applied by the same means — a permissioned temporary file
 /// rather than whatever the umask happens to be.
 ///
@@ -230,7 +309,7 @@ mod tests {
         let file = PrefsFile::at(&paths);
         assert!(!file.read().close_on_decide, "the default is to stay");
 
-        file.write(&Prefs { close_on_decide: true });
+        file.write(&Prefs { close_on_decide: true, ..Prefs::default() });
         assert!(PrefsFile::at(&paths).read().close_on_decide, "a fresh window read the default");
     }
 
@@ -240,8 +319,8 @@ mod tests {
         // box is ticked would get wrong.
         let (_root, paths) = a_layout();
         let file = PrefsFile::at(&paths);
-        file.write(&Prefs { close_on_decide: true });
-        file.write(&Prefs { close_on_decide: false });
+        file.write(&Prefs { close_on_decide: true, ..Prefs::default() });
+        file.write(&Prefs { close_on_decide: false, ..Prefs::default() });
         assert!(!PrefsFile::at(&paths).read().close_on_decide);
     }
 
@@ -258,7 +337,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths::scratch(&root.path().join("never-created"));
         let file = PrefsFile::at(&paths);
-        file.write(&Prefs { close_on_decide: true });
+        file.write(&Prefs { close_on_decide: true, ..Prefs::default() });
         assert_eq!(file.read(), Prefs::default());
     }
 
@@ -275,7 +354,7 @@ mod tests {
                 "{rubbish:?} was not shrugged off"
             );
         }
-        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
         assert!(PrefsFile::at(&paths).read().close_on_decide, "the rubbish outlived a write");
     }
 
@@ -297,11 +376,11 @@ mod tests {
         // A screenshot tool that changed a user's settings would be a
         // surprising thing for a screenshot to do.
         let (_root, paths) = a_layout();
-        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
 
         let preview = PrefsFile::at(&paths).read_only();
         assert!(preview.read().close_on_decide, "a preview must show the window as it is");
-        preview.write(&Prefs { close_on_decide: false });
+        preview.write(&Prefs { close_on_decide: false, ..Prefs::default() });
         assert!(
             PrefsFile::at(&paths).read().close_on_decide,
             "the preview wrote to the user's file"
@@ -312,14 +391,14 @@ mod tests {
     fn a_window_with_no_file_behind_it_defaults_and_never_writes() {
         let file = PrefsFile::none();
         assert_eq!(file.read(), Prefs::default());
-        file.write(&Prefs { close_on_decide: true });
+        file.write(&Prefs { close_on_decide: true, ..Prefs::default() });
         assert_eq!(file.read(), Prefs::default());
     }
 
     #[test]
     fn the_file_is_written_at_0600() {
         let (_root, paths) = a_layout();
-        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
         let mode = std::fs::metadata(paths.prefs_file()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "written at {mode:04o}");
     }
@@ -336,7 +415,10 @@ mod tests {
             windows.push(std::thread::spawn(move || {
                 let file = PrefsFile::at(&paths);
                 for round in 0..40 {
-                    file.write(&Prefs { close_on_decide: (window + round) % 2 == 0 });
+                    file.write(&Prefs {
+                        close_on_decide: (window + round) % 2 == 0,
+                        ..Prefs::default()
+                    });
                     // Reading in the middle of everyone else's writes is the
                     // half of this that a torn file would break.
                     let _ = file.read();
@@ -351,13 +433,85 @@ mod tests {
     }
 
     #[test]
+    fn every_box_is_remembered_on_its_own_and_none_of_them_is_the_default() {
+        // Three preferences, three keys, and a default of `false` for each:
+        // the file's absence and the file saying no to all three have to be
+        // the same window, because a first run produces the absence.
+        let (_root, paths) = a_layout();
+        let file = PrefsFile::at(&paths);
+        assert_eq!(file.read(), Prefs::default());
+        assert_eq!(
+            Prefs::default(),
+            Prefs { close_on_decide: false, stream: false, terminal: false }
+        );
+
+        file.write(&Prefs { close_on_decide: true, stream: true, terminal: true });
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs { close_on_decide: true, stream: true, terminal: true },
+            "a fresh window did not read back all three"
+        );
+    }
+
+    #[test]
+    fn a_window_changing_one_box_leaves_the_two_it_did_not_touch_alone() {
+        // The whole reason writes go through `update`. A window that
+        // serialized its own struct would write back its stale copy of the
+        // other two, and the reader who ticked Stream in the window beside
+        // this one would find it unticked again.
+        let (_root, paths) = a_layout();
+        PrefsFile::at(&paths).write(&Prefs {
+            close_on_decide: true,
+            stream: true,
+            terminal: false,
+        });
+
+        // A second window that opened before any of that and knows nothing
+        // about it, ticking the one box its reader clicked.
+        PrefsFile::at(&paths).update(|prefs| prefs.terminal = true);
+
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs { close_on_decide: true, stream: true, terminal: true },
+            "a window writing one box trampled the others"
+        );
+    }
+
+    #[test]
+    fn an_update_on_a_file_that_cannot_be_read_still_writes_what_it_was_given() {
+        // `update` reads first, and a read that fails is the defaults — which
+        // is the same answer a window opening on that file would get. The
+        // click must still stick.
+        let (_root, paths) = a_layout();
+        std::fs::write(paths.prefs_file(), "not toml at all {{{").unwrap();
+        PrefsFile::at(&paths).update(|prefs| prefs.stream = true);
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs { close_on_decide: false, stream: true, terminal: false }
+        );
+    }
+
+    #[test]
+    fn a_preview_updates_nothing_either() {
+        // `read_only` has to cover every way in, not only the one it was
+        // written against.
+        let (_root, paths) = a_layout();
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
+        PrefsFile::at(&paths).read_only().update(|prefs| prefs.close_on_decide = false);
+        assert!(
+            PrefsFile::at(&paths).read().close_on_decide,
+            "a preview updated the user's file"
+        );
+    }
+
+    #[test]
     fn nothing_is_left_beside_the_file_once_a_write_is_over() {
         // The temporary file is the mechanism, not a leftover: a window that
         // dropped one per click would fill the state directory with them.
         let (_root, paths) = a_layout();
         let file = PrefsFile::at(&paths);
         for _ in 0..5 {
-            file.write(&Prefs { close_on_decide: true });
+            file.write(&Prefs { close_on_decide: true, ..Prefs::default() });
         }
         let dir = paths.prefs_file().parent().unwrap().to_path_buf();
         let left: Vec<_> = std::fs::read_dir(&dir)

@@ -105,7 +105,7 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 
 use crate::exec::Stream;
-use crate::prefs::{Prefs, PrefsFile};
+use crate::prefs::PrefsFile;
 use crate::prompt_ui::guard::{Action, Guard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
@@ -239,6 +239,17 @@ const TERMINAL_CAPTURE: &str = "Everything in that terminal is sent to the agent
 /// Why the control is dead on a request that already asked for a terminal.
 const TERMINAL_ASKED: &str = "The agent asked for one.";
 
+/// The label on the control that shows the output as it arrives.
+const STREAM_LABEL: &str = "Stream output to this window";
+
+/// Why that control is dead when it is.
+///
+/// A terminal is a stream of its own and the reader is about to be looking at
+/// it, so there is nothing for this window to show that they will not already
+/// have. Also what [`REFUSAL_NOTICE`] points at when the chord asks for a
+/// stream there is no room for.
+const STREAM_DEAD: &str = "It runs in a terminal of its own.";
+
 /// The label on the control that sends the window away at the verdict.
 ///
 /// "When I decide" and not "after approving", although approving is the only
@@ -275,6 +286,41 @@ const CLOSE_COST: &str = "The Kill button goes with it.";
 /// drawn unticked because that is what will happen, not because anything was
 /// forgotten — so unticking Stream brings it straight back.
 const CLOSE_WATCHING: &str = "You asked to watch this one.";
+
+/// The same greyed box, when nobody chose it in front of this command.
+///
+/// Stream is remembered now, so "you asked to watch this one" is a sentence
+/// that can be false: a reader who ticked Stream last week and Close the week
+/// before opens every window from now on with the close box greyed out and a
+/// window telling them they asked for something about a command they have not
+/// read yet. That is the state that reads like a fault, and it is not one —
+/// it is two standing preferences that contradict each other, with the same
+/// tie-break as before.
+///
+/// So the tie-break is unchanged and only the sentence moves. Streaming still
+/// wins, because a window that has gone shows nothing and the live view is
+/// the more specific of the two requests; what changes is that the window now
+/// says *why* it is grey in words that are true — a standing choice, named as
+/// one — and the way out is the one the reader can see from here: untick
+/// Stream and the close box comes straight back, with the preference it had.
+///
+/// Shorter than [`CLOSE_WATCHING`] on purpose, so that [`PromptApp::close_width`]
+/// is unchanged and a third sentence cannot move the two buttons that decide.
+const CLOSE_WATCHING_ALWAYS: &str = "You stream every run.";
+
+/// How long a refused chord is pointed at.
+///
+/// Alt+S on a command that is going to run in a terminal of its own has
+/// nothing to tick, and a shortcut that does nothing and says nothing teaches
+/// the reader that it is broken. So the window flashes the sentence it is
+/// already drawing — the one that says why the box is dead — in the warning
+/// colour, which answers the chord without adding a word to the window or
+/// moving anything in it.
+///
+/// Two seconds, the same as [`COPY_NOTICE`], and for the same reason: long
+/// enough for an eye to arrive, short enough not to become part of how the
+/// window looks.
+const REFUSAL_NOTICE: Duration = Duration::from_secs(2);
 
 /// The most of the window the live output takes while a command runs, in
 /// lines of the monospace font it is drawn in.
@@ -1081,8 +1127,26 @@ pub(crate) struct PromptApp {
     state: PromptState,
     inbox: Receiver<Incoming>,
     out: Box<dyn Write + Send>,
-    /// The Stream output checkbox. A display preference and nothing else.
+    /// The Stream output checkbox, as the reader last left it.
+    ///
+    /// A display preference and nothing else, and — like
+    /// [`PromptApp::close_on_decide`] — the *stored* answer rather than the
+    /// effective one. A terminal run has no second stream to show, so the box
+    /// is drawn unticked for one; storing that would turn "this command wants
+    /// a terminal" into "the reader stopped wanting output", which would
+    /// outlive the command that caused it. [`PromptApp::streams`] is the only
+    /// thing that should be asked what this window will actually do.
     stream: bool,
+    /// Whether the tick above came out of the file rather than out of this
+    /// window.
+    ///
+    /// Only the sentence under the close box reads it, and only to tell two
+    /// true things apart: "you asked to watch this one", which is about the
+    /// command on the screen, and [`CLOSE_WATCHING_ALWAYS`], which is about a
+    /// standing choice made some other day. Cleared the moment the reader
+    /// touches the box either way, because from then on they have asked about
+    /// this one.
+    stream_is_remembered: bool,
     /// The Close when I decide checkbox, as the reader last left it.
     ///
     /// The *stored* preference rather than the effective answer: it stays as
@@ -1102,6 +1166,10 @@ pub(crate) struct PromptApp {
     /// reader's half of a decision the agent also has a half of — see
     /// [`PromptApp::in_a_terminal`], which is the only thing that should be
     /// asked whether this run gets one.
+    ///
+    /// Remembered between windows like the other two, and unlike the other
+    /// two that is a standing decision about execution rather than about the
+    /// view. [`crate::prefs::Prefs`] is where the difference is set out.
     terminal: bool,
     /// What the user is telling the agent, for every verdict but Approve.
     note: String,
@@ -1118,6 +1186,11 @@ pub(crate) struct PromptApp {
     kept: Arc<AtomicBool>,
     /// When something was last put on the clipboard, so the window can say so.
     copied: Option<Instant>,
+    /// The last chord this window could not carry out, and when.
+    ///
+    /// Read only by the control that was asked for, which flashes the reason
+    /// it is dead. See [`REFUSAL_NOTICE`].
+    refused: Option<(guard::Toggle, Instant)>,
     fatal: Arc<OnceLock<String>>,
 }
 
@@ -1128,27 +1201,29 @@ impl PromptApp {
         fatal: Arc<OnceLock<String>>,
         prefs: PrefsFile,
     ) -> PromptApp {
-        // The one thing this window starts with that another window decided.
+        // Everything this window starts with that another window decided.
         // Read once, here, and not per frame: a file changing under an open
         // window would move a control somebody is looking at.
-        let close_on_decide = prefs.read().close_on_decide;
+        //
+        // All three default to false when there is no file, which is what
+        // makes a first run and an unreadable file the same window: headless,
+        // staying, and with no terminal that nobody asked for.
+        let remembered = prefs.read();
         PromptApp {
             state: PromptState::new(),
             inbox,
             out,
-            // Headless by default: streaming is what the reader opts into
-            // when they want to watch, not what they get for asking.
-            stream: false,
-            close_on_decide,
+            stream: remembered.stream,
+            stream_is_remembered: remembered.stream,
+            close_on_decide: remembered.close_on_decide,
             prefs,
-            // And a terminal is not opened for a command that did not ask
-            // for one unless the person reading it decides otherwise.
-            terminal: false,
+            terminal: remembered.terminal,
             note: String::new(),
             guard: Guard::new(Instant::now()),
             guard_open: false,
             kept: Arc::new(AtomicBool::new(false)),
             copied: None,
+            refused: None,
             fatal,
         }
     }
@@ -1209,6 +1284,19 @@ impl PromptApp {
         self.terminal || self.state.shown().is_some_and(|shown| shown.interactive())
     }
 
+    /// Whether this window is going to show the output as it arrives.
+    ///
+    /// The reader's stored answer, minus the one thing that makes it
+    /// impossible. Streaming and a terminal are exclusive and it is not a rule
+    /// this window enforces so much as a fact it reports: the terminal *is*
+    /// the stream. Computed rather than written back into
+    /// [`PromptApp::stream`], for the reason that field gives — a remembered
+    /// "show me the output" must survive one command that happens to want a
+    /// terminal.
+    fn streams(&self) -> bool {
+        self.stream && !self.in_a_terminal()
+    }
+
     /// The approval this window would send, however it was asked for.
     ///
     /// One function rather than one expression per button, because there are
@@ -1217,7 +1305,7 @@ impl PromptApp {
     /// window whose keyboard and mouse ran different commands.
     fn approval(&self) -> Verdict {
         Verdict::Approve {
-            stream: self.stream,
+            stream: self.streams(),
             terminal: self.in_a_terminal(),
             closing: self.closes_on_decide(),
             note: self.note.clone(),
@@ -1236,10 +1324,17 @@ impl PromptApp {
     /// The terminal is a window of its own that the reader is about to be
     /// sitting in front of, so hatch's window standing behind it shows them
     /// nothing they are not already looking at — and this box is at its most
-    /// useful there. `stream` is already false whenever there is a terminal,
-    /// so a terminal run reads as true here without having to say so twice.
+    /// useful there. [`PromptApp::streams`] is already false whenever there is
+    /// a terminal, so a terminal run reads as true here without having to say
+    /// so twice.
     fn closes_on_decide(&self) -> bool {
-        self.close_on_decide && !self.stream
+        self.close_on_decide && !self.streams()
+    }
+
+    /// Whether a control is pointing at the reason it could not do what a
+    /// chord asked of it.
+    fn refusing(&self, toggle: guard::Toggle) -> bool {
+        self.refused.is_some_and(|(which, at)| which == toggle && at.elapsed() < REFUSAL_NOTICE)
     }
 }
 
@@ -1343,7 +1438,14 @@ impl eframe::App for PromptApp {
             arm_exit_backstop(Arc::clone(&self.fatal));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        ctx.request_repaint_after(CLOCK_TICK);
+        // The clock, or the end of a refusal flash, whichever is sooner: a
+        // colour that only faded when the countdown next ticked would be up
+        // for as much as a second longer than it says it is.
+        let next = match self.refused {
+            Some((_, at)) => CLOCK_TICK.min(REFUSAL_NOTICE.saturating_sub(at.elapsed())),
+            None => CLOCK_TICK,
+        };
+        ctx.request_repaint_after(next);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1492,10 +1594,56 @@ impl PromptApp {
             // afterwards does not change who the words were for.
             Action::Approve => self.approval(),
             Action::Deny => Verdict::Deny { note: self.note.clone() },
+            Action::Toggle(toggle) => return self.flip(toggle),
             Action::Ignored | Action::Passthrough => return,
         };
         let frame = self.state.decide(verdict);
         answer(&mut self.out, &mut self.state, frame);
+    }
+
+    /// Flip one of the two boxes a chord names, or say why it cannot be.
+    ///
+    /// The chord does exactly what the click does — the same one method
+    /// writes the preference down either way — so there is no state of this
+    /// window in which the keyboard and the mouse remember different things.
+    ///
+    /// # When there is nothing to flip
+    ///
+    /// Both boxes have a state in which they are drawn dead, with a sentence
+    /// beside them saying why. A chord aimed at a dead box must not tick it
+    /// anyway — the tick would be a promise the window cannot keep, and for
+    /// Stream it would persist — and it must not be silence either, because a
+    /// shortcut that does nothing and says nothing teaches the reader that it
+    /// does not work. So it points at the sentence that is already there: see
+    /// [`REFUSAL_NOTICE`].
+    ///
+    /// The one case with nothing to point at is a payload that offers no
+    /// stream box at all — a file swap writes bytes and prints nothing, so
+    /// there is no control on the window for Alt+S to be refused *by*. That
+    /// chord is inert there, and a window cannot flash a sentence it is not
+    /// drawing.
+    fn flip(&mut self, toggle: guard::Toggle) {
+        // Only while there is something to decide. In every later phase these
+        // boxes are gone from the window along with the question they belonged
+        // to, and a chord that changed a preference nobody could see change
+        // would be the invisible write this whole design is against.
+        if self.state.phase() != Phase::AwaitingVerdict {
+            return;
+        }
+        match toggle {
+            guard::Toggle::Stream => {
+                let offered = self.state.shown().is_some_and(|shown| shown.streamable());
+                match offered && !self.in_a_terminal() {
+                    true => self.set_stream(!self.streams()),
+                    // Dead, or never drawn. Either way nothing is ticked.
+                    false => self.refused = Some((toggle, Instant::now())),
+                }
+            }
+            guard::Toggle::Close => match self.streams() {
+                false => self.set_close_on_decide(!self.closes_on_decide()),
+                true => self.refused = Some((toggle, Instant::now())),
+            },
+        }
     }
 
     /// Everything below the panes: what the clock says, and what can be
@@ -1711,7 +1859,7 @@ impl PromptApp {
         } else {
             ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
         }
-        if self.stream {
+        if self.streams() {
             let text = self.state.output_text();
             egui::ScrollArea::vertical()
                 .id_salt("hatch-output")
@@ -1817,12 +1965,12 @@ impl PromptApp {
 
         // Streaming and a terminal are exclusive, and it is not a rule this
         // window enforces so much as a fact it reports: the terminal *is* the
-        // stream. Cleared rather than merely disabled, because a ticked box
-        // that has been greyed out reads as a promise to stream, and nothing
-        // is going to.
-        if self.in_a_terminal() {
-            self.stream = false;
-        }
+        // stream. The box is drawn unticked rather than merely disabled,
+        // because a ticked box that has been greyed out reads as a promise to
+        // stream and nothing is going to — see [`PromptApp::streams`], which
+        // is where the effective answer is worked out now that the stored one
+        // outlives the window.
+        //
         // One name for it, used by the checkbox and by the line that says why
         // it is dead: a control that cannot be ticked and does not say why is
         // a window asking the reader to guess.
@@ -1951,8 +2099,11 @@ impl PromptApp {
             }
             + 3.0 * ui.spacing().item_spacing.x;
 
+        let mut changed = false;
         let mut controls = |ui: &mut egui::Ui| {
-            ui.add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL));
+            changed |= ui
+                .add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL))
+                .changed();
             if asked_for {
                 ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
             }
@@ -1964,37 +2115,70 @@ impl PromptApp {
             // Under the box rather than beside it. The sentence is the part
             // that must not be dropped, so the row that cannot hold it gets
             // taller instead of shorter.
-            ui.vertical_centered(|ui| {
-                ui.add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL));
-                if asked_for {
-                    ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
-                }
-                ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn));
-            });
+            ui.vertical_centered(&mut controls);
         }
         // Only the reader's half is stored. `ticked` is the *effective*
         // answer, which is already true for a request the agent asked for, and
         // writing that back would turn the agent's ask into the reader's
         // choice — indistinguishable afterwards, and the wrong thing to show
         // if the payload ever changed under this window.
+        //
+        // The same gate is what keeps a remembered preference honest: a window
+        // opened on a request the agent asked a terminal for never writes
+        // anything down, so the agent's ask cannot become the reader's
+        // standing decision by having been shown to them once.
         if !asked_for {
             self.terminal = ticked;
+            if changed {
+                self.prefs.update(|prefs| prefs.terminal = ticked);
+            }
         }
     }
 
     /// The stream checkbox, and the reason it is dead when it is.
+    ///
+    /// Drawn as the effective answer and stored only when the reader is the
+    /// one who settled it, exactly as the close box and the terminal box are.
+    /// See [`PromptApp::streams`].
     fn stream_box(&mut self, ui: &mut egui::Ui, can_stream: bool) {
-        ui.add_enabled(
-            can_stream,
-            egui::Checkbox::new(&mut self.stream, "Stream output to this window"),
-        );
-        if !can_stream {
-            ui.label(
-                egui::RichText::new("It runs in a terminal of its own.")
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
+        let mut ticked = self.streams();
+        let changed = ui
+            .add_enabled(can_stream, egui::Checkbox::new(&mut ticked, STREAM_LABEL))
+            .on_hover_text(guard::STREAM_CHORD)
+            .on_disabled_hover_text(guard::STREAM_CHORD)
+            .changed();
+        if changed {
+            self.set_stream(ticked);
         }
+        if !can_stream {
+            // The sentence that says why the box is dead, and the one thing
+            // this window has to answer Alt+S with when there is nothing to
+            // tick. See [`REFUSAL_NOTICE`]: the colour is the answer, and it
+            // costs no width, because the sentence is drawn either way.
+            let colour = match self.refusing(guard::Toggle::Stream) {
+                true => ui.visuals().warn_fg_color,
+                false => ui.visuals().weak_text_color(),
+            };
+            ui.label(egui::RichText::new(STREAM_DEAD).small().color(colour));
+        }
+    }
+
+    /// Take the reader's answer about streaming, and write it down.
+    ///
+    /// One place, because there are two ways to give it — the box and the
+    /// chord — and a preference that persisted from one and not the other
+    /// would be a window whose keyboard and mouse remembered different things.
+    fn set_stream(&mut self, ticked: bool) {
+        self.stream = ticked;
+        // They have now said something about this command, so the sentence
+        // under the close box is about this command again.
+        self.stream_is_remembered = false;
+        // On the click, and not on the way out, because there may be no way
+        // out to write it on: this window's ordinary ending is the daemon
+        // killing the process once the operation is over. One field, because
+        // the window beside this one may be writing another; see
+        // [`crate::prefs`].
+        self.prefs.update(|prefs| prefs.stream = ticked);
     }
 
     /// How much room the checkbox and its note need beside the field.
@@ -2011,11 +2195,11 @@ impl PromptApp {
         let box_ = ui.spacing().icon_width + ui.spacing().icon_spacing;
         // `Button` and not `Body`: that is the style a checkbox draws its own
         // label in.
-        let label = text_width(ui, "Stream output to this window", egui::TextStyle::Button);
+        let label = text_width(ui, STREAM_LABEL, egui::TextStyle::Button);
         let dead = match self.in_a_terminal() {
             true => {
                 ui.spacing().item_spacing.x
-                    + text_width(ui, "It runs in a terminal of its own.", egui::TextStyle::Small)
+                    + text_width(ui, STREAM_DEAD, egui::TextStyle::Small)
             }
             false => 0.0,
         };
@@ -2036,23 +2220,37 @@ impl PromptApp {
         // asked for. Writing the effective answer back would turn a ticked
         // Stream box into the reader having unticked this one, and it would
         // stay unticked after Stream was cleared again.
-        let live = !self.stream;
+        let live = !self.streams();
         let mut ticked = self.closes_on_decide();
-        if ui.add_enabled(live, egui::Checkbox::new(&mut ticked, CLOSE_LABEL)).changed() {
-            self.close_on_decide = ticked;
-            // On the click, and not on the way out, because there may be no
-            // way out to write it on: this window's ordinary ending is the
-            // daemon killing the process once the operation is over.
-            self.prefs.write(&Prefs { close_on_decide: ticked });
+        let changed = ui
+            .add_enabled(live, egui::Checkbox::new(&mut ticked, CLOSE_LABEL))
+            .on_hover_text(guard::CLOSE_CHORD)
+            .on_disabled_hover_text(guard::CLOSE_CHORD)
+            .changed();
+        if changed {
+            self.set_close_on_decide(ticked);
         }
-        ui.label(
-            egui::RichText::new(match live {
-                true => CLOSE_COST,
-                false => CLOSE_WATCHING,
-            })
-            .small()
-            .color(ui.visuals().weak_text_color()),
-        );
+        // Three sentences and not two: a greyed box has two different reasons
+        // for being grey now, and only one of them is about the command on
+        // the screen. See [`CLOSE_WATCHING_ALWAYS`].
+        let said = match (live, self.stream_is_remembered) {
+            (true, _) => CLOSE_COST,
+            (false, false) => CLOSE_WATCHING,
+            (false, true) => CLOSE_WATCHING_ALWAYS,
+        };
+        let colour = match self.refusing(guard::Toggle::Close) {
+            true => ui.visuals().warn_fg_color,
+            false => ui.visuals().weak_text_color(),
+        };
+        ui.label(egui::RichText::new(said).small().color(colour));
+    }
+
+    /// Take the reader's answer about closing, and write it down.
+    ///
+    /// [`PromptApp::set_stream`]'s reasons, for the other box.
+    fn set_close_on_decide(&mut self, ticked: bool) {
+        self.close_on_decide = ticked;
+        self.prefs.update(|prefs| prefs.close_on_decide = ticked);
     }
 
     /// How much room the close control needs: the wider of its two lines.
@@ -2068,7 +2266,8 @@ impl PromptApp {
         // label in.
         let label = box_ + text_width(ui, CLOSE_LABEL, egui::TextStyle::Button);
         let said = text_width(ui, CLOSE_COST, egui::TextStyle::Small)
-            .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small));
+            .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small))
+            .max(text_width(ui, CLOSE_WATCHING_ALWAYS, egui::TextStyle::Small));
         label.max(said) + 2.0 * ui.spacing().item_spacing.x
     }
 
@@ -2378,12 +2577,16 @@ fn strong(label: &str) -> egui::RichText {
 /// It is drawn from [`guard::APPROVE_CHORD`] and [`guard::DENY_CHORD`], which
 /// live beside the rule they describe and are held to it by a test. Nothing
 /// here may word the shortcut for itself: `Ctrl+Shift+Enter` is deliberately
-/// inert, so a label loose enough for a reader to expect it to work would be
-/// this window promising something it refuses to do.
+/// inert although both of its halves approve on their own, so a label loose
+/// enough for a reader to expect it to work would be this window promising
+/// something it refuses to do.
 ///
 /// The hint is small and quiet — hatch's own voice, beside the word for what
 /// the button does — and it fits inside the width the button already had, so
-/// the cluster the two buttons are centred in does not move. That claim is
+/// the cluster the two buttons are centred in does not move. Approve's is two
+/// lines, because there are two ways to approve and the button has the height
+/// to say both; see [`guard::APPROVE_CHORD`] for why neither is left out and
+/// why neither is abbreviated. That it fits is
 /// `the_shortcut_hints_fit_the_buttons_that_were_already_there`.
 fn primary(ui: &egui::Ui, label: &str, chord: &str) -> egui::Button<'static> {
     egui::Button::new((strong(label), egui::RichText::new(chord).small().weak()))
@@ -2398,6 +2601,8 @@ mod tests {
     use std::path::PathBuf;
 
     use chrono::Utc;
+
+    use crate::prefs::Prefs;
 
     use crate::protocol::{
         DaemonMsg, Outcome, Payload, Request, ReviseKind, Verdict, approved, every_verdict,
@@ -3633,7 +3838,7 @@ mod tests {
         // The other direction, which a window that only ever wrote a tick
         // would get wrong: the preference would be unsettable once set.
         let (_root, paths) = a_prefs_file();
-        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true });
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
 
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         assert!(app.closes_on_decide());
@@ -4263,15 +4468,15 @@ mod tests {
     #[test]
     fn choosing_a_terminal_takes_the_stream_box_away_and_says_why() {
         // The terminal *is* the stream, so the box has nothing left to offer.
-        // It is cleared rather than greyed with a tick still in it: a ticked
-        // box that cannot be untucked reads as a promise to stream, and
-        // nothing is going to.
+        // It is drawn unticked rather than greyed with a tick still in it: a
+        // ticked box that cannot be unticked reads as a promise to stream,
+        // and nothing is going to.
         let mut app = a_window_showing("pacman -Syu");
         app.stream = true;
         app.terminal = true;
         let drawn = window_text(&mut app, true);
 
-        assert!(!app.stream, "a terminal run has no stream to promise");
+        assert!(!app.streams(), "a terminal run has no stream to promise");
         assert!(
             drawn.contains("terminal of its own"),
             "a checkbox that went dead was left unexplained: {drawn}"
@@ -4281,6 +4486,9 @@ mod tests {
             "got {:?}",
             app.approval()
         );
+        // And the reader's own answer is untouched underneath, so a command
+        // that wanted a terminal has not also unticked a standing preference.
+        assert!(app.stream, "the terminal took the remembered answer with it");
     }
 
     #[test]
@@ -5294,4 +5502,5 @@ mod tests {
     }
 
 }
+
 
