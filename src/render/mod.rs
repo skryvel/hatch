@@ -58,7 +58,60 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, var
 /// written without it, and wiring each pass in here is what puts it under
 /// those properties.
 pub fn render_command(command: &str, env: &BTreeMap<String, String>) -> Spans {
-    command::highlight(command::annotate_variables(command::segment(command), env))
+    render_command_breaking_at(command, env, None)
+}
+
+/// [`render_command`], and one further line break at a byte offset the caller
+/// knows and the passes below cannot see.
+///
+/// One caller has one: an elevated request is drawn as the whole line that
+/// will run, `run0 --pipe --setenv=… -- bash -c '…'`, and
+/// [`crate::exec::elevate::ElevatedArgv::inner_at`] says where the approved
+/// command begins in it, so the window can put the boilerplate on its own
+/// lines and start the command on a fresh one. The offset travels from the
+/// place that built the line to the place that draws it, because nothing in
+/// the finished text marks the seam — a `--` can occur inside the command,
+/// and so can the word `run0`. See [`command::segment_breaking_at`].
+///
+/// The break is metadata on a span and changes no character, so
+/// `tests/fidelity.rs` is as blind to it as it is to the breaks segmentation
+/// asks for, and so is the reader's approval: the bytes on screen are the
+/// bytes that run either way.
+///
+/// # Panics
+///
+/// If `at` is not a place the passes below can cut — see
+/// [`command::segment_breaking_at`] — or if the break does not survive into
+/// the rendering they produce.
+///
+/// That last check catches the two ways an offset can be wrong that
+/// segmentation itself lets through. An `at` past the end of the line is
+/// never spent, because no boundary reaches it; and a later pass that
+/// rewrote the boundary segmentation cut would take the break with it —
+/// which neither of them does, since both only ever subdivide what they are
+/// given, so this half is belt and braces in the spirit of the check
+/// [`SpanBuilder::finish`] makes against a bug in its own module.
+///
+/// Either way the alternative to noticing is a line that quietly fails to
+/// break, and the whole reason the offset is passed in rather than searched
+/// for is that nobody should have to wonder which `--` it found.
+pub fn render_command_breaking_at(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    at: Option<usize>,
+) -> Spans {
+    let segmented = command::segment_breaking_at(command, at);
+    let spans = command::highlight(command::annotate_variables(segmented, env));
+    if let Some(at) = at {
+        assert!(
+            spans.iter().any(|span| span.range().start == at && span.break_before()),
+            "the line break asked for at byte {at} begins no span of this {}-byte rendering: \
+             the offset is past the end of the line, or a pass below rewrote the boundary \
+             segmentation cut for it",
+            command.len()
+        );
+    }
+    spans
 }
 
 #[cfg(test)]

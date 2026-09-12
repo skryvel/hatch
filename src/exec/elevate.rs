@@ -197,7 +197,13 @@ pub fn platform() -> Box<dyn Elevation> {
 /// path that would be silent — the command runs, produces output, exits zero,
 /// and was never root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ElevatedArgv(Vec<String>);
+pub struct ElevatedArgv {
+    /// The program, the wrapper and the inner argv, in that order.
+    argv: Vec<String>,
+    /// Where the inner argv begins in [`ElevatedArgv::display_line`]. See
+    /// [`ElevatedArgv::inner_at`].
+    inner_at: Option<usize>,
+}
 
 impl ElevatedArgv {
     /// `program`, then `wrapper`, then `inner`.
@@ -206,27 +212,67 @@ impl ElevatedArgv {
     /// invariant hold by construction: a caller cannot pass an argv that has
     /// no program in front of it, because the program is a separate argument
     /// and this function is what joins them.
+    ///
+    /// It is also the only moment at which the three parts are still telling
+    /// them apart, which is why [`ElevatedArgv::inner_at`] is measured here
+    /// and not recovered later.
     fn wrapping(program: &str, wrapper: Vec<String>, inner: Vec<String>) -> ElevatedArgv {
         let mut argv = Vec::with_capacity(1 + wrapper.len() + inner.len());
         argv.push(program.to_string());
         argv.extend(wrapper);
+        // Measured on the program and the wrapper alone, before `inner` is
+        // appended: [`shell_line`] quotes each argument and joins the results
+        // with one space, so the rendered `inner` starts exactly one byte
+        // past the end of the rendered wrapper. Arithmetic on a string this
+        // function is about to build, rather than a search through a string
+        // somebody else built.
+        //
+        // `None` for an empty `inner`, because an offset one past the end of
+        // the line is not a place anything begins. Neither caller elevates
+        // nothing, and answering honestly costs one word.
+        let inner_at = (!inner.is_empty()).then(|| shell_line(&argv).len() + 1);
         argv.extend(inner);
-        ElevatedArgv(argv)
+        ElevatedArgv { argv, inner_at }
     }
 
     /// The elevation program — `argv[0]`, which this type guarantees exists.
     pub fn program(&self) -> &str {
-        &self.0[0]
+        &self.argv[0]
     }
 
     /// The argv, for the spawner.
     pub fn as_slice(&self) -> &[String] {
-        &self.0
+        &self.argv
     }
 
     /// The argv, consumed.
     pub fn into_vec(self) -> Vec<String> {
-        self.0
+        self.argv
+    }
+
+    /// Where the elevated operation begins in [`Self::display_line`], as a
+    /// byte offset — `None` when there is nothing under the wrapper.
+    ///
+    /// The window draws the whole line, wrapper and all, because the parts of
+    /// a root command line a reader would most want folded away are the parts
+    /// that decide what it does. But that puts the thing the reader came to
+    /// read behind a wall of `--setenv` whose length grows with the size of
+    /// the child environment, so the window asks for a line break here and
+    /// the approved command starts a line of its own.
+    ///
+    /// This has to be handed to the renderer rather than found by it. The
+    /// renderer receives a flat string, and nothing in that string marks the
+    /// seam: a `--` can occur inside the command, and so can the word `run0`,
+    /// so a search would sometimes find the wrong one and break the line in
+    /// the middle of what it claims to be showing. This type is the one that
+    /// knows, because it is the one that joined the two halves.
+    ///
+    /// It is an offset and not a line, because the break is layout: see
+    /// [`crate::render::render_command_breaking_at`]. No character is added,
+    /// removed or moved by it, and the bytes the reader approves are the
+    /// bytes that run.
+    pub fn inner_at(&self) -> Option<usize> {
+        self.inner_at
     }
 
     /// The line the window shows, shell-quoted from the argv above.
@@ -237,6 +283,10 @@ impl ElevatedArgv {
     /// wrapper, every `--setenv`, the `--` — because the parts of a root
     /// command line a reader would most want hidden are exactly the parts that
     /// decide what it does.
+    ///
+    /// Nothing about it is folded away, but it is not all one line on screen:
+    /// [`Self::inner_at`] says where the approved command starts, and the
+    /// window breaks the line there.
     pub fn display_line(&self) -> String {
         shell_line(self.as_slice())
     }
@@ -1096,6 +1146,98 @@ mod tests {
             "{}",
             argv.display_line()
         );
+    }
+
+    // ---- where the line breaks ---------------------------------------------
+
+    #[test]
+    fn the_line_says_where_the_approved_command_begins() {
+        // The window breaks the line there, so the offset has to name the
+        // exact byte the rendered inner argv starts at. One byte early puts
+        // the `--` at the head of the command's line; one byte late cuts a
+        // character off the front of the word that names what runs.
+        let (_dir, env) = with_run0();
+        let elevated = Run0::new().argv("systemctl status zram0", &env).unwrap();
+        let line = elevated.display_line();
+        let at = elevated.inner_at().expect("there is a command under the wrapper");
+
+        assert_eq!(&line[at..], "bash -c 'systemctl status zram0'");
+        assert_eq!(&line[at - 3..at], "-- ", "the wrapper ends where the command begins");
+    }
+
+    #[test]
+    fn a_direct_argv_says_where_it_begins_too() {
+        // A root `swap_file` has no shell under it, so the thing the break
+        // starts is `install` rather than `bash`. The offset is about the
+        // seam between the wrapper and what it wraps, and knows nothing about
+        // which of the two callers made it.
+        let (_dir, env) = with_run0();
+        let install = vec![
+            "install".to_string(),
+            "-m".to_string(),
+            "0644".to_string(),
+            "--".to_string(),
+            "/stage/a".to_string(),
+            "/etc/hosts".to_string(),
+        ];
+        let elevated = Run0::new().elevate(install.clone(), &env).unwrap();
+        let at = elevated.inner_at().expect("there is an argv under the wrapper");
+        assert_eq!(&elevated.display_line()[at..], shell_line(&install));
+    }
+
+    #[test]
+    fn a_setenv_that_has_to_be_quoted_does_not_move_the_seam() {
+        // Why the offset is measured rather than searched for. This line has
+        // a `--` inside a `--setenv` value and another inside the command, so
+        // a renderer hunting for the separator in the finished text has three
+        // candidates and no way to tell which one it built.
+        let (_dir, mut env) = with_run0();
+        env.insert("FLAGS".to_string(), "-- everything".to_string());
+        let elevated = Run0::new().argv("git log -- src", &env).unwrap();
+        let line = elevated.display_line();
+        let at = elevated.inner_at().unwrap();
+
+        assert_eq!(&line[at..], "bash -c 'git log -- src'");
+        assert!(line.matches(" -- ").count() > 1, "the line really is ambiguous: {line}");
+    }
+
+    #[test]
+    fn elevating_nothing_names_no_place_for_a_break() {
+        // An offset one past the end of the line is not a place anything
+        // begins, and a window asked to break there would be asked to break
+        // after the last character. Neither caller elevates an empty argv;
+        // the honest answer costs one word and is not a special case anybody
+        // downstream has to invent.
+        let (_dir, env) = with_run0();
+        let elevated = Run0::new().elevate(Vec::new(), &env).unwrap();
+        assert_eq!(elevated.inner_at(), None);
+        assert!(elevated.display_line().ends_with(" --"), "{}", elevated.display_line());
+    }
+
+    #[test]
+    fn every_elevation_says_where_the_argv_it_wrapped_begins() {
+        // Across every implementation that returns an argv at all, including
+        // the double whose wrapper is empty: the offset lands on the rendered
+        // inner argv. A third implementation added later inherits the check,
+        // exactly as it inherits the one above it.
+        let (_dir, env) = with_run0();
+        let inner = shell_argv("echo hi");
+        let all: Vec<Box<dyn Elevation>> = vec![
+            Box::new(Run0::new()),
+            Box::new(NoElevation::for_os("macos")),
+            Box::new(Rehearsed::recording(RootOutcome::Ran { exit: Some(0) })),
+        ];
+        for elevation in all {
+            if let Ok(elevated) = elevation.elevate(inner.clone(), &env) {
+                let at = elevated.inner_at().expect("it wrapped an argv");
+                assert_eq!(
+                    &elevated.display_line()[at..],
+                    shell_line(&inner),
+                    "{} put the break somewhere else",
+                    elevation.mechanism()
+                );
+            }
+        }
     }
 
     // ---- classification ----------------------------------------------------

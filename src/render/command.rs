@@ -477,13 +477,65 @@ fn references(command: &str) -> Vec<Range<usize>> {
 /// function or in the scanner. A panicking prompt window is a dead prompt
 /// window, and hatch treats that as a denial, so failing this way fails
 /// closed.
+///
+/// Every break here is one the command's own structure asked for. A caller
+/// that knows something about the line the scanner cannot see — where the
+/// approved command starts inside an elevated one — wants
+/// [`segment_breaking_at`].
 pub fn segment(command: &str) -> Spans {
+    segment_breaking_at(command, None)
+}
+
+/// [`segment`], and one further line break at a byte offset the caller knows
+/// and this pass cannot see.
+///
+/// The elevated line is the whole of why this exists. A root request is drawn
+/// as the line that will actually run —
+/// `run0 --pipe --setenv=… -- bash -c '…'` — and the command the reader came
+/// to read arrives after a wall of boilerplate whose length grows with the
+/// size of the child environment. `run0` and its own options are one thing,
+/// the approved command is another, so the second starts a line of its own.
+///
+/// # Why the offset is a parameter
+///
+/// Because it cannot be recovered from the text. A `--` can occur inside the
+/// command, and so can the word `run0`, so a search through the finished line
+/// would sometimes find the wrong seam and break the line in the middle of
+/// what it claims to be showing.
+/// [`crate::exec::elevate::ElevatedArgv::inner_at`] is the one place that
+/// knows, because it is the place that joined the two halves, and the offset
+/// travels from there to here rather than being guessed at either end.
+///
+/// # It is layout, and layout only
+///
+/// The break is [`Span::break_before`](super::Span::break_before) on the span
+/// that starts at `at`, exactly as a separator's break is on the span that
+/// follows it. Nothing is inserted into the command: a newline character
+/// there would change the bytes the reader is approving, and those are the
+/// bytes that run.
+///
+/// # Panics
+///
+/// If `at` is inside a character, or behind a point this pass has already
+/// covered — inside a separator token it has emitted, say. Either means the
+/// caller's idea of where the command begins and this pass's have come apart,
+/// and a line that quietly failed to break is the worse answer: the reader
+/// would be shown a wall of wrapper with no sign that anything was meant to
+/// end it.
+///
+/// An `at` past the end of the command is simply never spent, because no
+/// boundary ever reaches it. That one is caught by
+/// [`super::render_command_breaking_at`], which asks the finished rendering
+/// whether the break it ordered is really on it.
+pub fn segment_breaking_at(command: &str, at: Option<usize>) -> Spans {
     let mut builder = SpanBuilder::new(command);
     let found = boundaries(command);
+    let mut asked = at;
 
     for (index, boundary) in found.iter().enumerate() {
         match boundary {
             Boundary::Separator(token) => {
+                take_break(&mut builder, &mut asked, token.start);
                 // The run before the separator. May be empty — `;;`, or a
                 // leading separator — and `classify_into` at the cursor is a
                 // no-op, so there is nothing to guard against.
@@ -496,15 +548,43 @@ pub fn segment(command: &str) -> Spans {
             // The newline goes *through* the classifier rather than around
             // it, which is what makes it a chip and not a drawn-as-itself
             // separator.
-            Boundary::Newline(end) => unicode::classify_into(&mut builder, *end),
+            Boundary::Newline(end) => {
+                take_break(&mut builder, &mut asked, *end);
+                unicode::classify_into(&mut builder, *end);
+            }
         }
         // On the span that follows, never on the separator: the separator is
         // a character the user is approving and it stays where it is.
         builder.break_next();
     }
 
+    take_break(&mut builder, &mut asked, command.len());
     unicode::classify_into(&mut builder, command.len());
     builder.finish()
+}
+
+/// Spend the caller's requested break, if the boundary about to be emitted
+/// would carry the cursor past it.
+///
+/// Called before each boundary rather than after, so that a break asked for
+/// inside the run leading up to one lands where it was asked for and not
+/// after the separator that happens to follow it. Flushing to `at` first is
+/// what makes the offset a span boundary at all: everything before it is one
+/// span or more, and the next span emitted is the one that starts the line.
+///
+/// # Panics
+///
+/// Through [`unicode::classify_into`], if `at` is not a place this pass can
+/// still cut: behind the cursor, past the end, or inside a character.
+fn take_break(builder: &mut SpanBuilder<'_>, asked: &mut Option<usize>, before: usize) {
+    match *asked {
+        Some(at) if at <= before => {
+            unicode::classify_into(builder, at);
+            builder.break_next();
+            *asked = None;
+        }
+        _ => {}
+    }
 }
 
 /// Whether the author's own newline is already going to end the line this
@@ -1016,6 +1096,102 @@ mod tests {
         assert_eq!(separators(&spans), vec![";", ";"]);
         assert_eq!(breaks(&spans), vec![";", "b"]);
         assert_eq!(unrender(&spans), "a;;b");
+    }
+
+    // --- a break the caller asks for --------------------------------------
+
+    /// The shape a root request draws: `run0`, its own options, the `--`, and
+    /// the approved command at the end of all of it. Two `--setenv` here and
+    /// half a dozen in life, which is the point — the wall in front of the
+    /// command grows with the child environment.
+    const ELEVATED: &str =
+        "run0 --pipe --setenv=HOME=/home/u --setenv=PAGER=cat -- bash -c 'rm -rf /tmp/x'";
+
+    /// The whole pipeline with a break asked for at `at`, which is what an
+    /// elevated request draws. Through `render_command_breaking_at` rather
+    /// than through `segment_breaking_at`, for the reason the other helpers
+    /// here give: a pass that is correct but unwired shows the reader nothing.
+    fn broken_at(command: &str, at: usize) -> Spans {
+        crate::render::render_command_breaking_at(command, &BTreeMap::new(), Some(at))
+    }
+
+    #[test]
+    fn the_approved_command_starts_a_line_of_its_own() {
+        let at = ELEVATED.find("bash").expect("the wrapper ends and the command starts");
+        let spans = broken_at(ELEVATED, at);
+
+        let broken: Vec<&Span> = spans.iter().filter(|s| s.break_before()).collect();
+        assert_eq!(broken.len(), 1, "one break, and the caller asked for it");
+        assert_eq!(broken[0].range().start, at, "and it is where the caller said");
+        assert!(broken[0].text().starts_with("bash -c"), "{}", broken[0].text());
+    }
+
+    #[test]
+    fn a_requested_break_adds_no_character_and_moves_none() {
+        // The whole reason it is a flag on a span and not a newline in the
+        // text: the bytes the reader approves are the bytes that run, and a
+        // line break that changed one of them would be the fidelity failure
+        // this crate exists to refuse.
+        let at = ELEVATED.find("bash").unwrap();
+        let broken = broken_at(ELEVATED, at);
+        assert_eq!(unrender(&broken), ELEVATED);
+        assert!(broken.covers_source());
+        // The one-line form is the same line too, which is what the title bar
+        // draws and what `Payload::rendering` checks the spans against.
+        let shown = |spans: &Spans| spans.iter().map(Span::display_text).collect::<String>();
+        assert_eq!(shown(&broken), shown(&render_command(ELEVATED)));
+    }
+
+    #[test]
+    fn a_line_nobody_asked_to_break_is_the_line_render_command_draws() {
+        // The unelevated path passes `None` and must be untouched by any of
+        // this: same spans, same boundaries, same absence of layout.
+        let spans = crate::render::render_command_breaking_at(ELEVATED, &BTreeMap::new(), None);
+        assert!(breaks(&spans).is_empty(), "a break appeared that nothing asked for");
+        assert_eq!(spans, render_command(ELEVATED));
+    }
+
+    #[test]
+    fn a_requested_break_takes_its_place_among_the_ones_the_command_asked_for() {
+        // It is spent where it was asked for rather than at the next
+        // boundary: `c` starts a line, and so does each run after a
+        // separator. A break deferred to the separator after it would draw
+        // ` b c` as one line and put the reader's eye back where it started.
+        let line = "a; b c; d";
+        let at = line.find('c').unwrap();
+        assert_eq!(breaks(&broken_at(line, at)), vec![" ", "c", " "]);
+        assert_eq!(unrender(&broken_at(line, at)), line);
+    }
+
+    #[test]
+    #[should_panic(expected = "not on a character boundary")]
+    fn a_break_inside_a_character_is_refused() {
+        // The offset is arithmetic on an argv, so a caller that had counted
+        // characters where it should have counted bytes would ask for a cut
+        // inside one. There is no half-character to start a line with.
+        broken_at("echo é", 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "behind cursor")]
+    fn a_break_behind_what_is_already_drawn_is_refused() {
+        // Inside a separator token, which segmentation has emitted by the
+        // time the offset comes up. It means the caller's idea of the line
+        // and the scanner's have come apart, and the whole reason the offset
+        // travels from the caller is that nobody should have to guess which
+        // of the two was right -- so it is loud, rather than a line that
+        // quietly fails to break.
+        broken_at("a && b", 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "begins no span")]
+    fn a_break_past_the_end_of_the_line_is_refused() {
+        // One past the last character is not a place anything begins, and a
+        // break nothing carries is a break nobody would see. The elevation
+        // that has nothing to wrap says `None` instead -- see
+        // `ElevatedArgv::inner_at`.
+        broken_at("echo hi", "echo hi".len());
     }
 
     // --- quoting ----------------------------------------------------------

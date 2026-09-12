@@ -149,7 +149,7 @@ use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
 use crate::protocol::{Payload, Request as PromptRequest, ReviseKind, Verdict};
 use crate::render::diff::{FileDiff, diff_files};
-use crate::render::render_command;
+use crate::render::render_command_breaking_at;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
 use crate::swap::{ApplyError, PlanKind, RootWrite, SwapPlan};
@@ -1487,7 +1487,7 @@ impl Daemon {
         // that is the one the command will actually have — resolving against
         // the spawner's would put a value on screen that the command never
         // sees. See `crate::exec::elevate::Run0::spawner_env`.
-        let (argv, spawn_env, line, caveat) = if params.root {
+        let (argv, spawn_env, line, break_at, caveat) = if params.root {
             let elevated = match self.elevation.argv(&params.command, &env) {
                 Ok(elevated) => elevated,
                 // Nothing was rendered and nobody was asked: this build
@@ -1503,6 +1503,11 @@ impl Daemon {
                 // command line somebody would most want folded away are the
                 // parts that decide what it does.
                 elevated.display_line(),
+                // ...and a break where the approved command begins, so the
+                // reader does not have to walk the whole wrapper to reach
+                // the part they were asked about. Layout only: the line is
+                // the same line. See `ElevatedArgv::inner_at`.
+                elevated.inner_at(),
                 self.elevation.caveat(),
             )
         } else {
@@ -1512,6 +1517,9 @@ impl Daemon {
                 vec!["bash".to_string(), "-c".to_string(), params.command.clone()],
                 env.clone(),
                 params.command.clone(),
+                // Nothing to break before: the line an unelevated request
+                // draws is the command the agent wrote and nothing else.
+                None,
                 None,
             )
         };
@@ -1520,7 +1528,7 @@ impl Daemon {
             false => env.clone(),
         };
 
-        let spans = render_command(&line, &render_env);
+        let spans = render_command_breaking_at(&line, &render_env, break_at);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
         let payload =
@@ -4368,6 +4376,55 @@ later"), "");
             assert_eq!(raw, "echo hi");
             assert!(!root);
             assert_eq!(caveat, None, "an ordinary command was given a root warning");
+        }
+
+        #[tokio::test]
+        async fn the_elevated_line_breaks_where_the_approved_command_begins() {
+            // The wrapper stays on screen in full -- that is the rule, and the
+            // test above is what holds it there. What it must not do is push
+            // the command the reader came to read out past a wall of
+            // `--setenv` whose length is the size of the child environment.
+            // So the line breaks once, before the argv the wrapper wraps, and
+            // the approved command starts at the start of a line.
+            let harness = rooted(
+                vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            within(harness.daemon.run_command(root_run("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let spans = shown.payload.rendering().expect("a rendering the window can rebuild");
+            let broken: Vec<_> = spans.iter().filter(|span| span.break_before()).collect();
+            assert_eq!(broken.len(), 1, "one break, and the daemon asked for it");
+            assert!(
+                broken[0].text().starts_with("bash -c"),
+                "the line breaks somewhere other than the command: {}",
+                broken[0].text()
+            );
+            // Layout, and layout only: the line the reader approves is the
+            // same line, byte for byte.
+            let Payload::Command { raw, .. } = &shown.payload else {
+                panic!("not a command payload");
+            };
+            assert_eq!(&crate::render::unrender(&spans), raw);
+        }
+
+        #[tokio::test]
+        async fn an_unelevated_line_breaks_only_where_the_command_itself_asks() {
+            // The offset belongs to the elevated line and to nothing else.
+            // An ordinary request draws the command the agent wrote, and the
+            // only thing that may break it is the command's own structure --
+            // which `echo hi` has none of.
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })]);
+            within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let spans = shown.payload.rendering().expect("a rendering the window can rebuild");
+            assert!(
+                spans.iter().all(|span| !span.break_before()),
+                "an unelevated line was broken somewhere the command did not ask for"
+            );
         }
 
         #[tokio::test]
