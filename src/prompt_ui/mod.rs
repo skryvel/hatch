@@ -888,6 +888,58 @@ pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn(N
 
 // ---- the window ------------------------------------------------------------
 
+/// Open the window this program draws, whatever is going to fill it.
+///
+/// The viewport, the faces, the point size and the palette, and then whatever
+/// `build` makes of the context they were applied to. Two things open this
+/// window: [`run_prompt`], which fills it from the daemon on this process's
+/// stdin, and [`crate::preview`], which fills it from a sample it built
+/// itself. Sharing the function is the point rather than a tidiness: a
+/// preview that opened a window of its own would be evidence about a window
+/// nobody is ever shown, and the screenshots in the README would be pictures
+/// of something that does not exist.
+///
+/// `title` is the one thing the two differ on, and it is deliberately the one
+/// thing that is not in the picture: the screenshot is the client area, so a
+/// preview can say "preview" in its title bar and on the taskbar without
+/// changing a pixel of what it is a preview *of*. Everything a reader sees
+/// inside the frame comes from the same code either way.
+///
+/// # Errors
+///
+/// The window could not be opened at all. What happens *in* it is the
+/// caller's to report.
+pub(crate) fn open_window(
+    title: &str,
+    font_size: f32,
+    theme: theme::Theme,
+    build: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>>,
+) -> anyhow::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id(APP_ID)
+            .with_title(title)
+            .with_inner_size(WINDOW_SIZE)
+            // A no-op on Wayland, where only the compositor may raise a
+            // window, and correct everywhere else. The Wayland answer is a
+            // compositor rule matching the app id above.
+            .with_always_on_top(),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        APP_ID,
+        options,
+        Box::new(move |cc| {
+            apply_faces(&cc.egui_ctx);
+            apply_font_size(&cc.egui_ctx, font_size);
+            theme::apply(&cc.egui_ctx, theme);
+            Ok(build(cc))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("the approval window could not be opened: {e}"))
+}
+
 /// Draw one approval window, and do not return until it is over.
 ///
 /// # Errors
@@ -902,30 +954,17 @@ pub fn run_prompt() -> anyhow::Result<()> {
     // default size rather than a request that never opens one -- which the
     // daemon would resolve as a denial.
     let (font_size, theme) = crate::config::display_style();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id(APP_ID)
-            .with_title("hatch — approval")
-            .with_inner_size(WINDOW_SIZE)
-            // A no-op on Wayland, where only the compositor may raise a
-            // window, and correct everywhere else. The Wayland answer is a
-            // compositor rule matching the app id above.
-            .with_always_on_top(),
-        ..Default::default()
-    };
 
     let app_fatal = Arc::clone(&fatal);
-    eframe::run_native(
-        APP_ID,
-        options,
+    open_window(
+        "hatch — approval",
+        font_size,
+        theme,
         Box::new(move |cc| {
             // The reader is started here, not before, so it has a real
             // context to wake and so a window that never opens never reads a
             // request it could not have shown. Nothing is lost by waiting:
             // the daemon's first write fits in the pipe.
-            apply_faces(&cc.egui_ctx);
-            apply_font_size(&cc.egui_ctx, font_size);
-            theme::apply(&cc.egui_ctx, theme);
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
             let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal));
@@ -949,10 +988,9 @@ pub fn run_prompt() -> anyhow::Result<()> {
                 std::thread::sleep(CHANNEL_END_GRACE);
                 leave(&app_fatal);
             });
-            Ok(Box::new(app))
+            Box::new(app)
         }),
-    )
-    .map_err(|e| anyhow::anyhow!("the approval window could not be opened: {e}"))?;
+    )?;
 
     match fatal.get() {
         Some(why) => Err(anyhow::anyhow!("{why}")),
@@ -961,7 +999,13 @@ pub fn run_prompt() -> anyhow::Result<()> {
 }
 
 /// The eframe side: drain, draw, and write back.
-struct PromptApp {
+///
+/// Visible to the crate rather than to this module, because there is a second
+/// thing that opens this window: [`crate::preview`] builds one of these with
+/// a sample in its inbox and nobody on the other end of its `out`. It is the
+/// same app, drawing the same frames through the same code -- which is the
+/// whole of what makes a preview evidence about the real window.
+pub(crate) struct PromptApp {
     state: PromptState,
     inbox: Receiver<Incoming>,
     out: Box<dyn Write + Send>,
@@ -993,7 +1037,7 @@ struct PromptApp {
 }
 
 impl PromptApp {
-    fn new(
+    pub(crate) fn new(
         inbox: Receiver<Incoming>,
         out: Box<dyn Write + Send>,
         fatal: Arc<OnceLock<String>>,
@@ -1021,6 +1065,28 @@ impl PromptApp {
     /// started before the window has anything to keep.
     fn kept(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kept)
+    }
+
+    /// What this window currently is.
+    ///
+    /// For a caller wrapping this app rather than one inside it: a preview
+    /// has to know when the window has stopped asking, because a preview is
+    /// over the moment it has been decided -- there is nothing behind it to
+    /// run what was approved, and a window that sat there saying "running"
+    /// would be claiming one.
+    pub(crate) fn state(&self) -> &PromptState {
+        &self.state
+    }
+
+    /// Whether the typing guard was open when this frame's input was judged.
+    ///
+    /// The one thing a screenshot has to wait for that is not layout. Until
+    /// the guard opens the verdict buttons are drawn disabled -- see
+    /// [`guard`] -- so a picture taken before then is a picture of a window
+    /// nobody can answer yet, which is true for 750 ms and misleading for
+    /// ever afterwards in a README.
+    pub(crate) fn guard_open(&self) -> bool {
+        self.guard_open
     }
 
     /// Whether this run gets a terminal of its own.
@@ -1286,7 +1352,7 @@ impl PromptApp {
     /// state machine is what makes a doubled one harmless — it answers only
     /// while the window awaits a verdict, and it leaves that phase on the way
     /// out.
-    fn act(&mut self, action: Action) {
+    pub(crate) fn act(&mut self, action: Action) {
         // A window that is only showing a result has nothing to decide, so the
         // two keys the guard owns mean the only things left: Escape puts the
         // window away, and Enter means nothing at all. Neither reaches

@@ -100,7 +100,12 @@ use serde::{Deserialize, Serialize};
 /// A preference and nothing more: no colour here decides anything, and both
 /// themes carry every meaning the window has. Default is [`Theme::Dark`],
 /// which is what the window has always been.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// It is a command-line value as well as a config one: `hatch preview --theme
+/// light` draws that run in the other palette without touching the file. The
+/// list of palettes lives here and the flag reads it, so a third one would
+/// not have to be spelled out in two places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
     #[default]

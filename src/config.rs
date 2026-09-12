@@ -334,6 +334,32 @@ pub fn display_font_size() -> f32 {
     display_style().0
 }
 
+/// The config as a window should read it: read-only, and defaulted rather
+/// than refused on anything it cannot make sense of.
+///
+/// The counterpart to [`Config::load_or_create`], which creates directories,
+/// writes a token back and fails loudly. Nothing here does any of that. A
+/// process that only draws owns nothing — not the file, not the directories —
+/// and the two callers both have something better to do with a typo in a
+/// preference than to stop: `hatch prompt` would resolve the request it was
+/// about to show as a denial, and `hatch preview` would refuse to show
+/// anybody the window they asked to look at.
+pub fn display_config() -> Config {
+    match Paths::from_env() {
+        Ok(paths) => display_config_at(&paths),
+        Err(_) => Config::default(),
+    }
+}
+
+/// The whole of [`display_config`] except for reading the environment, so
+/// every case is testable without one.
+pub fn display_config_at(paths: &Paths) -> Config {
+    fs::read_to_string(paths.config_file())
+        .ok()
+        .and_then(|text| toml::from_str::<Config>(&text).ok())
+        .unwrap_or_default()
+}
+
 /// The point size and the palette the approval window should draw in, read
 /// without creating or writing anything.
 ///
@@ -341,19 +367,14 @@ pub fn display_font_size() -> f32 {
 /// window drawn at one config's size in another config's colours would be a
 /// window nobody configured.
 pub fn display_style() -> (f32, Theme) {
-    match Paths::from_env() {
-        Ok(paths) => display_style_at(&paths),
-        Err(_) => (Config::default().font_size_points(), Config::default().theme),
-    }
+    let config = display_config();
+    (config.font_size_points(), config.theme)
 }
 
 /// The whole of [`display_style`] except for reading the environment, so
 /// every case is testable without one.
 pub fn display_style_at(paths: &Paths) -> (f32, Theme) {
-    let config = fs::read_to_string(paths.config_file())
-        .ok()
-        .and_then(|text| toml::from_str::<Config>(&text).ok())
-        .unwrap_or_default();
+    let config = display_config_at(paths);
     (config.font_size_points(), config.theme)
 }
 

@@ -26,6 +26,10 @@ dirs = "7.0.0"
 eframe = "0.36.1"
 futures-core = "0.3.34"
 nix = { version = "0.31.3", features = ["signal", "process", "user"] }
+# Writing one PNG, for `hatch preview --shot`. Already in the tree under
+# eframe; the alternative was `image`, which is that plus a dozen codecs
+# nothing here decodes.
+png = "0.18.1"
 rand = "0.10.2"
 regex = "1.13.1"
 rmcp = { version = "3.2.0", features = ["server", "macros", "transport-streamable-http-server"] }

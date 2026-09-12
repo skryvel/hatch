@@ -13,6 +13,24 @@ enum Mode {
     Serve,
     /// Internal: render one approval window
     Prompt,
+    /// Open the approval window on a sample, and run nothing
+    ///
+    /// The window `hatch prompt` draws, on a request built in this process
+    /// rather than sent by an agent, so a person can see what their
+    /// `font_size`, `theme` and `terminal` settings look like without having
+    /// to get an agent to knock. `--shot` photographs the viewport to a PNG
+    /// and exits, which is how the README's images are made.
+    Preview {
+        /// Which sample to draw
+        #[arg(value_enum, default_value_t = hatch::preview::Scenario::Command)]
+        scenario: hatch::preview::Scenario,
+        /// Write the window to this PNG and exit
+        #[arg(long, value_name = "PATH")]
+        shot: Option<std::path::PathBuf>,
+        /// Draw this run in the other palette, leaving the config alone
+        #[arg(long, value_enum, value_name = "PALETTE")]
+        theme: Option<hatch::prompt_ui::theme::Theme>,
+    },
     /// Tail the audit log
     Log,
     /// Print the client registration line
@@ -47,6 +65,7 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().mode {
         Mode::Serve => hatch::server::run_serve(),
         Mode::Prompt => hatch::prompt_ui::run_prompt(),
+        Mode::Preview { scenario, shot, theme } => hatch::preview::run(scenario, shot, theme),
         Mode::Log => hatch::audit::tail(),
         Mode::Token => hatch::config::print_client_line(),
         Mode::Setup { topic } => match topic {

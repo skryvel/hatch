@@ -1878,6 +1878,7 @@ dependencies = [
  "eframe",
  "futures-core",
  "nix",
+ "png",
  "proptest",
  "rand 0.10.2",
  "regex",
