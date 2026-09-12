@@ -33,8 +33,9 @@
 //! # What the meanings are, and what may change
 //!
 //! The *roles* are fixed and are the same in both themes: danger is red, warn
-//! is orange, quiet is a grey below body text, quoted is the coolest hue on
-//! screen, and the command word is contrast rather than a hue. What changes
+//! is orange, quiet is a grey below body text, quoted is a cool blue, a
+//! redirection is the violet next along, and the command word is contrast
+//! rather than a hue. What changes
 //! between themes is the luminance each one needs to keep those roles
 //! legible. Two rules hold in both:
 //!
@@ -201,6 +202,25 @@ pub struct Palette {
     /// success signal for a green to be confused with, and every editor a
     /// reader has ever used has already taught them this one.
     pub comment: Color32,
+    /// A redirection: the operator and the word it points at.
+    ///
+    /// Structure rather than alarm. The window already spends red on danger
+    /// and orange on a warning, and a redirection is neither -- `> /dev/null`
+    /// uses the same operator as `> /etc/passwd`, and which of them is
+    /// frightening is a question about the *path*, which this colour does not
+    /// answer. So it is a hue with no alarm in it.
+    ///
+    /// Violet, which is where the unspent arc of the circle actually is: red,
+    /// orange, green and blue are taken, and the gap between blue and red is
+    /// the only one wide enough that a new hue is not adjacent to an old
+    /// meaning. Its nearest neighbour is [`Palette::quoted`], and the two are
+    /// told apart by hue and not by lightness -- they sit in the same contrast
+    /// band on purpose, because neither is louder than the other -- so the
+    /// distance between them is asserted in the cube, the way the three
+    /// grounds are. The finished window's ground is also a violet, and it is a
+    /// far more desaturated one; that pair is held apart by contrast instead,
+    /// because a ground is never text.
+    pub redirect: Color32,
     /// Behind a chip.
     pub chip_bg: Color32,
     /// Behind a separator's own characters.
@@ -227,7 +247,8 @@ pub struct Palette {
 /// 1.7:1 against the chrome and its border is 3.0:1 against it. egui's own
 /// dark theme is 5.1:1 and 1.00:1 for the first and third of those. A comment
 /// is 7.3:1 on a pane, against body text's 15.3:1: half the contrast and
-/// still above AAA.
+/// still above AAA. A redirection is 10.1:1, which is the same band as a
+/// quoted string's 9.3:1 and above it rather than below.
 pub const DARK: Palette = Palette {
     chrome: Color32::from_rgb(58, 58, 58),
     running: Color32::from_rgb(38, 58, 82),
@@ -241,6 +262,7 @@ pub const DARK: Palette = Palette {
     command: Color32::from_rgb(255, 255, 255),
     quoted: Color32::from_rgb(110, 185, 255),
     comment: Color32::from_rgb(122, 170, 122),
+    redirect: Color32::from_rgb(210, 170, 255),
     chip_bg: Color32::from_rgb(72, 72, 72),
     separator_bg: Color32::from_rgb(60, 60, 60),
     value_bg: Color32::from_rgb(52, 52, 52),
@@ -257,7 +279,9 @@ pub const DARK: Palette = Palette {
 /// here is a dark amber, and it is still the *lighter* of the danger/warn
 /// pair — which is the relation a reader learns, in either theme. A comment
 /// is 7.3:1 against this pane as it is against the dark one, and body text is
-/// 17.4:1, so the relation a reader learns there holds here too.
+/// 17.4:1, so the relation a reader learns there holds here too. A
+/// redirection is 9.0:1 here against a quoted string's 6.7:1, which is again
+/// the same band and again the louder of the two.
 pub const LIGHT: Palette = Palette {
     chrome: Color32::from_rgb(201, 201, 201),
     running: Color32::from_rgb(184, 204, 224),
@@ -271,6 +295,7 @@ pub const LIGHT: Palette = Palette {
     command: Color32::from_rgb(0, 0, 0),
     quoted: Color32::from_rgb(0, 90, 180),
     comment: Color32::from_rgb(0, 100, 50),
+    redirect: Color32::from_rgb(95, 35, 175),
     chip_bg: Color32::from_rgb(224, 224, 224),
     separator_bg: Color32::from_rgb(232, 232, 232),
     value_bg: Color32::from_rgb(238, 238, 238),
@@ -583,6 +608,7 @@ mod tests {
                 ("command", palette.command),
                 ("quoted", palette.quoted),
                 ("comment", palette.comment),
+                ("redirect", palette.redirect),
             ] {
                 let ratio = contrast(colour, palette.surface);
                 assert!(ratio >= 4.5, "{name}: {role} is {ratio:.2}:1 on a pane");
@@ -640,6 +666,13 @@ mod tests {
             for (mood, ground) in grounds(palette) {
                 let ratio = contrast(palette.quoted, ground);
                 assert!(ratio >= 3.0, "{name}/{mood}: quoted is {ratio:.2}:1 on the chrome");
+                // And `redirect` is the one the finished ground could
+                // plausibly collide with, for the mirror of that reason: it
+                // is a violet and the finished ground is a violet. The ground
+                // is the far more desaturated of the two, so what tells them
+                // apart is contrast, and it is asserted rather than assumed.
+                let ratio = contrast(palette.redirect, ground);
+                assert!(ratio >= 3.0, "{name}/{mood}: redirect is {ratio:.2}:1 on the chrome");
                 // And the ground is a ground, not a meaning: no mood may land
                 // on a colour this window already uses to say something.
                 for (role, colour) in [
@@ -647,6 +680,7 @@ mod tests {
                     ("warn", palette.warn),
                     ("quoted", palette.quoted),
                     ("comment", palette.comment),
+                    ("redirect", palette.redirect),
                     ("surface", palette.surface),
                     ("gap", palette.gap_bg),
                 ] {
@@ -820,6 +854,58 @@ mod tests {
     }
 
     #[test]
+    fn a_redirection_is_told_apart_from_every_other_hue_by_hue() {
+        // The opposite device from the one danger and warn need, and it is
+        // the right one here. Red against orange is a collision of two alarm
+        // colours, so they are separated by lightness; a redirection is not
+        // an alarm, and it sits in the same contrast band as a quoted string
+        // on purpose -- neither of them is the louder meaning. So what has to
+        // hold is the distance contrast cannot see, which is the measure
+        // `the_three_grounds_are_told_apart` uses for the same reason, and
+        // sixty is three times the twenty a flat field needs because these
+        // are glyphs a few pixels wide rather than fields.
+        for (name, palette) in palettes() {
+            for (role, colour) in [
+                ("danger", palette.danger),
+                ("warn", palette.warn),
+                ("quoted", palette.quoted),
+                ("comment", palette.comment),
+                ("text", palette.text),
+                ("quiet", palette.quiet),
+                ("command", palette.command),
+            ] {
+                let apart = f64::from(i32::from(palette.redirect.r()) - i32::from(colour.r()))
+                    .powi(2)
+                    + f64::from(i32::from(palette.redirect.g()) - i32::from(colour.g())).powi(2)
+                    + f64::from(i32::from(palette.redirect.b()) - i32::from(colour.b())).powi(2);
+                assert!(
+                    apart.sqrt() >= 60.0,
+                    "{name}: redirect and {role} are {:.1} apart in RGB",
+                    apart.sqrt()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_redirection_is_structure_and_is_not_drawn_as_quietly_as_a_comment() {
+        // The one relation between these two that has to hold. A comment is
+        // the part of the line that will not run and is deliberately the
+        // quietest thing on a pane; a redirection is part of what *will* run,
+        // and one of the few parts of it that decides where the effects land.
+        // A redirection drawn quieter than a comment would have the window
+        // saying the opposite of what it means.
+        for (name, palette) in palettes() {
+            let redirect = contrast(palette.redirect, palette.surface);
+            let comment = contrast(palette.comment, palette.surface);
+            assert!(
+                redirect > comment,
+                "{name}: a redirection is {redirect:.2}:1 and a comment is {comment:.2}:1"
+            );
+        }
+    }
+
+    #[test]
     fn danger_and_warn_are_told_apart_by_lightness_and_not_only_by_hue() {
         // Red against orange is the collision a colour-blind reader actually
         // has, and this window says "Marked:" in words for the same reason.
@@ -875,6 +961,7 @@ mod tests {
                 assert_eq!(worn.warn, palette.warn, "{name}/{mood}");
                 assert_eq!(worn.quoted, palette.quoted, "{name}/{mood}");
                 assert_eq!(worn.comment, palette.comment, "{name}/{mood}");
+                assert_eq!(worn.redirect, palette.redirect, "{name}/{mood}");
                 assert_eq!(worn.command, palette.command, "{name}/{mood}");
                 assert_eq!(worn.surface, palette.surface, "{name}/{mood}");
             }

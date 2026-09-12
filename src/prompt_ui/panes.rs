@@ -2520,6 +2520,17 @@ fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text
             // much; a comment is the command's own text, so it is drawn with
             // the same tools the other two highlights are.
             SpanKind::Comment => egui::TextFormat { color: palette.comment, ..plain.clone() },
+            // Structure, and drawn like the other highlights rather than like
+            // a separator: a separator earns its faint block by being
+            // punctuation *between* two commands, while a redirection's
+            // target is a word inside one, and a block behind a path would
+            // read as a chip -- as hatch having substituted something. The
+            // operator and its target are one colour for the reason they are
+            // one kind: they say one thing, which is where the effects of
+            // this command land. Nothing here says whether landing there is a
+            // bad idea; that is `render::danger`'s to say, in the colour this
+            // one is deliberately not.
+            SpanKind::Redirect => egui::TextFormat { color: palette.redirect, ..plain.clone() },
             SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
         job.append(&span.display_text(), 0.0, format);
@@ -4435,6 +4446,7 @@ mod tests {
             command: Color32::from_rgb(5, 0, 0),
             quoted: Color32::from_rgb(6, 0, 0),
             comment: Color32::from_rgb(19, 0, 0),
+            redirect: Color32::from_rgb(20, 0, 0),
             chip_bg: Color32::from_rgb(7, 0, 0),
             separator_bg: Color32::from_rgb(8, 0, 0),
             value_bg: Color32::from_rgb(9, 0, 0),

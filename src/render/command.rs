@@ -47,8 +47,9 @@
 //! # Where the model stops, and what it costs
 //!
 //! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting,
-//! backslash escaping and comments around them. The rest of shell grammar is
-//! outside the model, and the cost falls in both directions.
+//! backslash escaping, comments and redirections around them. The rest of
+//! shell grammar is outside the model, and the cost falls in both
+//! directions.
 //!
 //! ## Under-segmentation: structure the shell has that the screen does not
 //!
@@ -67,7 +68,6 @@
 //!
 //! * `echo $((1 || 0))` — arithmetic OR.
 //! * `[[ -n x || -n y ]]` — conditional OR.
-//! * `echo x >| out.txt` — `>|` is one redirection operator.
 //! * `$'a\'b; c'` — ANSI-C quoting, where `\'` does not end the string, so
 //!   the `;` is data.
 //! * A heredoc whose body contains `a; b` — the body is data.
@@ -125,6 +125,39 @@
 //! old rendering was already wrong in for the whole body, and no larger.
 //! `a_heredoc_body_line_that_starts_with_a_hash_is_drawn_as_a_comment` pins
 //! it so that changing it has to be deliberate.
+//!
+//! # Redirections, which are structure and not a verdict
+//!
+//! A redirection is one of the few constructs that changes *where a command's
+//! effects land*, and until it had a pass of its own the window drew
+//! `> /etc/passwd` with exactly the emphasis it drew `-l` with. So the
+//! operator and the word it points at are marked — see [`Redirect`] for why
+//! both, and why both the same — and [`Scan`] carries the rules, which are
+//! bash's and are written out there with the case each of them decides.
+//! [`REDIRECTIONS`] is the set of operators and says which forms of the
+//! manual's are deliberately not in it.
+//!
+//! It is a **lexical** claim and nothing more. `> /dev/null` and
+//! `> /etc/passwd` are the same construct and get the same colour; which of
+//! them should alarm a reader is a question about the path, and answering it
+//! is [`super::danger`]'s job, which is still unwritten. Putting a judgement
+//! here would mean two passes with an opinion about the same word and a
+//! window that shouts at `/dev/null`.
+//!
+//! Recognising them is a correctness fix first, in the same way a comment
+//! was, and this page is one entry shorter for it: `>|` is one redirection
+//! operator, and segmentation used to split at the `|` in it. It cannot any
+//! more, because [`boundaries`] reads the same flag [`regions`] does rather
+//! than deciding for itself what an operator is — one `Scan`, one answer, the
+//! argument [`Scan`] makes at length. Two smaller corrections come with it,
+//! both in [`is_word_break`]: `cat<file` names `cat` as the word that runs
+//! rather than `cat<file`, and `>out.txt cat` names `cat` rather than
+//! `>out.txt`.
+//!
+//! The heredoc gap is untouched. `<<EOF` is recognised as an operator and
+//! `EOF` as the word it points at, which is right, and hatch still does not
+//! know that what follows is a body rather than shell — so everything the
+//! lists above say about a heredoc body is as true as it was.
 //!
 //! # Variables: the window resolves against the environment that will run
 //!
@@ -196,8 +229,9 @@
 //! # Highlighting: the same scanner again, and why not `syntect`
 //!
 //! [`highlight`] is the last pass. It marks the word that names what runs,
-//! the quoted strings and the comments, so the annotated pane shows
-//! *structure* rather than being the raw pane with line breaks in it.
+//! the quoted strings, the comments and the redirections, so the annotated
+//! pane shows *structure* rather than being the raw pane with line breaks in
+//! it.
 //!
 //! The spec called for `syntect` with the bash grammar and this does not use
 //! it, for three reasons in descending order of weight:
@@ -221,13 +255,15 @@
 //!    ones ordinary.
 //!
 //! What it costs is scope, and the scope is deliberately small: the first
-//! word, the quoted strings and the comments, and nothing else. There is no
-//! keyword list, no builtin table and no flag rule, because each one is
-//! another colour, and a pane where six things are coloured is a pane where
-//! the ones that matter are not. A comment earns its place on different
-//! grounds from the other two: it is not a hint about what the line means,
-//! it is the one region of the line that will not happen, and the pass that
-//! finds it is the pass that stops segmentation lying about the same bytes.
+//! word, the quoted strings, the comments and the redirections, and nothing
+//! else. There is no keyword list, no builtin table and no flag rule, because
+//! each one is another colour, and a pane where eight things are coloured is
+//! a pane where the ones that matter are not. The last two earn their place
+//! on different grounds from the first two, and on the same grounds as each
+//! other: neither is a hint about what the line means. A comment is the one
+//! region of the line that will *not* happen, and a redirection is where what
+//! does happen will land — and in both cases the pass that finds it is the
+//! pass that stops segmentation lying about the same bytes.
 //!
 //! **Highlighting is decoration and is never load-bearing.** Every span it
 //! marks is still drawn as its own text — nothing is replaced and nothing is
@@ -259,6 +295,66 @@ use super::{SpanBuilder, SpanKind, Spans, unicode, variable_name};
 /// prefix relationship matters at all: `&&&` matches `&&` and then leaves a
 /// plain `&`.
 const SEPARATORS: &[&str] = &["&&", "||", ";", "|"];
+
+/// The redirection operators, longest first.
+///
+/// The order is the same longest-match rule [`SEPARATORS`] is written to, and
+/// it matters more here because the table is full of prefixes: `>` starts
+/// `>>`, `>|` and `>&`, `<` starts all four of its own, and `&>` starts
+/// `&>>`. A shortest-first table would read `2>>log` as `2>` followed by an
+/// argument called `>log`. `redirection_table_is_longest_first` holds it.
+///
+/// The set is bash's, read off its manual's REDIRECTION section rather than
+/// off memory. Every form it lists that is one token is here: `<` and `>`,
+/// `>>` and `<<`, the here-string `<<<` and the tab-stripping here-document
+/// `<<-`, the read-write `<>`, the `noclobber` override `>|`, the descriptor
+/// duplications `>&` and `<&`, and `&>` and `&>>`, which are the two spellings
+/// that take stdout and stderr together.
+///
+/// Two forms the manual lists are deliberately absent. `{varname}>` — the
+/// shell allocating a descriptor into a variable — needs a brace-word the
+/// scanner has no other reason to model, and it is rare enough that missing
+/// it costs a highlight on a line hatch still draws correctly. `<<` and `<<-`
+/// are *listed*, but what follows them is a here-document body, and hatch
+/// still does not know where a body starts; see the module docs for what that
+/// costs and in which direction.
+const REDIRECTIONS: &[&str] =
+    &["&>>", "<<<", "<<-", "&>", ">>", "<<", "<>", ">|", ">&", "<&", ">", "<"];
+
+/// Which half of a redirection a character belongs to.
+///
+/// Two halves and one meaning. `> /etc/passwd` says *the effects of this
+/// command land there*, and the arrow alone does not say it: in
+/// `echo x > /etc/passwd` the word a reader is scanning for is the path. So
+/// both halves are marked, and both are marked the *same*, because they are
+/// one fact and a second colour would be a second thing to learn for no
+/// second meaning. This distinction exists so that the two can be found
+/// separately — the blank between them belongs to neither, and a target the
+/// highlighter declines still leaves its operator marked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Redirect {
+    /// The operator, with the file descriptor in front of it if it has one:
+    /// `>`, `2>>`, `&>`, `>|`, `1>&`.
+    Operator,
+    /// The word the operator points at: the file it opens, the descriptor
+    /// `>&` duplicates, or the delimiter a here-document ends on.
+    Target,
+}
+
+/// Where the scanner is in a redirection, between one character and the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Redirecting {
+    /// Not in one.
+    No,
+    /// Inside an operator, which ends at this byte offset.
+    Operator { end: usize },
+    /// The operator has ended and its word has not started: the blanks bash
+    /// allows between them, so that `> out` and `>out` are the same
+    /// redirection.
+    Blanks,
+    /// Inside the word the operator points at.
+    Target,
+}
 
 /// Where the scanner found one segment to end.
 #[derive(Debug, PartialEq, Eq)]
@@ -329,6 +425,17 @@ struct Scanned {
     /// Nothing inside a comment is anything else: not a separator, not a
     /// quote, not a reference, not a word. Every pass below asks this first.
     comment: bool,
+    /// Which half of a redirection this character is part of, if any -- see
+    /// [`Scan`] for the rules and [`Redirect`] for why both halves are
+    /// marked.
+    ///
+    /// A second lexical fact threaded through the same pass as `comment`, and
+    /// for the same reason: [`boundaries`] has to know that the `|` of a `>|`
+    /// is not a pipe, [`is_word_break`] has to know that the `<` of
+    /// `cat<file` ends the word `cat`, and [`regions`] has to know where to
+    /// put a colour. Three passes reading one flag cannot disagree; three
+    /// passes each finding redirections for themselves can.
+    redirect: Option<Redirect>,
 }
 
 /// True for one of bash's metacharacters: a character that, unquoted,
@@ -398,6 +505,44 @@ fn is_metacharacter(c: char) -> bool {
 /// body line beginning with `#` is drawn as a comment though it is data — see
 /// the module docs, which say what that costs and in which direction.
 ///
+/// # Where a redirection begins and ends
+///
+/// These are bash's rules too, read off the REDIRECTION section of its manual
+/// and checked against a real shell. [`REDIRECTIONS`] is the set of operators
+/// and says which forms are deliberately not in it; what is left is where one
+/// starts, how far it reaches, and the word it points at.
+///
+/// * An operator may be preceded by a **file descriptor**: a run of ASCII
+///   digits, immediately in front of the operator with no space, and making
+///   up the whole of the token so far. So `2>log`, `2>>log`, `1>&2` and
+///   `2>&1` are redirections whose operator includes its number, and
+///   `echo a2>log` is not: the token there is `a2`, which is not a number, so
+///   the `>` starts a fresh token and `a2` is an argument. That is exactly
+///   what bash does with it.
+/// * `&>` and `&>>` take no descriptor, because the `&` is part of the
+///   operator rather than a number. `2&>x` is the word `2` followed by an
+///   `&>`, which is again what bash reads.
+/// * The **target** is the word after the operator, with the blanks bash
+///   allows in between skipped, so `> out` and `>out` are one redirection
+///   either way. It ends where a word ends: at unquoted whitespace or at an
+///   unquoted metacharacter, so `>out;ls` points at `out` and `>a>b` is two
+///   redirections rather than one pointing at `a>b`. A quoted word is one
+///   word -- `> "my file"` points at all of `"my file"` -- because a quoted
+///   space is not a word break.
+/// * `>&` and `<&` point at a descriptor or a word, and nothing here tells
+///   them apart: `2>&1`, `>&2`, `>&-` and `>& out` all get a target, because
+///   which it is depends on what the word expands to and this scanner does
+///   not expand anything.
+/// * None of it is a redirection inside quotes, after a backslash, or inside
+///   a comment. That is the same rule a comment is found by, asked of the
+///   same state, rather than a second one written out again. A comment also
+///   *ends* a redirection that was waiting for its word: `echo z >#f` has no
+///   target, and bash agrees -- it is a syntax error there.
+///
+/// Where the scanner cannot see, it is wrong in the direction of finding no
+/// redirection, which leaves the text drawn exactly as it was drawn before
+/// this pass existed.
+///
 /// # Backslash inside double quotes
 ///
 /// Real `sh` escapes only `$`, `` ` ``, `"`, `\` and newline inside double
@@ -420,6 +565,8 @@ struct Scan<'a> {
     /// start of the input and after every unquoted metacharacter; see
     /// [`is_metacharacter`], which is the whole of the rule.
     word_start: bool,
+    /// Where the scan is in a redirection, if it is in one.
+    redirecting: Redirecting,
 }
 
 fn scan(command: &str) -> Scan<'_> {
@@ -432,6 +579,7 @@ fn scan(command: &str) -> Scan<'_> {
         // The very first character of the command is the first character of
         // a word, so `#ls` is a comment and the whole command is inert.
         word_start: true,
+        redirecting: Redirecting::No,
     }
 }
 
@@ -459,12 +607,15 @@ impl Iterator for Scan<'_> {
             self.comment = true;
         }
 
+        let redirect = self.redirect_at(ch);
+
         let current = Scanned {
             offset: self.cursor,
             ch,
             quoting: self.quoting,
             escaped: self.escaped,
             comment: self.comment,
+            redirect,
         };
 
         match (current.comment, self.escaped) {
@@ -512,6 +663,96 @@ impl Iterator for Scan<'_> {
     }
 }
 
+impl Scan<'_> {
+    /// Which half of a redirection the character at the cursor belongs to,
+    /// advancing the state that decides it for the next one.
+    ///
+    /// Called from [`Scan::next`] after the comment flag for this character
+    /// has been settled and before the quoting state is advanced past it, so
+    /// what it reads is the shell state *at* this character -- the same
+    /// reading every other pass gets. See [`Scan`] for the rules it applies.
+    fn redirect_at(&mut self, ch: char) -> Option<Redirect> {
+        // A comment is not shell, so nothing in one is a redirection and a
+        // redirection still waiting for its word does not get one out of it.
+        if self.comment {
+            self.redirecting = Redirecting::No;
+            return None;
+        }
+        if let Redirecting::Operator { end } = self.redirecting
+            && self.cursor < end
+        {
+            return Some(Redirect::Operator);
+        }
+        // An operator is tried before the word, so that the `>` of `>a>b`
+        // ends the target `a` and starts a second redirection rather than
+        // being swallowed by the first one's word.
+        if let Some(end) = self.operator_here() {
+            self.redirecting = Redirecting::Operator { end };
+            return Some(Redirect::Operator);
+        }
+        // Blanks and word breaks are only themselves when the shell would
+        // read them as themselves: a quoted or escaped space is part of the
+        // word, which is why `> "my file"` points at all of `"my file"`.
+        let bare = !self.escaped && self.quoting == Quoting::Normal;
+        match self.redirecting {
+            Redirecting::No => None,
+            Redirecting::Operator { .. } | Redirecting::Blanks => match ch {
+                // The blanks bash allows between an operator and its word.
+                // Only these two: a newline does not carry a redirection to
+                // the next line, and neither does any other metacharacter.
+                ' ' | '\t' if bare => {
+                    self.redirecting = Redirecting::Blanks;
+                    None
+                }
+                _ if bare && is_metacharacter(ch) => {
+                    self.redirecting = Redirecting::No;
+                    None
+                }
+                _ => {
+                    self.redirecting = Redirecting::Target;
+                    Some(Redirect::Target)
+                }
+            },
+            Redirecting::Target => match bare && is_metacharacter(ch) {
+                true => {
+                    self.redirecting = Redirecting::No;
+                    None
+                }
+                false => Some(Redirect::Target),
+            },
+        }
+    }
+
+    /// The byte offset a redirection operator starting at the cursor ends at,
+    /// or `None` if none starts here.
+    ///
+    /// Lookahead, and bounded: a file descriptor is a run of digits the
+    /// cursor is already at the start of, and an operator is one of twelve
+    /// fixed strings. Nothing here backtracks or rescans, so the pass is
+    /// still one left-to-right walk of an agent-controlled string.
+    fn operator_here(&self) -> Option<usize> {
+        if self.escaped || self.quoting != Quoting::Normal {
+            return None;
+        }
+        let rest = &self.command[self.cursor..];
+        // A file descriptor has to be the whole of the token so far, which is
+        // what `word_start` says: `2>x` redirects and `a2>x` does not.
+        let digits = match self.word_start {
+            true => rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len(),
+            false => 0,
+        };
+        let token = REDIRECTIONS.iter().find(|op| rest[digits..].starts_with(**op))?;
+        // A run of digits with no operator behind it is an ordinary word, and
+        // `&>` is not an operator a descriptor may precede -- the `&` is part
+        // of the operator, not a number. Either way the digits are left to be
+        // read as what they are.
+        match digits > 0 && token.starts_with('&') {
+            true => None,
+            false => Some(self.cursor + digits + token.len()),
+        }
+    }
+}
+
 /// Find every command boundary in `command`, in source order.
 fn boundaries(command: &str) -> Vec<Boundary> {
     let mut found = Vec::new();
@@ -525,7 +766,18 @@ fn boundaries(command: &str) -> Vec<Boundary> {
         // `echo hi # then && rm -rf /tmp` is text, and a break drawn there
         // claims a boundary the shell does not have. The newline that ends a
         // comment is reported outside it and still lands below.
-        if c.comment || c.offset < consumed || c.escaped || c.quoting != Quoting::Normal {
+        // A redirection operator next, because `>|` is one token and the `|`
+        // in it is not a pipe. This is the whole of what it takes for the two
+        // passes to agree about a byte: one of them decides, and the other
+        // reads the decision. Only the operator has to be skipped -- a target
+        // ends at any unquoted metacharacter, so a separator character can
+        // only be inside one when it is quoted, and quoting already stops it.
+        if c.comment
+            || c.redirect == Some(Redirect::Operator)
+            || c.offset < consumed
+            || c.escaped
+            || c.quoting != Quoting::Normal
+        {
             continue;
         }
         if c.ch == '\n' {
@@ -911,8 +1163,8 @@ fn segments(command: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// True where a word ends: unescaped whitespace outside quotes, or anywhere
-/// inside a comment.
+/// True where a word ends: unescaped whitespace outside quotes, anywhere
+/// inside a comment, and anywhere inside a redirection.
 ///
 /// Quoting is the whole of it, and it is the scanner's answer rather than a
 /// second one. `echo "a b"` is two words to the shell, so it has to be two
@@ -925,8 +1177,18 @@ fn segments(command: &str) -> Vec<Range<usize>> {
 /// `Command` region from ever overlapping a `Comment` one — two regions that
 /// overlap have no honest drawing — and it is the same move [`claimable`]
 /// makes for a quoted word.
+///
+/// A redirection is the same answer again, and here it is a correction as
+/// well as a guard. `<` and `>` are metacharacters, so bash reads `cat<file`
+/// as the command `cat` with its input redirected; this pass used to call the
+/// whole of `cat<file` one word and underline it as the thing that runs. It
+/// also used to underline the `>out.txt` of `>out.txt cat`, where the word
+/// that names what runs is `cat` and comes after the redirection. Both are
+/// right now, and a `Command` region can no longer overlap a `Redirect` one.
 fn is_word_break(c: &Scanned) -> bool {
-    c.comment || (!c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace())
+    c.comment
+        || c.redirect.is_some()
+        || (!c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace())
 }
 
 /// True for `NAME=…`, the form a leading word takes when it is an assignment
@@ -1068,6 +1330,33 @@ fn comments(command: &str) -> Vec<Range<usize>> {
     out
 }
 
+/// The byte range of every redirection operator and every redirection target
+/// in `command`, in source order and paired with which it is.
+///
+/// Read straight off the scanner's own flag, exactly as [`comments`] is, and
+/// for the same reason: [`boundaries`] and [`is_word_break`] already have to
+/// stop at a redirection, and a second definition here is how the colour on
+/// screen comes to disagree with the boundaries drawn under it.
+///
+/// Adjacent characters of the same half are one run. Two operators with
+/// nothing between them -- `>><` -- therefore arrive as one run rather than
+/// two, which is a distinction with no drawing behind it and a command bash
+/// refuses to parse in the first place.
+fn redirections(command: &str) -> Vec<(Range<usize>, Redirect)> {
+    let mut out: Vec<(Range<usize>, Redirect)> = Vec::new();
+    for c in scan(command) {
+        let Some(half) = c.redirect else {
+            continue;
+        };
+        let end = c.offset + c.ch.len_utf8();
+        match out.last_mut() {
+            Some((last, kind)) if last.end == c.offset && *kind == half => last.end = end,
+            _ => out.push((c.offset..end, half)),
+        }
+    }
+    out
+}
+
 /// Every region [`highlight`] wants to mark, in source order and never
 /// overlapping.
 fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
@@ -1080,6 +1369,18 @@ fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
         .collect();
     out.extend(quoted_strings(command).into_iter().map(|range| (range, SpanKind::Quoted)));
     out.extend(comments(command).into_iter().map(|range| (range, SpanKind::Comment)));
+    // Both halves of a redirection, in the one kind: see [`Redirect`] for why
+    // the destination is marked as loudly as the arrow and why it is marked
+    // the same. A target carrying a quote character is declined, which is the
+    // move `claimable` makes for a command word and is here for the identical
+    // reason -- a quoted word extends to include its quotes, so claiming
+    // `> "my file"`'s target would put a `Redirect` region exactly on top of
+    // a `Quoted` one, and two overlapping regions have no honest drawing. The
+    // operator in front of it is marked either way, so what the refusal costs
+    // is a colour on the path and never the sight of the arrow.
+    out.extend(redirections(command).into_iter().filter(|(range, half)| {
+        *half == Redirect::Operator || !command[range.clone()].contains(['\'', '"'])
+    }).map(|(range, _)| (range, SpanKind::Redirect)));
     out.sort_by_key(|(range, _)| range.start);
     out
 }
@@ -1621,7 +1922,6 @@ mod tests {
         // shell; this test is what stops the list drifting from the docs.
         assert_eq!(separators(&render_command("echo $((1 || 0))")), vec!["||"], "arithmetic");
         assert_eq!(separators(&render_command("[[ -n x || -n y ]]")), vec!["||"], "conditional");
-        assert_eq!(separators(&render_command("echo x >| out.txt")), vec!["|"], "redirection");
         assert_eq!(separators(&render_command(r"$'a\'b; c'")), vec![";"], "ANSI-C quoting");
         assert_eq!(separators(&render_command("cat <<EOF\na; b\nEOF")), vec![";"], "heredoc");
         assert_eq!(

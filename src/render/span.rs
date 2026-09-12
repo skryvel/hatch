@@ -193,6 +193,30 @@ pub enum SpanKind {
     /// the direction of finding no comment, so text that will run is never
     /// drawn as text that will not.
     Comment,
+    /// One half of a redirection: the operator -- `>`, `2>>`, `&>`, `>|`,
+    /// `1>&2`'s `1>&` -- or the word it points at.
+    ///
+    /// Structure, and the same kind for both halves on purpose. A redirection
+    /// is one of the few things in a command that changes *where its effects
+    /// land*, and the arrow is only half of saying so: in
+    /// `echo x > /etc/passwd` the word a reader is scanning for is the path.
+    /// Marking the destination in a second colour would be a second thing to
+    /// learn for one fact, so the two share one, and the blank between them
+    /// belongs to neither and is left [`SpanKind::Plain`].
+    ///
+    /// It is **not** a danger marker, and nothing here is a judgement about
+    /// the target. `> /etc/passwd` is alarming because of what `/etc/passwd`
+    /// is, and deciding that is [`super::danger`]'s job; this kind says only
+    /// that the shell will treat these bytes as a redirection, which is a
+    /// lexical fact and true of `> /dev/null` as well.
+    ///
+    /// Decoration, on the same terms as [`SpanKind::Command`],
+    /// [`SpanKind::Quoted`] and [`SpanKind::Comment`]: drawn as its own text,
+    /// nothing hidden, nothing replaced, so a reader who ignores colour reads
+    /// the same characters. See [`super::command`] for the rules -- which
+    /// operators, what a file descriptor in front of one is, and how far a
+    /// target reaches.
+    Redirect,
     Danger,
     /// A character that must not be drawn as itself. `text` is still the
     /// original character, and stays exactly one codepoint long; `name` is
