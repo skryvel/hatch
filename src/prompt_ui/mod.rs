@@ -217,7 +217,7 @@ const TERMINAL_LABEL: &str = "Run it in a terminal";
 /// not list; the second is the one instruction that follows from it, which is
 /// the part somebody skimming will take away. See
 /// [`PromptApp::terminal_row`] for why it is not a tooltip.
-const TERMINAL_CAPTURE: &str = "Everything in that terminal is sent to the agent, including what      you type into it. Do not type a password there.";
+const TERMINAL_CAPTURE: &str = "Everything in that terminal is sent to the agent, including what you type into it. Do not type a password there.";
 
 /// Why the control is dead on a request that already asked for a terminal.
 const TERMINAL_ASKED: &str = "The agent asked for one.";
