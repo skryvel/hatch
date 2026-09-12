@@ -154,6 +154,15 @@
 //! rather than `cat<file`, and `>out.txt cat` names `cat` rather than
 //! `>out.txt`.
 //!
+//! One boundary moved the other way and is worth naming. `a >&& b` used to be
+//! drawn with a segment boundary at the `&&`; the `>&` now claims the first of
+//! those two characters, so there is none. Neither rendering is the shell's,
+//! because bash refuses to parse the line at all — it is a syntax error near
+//! the `&` — so what changed is which wrong layout is drawn over a command
+//! that will never run.
+//! `an_operator_that_eats_an_ampersand_pair_costs_a_boundary_bash_does_not_
+//! have` pins it, so changing it again has to be deliberate.
+//!
 //! The heredoc gap is untouched. `<<EOF` is recognised as an operator and
 //! `EOF` as the word it points at, which is right, and hatch still does not
 //! know that what follows is a body rather than shell — so everything the
@@ -2839,6 +2848,8 @@ mod tests {
             "echo '>' out",
             "# > out",
             "a >| b || c",
+            "a >&& b",
+            "echo x > \\\nout",
             "cat <<EOF\n> not a redirection\nEOF",
             "ünïcödé > ✓",
         ] {
@@ -2846,6 +2857,34 @@ mod tests {
             assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
             assert!(spans.covers_source(), "{command:?} is not tiled by its spans");
         }
+    }
+
+    #[test]
+    fn a_descriptor_target_is_a_target_like_any_other() {
+        // `>&` and `<&` point at a descriptor or a word and nothing here
+        // tells them apart: which it is depends on what the word expands to,
+        // and this scanner expands nothing. `-` closes a descriptor and
+        // `1-` moves one, and both are words as far as this pass is
+        // concerned.
+        assert_eq!(redirects(&render_command("exec 2>&-")), vec!["2>&", "-"]);
+        assert_eq!(redirects(&render_command("exec 2>&1-")), vec!["2>&", "1-"]);
+        assert_eq!(redirects(&render_command("exec 3<&0")), vec!["3<&", "0"]);
+    }
+
+    #[test]
+    fn an_operator_that_eats_an_ampersand_pair_costs_a_boundary_bash_does_not_have() {
+        // Pinned because it moved and because the move is invisible in the
+        // lists above. `a >&& b` used to be drawn with a segment boundary at
+        // the `&&`; the `>&` now claims the first of those two characters, so
+        // there is none. Neither rendering is the shell's, because bash
+        // refuses to parse the line at all -- it is a syntax error near the
+        // `&` -- so what changed is which wrong layout is drawn over a
+        // command that will never run. It is here so that changing it again
+        // has to be deliberate.
+        let spans = render_command("a >&& b");
+        assert!(separators(&spans).is_empty());
+        assert_eq!(redirects(&spans), vec![">&"]);
+        assert_eq!(unrender(&spans), "a >&& b");
     }
 
     #[test]
