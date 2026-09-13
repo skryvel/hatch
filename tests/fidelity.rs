@@ -70,6 +70,9 @@ proptest! {
                 Just("${a}".to_string()),       // one whose value is a command
                 Just("$".to_string()),          // and one that is not a reference
                 Just("#".to_string()),          // which begins a comment, or does not
+                Just("<<EOF".to_string()),      // which opens a here-document, or does not
+                Just("<<-'EOF'".to_string()),   // one whose body expands nothing
+                Just("EOF".to_string()),        // which ends one, on a line of its own
                 Just("'".to_string()),
                 Just("\"".to_string()),
             ], 1..20)
@@ -127,6 +130,9 @@ proptest! {
                 Just("$HOME".to_string()),      // a reference that resolves
                 Just("${b}".to_string()),       // to a value full of controls
                 Just("#".to_string()),          // which begins a comment, or does not
+                Just("<<EOF".to_string()),      // which opens a here-document, or does not
+                Just("<<-'EOF'".to_string()),   // one whose body expands nothing
+                Just("EOF".to_string()),        // which ends one, on a line of its own
                 Just("'".to_string()),
                 Just("\"".to_string()),
             ], 1..20)
