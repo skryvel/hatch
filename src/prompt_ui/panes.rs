@@ -679,11 +679,10 @@ pub fn roster_summary(runs: &[Entry]) -> Option<String> {
             _ => None,
         })
         .collect();
-    if let Some((first, _)) = found.first() {
-        let _ = first;
-        let shared = found[0].1.parent().filter(|dir| {
-            found.iter().all(|(_, path)| path.parent() == Some(dir))
-        });
+    if let Some((_, first)) = found.first() {
+        let shared = first
+            .parent()
+            .filter(|dir| found.iter().all(|(_, path)| path.parent() == Some(dir)));
         clauses.push(match shared {
             // One directory, said once. The names against it are the same
             // claim as the absolute paths and are what fits on a row.

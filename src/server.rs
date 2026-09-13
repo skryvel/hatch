@@ -4465,8 +4465,12 @@ later"), "");
             // once by handing the very same request to a real daemon and
             // taking the payload off the window it opened. They have to be
             // equal field for field -- the spans, the one-line form, the raw
-            // text, the working directory, the root flag, the caveat, and for
-            // a swap the plan and every diff row.
+            // text, the working directory, the root flag, the caveat, the
+            // roster of what the command runs, and for a swap the plan and
+            // every diff row. The roster is the one that reaches the
+            // filesystem, so this is also what holds the two lookups to the
+            // same `PATH`: the daemon's and the preview's are the same
+            // config's or the payloads differ.
             for scenario in crate::preview::Scenario::all() {
                 let dir = tempfile::tempdir().unwrap();
                 let paths = Paths::scratch(dir.path());
