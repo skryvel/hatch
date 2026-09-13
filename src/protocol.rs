@@ -345,10 +345,12 @@ pub enum DaemonMsg {
     /// along because the order already is one -- operations run in sequence
     /// and never overlap.
     ///
-    /// What the window does with it is the window's own business and is not on
-    /// the wire: a run nobody asked to watch closes here, and one the reader
-    /// ticked the stream box on stays for a few seconds with the result on it.
-    /// The frame says how it ended and nothing about how long anyone looks.
+    /// What the window does with it is decided from what the frame says and
+    /// not sent alongside it: a run the reader ticked the stream box on stays
+    /// for a few seconds with the result on it, and so does any operation
+    /// whose ending is news — see [`Outcome::is_news`] — while the rest close
+    /// here. The frame says how it ended and nothing about how long anyone
+    /// looks.
     Finished(Outcome),
 }
 
@@ -401,10 +403,11 @@ pub enum Outcome {
     /// further along. [`Outcome::ElevationFailed`] stops an exit code being
     /// invented for a command that never ran; this stops *either* of the
     /// other two being drawn for a command hatch has no evidence about. The
-    /// window closes on this frame, so whatever it says here is the last
-    /// thing the person who approved the operation reads about it, and
-    /// "Finished — exit 1" or "Nothing ran" would both be a claim hatch
-    /// cannot support. See [`crate::exec::elevate::RootOutcome::Unclear`].
+    /// window stays up to show this frame — it is news, see
+    /// [`Outcome::is_news`] — so whatever it says here is what the person who
+    /// approved the operation reads about it, and "Finished — exit 1" or
+    /// "Nothing ran" would both be a claim hatch cannot support. See
+    /// [`crate::exec::elevate::RootOutcome::Unclear`].
     Unclear {
         /// What to tell the user, as text.
         message: String,
@@ -416,7 +419,8 @@ pub enum Outcome {
     /// in for "it landed" is a number drawn from the vocabulary of a command
     /// onto a window about a file: "Finished — exit 0" under a diff. It also
     /// made two different facts share a spelling, and a window reading the
-    /// frame could not tell a command's answer from a file's landing.
+    /// frame could not tell a command's answer from a file's landing — which
+    /// is the difference [`Outcome::is_news`] turns on.
     ///
     /// A root write hatch could not re-examine afterwards is sent as this
     /// too. That is the absence of evidence against the write, not evidence
@@ -437,6 +441,87 @@ pub enum Outcome {
         /// quote a path or another program's diagnostic.
         message: String,
     },
+}
+
+impl Outcome {
+    /// Whether this ending tells the person who approved the operation
+    /// something they did not already know — which is the whole of whether a
+    /// window nobody asked to watch stays up to show it.
+    ///
+    /// # Why a window stays only for news
+    ///
+    /// Between closing on the outcome and holding it up for a while, the one
+    /// thing worse than either is a flash: a result on screen for half a
+    /// second, too short to read and long enough to catch the eye. So a
+    /// window either goes at once or stays long enough to be read, and what
+    /// decides it is whether there is anything to read. The rule belongs to
+    /// the frame rather than to either end of the pipe, because both ends act
+    /// on it — the window by lingering, the daemon by letting go of a window
+    /// that is going to — and a rule each of them wrote down separately is
+    /// one they could come to disagree about, with the daemon killing a
+    /// window half way through what it stayed to say.
+    ///
+    /// # A write
+    ///
+    /// [`Outcome::Written`] is not news. The window drew the diff, the mode
+    /// and the owner before anybody approved them, and a write that landed
+    /// as described adds nothing to what the reader already saw and said yes
+    /// to. Every other ending of a write is: refused because the file moved,
+    /// landed as something else, left short by a failed `install`, a password
+    /// dialog dismissed or unreadable. Each means the file is not what the
+    /// reader approved, and the tool result reaching the agent is no help to a
+    /// person who is not reading it.
+    ///
+    /// # A command
+    ///
+    /// An [`Outcome::Exit`] is not news, whatever its status. A non-zero exit
+    /// is very often the answer the command was run to get — `grep` finding
+    /// nothing, `diff` finding a difference, `test` saying no — which is the
+    /// same reason `stop_on_failure` is the agent's to choose rather than
+    /// hatch's to impose. The status goes to the agent, which asked the
+    /// question; a window that stayed up for every `grep` with no match would
+    /// teach its reader that a staying window means nothing.
+    ///
+    /// Everything else is. A status is something a command chose to say; the
+    /// other endings are things that happened to it, and none of them is an
+    /// answer:
+    ///
+    /// * [`Outcome::Signal`] — hatch ended it at the execution deadline, the
+    ///   reader pressed Kill, or it crashed. The window cannot tell the three
+    ///   apart and does not need to: in each the run was cut short, what it
+    ///   left is unknown, and a reader who pressed Kill is owed the sight of
+    ///   it having worked.
+    /// * [`Outcome::Failed`] — hatch could not start it, so nothing ran.
+    /// * [`Outcome::ElevationFailed`] — nothing ran, whether because the
+    ///   dialog was dismissed or because elevation was not possible. The
+    ///   first is something the reader did, and it is still news that hatch
+    ///   took it as a cancellation rather than as a slow answer.
+    /// * [`Outcome::Unclear`] — hatch cannot say whether it ran, which is the
+    ///   one ending whose next step is the reader's rather than the agent's.
+    ///
+    /// # A batch
+    ///
+    /// A request carries one operation today. When it carries several, each
+    /// sends its own outcome, and the rule is: a window nobody asked to watch
+    /// stays if **any** operation's ending is news. One failed write among
+    /// five that landed is exactly the ending a window that closed would hide,
+    /// and a window that stayed for the last operation alone would hide it
+    /// whenever it was not last. What it would show then is every operation's
+    /// ending, the quiet ones included, so the news is read in its place.
+    ///
+    /// # What it does not touch
+    ///
+    /// The agent's result. The window is the person's and the tool result is
+    /// the agent's; nothing here changes what the agent is told, or when.
+    pub fn is_news(&self) -> bool {
+        match self {
+            Outcome::Exit { .. } | Outcome::Written => false,
+            Outcome::Signal { .. }
+            | Outcome::ElevationFailed { .. }
+            | Outcome::Unclear { .. }
+            | Outcome::Failed { .. } => true,
+        }
+    }
 }
 
 /// The one request a window is about.
@@ -1425,6 +1510,28 @@ mod tests {
         assert!(encoded.contains("\"reason\":\"elevation_failed\""), "{encoded}");
         let encoded = encode(&DaemonMsg::Finished(Outcome::Written)).expect("encodes");
         assert!(encoded.contains("\"reason\":\"written\""), "{encoded}");
+    }
+
+    #[test]
+    fn only_an_ending_the_reader_could_not_have_known_is_news() {
+        // A command's status is its answer, and a write that landed is the
+        // diff the reader already approved. Everything that happened *to* the
+        // operation rather than being said by it is news.
+        let message = || "why".to_string();
+        let quiet =
+            [Outcome::Exit { code: 0 }, Outcome::Exit { code: 1 }, Outcome::Exit { code: 127 }];
+        for quiet in quiet.into_iter().chain([Outcome::Written]) {
+            assert!(!quiet.is_news(), "{quiet:?} would hold a window up");
+        }
+        for news in [
+            Outcome::Signal { signal: 9 },
+            Outcome::Signal { signal: 11 },
+            Outcome::ElevationFailed { message: message() },
+            Outcome::Unclear { message: message() },
+            Outcome::Failed { message: message() },
+        ] {
+            assert!(news.is_news(), "{news:?} would close a window over what it has to say");
+        }
     }
 
     // ---- renderings across the pipe ----------------------------------------

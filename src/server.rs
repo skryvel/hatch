@@ -1193,9 +1193,11 @@ impl Hatch {
 /// It is bounded because [`PromptSession::close`] is unconditional and a
 /// wedged window must not be able to hold a finished request open.
 ///
-/// It is not the linger. A streamed run's window stays on screen for as long
-/// as [`crate::prompt_ui`] says it does, and this daemon waits none of it: see
-/// [`Windup`].
+/// It is not the linger, and it must never be spent as one: a window still
+/// on screen when this runs out is killed mid-sentence, which is a flash. A
+/// window that stays to show something — a watched run, or an ending that is
+/// news — stays for as long as [`crate::prompt_ui`] says it does, and this
+/// daemon waits none of it: see [`Windup`].
 const FINAL_FRAME_GRACE: Duration = Duration::from_millis(500);
 
 /// How often the client is told the request is still alive.
@@ -1852,9 +1854,17 @@ impl Daemon {
             if step.ends_the_run(stop_on_failure) {
                 stopped_at = Some(index);
             }
-            // The last operation that ran decides what becomes of the window,
-            // because it is the one whose ending the window was shown last.
-            windup = step.windup;
+            // Any operation the window is staying for keeps it, not only the
+            // last: one failed write among several that landed is exactly the
+            // ending a window that closed would hide. See
+            // `protocol::Outcome::is_news`, where the rule for a batch is.
+            //
+            // And never a window that closed itself on its verdict. The frame
+            // it sent said it was going, and handing over a window that has
+            // gone would leave a process nothing is watching or reaping.
+            if step.windup == Windup::Detach && !closing {
+                windup = Windup::Detach;
+            }
             reached.push(Reached::Ran { label: label_of(&detail), status: step.status, result: step.result });
             effects.push(Effect { verdict: step.verdict, detail });
         }
@@ -2142,10 +2152,10 @@ enum Windup {
     /// End it. The window closes itself on the outcome frame; the daemon
     /// gives it [`FINAL_FRAME_GRACE`] to do so and then kills and reaps it.
     Close,
-    /// Let it go. A streamed run has finished and the window is showing the
-    /// output to the person who asked to watch it, so the request stops
-    /// waiting for it and stops ending it — see
-    /// [`crate::prompter::PromptSession::detach`].
+    /// Let it go. The window is staying to show what happened — the output
+    /// of a run its reader asked to watch, or an ending that is news — so
+    /// the request stops waiting for it and stops ending it: see
+    /// [`crate::prompter::PromptSession::detach`] and `tell_the_window`.
     Detach,
 }
 
@@ -2613,12 +2623,14 @@ impl Daemon {
                 // Not "exited" and not "was signalled": both would be a
                 // plausible-looking lie about a command that never started.
                 // The window is told what the agent is told.
-                let told = session
-                    .outbox()
-                    .finished(protocol::Outcome::Failed {
+                let windup = tell_the_window(
+                    session,
+                    protocol::Outcome::Failed {
                         message: format!("hatch could not start it, so nothing ran: {error}"),
-                    })
-                    .await;
+                    },
+                    stream,
+                )
+                .await;
                 return Step {
                     // The elevation program failing to start is an elevation
                     // failure and nothing else: nothing was elevated, so
@@ -2631,12 +2643,7 @@ impl Daemon {
                         "the user approved this, but hatch could not start it, so nothing ran: \
                          {error}"
                     ))]),
-                    // What becomes of any window told how its run ended; see
-                    // the end of this function.
-                    windup: match told && stream {
-                        true => Windup::Detach,
-                        false => Windup::Close,
-                    },
+                    windup,
                     // A failure that left nothing behind: nothing started.
                     status: Status::Failed(Failure::Settled),
                 };
@@ -2710,20 +2717,10 @@ impl Daemon {
                 )
             }
         };
-        // A streamed run's window stays: the reader ticked a box asking to
-        // watch this command, and for anything short of a slow one the whole
-        // run is over before they have read a line. Only when the outcome
-        // actually reached the window, though — a window that was not told the
-        // command ended has no reason to close itself, and handing that one
-        // over would be leaving it for the reader to explain.
+        // See `tell_the_window` for which windows stay. A run with no frame to
+        // send is one the window was never told had ended, and it is closed.
         let windup = match frame {
-            Some(frame) => {
-                let told = session.outbox().finished(frame).await;
-                match told && stream {
-                    true => Windup::Detach,
-                    false => Windup::Close,
-                }
-            }
+            Some(frame) => tell_the_window(session, frame, stream).await,
             None => Windup::Close,
         };
         Step { verdict, result, windup, status }
@@ -2805,7 +2802,8 @@ impl Daemon {
             Ok(()) => protocol::Outcome::Written,
             Err(error) => protocol::Outcome::Failed { message: error.to_string() },
         };
-        let _ = session.outbox().finished(frame).await;
+        // Nobody watches a write, so it stays only for news.
+        let windup = tell_the_window(session, frame, false).await;
 
         let result = match applied {
             Ok(()) => CallToolResult::success(vec![ContentBlock::text(format!(
@@ -2818,13 +2816,13 @@ impl Daemon {
             ))]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
         };
-        // A swap writes a file and says nothing. There is no output to hold up
-        // and no stream checkbox to have ticked, so its window closes on the
-        // outcome as every window used to.
+        // A write says nothing and nobody can have asked to watch one, so its
+        // window closes on a landing and stays for a refusal, which is the
+        // only one of the two its reader did not already see.
         Step {
             verdict: LogVerdict::Approve,
             result,
-            windup: Windup::Close,
+            windup,
             // Every `ApplyError` guarantees the file was not touched, so a
             // refused write is a failure that left nothing behind.
             status: match landed {
@@ -2859,16 +2857,18 @@ impl Daemon {
         let staged = match swap::stage_root(path, content, plan, &self.denylist, &self.stage_dir) {
             Ok(staged) => staged,
             Err(error) => {
-                let _ = session
-                    .outbox()
-                    .finished(protocol::Outcome::Failed { message: error.to_string() })
-                    .await;
+                let windup = tell_the_window(
+                    session,
+                    protocol::Outcome::Failed { message: error.to_string() },
+                    false,
+                )
+                .await;
                 // The re-check refused before anything was staged or
                 // elevated: the file is untouched, as with any refused write.
                 return Step {
                     verdict: LogVerdict::Approve,
                     result: CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
-                    windup: Windup::Close,
+                    windup,
                     status: Status::Failed(Failure::Settled),
                 };
             }
@@ -2964,16 +2964,18 @@ impl Daemon {
                     // the write happened, because the agent's next move —
                     // and the user's — depends on knowing that the thing on
                     // disk is not the thing on the screen.
-                    let _ = session
-                        .outbox()
-                        .finished(protocol::Outcome::Failed {
+                    let windup = tell_the_window(
+                        session,
+                        protocol::Outcome::Failed {
                             message: format!(
                                 "the write happened, but what is on disk is not what was \
                                  approved: {} is now {found}, and the window said {described}",
                                 path.display(),
                             ),
-                        })
-                        .await;
+                        },
+                        false,
+                    )
+                    .await;
                     return Step {
                         verdict: LogVerdict::Approve,
                         result: CallToolResult::error(vec![ContentBlock::text(format!(
@@ -2984,7 +2986,7 @@ impl Daemon {
                              before doing anything else.",
                             path.display(),
                         ))]),
-                        windup: Windup::Close,
+                        windup,
                         // Something landed, and it is not the thing on the
                         // screen: whatever runs next runs against a file
                         // nobody approved.
@@ -2992,14 +2994,14 @@ impl Daemon {
                     };
                 }
                 record_landing(detail, content, plan);
-                let _ = session.outbox().finished(protocol::Outcome::Written).await;
+                let windup = tell_the_window(session, protocol::Outcome::Written, false).await;
                 Step {
                     verdict: LogVerdict::Approve,
                     result: CallToolResult::success(vec![ContentBlock::text(format!(
                         "wrote {described} as root{}",
                         confirmation_note(&landed)
                     ))]),
-                    windup: Windup::Close,
+                    windup,
                     status: Status::Done,
                 }
             }
@@ -3012,9 +3014,9 @@ impl Daemon {
                     Some(code) => format!("exited {code}"),
                     None => "ended on a signal".to_string(),
                 };
-                let _ = session
-                    .outbox()
-                    .finished(protocol::Outcome::Failed {
+                let windup = tell_the_window(
+                    session,
+                    protocol::Outcome::Failed {
                         message: match first_line(&output.stderr) {
                             "" => format!(
                                 "{} {how}; a root write is not a rename, so the file may be \
@@ -3027,8 +3029,10 @@ impl Daemon {
                                 self.elevation.mechanism(),
                             ),
                         },
-                    })
-                    .await;
+                    },
+                    false,
+                )
+                .await;
                 Step {
                     verdict: LogVerdict::Approve,
                     result: CallToolResult::error(vec![ContentBlock::text(format!(
@@ -3044,7 +3048,7 @@ impl Daemon {
                         },
                         first_line(&output.stderr),
                     ))]),
-                    windup: Windup::Close,
+                    windup,
                     // `install` truncates rather than renaming, so a write
                     // that failed part way can leave the file neither version.
                     status: Status::Failed(Failure::Unsettled),
@@ -3071,7 +3075,8 @@ impl Daemon {
         tail: &str,
     ) -> Step {
         let (verdict, message, frame) = elevation_ending(outcome);
-        let _ = session.outbox().finished(frame).await;
+        // Every one of these is news; see `tell_the_window`.
+        let windup = tell_the_window(session, frame, false).await;
         let text = match tail.trim().is_empty() {
             true => message,
             false => format!("{message}\n\n{}", tail.trim()),
@@ -3079,7 +3084,7 @@ impl Daemon {
         Step {
             verdict,
             result: CallToolResult::error(vec![ContentBlock::text(text)]),
-            windup: Windup::Close,
+            windup,
             status: elevation_status(outcome),
         }
     }
@@ -3244,6 +3249,33 @@ fn finished_frame(output: &Output) -> Option<protocol::Outcome> {
         (Some(code), _) => Some(protocol::Outcome::Exit { code }),
         (None, Some(signal)) => Some(protocol::Outcome::Signal { signal }),
         (None, None) => None,
+    }
+}
+
+/// Tell the window how its operation ended, and say what that leaves the
+/// daemon to do with the window.
+///
+/// The window stays to show a run its reader asked to watch (`watched`), and
+/// any ending that is news — see [`protocol::Outcome::is_news`], which is
+/// where the rule and its reasons are. The window reads the same rule off the
+/// same frame, and that is why this asks it rather than restating it: a
+/// daemon that ended a window the window meant to keep would kill it half a
+/// second into what it stayed to say, which is the flash the rule exists to
+/// prevent.
+///
+/// Only once the frame has actually arrived. A window that was not told how
+/// its operation ended has no reason to close itself, and handing that one
+/// over would be leaving it for the reader to explain.
+async fn tell_the_window(
+    session: &PromptSession,
+    frame: protocol::Outcome,
+    watched: bool,
+) -> Windup {
+    let stays = watched || frame.is_news();
+    let told = session.outbox().finished(frame).await;
+    match told && stays {
+        true => Windup::Detach,
+        false => Windup::Close,
     }
 }
 
@@ -5758,7 +5790,13 @@ later"), "");
         }
 
         /// Every frame the one window was sent.
-        fn frames(harness: &Harness) -> Vec<crate::protocol::DaemonMsg> {
+        ///
+        /// Once the window has finished with its channel, which is not the
+        /// moment the request returns for a window that stayed to show its
+        /// ending: the daemon lets go of that one without waiting. See
+        /// `StubPrompter::settled`.
+        async fn frames(harness: &Harness) -> Vec<crate::protocol::DaemonMsg> {
+            harness.prompter.settled().await;
             harness.prompter.recorded()[0].sent.clone()
         }
 
@@ -6041,12 +6079,12 @@ later"), "");
             // And the window closed saying nothing ran, rather than drawing a
             // status for a command that never started.
             assert!(
-                frames(&harness).iter().any(|f| matches!(
+                frames(&harness).await.iter().any(|f| matches!(
                     f,
                     crate::protocol::DaemonMsg::Finished(protocol::Outcome::ElevationFailed { .. })
                 )),
                 "{:?}",
-                frames(&harness)
+                frames(&harness).await
             );
         }
 
@@ -6105,12 +6143,12 @@ later"), "");
             );
             assert_eq!(record["exit_code"], serde_json::Value::Null, "{record}");
             assert!(
-                frames(&harness).iter().any(|f| matches!(
+                frames(&harness).await.iter().any(|f| matches!(
                     f,
                     crate::protocol::DaemonMsg::Finished(protocol::Outcome::Unclear { .. })
                 )),
                 "the window closed on a claim: {:?}",
-                frames(&harness)
+                frames(&harness).await
             );
         }
 
@@ -6160,7 +6198,7 @@ later"), "");
             );
             within(harness.daemon.run_command(root_run("true"), Caller::quiet())).await;
 
-            let sent = frames(&harness);
+            let sent = frames(&harness).await;
             let elevating = sent
                 .iter()
                 .position(|f| matches!(f, crate::protocol::DaemonMsg::Elevating))
@@ -6181,11 +6219,11 @@ later"), "");
             let harness = Harness::new(vec![approve()]);
             within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
             assert!(
-                !frames(&harness)
+                !frames(&harness).await
                     .iter()
                     .any(|f| matches!(f, crate::protocol::DaemonMsg::Elevating)),
                 "{:?}",
-                frames(&harness)
+                frames(&harness).await
             );
         }
 
@@ -6250,12 +6288,12 @@ later"), "");
             assert_eq!(record["verdict"], "approve");
             assert_eq!(record["root"], true);
             assert_eq!(record["mode"], "0640");
-            assert_eq!(told_the_window(&harness), Some(protocol::Outcome::Written));
+            assert_eq!(told_the_window(&harness).await, Some(protocol::Outcome::Written));
         }
 
         /// How the window was told the one operation ended, if it was.
-        fn told_the_window(harness: &Harness) -> Option<protocol::Outcome> {
-            harness.prompter.recorded()[0].sent.iter().find_map(|frame| match frame {
+        async fn told_the_window(harness: &Harness) -> Option<protocol::Outcome> {
+            frames(harness).await.iter().find_map(|frame| match frame {
                 crate::protocol::DaemonMsg::Finished(outcome) => Some(outcome.clone()),
                 _ => None,
             })
@@ -6344,7 +6382,7 @@ later"), "");
             assert_eq!(record["mode"], serde_json::Value::Null, "{record}");
             // And the window is told the same two facts, not an exit code:
             // this is the ending its reader most needs to read.
-            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness) else {
+            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness).await else {
                 panic!("the window was not told the write landed differently")
             };
             assert!(message.contains("0640") && message.contains("0600"), "{message}");
@@ -6450,7 +6488,7 @@ later"), "");
             assert_eq!(harness.verdict(), "approve", "a failed write was filed as an elevation problem");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
             assert_eq!(staged_files(&harness), 0);
-            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness) else {
+            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness).await else {
                 panic!("the window was not told the write failed")
             };
             assert!(message.contains("not a rename"), "the window was promised an untouched file: {message}");
@@ -8097,7 +8135,10 @@ later"), "");
             );
             // In words, and the words the agent was given: an exit code of 1
             // is a command's vocabulary, and "failed" alone is not something
-            // the person who approved the write can act on.
+            // the person who approved the write can act on. Once the window
+            // is done with its channel: it stays to show this, so the request
+            // returning is not the moment its last frame was taken.
+            harness.prompter.settled().await;
             let sent = &harness.prompter.recorded()[0].sent;
             let told = sent.iter().find_map(|frame| match frame {
                 crate::protocol::DaemonMsg::Finished(protocol::Outcome::Failed { message }) => {
@@ -8218,9 +8259,11 @@ later"), "");
             // could only say "exited" or "was signalled" and both would have
             // been a lie about a command that never started. So the window
             // went on drawing "it is running" until it was killed. It is told
-            // now, in words, and a window that is told how its run ended is
-            // one the reader can be left with.
-            let harness = Harness::new(vec![Reply::verdict(approved(true))]);
+            // now, in words, and it is news whether or not anybody asked to
+            // watch: the reader approved a command and nothing ran. So the
+            // window stays, and is left with them. Unwatched, because that is
+            // the case the news alone has to carry.
+            let harness = Harness::new(vec![approve()]);
             let mut params = run_of("echo hello");
             // A working directory that is one, so it passes validation, and
             // that cannot be entered, so the spawn fails. Nothing ran and
@@ -8246,6 +8289,77 @@ later"), "");
                 )),
                 "the window was not told the command never started: {sent:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn a_run_nobody_watched_that_answered_with_a_failing_status_still_has_its_window_ended() {
+            // A non-zero exit is so often the answer — grep finding nothing,
+            // diff finding a difference — that a window staying up for one
+            // would teach its reader that a staying window means nothing.
+            let harness = Harness::new(vec![approve()]);
+            let result = within(harness.daemon.run_command(run_of("exit 1"), Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            assert!(!windup_of(&harness).await, "a window stayed up over a command's own answer");
+        }
+
+        #[tokio::test]
+        async fn a_run_nobody_watched_that_was_cut_short_leaves_its_window_with_the_reader() {
+            // A signal is something that happened to the command rather than
+            // something it said, and the window stays to show it. The daemon
+            // has to let go of that window, or it kills it half a second into
+            // what it stayed to say — which is the flash all over again.
+            let harness = Harness::new(vec![approve()]);
+            within(harness.daemon.run_command(run_of("kill -9 $$"), Caller::quiet())).await;
+
+            assert!(windup_of(&harness).await, "the window was killed over what it stayed to show");
+            let sent = &harness.prompter.recorded()[0].sent;
+            assert!(
+                sent.contains(&crate::protocol::DaemonMsg::Finished(protocol::Outcome::Signal {
+                    signal: 9
+                })),
+                "{sent:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_write_that_did_not_land_leaves_its_window_with_the_reader() {
+            // The one ending of a write its reader did not already see. Its
+            // window stays to say so, and the daemon lets it.
+            let harness = Harness::new(vec![approve().after(Duration::from_millis(300))]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            let call = {
+                let daemon = Arc::clone(&harness.daemon);
+                let params = swap_of(&target, "after\n", false);
+                tokio::spawn(async move { daemon.batch(params, Caller::quiet()).await })
+            };
+            while harness.prompter.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            std::fs::write(&target, b"somebody else got there first\n").unwrap();
+            let result = within(call).await.unwrap();
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(windup_of(&harness).await, "a refused write had its window killed");
+        }
+
+        #[tokio::test]
+        async fn a_window_that_closed_on_its_verdict_is_never_handed_over() {
+            // Even for news. The frame it sent said it was going, and handing
+            // over a window that has gone would leave a process that nothing
+            // is watching and nothing will reap.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Approve {
+                stream: false,
+                terminal: false,
+                closing: true,
+                note: String::new(),
+            })]);
+            within(harness.daemon.run_command(run_of("kill -9 $$"), Caller::quiet())).await;
+
+            assert!(!windup_of(&harness).await, "a window that said it was going was handed over");
         }
 
         #[tokio::test]

@@ -44,7 +44,8 @@
 //! * **Stay and show the result.** The reader ticked the stream box, so the
 //!   window lingers; the rest of this section is about that.
 //! * **Stay until the outcome.** Neither box, so the window is a running
-//!   indicator with a Kill button and closes on [`DaemonMsg::Finished`].
+//!   indicator — with a Kill button, for a command — and on
+//!   [`DaemonMsg::Finished`] it closes, unless the ending is news.
 //!
 //! A window whose reader ticked "Stream output to this window" does not close
 //! on [`DaemonMsg::Finished`]. The whole life of an ordinary command is
@@ -52,8 +53,19 @@
 //! arrived — the box working exactly as built and being useless. Instead the
 //! window *lingers* for [`LINGER`], showing the result with a countdown on it,
 //! and a button turns it into a *detached viewer*: no countdown, no verdict,
-//! just the output, a way to copy it and a way to close it. A run nobody asked
-//! to watch is unchanged and closes on the frame.
+//! just the output, a way to copy it and a way to close it.
+//!
+//! A window nobody asked to watch lingers the same way when, and only when,
+//! its ending is news: something the reader could not have known from what
+//! they approved, such as a write refused because the file moved or a run
+//! hatch cut short. Otherwise it closes on the frame, at once. The one thing
+//! it never does is show the result for a moment and go, which is too short
+//! to read and long enough to catch the eye. [`Outcome::is_news`] is the rule
+//! and says why a command's non-zero exit is not on it; the daemon reads the
+//! same rule and lets go of a window that is staying, so it is not killed
+//! half way through. A closing window goes on drawing what it was until it is
+//! gone — see [`PromptState::drawn_phase`] — so that "at once" does not end
+//! on a picture of its own either.
 //!
 //! From the moment that frame is sent the daemon has let go — see
 //! [`crate::prompter::PromptSession::detach`] — so this is the only state in
@@ -180,8 +192,10 @@ const EXIT_BACKSTOP: Duration = Duration::from_millis(250);
 /// windows. It is not long enough to *read* a long output in, which is what
 /// the button is for.
 ///
-/// It applies to streamed runs only. A window nobody asked to watch has
-/// nothing to linger over and closes on the outcome as it always did.
+/// It also applies to a window nobody asked to watch whose ending is news —
+/// see [`Outcome::is_news`] — for the same two reasons: long enough to read
+/// what went wrong and reach the button that keeps it, short enough not to
+/// collect. Every other window closes on the outcome, at once.
 const LINGER: Duration = Duration::from_secs(10);
 
 /// How long after the countdown has run out the process leaves anyway.
@@ -549,11 +563,12 @@ pub enum Phase {
     AwaitingVerdict,
     /// The operation was approved and is running; the window is an indicator.
     Running,
-    /// The command has finished, the reader asked to watch it, and the window
-    /// is holding the result up for a few seconds before taking itself away.
+    /// The operation has finished, and the window is holding the result up
+    /// for a few seconds before taking itself away.
     ///
     /// Reachable only through [`Phase::Running`], and only for a run the
-    /// reader ticked the stream box on.
+    /// reader ticked the stream box on or an ending that is news; see
+    /// [`Outcome::is_news`].
     Lingering,
     /// The reader kept the window. It is a viewer now: the output, a way to
     /// copy it and a way to close it, and no decision of any kind.
@@ -588,9 +603,11 @@ pub struct PromptState {
     output_dropped: bool,
     streaming: bool,
     elevating: bool,
+    was_elevated: bool,
     keeping: bool,
     linger_until: Option<Instant>,
     broken: Option<String>,
+    closed_from: Phase,
     close_taken: bool,
     title_taken: bool,
 }
@@ -615,9 +632,11 @@ impl PromptState {
             output_dropped: false,
             streaming: false,
             elevating: false,
+            was_elevated: false,
             keeping: false,
             linger_until: None,
             broken: None,
+            closed_from: Phase::WaitingForRequest,
             close_taken: false,
             title_taken: false,
         }
@@ -783,6 +802,46 @@ impl PromptState {
         self.phase == Phase::Closed
     }
 
+    /// The phase this window is drawn as, which is its phase — except once
+    /// it is closing, when it is the phase it closed from.
+    ///
+    /// # Why a closing window goes on looking like what it was
+    ///
+    /// Closing is not the instant the state machine says so. The frame that
+    /// decides to close is painted, and so is at least one more while the
+    /// desktop takes the window away, and a compositor that animates a window
+    /// out animates the last picture it was given. A window that drew those
+    /// frames as [`Phase::Closed`] — back on the asking ground, its controls
+    /// gone and the panes grown into their room — put a picture on screen at
+    /// the end that had never been there before it: after a run that closed
+    /// on its outcome, a flash of the question it had already answered.
+    ///
+    /// So the picture does not change on the way out, and the phase does:
+    /// nothing drawn from this can decide, kill or keep anything, because
+    /// every one of those asks [`PromptState::phase`].
+    ///
+    /// A window closing on its verdict is the exception in the drawing and
+    /// not here. The verdict area is the one set of controls that writes
+    /// preferences down, and it is not drawn a second time for a window that
+    /// has answered; see [`PromptApp::controls`].
+    pub fn drawn_phase(&self) -> Phase {
+        match self.phase {
+            Phase::Closed => self.closed_from,
+            phase => phase,
+        }
+    }
+
+    /// Close, remembering what the window looked like while it was open.
+    ///
+    /// The only way into [`Phase::Closed`], so that [`PromptState::drawn_phase`]
+    /// cannot be left describing a window some other path closed.
+    fn close(&mut self) {
+        if self.phase != Phase::Closed {
+            self.closed_from = self.phase;
+        }
+        self.phase = Phase::Closed;
+    }
+
     /// True at the first moment the window should close, and never again.
     ///
     /// The latch is here rather than in the eframe app because closing is not
@@ -888,7 +947,10 @@ impl PromptState {
                 self.phase = Phase::AwaitingVerdict;
             }
             DaemonMsg::QueueDepth { depth } => self.queue_depth = depth,
-            DaemonMsg::Elevating => self.elevating = true,
+            DaemonMsg::Elevating => {
+                self.elevating = true;
+                self.was_elevated = true;
+            }
             DaemonMsg::Output { stream, text } => {
                 // The first byte out of the elevated command is proof that
                 // the dialog was answered and the command is running, which
@@ -901,32 +963,38 @@ impl PromptState {
                 self.push_output(stream, text);
             }
             DaemonMsg::Finished(outcome) => {
-                self.outcome = Some(outcome);
-                self.elevating = false;
+                // Two reasons to stay, and without either the window goes on
+                // this frame, at once.
+                //
                 // The reader ticked a box that says "I want to watch this".
                 // For anything but a slow command the whole run is over in
                 // milliseconds, so a window that closed on this frame closed
                 // at the moment the output arrived — the box working exactly
-                // as built and being useless. A streamed run therefore stays,
-                // with the result on it, until its own clock or its reader
-                // says otherwise.
+                // as built and being useless.
                 //
-                // Nothing else changes. A run nobody asked to watch has no
-                // result to hold up and closes here as it always did, and the
-                // daemon still waits its own grace for that.
+                // Or the ending is news: something the reader could not have
+                // known from what they approved. A write refused because the
+                // file moved, a run hatch cut short, a command that never
+                // started. See `Outcome::is_news` for the whole rule and why
+                // a non-zero exit is not on it. The daemon reads the same rule
+                // off the same frame and lets go of a window that is staying,
+                // so a window never stays only to be killed half way through.
+                let stays = self.streaming || outcome.is_news();
+                self.outcome = Some(outcome);
+                self.elevating = false;
                 // Three endings, and which one this is was settled before
-                // the command stopped. A reader who pressed Keep during the
+                // the operation stopped. A reader who pressed Keep during the
                 // run has already said what they want to happen now, so the
                 // countdown is not started and then immediately stopped --
                 // this window goes straight to being theirs.
-                self.phase = match (self.streaming, self.keeping) {
-                    (true, true) => Phase::Detached,
+                match (stays, self.keeping) {
+                    (true, true) => self.phase = Phase::Detached,
                     (true, false) => {
                         self.linger_until = Some(Instant::now() + LINGER);
-                        Phase::Lingering
+                        self.phase = Phase::Lingering;
                     }
-                    (false, _) => Phase::Closed,
-                };
+                    (false, _) => self.close(),
+                }
             }
         }
     }
@@ -949,7 +1017,7 @@ impl PromptState {
         if !self.is_viewer() {
             self.broken = Some(why.into());
         }
-        self.phase = Phase::Closed;
+        self.close();
     }
 
     /// Let the clock move the window on.
@@ -961,7 +1029,7 @@ impl PromptState {
     /// enforces it by killing this process.
     pub fn tick(&mut self, now: Instant) {
         if self.phase == Phase::Lingering && self.linger_until.is_some_and(|until| now >= until) {
-            self.phase = Phase::Closed;
+            self.close();
         }
     }
 
@@ -971,8 +1039,12 @@ impl PromptState {
     /// there is no countdown to say out loud. Rounded up, so the number the
     /// reader sees is the number of seconds they still have: it reads 1 for
     /// the whole of the last second and reaches 0 as the window goes.
+    ///
+    /// Asked of the phase the window is drawn as, so that the frames painted
+    /// while a lingering window goes away say "closing now" rather than
+    /// losing the countdown and reading as a kept window.
     pub fn linger_seconds_remaining(&self, now: Instant) -> Option<u64> {
-        let until = self.linger_until.filter(|_| self.phase == Phase::Lingering)?;
+        let until = self.linger_until.filter(|_| self.drawn_phase() == Phase::Lingering)?;
         let left = until.saturating_duration_since(now);
         Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
     }
@@ -1009,12 +1081,15 @@ impl PromptState {
     /// Close, which is on the window from the moment the command ends and is
     /// a key of its own.
     ///
-    /// # Only for a run that is being watched
+    /// # Early, only for a run that is being watched
     ///
-    /// A run nobody asked to stream has nothing to keep: no output was ever
-    /// sent to this window, so a kept one would be an empty viewer claiming
-    /// the command printed nothing. The drawing half does not offer the
-    /// control there, and this refuses it in any case.
+    /// Keeping from [`Phase::Running`] is refused for a run nobody asked to
+    /// stream. Nothing about it is known to be worth keeping yet: no output
+    /// is being sent to this window, and whether its ending will be news is
+    /// not known until it ends. The drawing half does not offer the control
+    /// there, and this refuses it in any case. A window that lingers because
+    /// its ending was news can be kept like any other, since what it is kept
+    /// for — the ending — is on it by then.
     pub fn keep(&mut self) -> bool {
         match self.phase {
             Phase::Lingering => {
@@ -1038,7 +1113,7 @@ impl PromptState {
     /// the daemon reads the dead process as a denial, which is what a window
     /// closed from its title bar already meant.
     pub fn dismiss(&mut self) {
-        self.phase = Phase::Closed;
+        self.close();
     }
 
     /// Record the user's decision, and hand back the one frame to send.
@@ -1056,20 +1131,20 @@ impl PromptState {
         if let Verdict::Approve { stream, .. } = verdict {
             self.streaming = stream;
         }
-        self.phase = match verdict {
+        match verdict {
             // The reader ticked "Close when I decide", so an approval joins
             // the five verdicts that were always over on the frame that
             // carried them. The command is authorised and runs on with no
             // window, which is a state an approved command could always reach
             // — the difference is that this time somebody asked for it, and
             // the frame just written is where they said so.
-            Verdict::Approve { closing: true, .. } => Phase::Closed,
-            Verdict::Approve { .. } => Phase::Running,
+            Verdict::Approve { closing: true, .. } => self.close(),
+            Verdict::Approve { .. } => self.phase = Phase::Running,
             Verdict::Deny { .. }
             | Verdict::Revise { .. }
             | Verdict::SelfRun { .. }
-            | Verdict::StopAndSync { .. } => Phase::Closed,
-        };
+            | Verdict::StopAndSync { .. } => self.close(),
+        }
         Some(PromptMsg::Verdict(verdict))
     }
 
@@ -1102,6 +1177,15 @@ impl PromptState {
     /// known to have run yet, which is the thing the reader needs.
     pub fn elevating(&self) -> bool {
         self.elevating
+    }
+
+    /// Whether hatch ever waited on a password dialog for this window.
+    ///
+    /// Unlike [`PromptState::elevating`], never cleared. The one thing that
+    /// reads it is the sentence a closing window replaces the waiting one
+    /// with, which has to take up the lines the waiting one did.
+    pub fn was_elevated(&self) -> bool {
+        self.was_elevated
     }
 
     fn push_output(&mut self, stream: Stream, text: String) {
@@ -1728,7 +1812,7 @@ impl PromptApp {
         // frames from this `Ui`'s style. What the window is doing is the
         // first thing about it a reader takes in, and for a long time three
         // different things looked like one.
-        theme::wear(ui, mood(self.state.phase()));
+        theme::wear(ui, mood(self.state.drawn_phase()));
         // Taken before the panels divide it up, because that is what it is:
         // the whole window, which is what the root edge is painted around.
         let window = ui.max_rect();
@@ -1752,8 +1836,9 @@ impl PromptApp {
         // from which the buttons are missing.
         egui::Panel::bottom("hatch-controls").show(ui, |ui| self.controls(ui, guard_open));
 
+        let viewing = matches!(self.state.drawn_phase(), Phase::Lingering | Phase::Detached);
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.state.is_viewer() {
+            if viewing && self.runs() {
                 // The question has been answered and the command has run, so
                 // the two panes arguing about what the command says are of no
                 // further use. What is worth the window now is what it
@@ -1761,6 +1846,13 @@ impl PromptApp {
                 self.viewer(ui, &title);
                 return;
             }
+            // A write that is staying keeps what it drew. It stays only to say
+            // it did not land as described — see `Outcome::is_news` — and the
+            // description it did not land as is the diff, the mode and the
+            // owner, which are exactly what the reader needs beside that
+            // sentence. It is also the picture they were already looking at,
+            // so the only thing that changes when the write fails is the
+            // controls panel and the ground.
             // There is always one once a request has arrived: a payload that
             // could not be rebuilt closed the window instead of becoming one.
             let aside = self.state.shown().and_then(panes::RunContext::of);
@@ -1815,6 +1907,19 @@ impl PromptApp {
             );
         }
         ui.separator();
+        // A run nobody watched sent this window no output, so there is none
+        // to show and "it printed nothing" would be a claim about a command
+        // this window never heard from. It is here because its ending is
+        // news, and that is in the row below; this says where the output
+        // went instead.
+        if !self.state.streaming() {
+            let went = match self.in_a_terminal() {
+                true => "Its output went to the terminal it ran in.",
+                false => "Its output was not streamed to this window.",
+            };
+            ui.label(egui::RichText::new(went).weak());
+            return;
+        }
         let text = self.state.output_text();
         if text.is_empty() {
             ui.label(egui::RichText::new("It printed nothing.").weak());
@@ -1848,7 +1953,12 @@ impl PromptApp {
             match action {
                 Action::Deny => self.state.dismiss(),
                 Action::Keep => self.keep_window(),
-                Action::Copy => self.copy_output(ctx),
+                // Inert where there is no output on the window to take, and
+                // silently: there is no copy control there for the chord to
+                // be refused by, and an empty clipboard with "copied" beside
+                // it would be a window claiming to have handed something over.
+                Action::Copy if self.state.streaming() => self.copy_output(ctx),
+                Action::Copy => {}
                 Action::Approve
                 | Action::Toggle(_)
                 | Action::Ignored
@@ -1968,10 +2078,17 @@ impl PromptApp {
     ///
     /// One method rather than a panel closure per phase, because the phase is
     /// what decides between them and the two must never both be drawn.
+    ///
+    /// Chosen by the phase the window is drawn as, so that a closing window
+    /// keeps the controls it had; see [`PromptState::drawn_phase`]. Every
+    /// control drawn on the way out is inert, because what it would do asks
+    /// the real phase. The verdict area is the exception and is not drawn
+    /// again at all: its checkboxes write preferences down, and nothing may
+    /// be written from a window that has already answered.
     fn controls(&mut self, ui: &mut egui::Ui, guard_open: bool) {
         ui.add_space(4.0);
-        match self.state.phase() {
-            Phase::AwaitingVerdict => {
+        match self.state.drawn_phase() {
+            Phase::AwaitingVerdict if self.state.phase() == Phase::AwaitingVerdict => {
                 self.status_row(ui);
                 self.verdict_area(ui, guard_open);
             }
@@ -1984,7 +2101,9 @@ impl PromptApp {
             // one that matters now is two numbers the reader has to tell
             // apart.
             Phase::Lingering | Phase::Detached => self.viewer_row(ui),
-            Phase::WaitingForRequest | Phase::Closed => self.status_row(ui),
+            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => {
+                self.status_row(ui)
+            }
         }
         ui.add_space(4.0);
     }
@@ -2032,6 +2151,9 @@ impl PromptApp {
         let (mut keep, mut close) = (false, false);
         let (mut copy_output, mut copy_command) = (false, false);
         let has_command = matches!(self.state.shown(), Some(Shown::Command { .. }));
+        // Only a watched run has output on this window to take. A write has
+        // neither output nor a command, so it has no copy row at all.
+        let has_output = self.state.streaming();
         ui.vertical_centered(|ui| {
             centred_row(ui, width, |ui| {
                 if closing.is_some() {
@@ -2045,13 +2167,18 @@ impl PromptApp {
                 close = unfocusable(ui, keyed(egui::RichText::new("Close"), guard::DENY_CHORD))
                     .clicked();
             });
+            if !has_output && !has_command {
+                return;
+            }
             ui.add_space(4.0);
             centred_row(ui, width, |ui| {
-                copy_output = unfocusable(
-                    ui,
-                    keyed(egui::RichText::new("Copy output").small(), guard::COPY_CHORD),
-                )
-                .clicked();
+                if has_output {
+                    copy_output = unfocusable(
+                        ui,
+                        keyed(egui::RichText::new("Copy output").small(), guard::COPY_CHORD),
+                    )
+                    .clicked();
+                }
                 if has_command {
                     copy_command = secondary(ui, "Copy command").clicked();
                 }
@@ -2158,24 +2285,39 @@ impl PromptApp {
         // shown over. An earlier pair claimed the dialog was being waited on
         // and that nothing had run, and went on saying both after the
         // password had been typed.
-        if self.state.elevating() {
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Approved. Waiting for the system to authorise this.")
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "If a password dialog is up, dismissing it cancels this.",
-                    )
-                    .small(),
-                );
-            });
-        } else if !self.runs() {
-            ui.vertical_centered(|ui| ui.label("Approved. Writing the file."));
-        } else {
-            ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
-        }
+        //
+        // The first arm is reached only by a window on its way out, after an
+        // ending it did not stay for: see `PromptState::drawn_phase`. What it
+        // was saying a moment ago is no longer true, so the sentence changes
+        // to one that is; what it does not do is change how many lines there
+        // are, because a panel a line shorter is panes a line taller, and a
+        // picture that moves as it goes is the flash the drawn phase exists to
+        // prevent.
+        let runs = self.runs();
+        let (said, aside) = match (self.state.outcome().is_some(), self.state.elevating()) {
+            (true, _) => (
+                match runs {
+                    true => "Approved. It has finished.",
+                    false => "Approved. The file is written.",
+                },
+                self.state.was_elevated().then_some("The system authorised it."),
+            ),
+            (false, true) => (
+                "Approved. Waiting for the system to authorise this.",
+                Some("If a password dialog is up, dismissing it cancels this."),
+            ),
+            (false, false) if !runs => ("Approved. Writing the file.", None),
+            (false, false) => ("Approved. It is running now.", None),
+        };
+        ui.vertical_centered(|ui| match aside {
+            Some(aside) => {
+                ui.label(egui::RichText::new(said).strong());
+                ui.label(egui::RichText::new(aside).small());
+            }
+            None => {
+                ui.label(said);
+            }
+        });
         // A write has nothing below its sentence. It prints nothing, so a line
         // saying its output is not being streamed would be a sentence about a
         // command; and it offers neither Keep, which exists for output, nor
@@ -2184,7 +2326,7 @@ impl PromptApp {
         // already names the stop for that — which ends it with nothing written,
         // where Kill on the `install` behind it would end it with hatch unable
         // to say whether the file was.
-        if !self.runs() {
+        if !runs {
             return;
         }
         if self.streams() {
@@ -3034,9 +3176,10 @@ fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
 /// The mapping and not the colours: [`theme::Mood`] is about what a window is
 /// doing, and this is the one place that says which of this machine's phases
 /// is which of those. `Closed` is a phase the window leaves on, and a window
-/// that repainted itself on the way out would flash a colour at somebody for
-/// one frame, so it keeps whatever it had — which, since nothing else is a
-/// question either, is the asking ground it started in.
+/// that repainted itself on the way out would flash a colour at somebody, so
+/// the window is never drawn as it: it is drawn as the phase it closed from
+/// — see [`PromptState::drawn_phase`] — and `Closed` arrives here only for a
+/// window that closed before it had a request, which was asking.
 fn mood(phase: Phase) -> theme::Mood {
     match phase {
         Phase::Running => theme::Mood::Running,
@@ -7144,5 +7287,212 @@ mod tests {
             write.abs() < 2.0,
             "a narrow write window still spends {write} points where the close control was"
         );
+    }
+
+    // ---- after the verdict: staying only for news --------------------------
+
+    /// Every ending a window nobody asked to watch stays up for.
+    fn news() -> Vec<Outcome> {
+        vec![
+            Outcome::Signal { signal: 9 },
+            Outcome::ElevationFailed { message: "the dialog was dismissed".to_string() },
+            Outcome::Unclear { message: "the run was ended at its deadline".to_string() },
+            Outcome::Failed { message: "the file changed after the request was approved".to_string() },
+        ]
+    }
+
+    #[test]
+    fn a_write_that_landed_closes_on_its_outcome_at_once() {
+        // It landed as the window described it, which the reader read and
+        // said yes to. There is nothing to hold up, so nothing is held up —
+        // not for a countdown and not for a moment.
+        let mut app = a_write_window();
+        app.state.decide(app.approval());
+        app.state.handle(DaemonMsg::Finished(Outcome::Written));
+
+        assert_eq!(app.state.phase(), Phase::Closed);
+        assert_eq!(app.state.linger_seconds_remaining(Instant::now()), None);
+        assert!(app.state.take_close(), "the process was never told to leave");
+        assert_eq!(app.state.broken(), None);
+    }
+
+    #[test]
+    fn a_write_that_did_not_land_stays_long_enough_to_be_read() {
+        // A refusal, a dismissed dialog, an elevation hatch cannot read: the
+        // file is not what the reader approved, and the tool result reaching
+        // the agent is no help to the person who is not reading it.
+        for outcome in news().into_iter().filter(|o| !matches!(o, Outcome::Signal { .. })) {
+            let mut app = a_write_window();
+            app.state.decide(app.approval());
+            app.state.handle(DaemonMsg::Finished(outcome.clone()));
+
+            assert_eq!(app.state.phase(), Phase::Lingering, "{outcome:?} closed the window");
+            assert_eq!(
+                app.state.linger_seconds_remaining(Instant::now()),
+                Some(LINGER.as_secs()),
+                "{outcome:?} did not get the whole linger"
+            );
+            app.state.tick(Instant::now() + LINGER);
+            assert_eq!(app.state.phase(), Phase::Closed, "{outcome:?} outstayed its countdown");
+        }
+    }
+
+    #[test]
+    fn a_run_nobody_watched_closes_on_its_own_answer_whatever_the_status() {
+        // grep finding nothing and diff finding a difference are answers,
+        // and they are the agent's: a window that stayed up for every one of
+        // them would teach its reader that a staying window means nothing.
+        for code in [0, 1, 2, 127] {
+            let mut state = PromptState::new();
+            state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+            state.decide(approved(false));
+            state.handle(DaemonMsg::Finished(Outcome::Exit { code }));
+            assert_eq!(state.phase(), Phase::Closed, "exit {code} held the window up");
+        }
+    }
+
+    #[test]
+    fn a_run_nobody_watched_that_something_happened_to_stays_to_show_it() {
+        for outcome in news() {
+            let mut state = PromptState::new();
+            state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+            state.decide(approved(false));
+            state.handle(DaemonMsg::Finished(outcome.clone()));
+
+            assert_eq!(state.phase(), Phase::Lingering, "{outcome:?} closed the window");
+            assert_eq!(state.outcome(), Some(&outcome));
+            // A viewer like any other, and so no more able to decide or kill.
+            for verdict in every_verdict() {
+                assert_eq!(state.decide(verdict.clone()), None, "{verdict:?} after {outcome:?}");
+            }
+            assert_eq!(state.request_kill(), None);
+        }
+    }
+
+    #[test]
+    fn a_window_staying_for_news_is_kept_and_put_away_by_the_keys_a_watched_one_is() {
+        for key in [egui::Key::E, egui::Key::O, egui::Key::Space] {
+            let mut app = a_write_window();
+            app.state.decide(app.approval());
+            app.state.handle(DaemonMsg::Finished(news().remove(3)));
+            press_key(&mut app, key, egui::Modifiers::NONE);
+            assert_eq!(app.state.phase(), Phase::Detached, "{key:?} did not keep it");
+            assert!(app.kept.load(Ordering::SeqCst), "{key:?} kept a window the backstop will kill");
+        }
+
+        let mut app = a_window_showing("sleep 30");
+        app.state.decide(approved(false));
+        app.state.handle(DaemonMsg::Finished(Outcome::Signal { signal: 9 }));
+        press_key(&mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!(app.state.phase(), Phase::Closed, "Escape did not put it away");
+    }
+
+    #[test]
+    fn a_write_staying_to_say_it_did_not_land_shows_why_beside_what_was_approved() {
+        let mut app = a_write_window();
+        app.state.decide(app.approval());
+        app.state.handle(DaemonMsg::Finished(Outcome::Failed {
+            message: "the file changed after the request was approved".to_string(),
+        }));
+
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(
+            drawn.contains("Failed — the file changed after the request was approved"),
+            "the window does not say why: {drawn}"
+        );
+        assert!(drawn.contains("closing in"), "{drawn}");
+        assert!(drawn.contains("Keep this window") && drawn.contains("Close"), "{drawn}");
+        // What it did not land as: the diff, the path and the landing.
+        assert!(drawn.contains("port = 8080") && drawn.contains("/tmp/conf.toml"), "{drawn}");
+        assert!(drawn.contains("0644"), "{drawn}");
+        // And nothing a command would have had.
+        for said in ["printed nothing", "Copy output", "Copy command", "exit", "Kill", "Deny"] {
+            assert!(!drawn.contains(said), "a failed write says {said:?}: {drawn}");
+        }
+    }
+
+    #[test]
+    fn a_run_nobody_watched_staying_for_news_does_not_claim_it_printed_nothing() {
+        // No output was ever sent to this window, so "it printed nothing"
+        // would be a claim about a command it never heard from, and a copy
+        // button would hand over an empty clipboard.
+        let mut app = a_window_showing("make -j8");
+        app.state.decide(approved(false));
+        app.state.handle(DaemonMsg::Finished(Outcome::Signal { signal: 9 }));
+
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(drawn.contains("Ended by signal 9"), "{drawn}");
+        assert!(drawn.contains("not streamed to this window"), "{drawn}");
+        assert!(drawn.contains("Copy command"), "the command it ran cannot be taken: {drawn}");
+        assert!(!drawn.contains("printed nothing"), "{drawn}");
+        assert!(!drawn.contains("Copy output"), "{drawn}");
+
+        press_key(&mut app, egui::Key::C, egui::Modifiers::ALT);
+        assert!(app.copied.is_none(), "Alt+C said it copied output there is none of");
+    }
+
+    #[test]
+    fn a_window_closing_on_its_outcome_goes_on_looking_like_the_run_it_was() {
+        // The frames painted while a window goes are the ones a compositor
+        // animates away. A window that drew them as the question it had
+        // already answered put that picture on screen at the very end.
+        let mut app = a_window_showing("systemctl restart thing");
+        app.state.decide(approved(false));
+        let running = window_shapes(&mut app, opening_size());
+        let kill = text_rects(&running).into_iter().find(|(t, _)| t == "Kill").expect("Kill").1;
+        let ground = ground_drawn(&mut app);
+
+        app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(app.state.phase(), Phase::Closed);
+        let closing = window_shapes(&mut app, opening_size());
+
+        assert_eq!(ground_drawn(&mut app), ground, "the ground changed on the way out");
+        assert_eq!(
+            text_rects(&closing).into_iter().find(|(t, _)| t == "Kill").map(|(_, r)| r),
+            Some(kill),
+            "the controls moved on the way out"
+        );
+        let said = shapes_text(&closing);
+        assert!(said.contains("It has finished"), "{said}");
+        assert!(!said.contains("running now"), "a finished command is said to be running: {said}");
+        assert_eq!(app.state.request_kill(), None, "the Kill button drawn on the way out kills");
+    }
+
+    #[test]
+    fn a_root_write_closing_on_its_landing_keeps_the_lines_its_waiting_took() {
+        // The waiting sentence is two lines. The one that replaces it as the
+        // window goes is two lines too, or the panel shrinks and the diff
+        // jumps into the room as the last thing the reader sees.
+        let mut app = a_write_window();
+        app.state.decide(app.approval());
+        app.state.handle(DaemonMsg::Elevating);
+        let waiting = pane_height(&mut app, opening_size());
+        assert!(window_text_sized(&mut app, opening_size()).contains("authorise"));
+
+        app.state.handle(DaemonMsg::Finished(Outcome::Written));
+        assert_eq!(app.state.phase(), Phase::Closed);
+
+        assert_eq!(pane_height(&mut app, opening_size()), waiting, "the diff moved on the way out");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains("The file is written") && said.contains("authorised it"), "{said}");
+        assert!(!said.contains("Waiting"), "{said}");
+    }
+
+    #[test]
+    fn a_linger_running_out_says_closing_now_on_its_way_out_rather_than_kept() {
+        let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
+        // The countdown as it is when it has really run out, since the frame
+        // below reads the real clock.
+        app.state.linger_until = Some(Instant::now());
+        app.state.tick(Instant::now());
+        assert_eq!(app.state.phase(), Phase::Closed);
+
+        let drawn = window_text(&mut app, true);
+
+        assert!(drawn.contains("closing now"), "{drawn}");
+        assert!(!drawn.contains("Kept"), "a window going on its countdown said it was kept: {drawn}");
+        assert!(drawn.contains("a line it printed"), "the output vanished before the window: {drawn}");
     }
 }
