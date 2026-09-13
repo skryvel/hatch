@@ -47,8 +47,8 @@
 //! # Where the model stops, and what it costs
 //!
 //! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting,
-//! backslash escaping, comments and redirections around them. The rest of
-//! shell grammar is outside the model, and the cost falls in both
+//! backslash escaping, comments, redirections and here-documents around them.
+//! The rest of shell grammar is outside the model, and the cost falls in both
 //! directions.
 //!
 //! ## Under-segmentation: structure the shell has that the screen does not
@@ -70,7 +70,6 @@
 //! * `[[ -n x || -n y ]]` — conditional OR.
 //! * `$'a\'b; c'` — ANSI-C quoting, where `\'` does not end the string, so
 //!   the `;` is data.
-//! * A heredoc whose body contains `a; b` — the body is data.
 //! * `case x in a) echo 1;; esac` — `;;` is one `case` terminator, drawn as
 //!   two separators.
 //!
@@ -115,16 +114,9 @@
 //! deliberately stricter than the whitespace rule the rest of this module
 //! uses.
 //!
-//! The heredoc gap is the case worth naming. hatch does not know where a
-//! heredoc body starts, so it reads one as ordinary shell — that is recorded
-//! below, and this change does not fix it. It does move it, in both
-//! directions and unequally: a body line beginning with `#` now has its
-//! separators and its `$NAME`s left alone, which is right, and is drawn in
-//! the colour that says *this will not run*, which is a new claim about a
-//! line that is data on some command's stdin. That is the same direction the
-//! old rendering was already wrong in for the whole body, and no larger.
-//! `a_heredoc_body_line_that_starts_with_a_hash_is_drawn_as_a_comment` pins
-//! it so that changing it has to be deliberate.
+//! A `#` inside a here-document body is not a comment, because a body is not
+//! shell — see below, which is the pass that decides that, and which runs
+//! before this one asks its question.
 //!
 //! # Redirections, which are structure and not a verdict
 //!
@@ -163,10 +155,87 @@
 //! `an_operator_that_eats_an_ampersand_pair_costs_a_boundary_bash_does_not_
 //! have` pins it, so changing it again has to be deliberate.
 //!
-//! The heredoc gap is untouched. `<<EOF` is recognised as an operator and
-//! `EOF` as the word it points at, which is right, and hatch still does not
-//! know that what follows is a body rather than shell — so everything the
-//! lists above say about a heredoc body is as true as it was.
+//! `<<EOF` is recognised as an operator and `EOF` as the word it points at,
+//! and the line that ends the body is marked as the same word closing what the
+//! operator opened. What is between them is the next section's.
+//!
+//! # Here-documents, which are the one region that is not shell
+//!
+//! A body is **data**. The shell hands it to the command on stdin and never
+//! reads a word of it as a program, which makes it a stronger statement than
+//! a comment: a comment is shell that does nothing, and a body is not shell.
+//! Every pass on this page was reading one as if it were, and the day the
+//! roster landed the cost stopped being quiet —
+//!
+//! ```text
+//! cat <<'EOF' > /tmp/x
+//! hello
+//! EOF
+//! ```
+//!
+//! — put an orange line under the panes saying *nothing on the command's PATH
+//! answers to hello, EOF*, which is a warning drawn on one of the most
+//! ordinary shapes an agent writes. A warning that fires there is a warning
+//! nobody reads anywhere.
+//!
+//! So [`Scan`] knows where a body is, and carries the rules, which are bash's
+//! and are written out there with the case each of them decides. Four passes
+//! read the one flag: a `;` in a body is not a boundary, its first word is not
+//! a command and is not in the roster, a `#` in it is not a comment, and a
+//! `$HOME` in it resolves only when the delimiter was left unquoted — which is
+//! the distinction that carries the most and is the easiest to flatten.
+//! `<<'EOF'` expands **nothing** anywhere in the body, so a value drawn beside
+//! one of its `$NAME`s is a lie in the window's most authoritative voice;
+//! `<<EOF` expands as usual, so the same value is the truth the reader came
+//! for.
+//!
+//! Two entries came off the lists above for it — a body containing `a; b` was
+//! on the over-segmentation list, and a body under a quoted delimiter was on
+//! the over-annotation one — which is the same shape the comment work and the
+//! `>|` had: recognising a construct retires a claim hatch was making falsely
+//! rather than documenting it better.
+//!
+//! ## The body has no colour, and that is the decision
+//!
+//! It has no [`SpanKind`] of its own. The window's vocabulary is five
+//! meanings and a palette with no unspent hue left in it — red is danger,
+//! orange a warning, green a comment, blue a quoted string, violet a
+//! redirection — and a sixth would have to sit next to one of them. That is
+//! the smaller half of the reason.
+//!
+//! The larger half is what a body *is*. It is often the whole point of the
+//! command: the file `cat <<EOF > /etc/sudoers` is about to write is in the
+//! body and nowhere else, so it is the last text on the pane that should be
+//! drawn quietly. A comment's colour is quieter than body text because a
+//! comment does not happen; a body happens harder than the command around it.
+//! Drawn plain, at full contrast, it is the one region of the pane making no
+//! claim at all — which is exactly the claim to make about data — and it is
+//! bracketed top and bottom by the delimiter, in the colour that already means
+//! *this is where the data goes*. That is how a reader finds the end of a body
+//! in a shell script anyway.
+//!
+//! ## An unterminated body runs to the end of the command
+//!
+//! Because that is what bash does with it, checked against a real shell rather
+//! than reasoned about: it warns that the here-document was delimited by
+//! end-of-file, hands the command everything that was left, and runs none of
+//! it. So in
+//!
+//! ```text
+//! cat <<EOF
+//! hello
+//! rm -rf /
+//! ```
+//!
+//! the `rm` is text that `cat` prints. Drawing it as shell would be the lie,
+//! and it is the lie this whole section exists to stop telling.
+//!
+//! Choosing the other way would have cost more than it looks. The failure to
+//! avoid is *hiding* shell, and nothing here hides anything: a body carries no
+//! colour, no fade and no chip, so every character of an unterminated one is
+//! on screen drawn as itself, at the same contrast as the line above it. What
+//! the choice costs is that the roster does not name a program inside such a
+//! body — and neither does the shell run one.
 //!
 //! # Command position, and the wrappers in front of it
 //!
@@ -262,7 +331,6 @@
 //!
 //! * `$'a\'$HOME'` — ANSI-C quoting, where `\'` does not close the string, so
 //!   the whole of `a'$HOME` is literal.
-//! * A heredoc with a quoted delimiter (`<<'EOF'`), whose body never expands.
 //!
 //! The cost is bounded the same way, and more tightly than for segmentation:
 //! the text is still on screen drawn as itself, and what is wrong is a label
@@ -274,9 +342,10 @@
 //! # Highlighting: the same scanner again, and why not `syntect`
 //!
 //! [`highlight`] is the last pass. It marks the word that names what runs,
-//! the quoted strings, the comments and the redirections, so the annotated
-//! pane shows *structure* rather than being the raw pane with line breaks in
-//! it.
+//! the quoted strings, the comments and the redirections — a here-document's
+//! delimiter being one of the last, at both of the places it appears — so the
+//! annotated pane shows *structure* rather than being the raw pane with line
+//! breaks in it.
 //!
 //! The spec called for `syntect` with the bash grammar and this does not use
 //! it, for three reasons in descending order of weight:
@@ -360,9 +429,10 @@ const SEPARATORS: &[&str] = &["&&", "||", ";", "|"];
 /// shell allocating a descriptor into a variable — needs a brace-word the
 /// scanner has no other reason to model, and it is rare enough that missing
 /// it costs a highlight on a line hatch still draws correctly. `<<` and `<<-`
-/// are *listed*, but what follows them is a here-document body, and hatch
-/// still does not know where a body starts; see the module docs for what that
-/// costs and in which direction.
+/// are here and are the two that do not end with their own token: what follows
+/// them is a delimiter and then, after the next newline, a body. [`Scan`]
+/// carries those rules and the module docs say why a body has to have a pass
+/// of its own.
 const REDIRECTIONS: &[&str] =
     &["&>>", "<<<", "<<-", "&>", ">>", "<<", "<>", ">|", ">&", "<&", ">", "<"];
 
@@ -383,6 +453,12 @@ enum Redirect {
     Operator,
     /// The word the operator points at: the file it opens, the descriptor
     /// `>&` duplicates, or the delimiter a here-document ends on.
+    ///
+    /// A here-document's delimiter is the one word that appears twice -- once
+    /// after the operator and once on the line that ends the body -- and both
+    /// are drawn in this kind. The second one is not found here, because it is
+    /// not on this line and not in this state machine: see [`Here::Delimiter`]
+    /// and [`delimiter_lines`].
     Target,
 }
 
@@ -399,6 +475,56 @@ enum Redirecting {
     Blanks,
     /// Inside the word the operator points at.
     Target,
+}
+
+/// Which part of a here-document a character belongs to.
+///
+/// The two are told apart because they are wrong in different ways when they
+/// are confused. A body is **data** -- the shell hands it to the command on
+/// stdin and never reads a word of it as shell -- and whether a `$NAME` in it
+/// expands depends on how the delimiter was written. The line that ends one
+/// is **structure**: it is not data, the command never sees it, and it is not
+/// a command either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Here {
+    /// Inside a body. `expands` is false when the delimiter was quoted, which
+    /// is bash's switch for the whole body at once: `<<'EOF'`, `<<"EOF"` and
+    /// `<<\EOF` substitute nothing anywhere in it, and a bare `<<EOF` expands
+    /// parameters, commands and arithmetic as usual.
+    Body { expands: bool },
+    /// The line that ends a body: exactly the delimiter, leading tabs aside
+    /// for a `<<-`.
+    Delimiter,
+}
+
+/// A here-document whose operator has been read, waiting for its body.
+///
+/// Everything the scanner has to remember about one, and it is remembered
+/// because the operator and the body are not in the same place: `cat <<EOF`
+/// says what the body will be delimited by, and the body itself starts after
+/// the newline that ends that line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HereDoc {
+    /// The word the body ends on, quoting removed: `<<'EOF'` ends on `EOF`.
+    delimiter: String,
+    /// `<<-` rather than `<<`: leading **tabs** are stripped from the body's
+    /// lines and from the line that terminates it, so an indented `EOF` still
+    /// ends it. Spaces are not stripped and an `EOF` indented with them does
+    /// not terminate anything, which was checked against a real shell.
+    strip_tabs: bool,
+    /// Whether the body expands -- see [`Here::Body`].
+    expands: bool,
+}
+
+/// A here-document operator whose delimiter word is still being read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Opening {
+    /// Whether the operator was `<<-`.
+    strip_tabs: bool,
+    /// Where the delimiter word starts, once one has begun. `None` while the
+    /// scanner is still in the operator or the blanks after it, and an
+    /// operator that never gets a word opens nothing.
+    word: Option<usize>,
 }
 
 /// Where the scanner found one segment to end.
@@ -432,6 +558,28 @@ enum Boundary {
     /// because the classifier happens to agree would make the segmenter's
     /// notion of a segment depend on how the classifier draws a character.
     Newline(usize),
+
+    /// A literal newline ending at this byte offset with a here-document's
+    /// data after it: a line ending, and **not** the end of a segment.
+    ///
+    /// The two are different claims and this is the one case where they come
+    /// apart. `cat <<EOF` and the body under it are one command -- the shell
+    /// reads the body as that command's stdin, not as the next thing to run
+    /// -- so a segment that stopped at the first of those newlines would draw
+    /// a boundary the shell does not have, and one that stopped at each of
+    /// them would draw one per line of a config file. The line still ends,
+    /// because a newline is a newline: [`super::unicode::classify_into`]
+    /// chips it and asks for the break, exactly as it does inside a
+    /// multi-line quoted string, which has never been a segment boundary
+    /// either.
+    ///
+    /// Every newline from the one that opens a body through the one that ends
+    /// the last delimiter line of the command is one of these, and the rule is
+    /// a single look ahead: a newline is a `HereLine` when the character after
+    /// it is inside a here-document. The newline *after* the last delimiter
+    /// line has ordinary shell after it and is an ordinary [`Boundary::Newline`],
+    /// which is what gives the command on the next line a segment of its own.
+    HereLine(usize),
 }
 
 /// What the scanner is inside of. Separators are recognised only in
@@ -481,6 +629,16 @@ struct Scanned {
     /// put a colour. Three passes reading one flag cannot disagree; three
     /// passes each finding redirections for themselves can.
     redirect: Option<Redirect>,
+    /// Which part of a here-document this character is in, if any -- see
+    /// [`Scan`] for the rules and [`Here`] for what the two parts are.
+    ///
+    /// The third lexical fact threaded through this pass, and the one that
+    /// costs the most to get wrong: a body is not shell at all, so every
+    /// other pass here was reading a config file as a program. A `;` in it is
+    /// not a boundary, its first word is not a command, a `#` in it is not a
+    /// comment, and whether a `$HOME` in it resolves is decided by how the
+    /// delimiter was quoted rather than by the `$`.
+    here: Option<Here>,
 }
 
 /// True for one of bash's metacharacters: a character that, unquoted,
@@ -546,9 +704,10 @@ fn is_metacharacter(c: char) -> bool {
 /// * A comment runs to the end of the line. The newline is **not** part of
 ///   it, and still ends the segment it ends.
 ///
-/// A heredoc body is not shell and hatch does not know where one starts, so a
-/// body line beginning with `#` is drawn as a comment though it is data — see
-/// the module docs, which say what that costs and in which direction.
+/// None of it happens inside a here-document body, where a `#` is a character
+/// in a config file and not a comment. That is the same rule again rather than
+/// a second one: the body flag is settled before the `#` is looked at, and
+/// nothing inside a body is anything else.
 ///
 /// # Where a redirection begins and ends
 ///
@@ -588,6 +747,54 @@ fn is_metacharacter(c: char) -> bool {
 /// redirection, which leaves the text drawn exactly as it was drawn before
 /// this pass existed.
 ///
+/// # Where a here-document's body begins and ends
+///
+/// bash's rules again, read off the manual's HERE DOCUMENTS section and
+/// checked against a real shell. This is the one construct where the text a
+/// pass is looking at is **not shell at all**, so it is a correctness rule
+/// before it is anything else.
+///
+/// * `<<WORD` opens one. The body does not start at the operator: it starts
+///   after the **next newline**, which is the end of the line the operator is
+///   on. `cat <<EOF | grep x` really does pipe into `grep`, and everything on
+///   that line is read as the shell reads it.
+/// * The body runs to a line that is **exactly** the delimiter and nothing
+///   else. Trailing whitespace on that line means it is not the delimiter, and
+///   bash agrees.
+/// * `<<-WORD` strips leading **tabs** -- not spaces -- from the body's lines
+///   and from the terminating line, so an `EOF` indented with tabs ends the
+///   body and one indented with spaces does not.
+/// * Quoting the delimiter turns expansion off for the whole body. All three
+///   spellings do it -- `<<'EOF'`, `<<"EOF"`, `<<\EOF` -- and so does quoting
+///   part of it (`<<EO'F'`), because the rule is about the word and not about
+///   where the quotes are. The delimiter itself is the word with quoting
+///   removed. An unquoted `<<EOF` expands parameters, commands and arithmetic
+///   in the body as usual, so a `$HOME` there is real and is annotated.
+/// * **Several can open on one line.** `cat <<A <<B` takes body A and then
+///   body B, in the order the operators appear, both after that same newline;
+///   the line that ends A is followed immediately by the first line of B.
+/// * The terminating line is structure: not data, not a command, and not a
+///   word of one.
+/// * An **unterminated** here-document -- the command ends before the
+///   delimiter line arrives -- runs to the end of the command, because that is
+///   what bash does with it: it warns, hands the command everything it got,
+///   and never runs a word of it. Reading the tail as shell would be the lie
+///   there, and this is the one direction that can be checked against the
+///   shell rather than argued about.
+/// * `<<<` is a here-**string** and is not any of this. Its word is on the
+///   same line and [`REDIRECTIONS`] already handles it as the ordinary
+///   redirection it is.
+///
+/// Where the scanner cannot see, it is wrong in the direction of finding no
+/// here-document -- `cat <<` with no word after it opens nothing -- and that
+/// direction is the one that leaves text drawn as shell. It is the safe
+/// direction here for the same reason it is everywhere else in this module,
+/// and it is worth saying that it points the *opposite* way from a comment's:
+/// a comment invented over live text hides it, while a body invented over
+/// live text would only stop hatch reporting what the line runs. Neither
+/// hides a character: a body carries no colour of its own, so the text of one
+/// is drawn exactly as any other argument is.
+///
 /// # Backslash inside double quotes
 ///
 /// Real `sh` escapes only `$`, `` ` ``, `"`, `\` and newline inside double
@@ -612,6 +819,18 @@ struct Scan<'a> {
     word_start: bool,
     /// Where the scan is in a redirection, if it is in one.
     redirecting: Redirecting,
+    /// The here-document operator whose delimiter word is being read, if the
+    /// scan is in one.
+    opening: Option<Opening>,
+    /// The here-documents opened on this line whose bodies have not started
+    /// yet, in the order their operators appeared. `cat <<A <<B` queues two
+    /// and the next newline starts the first of them.
+    pending: Vec<HereDoc>,
+    /// Which part of a here-document the character at the cursor is in.
+    here: Option<Here>,
+    /// The here-document `here` belongs to, kept because every line of a body
+    /// has to be compared against the same delimiter.
+    active: Option<HereDoc>,
 }
 
 fn scan(command: &str) -> Scan<'_> {
@@ -625,6 +844,10 @@ fn scan(command: &str) -> Scan<'_> {
         // a word, so `#ls` is a comment and the whole command is inert.
         word_start: true,
         redirecting: Redirecting::No,
+        opening: None,
+        pending: Vec::new(),
+        here: None,
+        active: None,
     }
 }
 
@@ -633,6 +856,34 @@ impl Iterator for Scan<'_> {
 
     fn next(&mut self) -> Option<Scanned> {
         let ch = self.command[self.cursor..].chars().next()?;
+
+        // A here-document's data is not shell, so the state machine stops for
+        // the whole of it, exactly as it stops for a comment and for the same
+        // reason: a quote in a config file opens nothing, a backslash escapes
+        // nothing, and a `<<` in one starts no second here-document. The
+        // quoting the scanner was in when the body began is the quoting it is
+        // still in when the body ends, and that is always `Normal`, because a
+        // body is only opened at a newline the scanner reads as a newline.
+        if let Some(here) = self.here {
+            let current = Scanned {
+                offset: self.cursor,
+                ch,
+                quoting: self.quoting,
+                escaped: false,
+                comment: false,
+                redirect: None,
+                here: Some(here),
+            };
+            self.cursor += ch.len_utf8();
+            if ch == '\n' {
+                self.cross_line();
+                // Whatever follows a here-document begins a word, so a `#` or
+                // a `2>` on the line after the delimiter is read as one.
+                self.word_start = true;
+            }
+            return Some(current);
+        }
+
         // Both edges of a comment are crossed before the character is
         // reported, so each of them belongs to the state it creates: the `#`
         // is the first character of the comment, and the newline is the first
@@ -661,6 +912,7 @@ impl Iterator for Scan<'_> {
             escaped: self.escaped,
             comment: self.comment,
             redirect,
+            here: None,
         };
 
         match (current.comment, self.escaped) {
@@ -704,6 +956,18 @@ impl Iterator for Scan<'_> {
         // never lands inside one and no offset this yields can split a
         // codepoint.
         self.cursor += ch.len_utf8();
+
+        // The body of a here-document starts after the newline that ends the
+        // line its operator is on, and this is that newline. It has to be a
+        // newline the shell reads as one: a `\<newline>` is a line
+        // continuation, so the line has not ended and the body waits for the
+        // one that does end it -- which was checked against a real shell --
+        // and a newline inside quotes is a character in a string. A comment
+        // between the operator and the newline changes nothing: `cat <<EOF #
+        // note` still takes a body, and bash agrees.
+        if ch == '\n' && !current.escaped && current.quoting == Quoting::Normal {
+            self.open_here();
+        }
         Some(current)
     }
 }
@@ -719,8 +983,11 @@ impl Scan<'_> {
     fn redirect_at(&mut self, ch: char) -> Option<Redirect> {
         // A comment is not shell, so nothing in one is a redirection and a
         // redirection still waiting for its word does not get one out of it.
+        // A here-document operator waiting for its delimiter loses it the same
+        // way: `cat << # x` opens nothing, and bash calls that a syntax error.
         if self.comment {
             self.redirecting = Redirecting::No;
+            self.opening = None;
             return None;
         }
         if let Redirecting::Operator { end } = self.redirecting
@@ -731,8 +998,19 @@ impl Scan<'_> {
         // An operator is tried before the word, so that the `>` of `>a>b`
         // ends the target `a` and starts a second redirection rather than
         // being swallowed by the first one's word.
-        if let Some(end) = self.operator_here() {
+        if let Some((end, token)) = self.operator_here() {
+            // A second operator ends the word the one before it pointed at:
+            // `cat <<EOF>out` ends on `EOF` and then redirects, which is what
+            // bash reads too.
+            self.close_opening(self.cursor);
             self.redirecting = Redirecting::Operator { end };
+            // Only these two take a body. `<<<` is a here-string: its word is
+            // on this line and there is nothing to wait for.
+            self.opening = match token {
+                "<<" => Some(Opening { strip_tabs: false, word: None }),
+                "<<-" => Some(Opening { strip_tabs: true, word: None }),
+                _ => None,
+            };
             return Some(Redirect::Operator);
         }
         // Blanks and word breaks are only themselves when the shell would
@@ -751,16 +1029,25 @@ impl Scan<'_> {
                 }
                 _ if bare && is_metacharacter(ch) => {
                     self.redirecting = Redirecting::No;
+                    // An operator with no word after it opens no
+                    // here-document: there is no delimiter for a body to end
+                    // on, so reading one would be inventing the shape of the
+                    // rest of the command.
+                    self.opening = None;
                     None
                 }
                 _ => {
                     self.redirecting = Redirecting::Target;
+                    if let Some(opening) = self.opening.as_mut() {
+                        opening.word = Some(self.cursor);
+                    }
                     Some(Redirect::Target)
                 }
             },
             Redirecting::Target => match bare && is_metacharacter(ch) {
                 true => {
                     self.redirecting = Redirecting::No;
+                    self.close_opening(self.cursor);
                     None
                 }
                 false => Some(Redirect::Target),
@@ -768,14 +1055,18 @@ impl Scan<'_> {
         }
     }
 
-    /// The byte offset a redirection operator starting at the cursor ends at,
-    /// or `None` if none starts here.
+    /// The byte offset a redirection operator starting at the cursor ends at
+    /// and the operator itself, or `None` if none starts here.
+    ///
+    /// The token comes back because `<<` and `<<-` are not finished when they
+    /// end: they take a body, and only the operator knows whether that body's
+    /// leading tabs are stripped.
     ///
     /// Lookahead, and bounded: a file descriptor is a run of digits the
     /// cursor is already at the start of, and an operator is one of twelve
     /// fixed strings. Nothing here backtracks or rescans, so the pass is
     /// still one left-to-right walk of an agent-controlled string.
-    fn operator_here(&self) -> Option<usize> {
+    fn operator_here(&self) -> Option<(usize, &'static str)> {
         if self.escaped || self.quoting != Quoting::Normal {
             return None;
         }
@@ -793,9 +1084,135 @@ impl Scan<'_> {
         // read as what they are.
         match digits > 0 && token.starts_with('&') {
             true => None,
-            false => Some(self.cursor + digits + token.len()),
+            false => Some((self.cursor + digits + token.len(), token)),
         }
     }
+
+    /// Queue the here-document whose delimiter word ends at `end`, so that its
+    /// body begins after the next newline.
+    ///
+    /// Called wherever a redirection's target run ends, which is the one place
+    /// the whole of the delimiter word is known. An operator that never got a
+    /// word queues nothing -- see [`Scan`] for why that is the safe direction.
+    fn close_opening(&mut self, end: usize) {
+        let Some(opening) = self.opening.take() else { return };
+        let Some(start) = opening.word else { return };
+        let (delimiter, expands) = delimiter_of(&self.command[start..end]);
+        self.pending.push(HereDoc { delimiter, strip_tabs: opening.strip_tabs, expands });
+    }
+
+    /// Start the next queued here-document's data at the cursor, if there is
+    /// one.
+    ///
+    /// The cursor is already past the newline when this is called, from both
+    /// of its callers, so "at the cursor" is the first character of the line
+    /// the data begins on.
+    fn open_here(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let doc = self.pending.remove(0);
+        self.enter(doc);
+    }
+
+    /// Enter `doc`'s data at the cursor: its terminating line when the line
+    /// there is already the delimiter, its body otherwise.
+    ///
+    /// The empty body is not a curiosity -- `cat <<EOF` with `EOF` on the very
+    /// next line is how a script says *nothing on stdin* -- and reading it as
+    /// a one-line body would leave the scanner looking for a delimiter that
+    /// has already gone past.
+    fn enter(&mut self, doc: HereDoc) {
+        self.here = Some(match self.line_is_delimiter(&doc) {
+            true => Here::Delimiter,
+            false => Here::Body { expands: doc.expands },
+        });
+        self.active = Some(doc);
+    }
+
+    /// Cross the newline at the cursor, which is inside a here-document.
+    ///
+    /// Three moves and no others. Inside a body, the line beginning here ends
+    /// it if it is the delimiter and is more body if it is not. Past a
+    /// delimiter line, this here-document is finished -- and the next one its
+    /// operator line queued begins immediately, which is what makes
+    /// `cat <<A <<B` read body A, then body B, with no shell in between.
+    fn cross_line(&mut self) {
+        match self.here {
+            Some(Here::Body { .. }) => {
+                let doc = self.active.take().expect("a body has a here-document behind it");
+                self.enter(doc);
+            }
+            Some(Here::Delimiter) => {
+                self.active = None;
+                self.here = None;
+                self.open_here();
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the line beginning at the cursor is exactly `doc`'s delimiter.
+    ///
+    /// Exactly: a line of `EOF ` is not the delimiter `EOF`, and bash agrees.
+    /// Leading tabs are the one thing stripped first, and only for a `<<-`.
+    ///
+    /// A line at a time, and each line is looked at once -- once at the
+    /// newline in front of it -- so this stays linear in a command the agent
+    /// chooses the length of.
+    fn line_is_delimiter(&self, doc: &HereDoc) -> bool {
+        let rest = &self.command[self.cursor..];
+        let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+        let line = match doc.strip_tabs {
+            true => line.trim_start_matches('\t'),
+            false => line,
+        };
+        line == doc.delimiter
+    }
+}
+
+/// The word a here-document's body ends on, and whether that body expands.
+///
+/// Quote removal, and one flag falling out of it: bash turns expansion off for
+/// the whole body when **any** part of the delimiter word is quoted, so
+/// `<<'EOF'`, `<<"EOF"`, `<<\EOF` and `<<EO'F'` all end on `EOF` and all
+/// substitute nothing anywhere in the body. That was checked against a real
+/// shell, including the last one, which is the case a rule written as "starts
+/// with a quote" would get wrong.
+///
+/// The three constructs are the three [`literal_word`] models, and this is a
+/// separate reading of them because it answers a different question: a
+/// delimiter that hatch cannot read is still a delimiter, and there is no
+/// `None` to return -- the body ends where the shell says it ends whether or
+/// not the word looks like a name.
+fn delimiter_of(word: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                quoted = true;
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            }
+            '\'' | '"' => {
+                quoted = true;
+                // To the matching quote, or to the end of the word if there is
+                // none -- bash refuses such a command outright, so what
+                // matters here is only that the scan terminates.
+                for inner in chars.by_ref() {
+                    if inner == c {
+                        break;
+                    }
+                    out.push(inner);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    (out, !quoted)
 }
 
 /// Find every command boundary in `command`, in source order.
@@ -805,28 +1222,40 @@ fn boundaries(command: &str) -> Vec<Boundary> {
     // it `|||` would report `||` at 0..2 and again at 1..3 — two overlapping
     // boundaries out of one operator and a `;`-worth of screen noise.
     let mut consumed = 0;
+    // One character of lookahead, for one question: whether a here-document's
+    // data starts on the line after a newline. It cannot be answered by the
+    // newline itself -- the newline that opens a body is on the operator's
+    // line and is ordinary shell -- and it is the whole of what tells a line
+    // ending apart from the end of a command. See [`Boundary::HereLine`].
+    let mut scan = scan(command).peekable();
 
-    for c in scan(command) {
+    while let Some(c) = scan.next() {
         // A comment first, because nothing in one is a boundary: the `&&` in
         // `echo hi # then && rm -rf /tmp` is text, and a break drawn there
         // claims a boundary the shell does not have. The newline that ends a
         // comment is reported outside it and still lands below.
-        // A redirection operator next, because `>|` is one token and the `|`
-        // in it is not a pipe. This is the whole of what it takes for the two
-        // passes to agree about a byte: one of them decides, and the other
-        // reads the decision. Only the operator has to be skipped -- a target
-        // ends at any unquoted metacharacter, so a separator character can
-        // only be inside one when it is quoted, and quoting already stops it.
-        if c.comment
-            || c.redirect == Some(Redirect::Operator)
-            || c.offset < consumed
-            || c.escaped
-            || c.quoting != Quoting::Normal
-        {
+        if c.comment || c.offset < consumed || c.escaped || c.quoting != Quoting::Normal {
             continue;
         }
         if c.ch == '\n' {
-            found.push(Boundary::Newline(c.offset + c.ch.len_utf8()));
+            let end = c.offset + c.ch.len_utf8();
+            // A newline with a here-document's data after it ends a line and
+            // not a command: the body belongs to the command that opened it.
+            found.push(match scan.peek().is_some_and(|next| next.here.is_some()) {
+                true => Boundary::HereLine(end),
+                false => Boundary::Newline(end),
+            });
+            continue;
+        }
+        // A here-document's data next, because a `;` in a config file is a
+        // character in a config file. Then a redirection operator, because
+        // `>|` is one token and the `|` in it is not a pipe. This is the whole
+        // of what it takes for these passes to agree about a byte: one of them
+        // decides, and the others read the decision. Only a redirection's
+        // operator has to be skipped -- a target ends at any unquoted
+        // metacharacter, so a separator character can only be inside one when
+        // it is quoted, and quoting already stops it.
+        if c.here.is_some() || c.redirect == Some(Redirect::Operator) {
             continue;
         }
         let rest = &command[c.offset..];
@@ -898,12 +1327,34 @@ fn dollar_extent(rest: &str) -> usize {
 /// reference that is never substituted — a small lie, and one told in the
 /// window's most authoritative voice, which is the value it promises comes
 /// out of the environment the command will really run in.
+///
+/// A here-document is the one place the answer is neither always yes nor
+/// always no, and the difference is worth keeping. An unquoted `<<EOF` expands
+/// its body, so a `$HOME` there really is substituted and is annotated like
+/// any other; a quoted `<<'EOF'` expands nothing anywhere in the body, so a
+/// value shown beside one would be exactly the lie above. The delimiter line
+/// is not data and expands nothing either way.
+/// Whether a `$` in this part of a here-document expands -- and `true` when it
+/// is not in one at all, which is every other character in the command.
+///
+/// Written the round way so that [`references`] reads as one list of reasons
+/// not to annotate. The delimiter line expands nothing: it is not handed to
+/// the command, so there is nothing there for the shell to substitute into.
+fn expands_here(here: Option<Here>) -> bool {
+    match here {
+        None => true,
+        Some(Here::Body { expands }) => expands,
+        Some(Here::Delimiter) => false,
+    }
+}
+
 fn references(command: &str) -> Vec<Range<usize>> {
     let mut found = Vec::new();
     let mut consumed = 0;
 
     for c in scan(command) {
         if c.comment
+            || !expands_here(c.here)
             || c.offset < consumed
             || c.ch != '$'
             || c.escaped
@@ -1008,7 +1459,15 @@ pub fn segment_breaking_at(command: &str, at: Option<usize>) -> Spans {
             // The newline goes *through* the classifier rather than around
             // it, which is what makes it a chip and not a drawn-as-itself
             // separator.
-            Boundary::Newline(end) => {
+            //
+            // A here-document's line ending goes the same way, because the
+            // drawing is the same drawing: the `↵` at the end of the line and
+            // a break after it. What it is not is the end of a segment, and
+            // that difference is [`segments`]'s to read -- the body is data
+            // belonging to the command above it, and numbering each line of a
+            // config file as a command of its own would be the same lie the
+            // separators in it used to tell.
+            Boundary::Newline(end) | Boundary::HereLine(end) => {
                 take_break(&mut builder, &mut asked, *end);
                 unicode::classify_into(&mut builder, *end);
             }
@@ -1075,7 +1534,15 @@ fn newline_already_ends_the_line(command: &str, after: usize, next: Option<&Boun
         // Through the newline rather than up to it: `end` is one past it and
         // a newline is whitespace, so including it asks the same question and
         // spares an offset that could be off by one.
-        Some(Boundary::Newline(end)) => command[after..*end].chars().all(char::is_whitespace),
+        //
+        // A here-document's line ending counts, because what this function is
+        // about is the break and both kinds carry one. `cat <<EOF |` ends a
+        // line with a separator on it and a body under it, and a separator
+        // that insisted on its own break there would put the `↵` alone at the
+        // top of the body.
+        Some(Boundary::Newline(end) | Boundary::HereLine(end)) => {
+            command[after..*end].chars().all(char::is_whitespace)
+        }
         _ => false,
     }
 }
@@ -1193,6 +1660,12 @@ pub fn annotate_variables(spans: Spans, env: &BTreeMap<String, String>) -> Spans
 /// whitespace, so it ends the word before it without needing to be excluded
 /// here. A separator token is not whitespace and does have to be: `ls;rm`
 /// would otherwise be one word called `ls;rm`.
+///
+/// A here-document's line ending is not a segment end at all, so the operator
+/// line and the body under it are one segment -- which is what they are to the
+/// shell, the body being that command's stdin rather than the next thing to
+/// run. The body contributes no words of its own ([`is_word_break`] sees to
+/// that), so the segment's command word is still the one on the operator line.
 fn segments(command: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -1200,6 +1673,7 @@ fn segments(command: &str) -> Vec<Range<usize>> {
         let (stop, next) = match boundary {
             Boundary::Separator(token) => (token.start, token.end),
             Boundary::Newline(end) => (end, end),
+            Boundary::HereLine(_) => continue,
         };
         out.push(start..stop);
         start = next;
@@ -1223,6 +1697,13 @@ fn segments(command: &str) -> Vec<Range<usize>> {
 /// overlap have no honest drawing — and it is the same move [`claimable`]
 /// makes for a quoted word.
 ///
+/// A here-document is the same answer and the loudest correction of the three.
+/// A body has no words in it because it is not shell: every line of a config
+/// file was being read as a command, and the first word of each one was drawn
+/// as the thing that runs and reported above the panes as a program nothing
+/// answers to. The delimiter line goes with it -- it is structure, and a
+/// `Command` region on an `EOF` would be naming a program that does not exist.
+///
 /// A redirection is the same answer again, and here it is a correction as
 /// well as a guard. `<` and `>` are metacharacters, so bash reads `cat<file`
 /// as the command `cat` with its input redirected; this pass used to call the
@@ -1232,6 +1713,7 @@ fn segments(command: &str) -> Vec<Range<usize>> {
 /// right now, and a `Command` region can no longer overlap a `Redirect` one.
 fn is_word_break(c: &Scanned) -> bool {
     c.comment
+        || c.here.is_some()
         || c.redirect.is_some()
         || (!c.escaped && c.quoting == Quoting::Normal && c.ch.is_whitespace())
 }
@@ -1354,7 +1836,15 @@ fn quoted_strings(command: &str) -> Vec<Range<usize>> {
         // reads it. Without this, `echo # it's fine` would open a string at
         // the apostrophe and run it to the end of the command, and the
         // highlight would cross a comment it has no business being inside.
-        if c.escaped || c.comment {
+        //
+        // A quote inside a here-document's data opens nothing for the same
+        // reason and with one more consequence: a body can only begin where
+        // the scanner reads a real newline, which is in `Normal` quoting, and
+        // nothing inside it changes that -- so no string can start in a body
+        // and none can span one. That is what keeps a `Quoted` region from
+        // ever landing on top of the delimiter line's, and two overlapping
+        // regions have no honest drawing.
+        if c.escaped || c.comment || c.here.is_some() {
             continue;
         }
         match (open, c.quoting, c.ch) {
@@ -1426,6 +1916,37 @@ fn redirections(command: &str) -> Vec<(Range<usize>, Redirect)> {
     out
 }
 
+/// The byte range of every here-document terminating line in `command`, the
+/// newline that ends the line excluded, in source order.
+///
+/// Read off the scanner's flag, exactly as [`comments`] and [`redirections`]
+/// are, and for the reason all three are: the passes that stop at a
+/// here-document have to stop at the same bytes the colour is drawn on.
+///
+/// The line is drawn as a redirection because that is what it is. `<<EOF` is
+/// an operator whose word is `EOF`, already marked as a redirection target,
+/// and the line that ends the body is that same word again closing what the
+/// operator opened -- which is how a reader finds the end of a body in the
+/// first place. Giving it a colour of its own would be a second name for one
+/// fact, and giving it none would leave the block with a marked top and an
+/// unmarked bottom.
+fn delimiter_lines(command: &str) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for c in scan(command) {
+        // The newline is left out: it is the end of the line rather than part
+        // of it, and it is drawn as a chip either way.
+        if c.here != Some(Here::Delimiter) || c.ch == '\n' {
+            continue;
+        }
+        let end = c.offset + c.ch.len_utf8();
+        match out.last_mut() {
+            Some(last) if last.end == c.offset => last.end = end,
+            _ => out.push(c.offset..end),
+        }
+    }
+    out
+}
+
 /// Every region [`highlight`] wants to mark, in source order and never
 /// overlapping.
 fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
@@ -1451,6 +1972,10 @@ fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
         *half == Redirect::Operator || !command[range.clone()].contains(['\'', '"'])
     });
     out.extend(marked.map(|(range, _)| (range, SpanKind::Redirect)));
+    // The line that closes a here-document, in the kind that opened it. It
+    // cannot overlap anything above: a body has no words and no strings in it,
+    // and no redirection is recognised inside one.
+    out.extend(delimiter_lines(command).into_iter().map(|range| (range, SpanKind::Redirect)));
     out.sort_by_key(|(range, _)| range.start);
     out
 }
@@ -1618,11 +2143,18 @@ const SCRIPT_DEPTH: usize = 4;
 ///
 /// # Where it stops
 ///
-/// Inside `$(…)`, inside a here-document body, and inside any of the
-/// constructs the module docs list as outside [`Scan`]'s model. Those are
-/// under-reports -- a command hatch does not list is a command the reader
-/// still sees in the pane -- and they are the same gaps every other pass in
-/// this module has, for the same reason: one scanner, one model.
+/// Inside `$(…)` and inside any of the constructs the module docs list as
+/// outside [`Scan`]'s model. Those are under-reports -- a command hatch does
+/// not list is a command the reader still sees in the pane -- and they are the
+/// same gaps every other pass in this module has, for the same reason: one
+/// scanner, one model.
+///
+/// A here-document body is not one of them, and used to be. Nothing in a body
+/// is listed because nothing in a body runs: the shell hands it to the command
+/// on stdin. That is not silence about a command, it is the absence of one,
+/// and before [`Scan`] knew where a body was it was the loudest wrong answer
+/// this list gave -- every first word of every line of a config file, reported
+/// as a program nothing on the `PATH` answers to.
 ///
 /// Two of them are worth naming because a reader might expect otherwise. A
 /// subshell -- `(cd /tmp && rm x)` -- and a `case` branch both put their
@@ -2796,7 +3328,6 @@ mod tests {
         assert_eq!(separators(&render_command("echo $((1 || 0))")), vec!["||"], "arithmetic");
         assert_eq!(separators(&render_command("[[ -n x || -n y ]]")), vec!["||"], "conditional");
         assert_eq!(separators(&render_command(r"$'a\'b; c'")), vec![";"], "ANSI-C quoting");
-        assert_eq!(separators(&render_command("cat <<EOF\na; b\nEOF")), vec![";"], "heredoc");
         assert_eq!(
             separators(&render_command("case x in a) echo 1;; esac")),
             vec![";", ";"],
@@ -3204,22 +3735,16 @@ mod tests {
         // An ANSI-C string's `$` is outside the region the ordinary
         // single-quote rule finds.
         assert_eq!(quotes(&render_command("echo $'a b'")), vec!["'a b'"], "ANSI-C quoting");
-        assert_eq!(
-            commands(&render_command("cat <<EOF\nls\nEOF")),
-            vec!["cat", "ls", "EOF"],
-            "a heredoc body is data, and is drawn as though it were commands"
-        );
 
-        // And in every one of them the text is untouched. The two without a
-        // newline in them are checked character for character as well: what
-        // the highlight got wrong is a colour, and nothing else moved.
+        // And in every one of them the text is untouched, character for
+        // character: what the highlight got wrong is a colour, and nothing
+        // else moved.
         for command in [r"echo $'a\'b'", "echo $'a b'"] {
             let spans = render_command(command);
             assert_eq!(unrender(&spans), command);
             let shown: String = spans.iter().map(|s| s.display_text()).collect();
             assert_eq!(shown, command, "{command:?} is not drawn as itself throughout");
         }
-        assert_eq!(unrender(&render_command("cat <<EOF\nls\nEOF")), "cat <<EOF\nls\nEOF");
     }
 
 
@@ -3359,24 +3884,17 @@ mod tests {
     }
 
     #[test]
-    fn a_heredoc_body_line_that_starts_with_a_hash_is_drawn_as_a_comment() {
-        // A known gap, pinned so that changing it is deliberate. hatch does
-        // not know where a heredoc body starts, so it reads one as ordinary
-        // shell -- and a body line beginning with `#` is therefore drawn as a
-        // comment though it is data on the command's stdin.
-        //
-        // It moves in both directions and the sizes are not equal. What it
-        // buys is that the separators and references on that line stop being
-        // reported: a `&&` in the body is not a boundary and a `$HOME` in a
-        // quoted heredoc does not expand, and both of those were wrong
-        // before. What it costs is a colour saying *this will not run* over a
-        // line that will be read by something -- which is the same direction
-        // the old rendering was wrong in for the whole body, and no larger.
+    fn a_hash_in_a_here_document_body_is_a_character_in_a_config_file() {
+        // This used to be drawn as a comment, and was pinned as a known cost
+        // of not knowing where a body starts. A `#` at the start of a line is
+        // how half the configuration files ever written begin a line, and
+        // drawing one in the colour that says *this will not run* was a claim
+        // about text a command is about to be handed.
         let env = env(&[("HOME", "/home/user")]);
         let command = "cat <<'EOF'\n# $HOME && ls\nEOF";
         let spans = rendered(command, &env);
 
-        assert_eq!(comments(&spans), vec!["# $HOME && ls"]);
+        assert!(comments(&spans).is_empty(), "a `#` in a body is data, not a comment");
         assert!(separators(&spans).is_empty(), "the body's `&&` is not a boundary");
         assert!(variables(&spans).is_empty(), "and a quoted heredoc expands nothing");
         assert_eq!(unrender(&spans), command);
@@ -3660,16 +4178,19 @@ mod tests {
     }
 
     #[test]
-    fn a_heredoc_operator_points_at_its_delimiter_and_the_body_is_unchanged() {
-        // What this pass does and does not move. `<<EOF` is an operator and
-        // `EOF` is the word it points at, which is right; hatch still does
-        // not know that what follows is a body rather than shell, so the
-        // separator in it is still reported. The known gap is unchanged, and
-        // this is what pins that.
+    fn a_here_document_is_marked_at_both_ends_and_is_plain_in_between() {
+        // `<<EOF` is an operator and the `EOF` after it is the word it points
+        // at, which was true before the body had a pass of its own. What is
+        // new is the third mark: the line that ends the body closes what the
+        // operator opened, in the same colour, so the block a reader is
+        // looking at has a top and a bottom. Between them the body is drawn
+        // plain -- it is the payload, and quieting it or colouring it would be
+        // a claim about text that is nothing but data.
         let command = "cat <<EOF\na; b\nEOF";
         let spans = render_command(command);
-        assert_eq!(redirects(&spans), vec!["<<", "EOF"]);
-        assert_eq!(separators(&spans), vec![";"], "the body is still read as shell");
+        assert_eq!(redirects(&spans), vec!["<<", "EOF", "EOF"]);
+        assert_eq!(commands(&spans), vec!["cat"], "the body names nothing that runs");
+        assert!(separators(&spans).is_empty(), "the body's `;` is data");
         assert_eq!(unrender(&spans), command);
     }
 
@@ -4138,7 +4659,7 @@ mod tests {
                 prop::sample::select(vec![
                     "sudo ", "env ", "bash ", "-c ", "timeout ", "run0 ", "-- ", "if ", "then ",
                     "{ ", "} ", "( ", ") ", "; ", "&& ", "| ", "> ", "# ", "'", "\\", "$x ",
-                    "A=1 ", "ls ", "f() ", "\n",
+                    "A=1 ", "ls ", "f() ", "\n", "<<EOF ", "EOF",
                 ].into_iter().map(str::to_string).collect::<Vec<String>>()),
                 0..40,
             ).prop_map(|parts| parts.concat()),
@@ -4157,6 +4678,344 @@ mod tests {
         assert!(!is_assignment("a-b=1"), "nor carry a hyphen");
         assert!(!is_assignment("ls"), "and a word with no `=` is not one");
         assert!(!is_assignment(""));
+    }
+
+
+    // --- here-documents: the region that is not shell ---------------------
+
+    /// Every run of here-document data in `command`, in source order, paired
+    /// with which part of one it is.
+    ///
+    /// Straight off the scanner's flag, because the flag is what the four
+    /// passes read: a test that inferred the body from the colours would be
+    /// checking the drawing rather than the reading it comes from.
+    fn parts(command: &str) -> Vec<(&str, Here)> {
+        let mut out: Vec<(Range<usize>, Here)> = Vec::new();
+        for c in scan(command) {
+            let Some(here) = c.here else { continue };
+            let end = c.offset + c.ch.len_utf8();
+            match out.last_mut() {
+                Some((last, part)) if last.end == c.offset && *part == here => last.end = end,
+                _ => out.push((c.offset..end, here)),
+            }
+        }
+        out.into_iter().map(|(range, part)| (&command[range], part)).collect()
+    }
+
+    const EXPANDS: Here = Here::Body { expands: true };
+    const LITERAL: Here = Here::Body { expands: false };
+
+    #[test]
+    fn a_body_is_data_and_the_four_passes_that_read_it_all_say_so() {
+        // The report this work came from, drawn exactly as it was written.
+        // `invoked` answered `[cat, hello, EOF]`, so the roster said *nothing
+        // on the command's PATH answers to hello, EOF* -- an orange line under
+        // one of the plainest shapes an agent writes, which is how a warning
+        // stops being read at all.
+        let env = env(&[("HOME", "/home/user")]);
+        let command = "cat <<'EOF' > /tmp/x\nhello\nEOF";
+        let spans = rendered(command, &env);
+
+        assert_eq!(invoked(command).runs, vec![Invocation::Named("cat".to_string())]);
+        assert_eq!(commands(&spans), vec!["cat"], "no word of the body runs");
+        assert!(separators(&spans).is_empty());
+        assert!(comments(&spans).is_empty());
+        assert_eq!(unrender(&spans), command);
+    }
+
+    #[test]
+    fn the_body_starts_after_the_next_newline_and_not_after_the_operator() {
+        // The rule that makes `cat <<EOF | grep x` work: everything on the
+        // operator's own line is shell, pipe and all, and the body is what
+        // comes after the newline. A pass that started the body at the
+        // operator would swallow a whole pipeline stage.
+        let command = "cat <<EOF | grep x\nbody\nEOF\nls";
+        let spans = render_command(command);
+
+        assert_eq!(parts(command), vec![("body\n", EXPANDS), ("EOF\n", Here::Delimiter)]);
+        assert_eq!(separators(&spans), vec!["|"], "the pipe is on the operator's line");
+        assert_eq!(commands(&spans), vec!["cat", "grep", "ls"]);
+    }
+
+    #[test]
+    fn a_body_ends_on_a_line_that_is_exactly_the_delimiter() {
+        // Exactly, which is bash's rule and not a convenience: a line of
+        // `EOF ` does not end the body, and the shell reads the rest of the
+        // command as more of it. Checked against a real shell, which is also
+        // where the trailing-space case comes from.
+        assert_eq!(
+            parts("cat <<EOF\na\nEOF\nls"),
+            vec![("a\n", EXPANDS), ("EOF\n", Here::Delimiter)]
+        );
+        assert_eq!(parts("cat <<EOF\na\nEOF \nls"), vec![("a\nEOF \nls", EXPANDS)]);
+        assert_eq!(
+            parts("cat <<EOF\na\nXEOF\nEOF"),
+            vec![("a\nXEOF\n", EXPANDS), ("EOF", Here::Delimiter)],
+            "a line the delimiter is only part of ends nothing"
+        );
+    }
+
+    #[test]
+    fn a_dash_here_document_strips_tabs_from_its_delimiter_and_not_spaces() {
+        // `<<-` strips leading tabs from the body's lines and from the line
+        // that terminates it, so an `EOF` indented with tabs ends the body.
+        // Spaces are not stripped and an `EOF` indented with them terminates
+        // nothing -- which was checked against a real shell, where the rest of
+        // the command went on being data.
+        assert_eq!(
+            parts("cat <<-EOF\n\tbody\n\tEOF\nls"),
+            vec![("\tbody\n", EXPANDS), ("\tEOF\n", Here::Delimiter)]
+        );
+        assert_eq!(parts("cat <<-EOF\n  body\n  EOF\nls"), vec![("  body\n  EOF\nls", EXPANDS)]);
+        assert_eq!(
+            parts("cat <<EOF\n\tbody\n\tEOF\nls"),
+            vec![("\tbody\n\tEOF\nls", EXPANDS)],
+            "a plain `<<` strips nothing, so an indented delimiter is body"
+        );
+    }
+
+    #[test]
+    fn quoting_the_delimiter_turns_expansion_off_for_the_whole_body() {
+        // The half of this that is most tempting to flatten, and the half a
+        // reader is most entitled to. A bare `<<EOF` expands, so the value
+        // beside a `$HOME` in its body is the value the command will receive;
+        // a quoted delimiter expands nothing anywhere in the body, so the same
+        // value would be a lie told in the window's most authoritative voice.
+        //
+        // All four spellings are bash's, the last one included: the rule is
+        // about the word carrying a quote anywhere, not about the quote being
+        // in front. Each was checked against a real shell.
+        let env = env(&[("HOME", "/home/user")]);
+        let resolved = vec![("$HOME", Some("/home/user"))];
+        assert_eq!(variables(&rendered("cat <<EOF\n$HOME\nEOF", &env)), resolved);
+        for quoted in [
+            "cat <<'EOF'\n$HOME\nEOF",
+            "cat <<\"EOF\"\n$HOME\nEOF",
+            "cat <<\\EOF\n$HOME\nEOF",
+            "cat <<EO'F'\n$HOME\nEOF",
+        ] {
+            assert!(
+                variables(&rendered(quoted, &env)).is_empty(),
+                "{quoted:?} substitutes nothing, and the window may not say otherwise"
+            );
+            assert_eq!(parts(quoted), vec![("$HOME\n", LITERAL), ("EOF", Here::Delimiter)]);
+        }
+    }
+
+    #[test]
+    fn several_here_documents_on_one_line_take_their_bodies_in_order() {
+        // `cat <<A <<B` reads body A and then body B, both starting after that
+        // same newline, and the line that ends A is followed immediately by
+        // the first line of B with no shell in between. Checked against a real
+        // shell, which runs `echo after` and nothing in either body.
+        let command = "cat <<A <<B\nbodyA\nA\nbodyB\nB\nrm -rf /";
+        assert_eq!(
+            parts(command),
+            vec![
+                ("bodyA\n", EXPANDS),
+                ("A\n", Here::Delimiter),
+                ("bodyB\n", EXPANDS),
+                ("B\n", Here::Delimiter),
+            ]
+        );
+        assert_eq!(commands(&render_command(command)), vec!["cat", "rm"]);
+        assert_eq!(invoked(command).runs.len(), 2, "two commands, not six");
+    }
+
+    #[test]
+    fn the_line_that_ends_a_body_is_structure_and_not_a_command() {
+        // It is the delimiter closing what the operator opened, so it is drawn
+        // in the kind the operator's own word is drawn in -- the block a
+        // reader is looking at gets a top and a bottom. What it is not is a
+        // program: `EOF` resolves to nothing anywhere, and naming it is how
+        // the roster came to report a word nothing answers to.
+        let command = "cat <<EOF\nbody\nEOF";
+        let spans = render_command(command);
+        assert_eq!(redirects(&spans), vec!["<<", "EOF", "EOF"]);
+        assert_eq!(commands(&spans), vec!["cat"]);
+        assert_eq!(invoked(command).runs, vec![Invocation::Named("cat".to_string())]);
+    }
+
+    #[test]
+    fn the_body_itself_is_drawn_plain_and_carries_no_colour_at_all() {
+        // The decision, pinned. A body is the payload -- the file
+        // `cat <<EOF > /etc/sudoers` writes is in it and nowhere else -- so it
+        // is the last text on the pane that should be quieted or tinted. Plain
+        // at full contrast is the one drawing that claims nothing, which is
+        // the right claim to make about data, and the delimiters either side
+        // of it are what say where the block ends.
+        let env = env(&[("HOME", "/home/user")]);
+        let command = "cat <<EOF\n'quoted' # hash > arrow\nEOF";
+        let spans = rendered(command, &env);
+        let body: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.range().start >= 10 && s.range().end <= 34)
+            .filter(|s| s.kind() != &SpanKind::Plain)
+            .map(Span::text)
+            .collect();
+        assert_eq!(body, vec!["\n"], "only the line ending, which is a chip");
+        assert!(quotes(&spans).is_empty(), "a quote in a body opens nothing");
+    }
+
+    #[test]
+    fn an_unterminated_here_document_runs_to_the_end_of_the_command() {
+        // Because that is what bash does with it: it warns that the
+        // here-document was delimited by end-of-file, hands the command
+        // everything that was left, and runs none of it. So the `rm` below is
+        // text `cat` prints, and drawing it as shell would be the lie.
+        //
+        // Nothing is hidden by this. A body carries no colour, no fade and no
+        // chip, so every character of one is on screen drawn as itself at the
+        // contrast of the line above it; what the choice costs is that the
+        // roster does not name a program the shell does not run either.
+        let command = "cat <<EOF\nhello\nrm -rf /";
+        let spans = render_command(command);
+        assert_eq!(parts(command), vec![("hello\nrm -rf /", EXPANDS)]);
+        assert_eq!(commands(&spans), vec!["cat"]);
+        assert!(separators(&spans).is_empty());
+        assert_eq!(unrender(&spans), command);
+        let shown: String = spans.iter().map(|s| s.display_text()).collect();
+        assert_eq!(shown, "cat <<EOF↵hello↵rm -rf /", "every character is still on screen");
+    }
+
+    #[test]
+    fn a_here_string_is_not_a_here_document() {
+        // `<<<` takes a word on the same line and nothing after it, which is
+        // the redirection work's answer and stays that way.
+        assert!(parts("cat <<<word\nls").is_empty());
+        assert_eq!(commands(&render_command("cat <<<word\nls")), vec!["cat", "ls"]);
+        assert_eq!(redirects(&render_command("cat <<<word")), vec!["<<<", "word"]);
+    }
+
+    #[test]
+    fn an_operator_with_no_delimiter_after_it_opens_no_body() {
+        // There is no word for a body to end on, so reading one would be
+        // inventing the shape of the rest of the command. bash calls this a
+        // syntax error; hatch draws the next line as the shell it looks like,
+        // which is this module's safe direction -- being wrong towards *no*
+        // here-document leaves text drawn exactly as it was drawn before.
+        assert!(parts("cat <<\nls").is_empty());
+        assert!(parts("cat << ;\nls").is_empty());
+        assert!(parts("cat <<EOF # note\nbody\nEOF").len() == 2, "a comment after one is fine");
+        assert!(parts("cat << # EOF\nls").is_empty(), "and a comment instead of one is not");
+    }
+
+    #[test]
+    fn a_continued_line_is_not_the_line_the_body_starts_after() {
+        // `\<newline>` is a line continuation, so the line the operator is on
+        // has not ended and the body waits for the newline that really ends
+        // it. Checked against a real shell.
+        assert_eq!(
+            parts("cat <<EOF \\\n  -\nbody\nEOF"),
+            vec![("body\n", EXPANDS), ("EOF", Here::Delimiter)]
+        );
+    }
+
+    #[test]
+    fn a_here_document_is_one_segment_with_the_command_that_opened_it() {
+        // The body is that command's stdin rather than the next thing to run,
+        // so none of the newlines through the last delimiter line ends a
+        // segment -- and the one after it does, which is what gives the
+        // command on the next line a segment of its own.
+        //
+        // The lines still break, because a newline is still a newline: the
+        // classifier chips it and asks for the break, exactly as it does
+        // inside a multi-line quoted string. So a forty-line config file is
+        // forty rows on screen and one segment, which is what it is.
+        let command = "cat <<EOF\none\ntwo\nEOF\nls";
+        assert_eq!(segments(command), vec![0..22, 22..24]);
+        let spans = render_command(command);
+        assert_eq!(breaks(&spans), vec!["one", "two", "EOF", "ls"]);
+    }
+
+    #[test]
+    fn nothing_in_a_body_is_read_as_shell_state_the_rest_of_the_line_inherits() {
+        // A quote in a body opens nothing and a `<<` in one starts no second
+        // here-document, so the shell after the delimiter line is read exactly
+        // as it would have been. Without this an apostrophe in a sentence
+        // would open a string that ran to the end of the command and took
+        // every boundary after it with it.
+        let command = "cat <<EOF\nit's fine <<AGAIN\nEOF\nls; echo done";
+        let spans = render_command(command);
+        assert_eq!(commands(&spans), vec!["cat", "ls", "echo"]);
+        assert_eq!(separators(&spans), vec![";"]);
+        assert!(quotes(&spans).is_empty());
+        assert!(redirects(&spans).iter().all(|r| *r != "AGAIN"));
+    }
+
+    #[test]
+    fn a_here_document_operator_inside_quotes_is_two_characters_of_text() {
+        // The same rule every other construct on this page is found by, asked
+        // of the same state rather than written out again.
+        assert!(parts("echo '<<EOF'\nls").is_empty());
+        assert!(parts("echo \"<<EOF\"\nls").is_empty());
+        assert!(parts("echo \\<<EOF\nls").is_empty(), "an escaped `<` is not an operator");
+    }
+
+    #[test]
+    fn a_delimiter_may_be_any_word_the_shell_accepts() {
+        // Including one made of punctuation. `<<';'` ends on a line that is a
+        // single `;`, and that line is the delimiter rather than a separator
+        // -- the flag is read before the separator table is, so the two cannot
+        // disagree about the byte.
+        let command = "cat <<';'\nbody\n;\nls";
+        let spans = render_command(command);
+        assert_eq!(parts(command), vec![("body\n", LITERAL), (";\n", Here::Delimiter)]);
+        assert!(separators(&spans).is_empty(), "the terminating line is not a boundary");
+        assert_eq!(commands(&spans), vec!["cat", "ls"]);
+    }
+
+    #[test]
+    fn an_empty_body_is_a_delimiter_line_and_not_a_body_of_one_line() {
+        // `cat <<EOF` with `EOF` on the very next line is how a script says
+        // *nothing on stdin*. Reading it as a one-line body would leave the
+        // scanner looking for a delimiter that has already gone past, and the
+        // rest of the command would be data.
+        let command = "cat <<EOF\nEOF\nls";
+        assert_eq!(parts(command), vec![("EOF\n", Here::Delimiter)]);
+        assert_eq!(commands(&render_command(command)), vec!["cat", "ls"]);
+    }
+
+    #[test]
+    fn a_here_document_is_drawn_as_itself_and_the_spans_still_tile_it() {
+        // The bound on all of it, restated for the region that is not shell: a
+        // body is not a place where characters may go missing, and a chip in
+        // one is still a chip.
+        let env = env(&[("HOME", "/home/user")]);
+        for command in [
+            "cat <<EOF",
+            "cat <<EOF\n",
+            "cat <<EOF\n\n",
+            "cat <<EOF\nEOF",
+            "cat <<-EOF\n\t\tEOF",
+            "cat <<'EOF'\n$HOME\nEOF\n",
+            "cat <<EOF\n\u{202E}gnp.exe\nEOF",
+            "cat <<EOF <<EOF\nEOF\nEOF\nls",
+            "cat <<\u{00A0}\n\u{00A0}\nls",
+            "cat <<EOF\nünïcödé ✓\nEOF",
+        ] {
+            let spans = rendered(command, &env);
+            assert_eq!(unrender(&spans), command, "{command:?} did not round-trip");
+            assert!(spans.covers_source(), "{command:?} is not tiled by its spans");
+        }
+        let spans = render_command("cat <<EOF\n\u{202E}gnp.exe\nEOF");
+        assert_eq!(chips(&spans), vec!['\n', '\u{202E}', '\n'], "a body still chips");
+    }
+
+    #[test]
+    fn the_delimiter_of_a_here_document_is_the_word_with_its_quoting_removed() {
+        // The reading `delimiter_of` does, and the flag that falls out of it.
+        // Quoting *any* part of the word turns expansion off for the whole
+        // body, which is bash's rule and the reason this is not "starts with a
+        // quote".
+        assert_eq!(delimiter_of("EOF"), ("EOF".to_string(), true));
+        assert_eq!(delimiter_of("'EOF'"), ("EOF".to_string(), false));
+        assert_eq!(delimiter_of("\"EOF\""), ("EOF".to_string(), false));
+        assert_eq!(delimiter_of("\\EOF"), ("EOF".to_string(), false));
+        assert_eq!(delimiter_of("EO'F'"), ("EOF".to_string(), false));
+        assert_eq!(delimiter_of("E\\ OF"), ("E OF".to_string(), false));
+        assert_eq!(delimiter_of("'EOF"), ("EOF".to_string(), false), "unterminated: no panic");
+        assert_eq!(delimiter_of(""), (String::new(), true));
     }
 
     // --- the boundary of what `$` is claimed to mean ----------------------
@@ -4233,22 +5092,19 @@ mod tests {
         // construct makes a `$` inert, it is annotated anyway. Each case was
         // checked against a real shell; this test is what stops the list
         // drifting from the docs.
+        // One entry, where there were two: a body under a quoted delimiter was
+        // the other, and it is annotated correctly now rather than recorded
+        // here. What is left is ANSI-C quoting, where `\'` does not close the
+        // string, so the whole of `a'$HOME` is literal and hatch resolves a
+        // `$HOME` the shell never substitutes.
         let env = env(&[("HOME", "/home/user")]);
-        for (command, why) in [
-            (r"echo $'a\'$HOME'", "ANSI-C quoting: `\\'` does not close the string"),
-            ("cat <<'EOF'\n$HOME\nEOF", "a quoted heredoc delimiter never expands"),
-        ] {
-            let spans = rendered(command, &env);
-            assert_eq!(
-                variables(&spans),
-                vec![("$HOME", Some("/home/user"))],
-                "{why}: {command:?} is annotated, and this test records that"
-            );
-            // The bound on the cost: the text is untouched and drawn as
-            // itself, so what is wrong is a label beside a `$`, not the
-            // command the reader approves.
-            assert_eq!(unrender(&spans), command);
-        }
+        let command = r"echo $'a\'$HOME'";
+        let spans = rendered(command, &env);
+        assert_eq!(variables(&spans), vec![("$HOME", Some("/home/user"))]);
+        // The bound on the cost: the text is untouched and drawn as itself, so
+        // what is wrong is a label beside a `$`, not the command the reader
+        // approves.
+        assert_eq!(unrender(&spans), command);
     }
 
     #[test]
