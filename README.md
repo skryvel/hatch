@@ -114,11 +114,26 @@ hatch exposes two MCP tools. Both block until a human answers.
 | Tool | Parameters | On approval |
 |------|-----------|-------------|
 | `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply. A run in a terminal returns one `transcript` instead of the two streams — see [Terminals](#terminals) |
-| `swap_file` | `title`, `path` (absolute), `content`, `reason`, `root?` | Replaces or creates the file and returns the final `mode`, `owner` and `bytes` |
+| `swap_file` | `title`, `path` (absolute), `content` **or** `patch`, `reason`, `root?` | Writes the file and returns the final `mode`, `owner` and `bytes` |
 
 `title` and `reason` are required on both. `title` is the first thing the
 person reads, so the tool descriptions ask the agent for the intent, not the
 syntax.
+
+`swap_file` takes what the file should contain in one of two forms, and exactly
+one: `content` is the complete new contents, for creating a file or replacing
+one wholesale, and `patch` is a unified diff against the file as it is now, for
+editing one — which costs an agent the lines it touches instead of the whole
+file. **A patch is a wire encoding and nothing more.** hatch applies it itself,
+before anybody is asked, and what the person approves is the bytes it produced:
+by the time the window opens there is no difference at all between a request
+that arrived as a patch and one that arrived as full contents. It is applied
+where its hunk headers say and nowhere else — no fuzz, no searching a line
+either way — because a hunk that applied *nearly* would have written bytes
+somewhere the agent did not mean, under an approval whose whole subject was
+where the change goes. A hunk whose context does not match is refused whole,
+naming the hunk, the line and what was found there; nothing is rendered and
+nobody is interrupted.
 
 Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 — never as a string handed to a second shell. With `root: true` the argv
@@ -1037,6 +1052,13 @@ log's verdicts are a superset of the agent-facing ones — `approve`, `deny`,
 because a user denial, a client that gave up and a window that crashed all
 answer the agent with "denied", and conflating them here would hide exactly the
 quiet failures the log exists to catch.
+
+A `swap_file` line records which of the two forms the request arrived in. The
+change itself is the same either way — a patch is applied before anybody is
+asked — but what the agent sent is a fact about the request, and this is where
+facts about requests live. A line rendered for a person says `(from a patch)`
+only when it was one; the JSON says either way, so a reader parsing the file
+gets an answer rather than an absence.
 
 `hatch log` escapes what it prints. `title`, `reason`, `note`, `command` and
 `path` all come from the agent, and a newline interpolated raw would split one
