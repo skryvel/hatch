@@ -187,8 +187,20 @@ pub fn roster(command: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Vec<
         // ls` runs one `sudo`, and counting the remark would draw `sudo x2`
         // over a line with one of them in it.
         if let Invocation::Behind(name) = invocation {
-            if let Some(seen) = out.iter_mut().find(|entry| &entry.name == name) {
-                seen.hides = true;
+            match out.iter_mut().find(|entry| &entry.name == name) {
+                Some(seen) => seen.hides = true,
+                // A wrapper that is also a reserved word -- `time -x ls` --
+                // was never listed as a name, because reserved words are
+                // structure. It still has to appear here: the alternative is
+                // a roster that silently says nothing at all about a command
+                // it could not read, which is the one thing this list must
+                // never do.
+                None => out.push(Entry {
+                    name: name.clone(),
+                    count: 1,
+                    found: resolve(name, env, cwd, &invoked),
+                    hides: true,
+                }),
             }
             continue;
         }
@@ -399,6 +411,18 @@ mod tests {
             names(&entries),
             vec![("run0", 1), ("bash", 1), ("systemctl", 1), ("journalctl", 1)]
         );
+    }
+
+    #[test]
+    fn a_reserved_word_that_hides_a_command_is_listed_even_though_it_is_structure() {
+        // `time` is a reserved word, so it is not a name and is not listed --
+        // until it is the thing hiding the command. A roster that said
+        // nothing at all about a command it could not read would be the one
+        // failure this list must never have.
+        let (_dir, entries) = against("time -x make", &["make"]);
+        assert_eq!(names(&entries), vec![("time", 1)]);
+        assert!(entries[0].hides);
+        assert_eq!(entries[0].found, Resolution::Builtin, "the shell runs it, not a file");
     }
 
     #[test]
