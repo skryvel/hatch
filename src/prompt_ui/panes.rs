@@ -716,7 +716,7 @@ pub fn roster_summary(runs: &[Entry]) -> Option<String> {
     }
 
     (!clauses.is_empty())
-        .then(|| format!("Resolved as this window opened: {}.", clauses.join("; ")))
+        .then(|| format!("Resolved when this window opened: {}.", clauses.join("; ")))
 }
 
 /// What the roster has to say out loud, or `None` when it has nothing.
@@ -749,9 +749,40 @@ pub fn roster_alarm(runs: &[Entry]) -> Option<String> {
     }
     let mut said = Vec::new();
 
-    let missing = of_kind(runs, |found| matches!(found, Resolution::Missing));
-    if !missing.is_empty() {
-        said.push(format!("No file to run was found for {}.", listed(missing.into_iter())));
+    // Two sentences for one resolution, because they are two different
+    // lookups and a reader wants to know which failed. A name with no `/` in
+    // it was searched for along the command's `PATH` and is not anywhere on
+    // it; a name with one was never searched for at all, because the shell
+    // does not search for those -- it is a place, and nothing was at it.
+    //
+    // The second is said with *when* in it on purpose. A release script that
+    // builds `target/release/service` and then runs it is the ordinary shape
+    // of a command whose own path is empty while the window is up, and a
+    // sentence that read as an accusation there would be the list crying
+    // wolf on one of the commonest scripts anybody writes. Saying what was
+    // true at a moment leaves the reader to know what happens next, which
+    // they do and hatch does not.
+    let missing = |path: bool| {
+        runs.iter()
+            .filter(|entry| {
+                matches!(entry.found, Resolution::Missing) && entry.name.contains('/') == path
+            })
+            .map(|entry| counted(&entry.name, entry.count))
+            .collect::<Vec<_>>()
+    };
+    let unsearchable = missing(false);
+    if !unsearchable.is_empty() {
+        said.push(format!(
+            "Nothing on the command's PATH answers to {}.",
+            listed(unsearchable.into_iter())
+        ));
+    }
+    let absent = missing(true);
+    if !absent.is_empty() {
+        said.push(format!(
+            "No file to run was at {} when this window was drawn.",
+            listed(absent.into_iter())
+        ));
     }
 
     let unread = of_kind(runs, |found| matches!(found, Resolution::Unread));

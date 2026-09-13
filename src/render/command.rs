@@ -1575,6 +1575,14 @@ const SCRIPT_DEPTH: usize = 4;
 /// under-reports -- a command hatch does not list is a command the reader
 /// still sees in the pane -- and they are the same gaps every other pass in
 /// this module has, for the same reason: one scanner, one model.
+///
+/// Two of them are worth naming because a reader might expect otherwise. A
+/// subshell -- `(cd /tmp && rm x)` -- and a `case` branch both put their
+/// commands behind a parenthesis, which is a metacharacter this pass does not
+/// segment on, so the segment those live in contributes **nothing** rather
+/// than contributing a wrong name. Silence is chosen over a finding there
+/// because the alternative is a warning on two entirely ordinary constructs,
+/// and the parentheses are on screen in the panes either way.
 pub fn invoked(command: &str) -> Invoked {
     let mut out = Invoked::default();
     invoke_into(command, &mut out, 0);
@@ -1616,6 +1624,16 @@ fn walk(command: &str, words: &[Range<usize>], out: &mut Invoked, depth: usize) 
             out.defines.insert(name);
             index += 1;
             continue;
+        }
+        // Shell structure this pass does not model, and deliberately says
+        // nothing about: the `(` of a subshell, the `)` that closes one, the
+        // pattern of a `case` branch. None of them is a name and none of them
+        // is a word hatch failed to read -- reporting `(cd` or `a)` either
+        // way would put a finding on constructs that are perfectly ordinary,
+        // which is the list crying wolf. The segment simply contributes
+        // nothing; see [`invoked`], where the under-report is written down.
+        if text(word).contains(['(', ')']) {
+            return;
         }
         let Some(name) = readable_name(text(word)) else {
             out.runs.push(Invocation::Unread(text(word).to_string()));
@@ -3740,6 +3758,290 @@ mod tests {
         assert_eq!(segments("a\nb"), vec![0..2, 2..3], "a newline ends the word by being space");
         assert_eq!(segments("a"), vec![0..1]);
         assert_eq!(segments(""), vec![0..0]);
+    }
+
+    // ---- what the command will run ---------------------------------------
+
+    /// The names, in source order and with repeats, as [`invoked`] reads
+    /// them. A word hatch declined and a wrapper it could not see past are
+    /// spelled out so a test cannot mistake one for a name.
+    fn runs(command: &str) -> Vec<String> {
+        invoked(command)
+            .runs
+            .into_iter()
+            .map(|found| match found {
+                Invocation::Named(name) => name,
+                Invocation::Unread(word) => format!("<unread {word}>"),
+                Invocation::Behind(name) => format!("<behind {name}>"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_name_of_what_runs_is_the_word_the_pane_underlines() {
+        // The two passes have to agree, because they are two drawings of one
+        // claim: the underline in the annotated pane and the first entry of
+        // the roster above it. They agree by construction -- both ask
+        // `words` -- and this is what holds the construction in place.
+        for command in [
+            "ls -la /etc",
+            "FOO=1 ls",
+            ">out.txt cat f",
+            "cat<f",
+            "a && b || c | d",
+            "cd /tmp; make -j4",
+        ] {
+            let spans = render_command(command);
+            let underlined: Vec<String> =
+                commands(&spans).into_iter().map(str::to_string).collect();
+            assert_eq!(underlined, runs(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeat_is_kept_because_the_count_is_the_point() {
+        // Ten greps in a pipeline is the case the roster was built for, and
+        // this pass is where the ten come from: deduplicating here would
+        // throw away the number before anybody could draw it.
+        assert_eq!(runs("grep a f | grep b | grep c"), vec!["grep", "grep", "grep"]);
+    }
+
+    #[test]
+    fn a_wrapper_is_named_and_so_is_what_it_runs() {
+        // "Ask what does this run of `sudo foo` and hatch answers `sudo`" was
+        // the whole complaint. Both of them run, and both are here.
+        assert_eq!(runs("sudo foo"), vec!["sudo", "foo"]);
+        assert_eq!(runs("sudo -u root -- systemctl restart x"), vec!["sudo", "systemctl"]);
+        assert_eq!(runs("env FOO=1 BAR=2 make"), vec!["env", "make"]);
+        assert_eq!(runs("nice -n 19 ionice -c3 tar cf - ."), vec!["nice", "ionice", "tar"]);
+        assert_eq!(runs("timeout -k 5s 30 curl https://x"), vec!["timeout", "curl"]);
+        assert_eq!(runs("xargs -0 -n 1 rm -f"), vec!["xargs", "rm"]);
+        assert_eq!(runs("nohup setsid --fork my-daemon"), vec!["nohup", "setsid", "my-daemon"]);
+        assert_eq!(runs("stdbuf -oL grep x"), vec!["stdbuf", "grep"]);
+        assert_eq!(runs("command -p ls"), vec!["command", "ls"]);
+        assert_eq!(runs("exec -a login /bin/bash"), vec!["exec", "/bin/bash"]);
+        assert_eq!(runs("doas -u root reboot"), vec!["doas", "reboot"]);
+    }
+
+    #[test]
+    fn a_timeouts_duration_is_not_the_program_it_runs() {
+        // The one wrapper with a positional in front of its command, and the
+        // one whose grammar a wrapper walk with no notion of a positional
+        // gets exactly wrong: it would name `30`.
+        assert_eq!(runs("timeout 30 curl https://x"), vec!["timeout", "curl"]);
+        assert_eq!(runs("timeout --foreground 30 curl https://x"), vec!["timeout", "curl"]);
+    }
+
+    #[test]
+    fn an_option_hatch_has_not_heard_of_stops_the_walk_rather_than_moving_it() {
+        // The failure this is shaped to avoid: an unknown option might take a
+        // value, so skipping one word where two were wanted lands on the
+        // value and reports it as the program. Naming nothing is the safe
+        // direction and the window says which wrapper it is behind.
+        assert_eq!(runs("sudo -X systemctl restart x"), vec!["sudo", "<behind sudo>"]);
+        assert_eq!(runs("nice -5 make"), vec!["nice", "<behind nice>"], "the adjustment as an option");
+        assert_eq!(runs("nohup -q foo"), vec!["nohup", "<behind nohup>"], "nohup has no options");
+        assert_eq!(
+            runs("sudo -i rm -rf /"),
+            vec!["sudo", "<behind sudo>"],
+            "a login shell turns the rest into a command line and not an argv"
+        );
+        assert_eq!(runs("command -v ls"), vec!["command", "<behind command>"], "which runs nothing");
+    }
+
+    #[test]
+    fn a_wrapper_with_nothing_after_it_hides_nothing() {
+        // Running out of words is not a failure to read them. `env` on its
+        // own prints the environment, and a window that said hatch could not
+        // see past it would be warning about a command with nothing behind
+        // it.
+        assert_eq!(runs("env"), vec!["env"]);
+        assert_eq!(runs("env -i"), vec!["env"]);
+        assert_eq!(runs("xargs -0"), vec!["xargs"]);
+    }
+
+    #[test]
+    fn a_shells_script_argument_is_read_as_the_command_it_is() {
+        // The line `Daemon::prepare_run` draws for a `root: true` request.
+        // Without this the roster for every root command would be `run0` and
+        // `bash`, which is hatch's own wrapper reported back as news.
+        assert_eq!(
+            runs("run0 --pipe --setenv=PAGER=cat -- bash -c 'systemctl restart x | tee log'"),
+            vec!["run0", "bash", "systemctl", "tee"]
+        );
+        assert_eq!(runs("sh -c 'rm -rf /tmp/x'"), vec!["sh", "rm"]);
+        assert_eq!(
+            runs(r"bash -c 'echo '\''a b'\'' | wc'"),
+            vec!["bash", "echo", "wc"],
+            "the escaping `shell_quote` produces unquotes back to what it quoted"
+        );
+    }
+
+    #[test]
+    fn a_script_hatch_cannot_read_is_a_wrapper_it_cannot_see_past() {
+        // `"$SCRIPT"` expands to something that is not on screen, so there is
+        // nothing here to read as a command. Reporting an empty script would
+        // say the shell runs nothing, which is the opposite of true.
+        assert_eq!(runs("bash -c \"$SCRIPT\""), vec!["bash", "<behind bash>"]);
+        assert_eq!(runs("bash -c"), vec!["bash"], "and no script at all runs nothing");
+    }
+
+    #[test]
+    fn a_shell_given_a_file_names_the_shell_and_stops() {
+        // What is in `deploy.sh` is not on screen, so the only honest answer
+        // is `bash`. Naming the script file as though it were a program would
+        // put a path in the list that nothing execs.
+        assert_eq!(runs("bash deploy.sh --now"), vec!["bash"]);
+    }
+
+    #[test]
+    fn a_reserved_word_is_not_a_program_and_is_not_listed() {
+        // The other half of the crying-wolf problem. `if` is on no PATH
+        // anywhere, and a list that reported it as unresolvable would put a
+        // warning on every conditional anybody writes.
+        assert_eq!(runs("if grep -q x f; then rm y; else touch y; fi"), vec!["grep", "rm", "touch"]);
+        assert_eq!(runs("while read line; do echo $line; done"), vec!["read", "echo"]);
+        assert_eq!(runs("! grep -q x f"), vec!["grep"], "negation is a reserved word too");
+        assert_eq!(runs("time make -j4"), vec!["make"], "and so is a bare `time`");
+        assert_eq!(runs("{ ls; cat f; }"), vec!["ls", "cat"]);
+    }
+
+    #[test]
+    fn a_reserved_word_that_is_not_followed_by_a_command_stops_the_walk() {
+        // `for x in *.txt` is a name and a word list, not a command, so
+        // reading past `for` would name `x`. The body is a segment of its own
+        // and is found there.
+        assert_eq!(runs("for f in *.txt; do cat $f; done"), vec!["cat"]);
+        assert_eq!(
+            runs("case $x in a) ls ;; esac"),
+            Vec::<String>::new(),
+            "and a `case` branch is a parenthesis this pass says nothing about"
+        );
+    }
+
+    #[test]
+    fn a_function_the_command_defines_is_bound_and_not_run() {
+        // Three spellings of the same thing, and in all three the body's own
+        // commands are what run. The name is recorded so that calling it
+        // later resolves to the command itself rather than to nothing.
+        let bound = invoked("deploy() { rsync -a . host:/srv; }; deploy");
+        assert_eq!(
+            bound.runs,
+            vec![
+                Invocation::Named("rsync".to_string()),
+                Invocation::Named("deploy".to_string())
+            ]
+        );
+        assert!(bound.defines.contains("deploy"));
+        assert!(invoked("deploy () { ls; }").defines.contains("deploy"), "with a space");
+        assert!(invoked("deploy(){ ls; }").defines.contains("deploy"), "and with none");
+    }
+
+    #[test]
+    fn a_name_is_read_through_its_quoting_and_not_through_its_expansions() {
+        // `'ls' -l` really does run `ls`, so declining it would be
+        // under-reporting for a reason the reader cannot see. `$TOOL` is the
+        // other way round: what it stands for is not on screen and hatch
+        // expands nothing.
+        assert_eq!(runs("'ls' -l"), vec!["ls"]);
+        assert_eq!(runs(r"\ls -l"), vec!["ls"]);
+        assert_eq!(runs("'/usr/bin/grep' x"), vec!["/usr/bin/grep"]);
+        assert_eq!(runs("$TOOL --version"), vec!["<unread $TOOL>"]);
+        assert_eq!(runs("\"$TOOL\" --version"), vec!["<unread \"$TOOL\">"]);
+        assert_eq!(runs("*.sh"), vec!["<unread *.sh>"], "a glob names whatever it matches");
+        assert_eq!(runs("~/bin/tool"), vec!["<unread ~/bin/tool>"], "and a tilde expands");
+        assert_eq!(runs("'unterminated"), vec!["<unread 'unterminated>"]);
+    }
+
+    #[test]
+    fn the_shells_punctuation_is_read_whole_and_not_as_a_pattern() {
+        // `[` is the test builtin and is made entirely of characters that are
+        // pattern syntax anywhere else. Declining it would put `[ -f x ]` --
+        // one of the commonest lines in any script -- in the list as a word
+        // hatch could not read.
+        assert_eq!(runs("[ -f x ] && echo yes"), vec!["[", "echo"]);
+        assert_eq!(runs("[[ -n $x ]] && echo yes"), vec!["echo"], "the keyword is not listed");
+        assert_eq!(runs(": ; ls"), vec![":", "ls"]);
+        assert_eq!(runs("[abc]ls"), vec!["<unread [abc]ls>"], "and a real glob still is one");
+    }
+
+    #[test]
+    fn nothing_in_a_comment_runs() {
+        // The comment pass already decided this for segmentation and for
+        // `$NAME`; asking it again here is what keeps the three from
+        // disagreeing about the same bytes.
+        assert_eq!(runs("echo hi   # then && rm -rf /tmp"), vec!["echo"]);
+        assert!(runs("# rm -rf /").is_empty());
+    }
+
+    #[test]
+    fn a_redirection_is_never_the_thing_that_runs() {
+        // Both corrections the redirection work made, asked of this pass:
+        // `>out.txt cat` runs `cat`, and `cat<f` runs `cat`.
+        assert_eq!(runs(">out.txt cat f"), vec!["cat"]);
+        assert_eq!(runs("cat<f"), vec!["cat"]);
+        assert!(runs("> out.txt").is_empty(), "a redirection alone runs nothing");
+    }
+
+    #[test]
+    fn a_script_inside_a_script_stops_at_a_depth_rather_than_at_a_stack() {
+        // The input is agent-controlled, so the one thing that must not
+        // happen is an unbounded recursion in a pass that runs before a human
+        // is asked anything.
+        let mut command = "ls".to_string();
+        for _ in 0..12 {
+            command = format!("bash -c '{}'", command.replace('\'', r"'\''"));
+        }
+        let found = runs(&command);
+        assert!(found.len() <= SCRIPT_DEPTH + 1, "{found:?}");
+        assert!(found.iter().all(|name| name == "bash"), "and it stopped before the innermost");
+    }
+
+    #[test]
+    fn the_builtin_and_keyword_tables_hold_the_names_the_window_leans_on() {
+        // Named individually because each of them is a way for the list to
+        // cry wolf: `cd` on every second command, `echo` on every first, `:`
+        // in every loop.
+        for name in [":", ".", "cd", "echo", "export", "read", "set", "test", "["] {
+            assert!(is_builtin(name), "{name} is a builtin and would be reported as missing");
+        }
+        for name in ["if", "then", "else", "fi", "for", "do", "done", "while", "[[", "time"] {
+            assert!(is_keyword(name), "{name} is a reserved word");
+        }
+        assert!(!is_builtin("grep"), "and an ordinary program is neither");
+        assert!(!is_keyword("grep"));
+    }
+
+    #[test]
+    fn a_name_that_is_both_a_builtin_and_a_binary_is_read_as_the_builtin() {
+        // bash looks for a builtin before it looks at PATH, and commands
+        // reach it as `bash -c`. The six that are both are listed here so
+        // that a later edit to `BUILTINS` cannot quietly drop one.
+        for name in ["echo", "test", "[", "kill", "printf", "pwd"] {
+            assert!(is_builtin(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_wrapper_in_the_table_is_reachable_by_its_own_name() {
+        // A table entry whose name never appears in command position is an
+        // entry nothing can use. This is cheap and catches a typo in a name,
+        // which would otherwise show up only as a wrapper that silently
+        // stopped being unwrapped.
+        for wrapper in WRAPPERS {
+            // Its positionals filled in, because `timeout`'s duration comes
+            // before its command and a wrapper handed one word would name
+            // that word.
+            let filler = "1 ".repeat(wrapper.positionals);
+            let command = format!("{} {filler}whatever-runs", wrapper.name);
+            let found = runs(&command);
+            assert!(
+                found.contains(&"whatever-runs".to_string())
+                    || matches!(wrapper.after, After::Nothing),
+                "{found:?} did not reach past {}",
+                wrapper.name
+            );
+        }
     }
 
     #[test]
