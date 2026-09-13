@@ -86,6 +86,7 @@ use crate::prompt_ui::{Incoming, Phase, PromptApp};
 use crate::protocol::{DaemonMsg, Payload, Request};
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_breaking_at;
+use crate::render::roster::roster;
 use crate::swap;
 
 /// How many frames are drawn after the request lands before the viewport is
@@ -303,12 +304,19 @@ fn command_payload(
         false => (command.clone(), None, env.clone(), None),
     };
     let spans = render_command_breaking_at(&line, &render_env, break_at);
+    // The roster, off the same line and the same environment the daemon uses
+    // -- which means a preview of a sample resolves the sample's own names
+    // against this machine, exactly as a real request would. A sample that
+    // named something this machine does not have draws the window that says
+    // so, which is the honest picture of what hatch would have shown.
+    let runs = roster(&line, &render_env, cwd);
     // Danger markers are display-only and land with the marker heuristics; an
     // empty list has never been a claim that a command is safe. The daemon
     // passes an empty one too, and a sample that invented markers would be
     // showing a header the daemon cannot currently produce.
     Ok(Payload::command(&spans, Vec::new(), cwd.clone(), *root, *interactive)
-        .with_caveat(caveat))
+        .with_caveat(caveat)
+        .with_runs(runs))
 }
 
 /// The payload for a `swap_file` sample.

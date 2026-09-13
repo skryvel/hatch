@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 pub mod command;
 pub mod danger;
 pub mod diff;
+pub mod roster;
 mod span;
 pub mod unicode;
 

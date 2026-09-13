@@ -49,6 +49,7 @@
 pub mod elevate;
 pub mod env;
 pub mod interactive;
+pub mod lookup;
 
 use std::collections::BTreeMap;
 use std::fmt;

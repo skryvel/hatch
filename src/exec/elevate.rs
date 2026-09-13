@@ -88,9 +88,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
 
+use super::lookup::lookup;
 use super::{Env, shell_argv, shell_line};
 
 // ---- what every platform must answer ---------------------------------------
@@ -774,27 +773,6 @@ fn locale_is_forced(env: &Env) -> bool {
     FORCED_LOCALE.iter().all(|(key, value)| env.get(*key).map(String::as_str) == Some(*value))
 }
 
-/// Find `program` on the `PATH` the child will be given.
-///
-/// Empty entries are skipped rather than read as `.`, which is what a shell
-/// would do with them: resolving an elevation program out of whatever
-/// directory a request happens to name is the one lookup nobody wants
-/// relative.
-fn lookup(program: &str, env: &Env) -> Option<PathBuf> {
-    env.get("PATH")?
-        .split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(program))
-        .find(|candidate| is_executable(candidate))
-}
-
-/// A file that could be executed: a regular file with an execute bit set.
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 // ---- everywhere else: refuse, and say what is missing ----------------------
 
 /// The implementation for a platform hatch has no elevation mechanism for.
@@ -1022,6 +1000,8 @@ impl Elevation for Rehearsed {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     /// A `PATH` with a real executable `run0` on it, so [`Run0::available`]

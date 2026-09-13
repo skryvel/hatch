@@ -150,6 +150,7 @@ use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
 use crate::protocol::{Payload, Request as PromptRequest, ReviseKind, Verdict};
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_breaking_at;
+use crate::render::roster::roster;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
 use crate::swap::{ApplyError, PlanKind, RootWrite, SwapPlan};
@@ -1569,11 +1570,19 @@ impl Daemon {
         };
 
         let spans = render_command_breaking_at(&line, &render_env, break_at);
+        // The roster is built from the same line the spans tile, so the list
+        // above the panes and the text in them cannot come to describe two
+        // different requests -- and against the same `render_env`, because the
+        // whole claim it makes is about the environment the command receives.
+        // It touches the filesystem, which is why it is here and not in the
+        // window: the child `PATH` is this process's config.
+        let runs = roster(&line, &render_env, &cwd);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
         let payload =
             Payload::command(&spans, Vec::new(), cwd.clone(), params.root, params.interactive)
-                .with_caveat(caveat);
+                .with_caveat(caveat)
+                .with_runs(runs);
         Prepared::Ready(Job {
             detail: detail(&cwd),
             payload,

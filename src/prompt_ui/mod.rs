@@ -4961,7 +4961,7 @@ mod tests {
     fn a_request_this_window_cannot_draw_closes_it_rather_than_being_guessed_at() {
         let mut state = PromptState::new();
         let mut request = a_request(90);
-        let Payload::Command { spans, raw, danger, cwd, root, interactive, .. } = request.payload
+        let Payload::Command { spans, raw, danger, runs, cwd, root, interactive, .. } = request.payload
         else {
             panic!("not a command")
         };
@@ -4973,6 +4973,7 @@ mod tests {
             spans,
             raw,
             danger,
+            runs,
             cwd,
             root,
             interactive,

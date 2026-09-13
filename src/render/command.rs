@@ -286,7 +286,7 @@
 //! scanner is wrong about a quote, the highlight is wrong in the same
 //! direction, and `highlighting_where_the_model_stops` pins those cases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use super::{SpanBuilder, SpanKind, Spans, unicode, variable_name};
@@ -1243,6 +1243,28 @@ fn command_word(
     at: &mut usize,
     segment: &Range<usize>,
 ) -> Option<Range<usize>> {
+    // The first word that is not an assignment: `FOO=1 ls` runs `ls`. What
+    // counts as a word, and which characters do not begin one, is
+    // [`words`]'s -- and it is the same answer [`command_positions`] works
+    // from, so the underline in the pane and the roster above it cannot come
+    // to disagree about which word names what runs.
+    let words = words(scanned, at, segment);
+    let first = words.into_iter().find(|word| !is_assignment(&command[word.clone()]))?;
+    claimable(command, first)
+}
+
+/// Every word of `segment`, in source order.
+///
+/// A word ends where [`is_word_break`] says it does, so a quoted space is
+/// inside one, a redirection is outside every one, and a comment contains
+/// none. Empty runs are not words: `a;;b` has a segment with nothing in it
+/// and that segment yields nothing rather than one word of no characters.
+///
+/// `at` is a cursor into `scanned` that this advances past `segment`, so a
+/// command of ten thousand segments costs one walk of the command rather than
+/// one walk per segment. The input is agent-controlled, so that is the
+/// difference between linear and quadratic in something the agent chooses.
+fn words(scanned: &[Scanned], at: &mut usize, segment: &Range<usize>) -> Vec<Range<usize>> {
     // Two binary searches rather than two hand-rolled cursor loops. The
     // offsets ascend, so the run belonging to this segment is a slice, and
     // taking it as one is what makes `at` impossible to fail to advance --
@@ -1253,22 +1275,24 @@ fn command_word(
     let run = &run[..run.partition_point(|c| c.offset < segment.end)];
     *at += run.len();
 
+    let mut out = Vec::new();
     let mut word: Option<usize> = None;
     for c in run {
         match (is_word_break(c), word) {
-            // A word closed by whitespace. An assignment is not the command,
-            // so it falls through to the arm below and the next word is
-            // tried; anything else is the answer.
-            (true, Some(start)) if !is_assignment(&command[start..c.offset]) => {
-                return claimable(command, start..c.offset);
+            (true, Some(start)) => {
+                out.push(start..c.offset);
+                word = None;
             }
-            (true, _) => word = None,
+            (true, None) => {}
             (false, None) => word = Some(c.offset),
             (false, Some(_)) => {}
         }
     }
     // A word that runs to the end of the segment is never closed by a break.
-    claimable(command, word?..segment.end)
+    if let Some(start) = word {
+        out.push(start..segment.end);
+    }
+    out
 }
 
 /// `word`, unless this pass declines to call it the command: an assignment,
@@ -1463,6 +1487,774 @@ pub fn highlight(spans: Spans) -> Spans {
     }
 
     builder.finish()
+}
+
+// ---- what the command will actually run ------------------------------------
+
+/// One word in command position, as the text says it.
+///
+/// Deliberately three answers and not two. A pass that could only say *this
+/// name* would have to invent one for `sudo -X ls`, where the argument
+/// grammar ran out before the command did, and inventing one there means
+/// naming the wrong executable -- which is worse than naming none, because
+/// the whole value of the list is that a reader can stop scanning the command
+/// once they have read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invocation {
+    /// A word hatch reads as the name of what runs.
+    Named(String),
+    /// A command word hatch will not read a name out of, kept as the text it
+    /// is: `$TOOL`, `"$@"`, `*.sh`. The shell expands or matches it and hatch
+    /// expands and matches nothing, so the name is not knowable from the text
+    /// the reader is being shown.
+    Unread(String),
+    /// A wrapper hatch could not see past, named by the wrapper. Its own
+    /// argument grammar ran out before its command did, so what it runs is
+    /// not in the list and the list says so.
+    Behind(String),
+}
+
+/// What one command puts in command position, and what it defines for itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Invoked {
+    /// Everything in command position, in source order and with repeats. The
+    /// repeats are the point: `grep ... | grep ... | grep ...` is three
+    /// entries here and one line with a count on it by the time a reader sees
+    /// it.
+    pub runs: Vec<Invocation>,
+    /// The names of shell functions this very command defines.
+    ///
+    /// Carried because a function is the one name that resolves to nothing on
+    /// disk and is not missing. `deploy() { rm -rf build; }; deploy` would
+    /// otherwise put `deploy` on screen as a name that does not resolve,
+    /// which is a warning about the most ordinary thing a script does.
+    pub defines: BTreeSet<String>,
+}
+
+/// How deep a `-c` script is followed.
+///
+/// `bash -c '…'` inside `bash -c '…'` is a real thing an agent can write and
+/// a real thing hatch itself produces one level of, and each level is a fresh
+/// scan of a string the level above it holds. Four is far past anything
+/// legible and is a number rather than a stack.
+const SCRIPT_DEPTH: usize = 4;
+
+/// Everything `command` puts in command position, wrappers unwrapped.
+///
+/// # Which word is the command
+///
+/// The first word of a segment that is neither a variable assignment nor a
+/// redirection. Both halves of that are somebody else's answer already:
+/// [`is_word_break`] excludes a redirection from every word, which is what
+/// makes `>out.txt cat` name `cat`, and [`is_assignment`] is the rule that
+/// makes `FOO=1 ls` name `ls`. This pass adds no third notion of where a
+/// command begins -- it asks [`words`], which is what [`command_word`] asks,
+/// so the word underlined in the pane is the word this list is built from.
+///
+/// # Wrappers
+///
+/// A wrapper is a program whose own arguments end with another program's
+/// name, and the answer to *what does this run* is both of them. See
+/// [`WRAPPERS`] for the set and for each one's grammar, and [`past`] for what
+/// happens when the grammar runs out: nothing is guessed, the wrapper is
+/// named, and the reader is told that what is behind it was not read.
+///
+/// # The shell's own vocabulary
+///
+/// A reserved word is structure rather than a program, so `if`, `then` and
+/// `{` are recognised and are **not** listed -- see [`is_keyword`]. What they
+/// do contribute is a place to keep looking: the word after `if` is a command
+/// and would otherwise be missed. A builtin *is* listed, because `cd` and
+/// `echo` really are things the command runs; what they are not is things
+/// that resolve to a file, which is [`super::roster`]'s distinction to draw.
+///
+/// # Where it stops
+///
+/// Inside `$(…)`, inside a here-document body, and inside any of the
+/// constructs the module docs list as outside [`Scan`]'s model. Those are
+/// under-reports -- a command hatch does not list is a command the reader
+/// still sees in the pane -- and they are the same gaps every other pass in
+/// this module has, for the same reason: one scanner, one model.
+pub fn invoked(command: &str) -> Invoked {
+    let mut out = Invoked::default();
+    invoke_into(command, &mut out, 0);
+    out
+}
+
+/// [`invoked`], accumulating into `out`, `depth` scripts deep.
+fn invoke_into(command: &str, out: &mut Invoked, depth: usize) {
+    if depth >= SCRIPT_DEPTH {
+        return;
+    }
+    let scanned: Vec<Scanned> = scan(command).collect();
+    let mut at = 0;
+    for segment in segments(command) {
+        let words = words(&scanned, &mut at, &segment);
+        walk(command, &words, out, depth);
+    }
+}
+
+/// Follow one segment from its command word through however many wrappers it
+/// names, adding what it finds to `out`.
+///
+/// The index only ever moves forward -- every arm either returns or lands on
+/// a word strictly further along -- so a wrapper that names itself
+/// (`sudo sudo sudo ls`) walks to the end of the words and stops there rather
+/// than needing a depth count of its own.
+fn walk(command: &str, words: &[Range<usize>], out: &mut Invoked, depth: usize) {
+    let text = |word: &Range<usize>| &command[word.clone()];
+    // `FOO=1 BAR=2 ls` runs `ls`, and every wrapper that takes assignments
+    // takes them in the same place, so this is the same skip [`past`] makes.
+    let mut index = words.iter().position(|word| !is_assignment(text(word))).unwrap_or(words.len());
+
+    loop {
+        let Some(word) = words.get(index) else { return };
+        // A definition is not a run. `deploy() { … }` puts `deploy` in
+        // command position and does not execute it, and the `{` after it
+        // carries on into the body, so the body's own commands are found.
+        if let Some(name) = defined_here(text(word), words.get(index + 1).map(text)) {
+            out.defines.insert(name);
+            index += 1;
+            continue;
+        }
+        let Some(name) = readable_name(text(word)) else {
+            out.runs.push(Invocation::Unread(text(word).to_string()));
+            return;
+        };
+        // A reserved word is syntax, not a program: see [`invoked`]. It is
+        // still looked up below, because half of them are the reason there is
+        // another command word further along the segment.
+        if !is_keyword(&name) {
+            out.runs.push(Invocation::Named(name.clone()));
+        }
+        let Some(wrapper) = WRAPPERS.iter().find(|w| w.name == name) else { return };
+        let rest: Vec<&str> = words[index + 1..].iter().map(text).collect();
+        match past(wrapper, &rest) {
+            Step::Command(ahead) => index += 1 + ahead,
+            Step::Script(ahead) => {
+                // The one place this pass reads text that is not laid out in
+                // front of the reader as a command: the argument to `-c` is
+                // one word on screen, and what is in it is a command line.
+                // Only a word whose characters stand for themselves is
+                // followed -- see [`literal_word`] -- so `bash -c "$SCRIPT"`
+                // is reported as a wrapper hatch could not see past rather
+                // than as a script with nothing in it.
+                match literal_word(rest[ahead]) {
+                    Some(script) => invoke_into(&script, out, depth + 1),
+                    None => out.runs.push(Invocation::Behind(name)),
+                }
+                return;
+            }
+            Step::Nothing => return,
+            Step::Lost => {
+                out.runs.push(Invocation::Behind(name));
+                return;
+            }
+        }
+    }
+}
+
+/// The name of the function a word in command position defines, if it defines
+/// one.
+///
+/// `deploy() {`, `deploy () {` and `deploy()` are the three spellings that
+/// reach here as one word or two, and all three mean the same thing: the name
+/// is being bound, not run. `next` is the word after it, because the space in
+/// `deploy ()` puts the parentheses in a word of their own.
+///
+/// The `function` keyword's spelling — `function deploy { … }` — is
+/// deliberately not recognised, and costs an entry in [`Invoked::defines`]
+/// rather than a wrong one: `function` is a reserved word, so it is not
+/// listed, and the walk stops there rather than reading `deploy` as something
+/// that runs.
+fn defined_here(word: &str, next: Option<&str>) -> Option<String> {
+    let name = match word.find("()") {
+        Some(at) => &word[..at],
+        None if next.is_some_and(|next| next.starts_with('(')) => word,
+        None => return None,
+    };
+    (!name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(is_name_char))
+    .then(|| name.to_string())
+}
+
+/// The name a word stands for, or `None` when it stands for something else.
+///
+/// Quoting is removed, because `'ls' -l` runs `ls` and a list that said
+/// otherwise would be under-reporting for a reason the reader cannot see.
+/// That is a different answer from [`claimable`]'s, which declines a quoted
+/// word — and the difference is deliberate. `claimable` is choosing a *byte
+/// range to colour*, and a range that included the quotes would be a
+/// `Command` region lying on top of a `Quoted` one; this is choosing a
+/// *name*, has no range and no colour, and nothing to overlap.
+///
+/// What is still declined is a word that stands for something the shell works
+/// out and hatch does not: a parameter (`$TOOL`), a substitution, a glob
+/// (`*.sh`), a brace expansion and a `~` at the front. Each of those names a
+/// program hatch would have to expand, match or run something to learn, and
+/// the direction this module is wrong in is the direction that names nothing.
+///
+/// The shell's own punctuation is the exception, and it has to be: `[` is a
+/// builtin and `[[`, `{` and `}` are reserved words, and every one of them is
+/// made of characters that are pattern syntax anywhere else. They are matched
+/// whole, so `[abc]ls` is still a glob and still declined.
+fn readable_name(word: &str) -> Option<String> {
+    let text = literal_word(word)?;
+    if text.is_empty() {
+        return None;
+    }
+    if PUNCTUATION.contains(&text.as_str()) {
+        return Some(text);
+    }
+    match text.starts_with('~') || text.contains(['*', '?', '[', ']', '{', '}']) {
+        true => None,
+        false => Some(text),
+    }
+}
+
+/// The words of the shell's vocabulary that are made of punctuation, so that
+/// [`readable_name`] does not read them as patterns.
+const PUNCTUATION: &[&str] = &["[", "[[", "{", "}", ":", "!", ".", "]]"];
+
+/// What a word means once quoting and escaping are removed, or `None` when
+/// hatch cannot say.
+///
+/// The shell's rules for the three constructs it models, and a refusal for
+/// everything else. `'…'` holds its contents exactly, a backslash outside
+/// quotes makes the next character itself, and any other character is itself.
+/// A `"`, a `$` or a backtick returns `None`: what is inside a double-quoted
+/// string can still expand, and a word that expands is a word whose value is
+/// not on screen.
+///
+/// This is an *unquoting*, which is the one thing the rendering passes in this
+/// module are forbidden to do — every one of them is additive, and none of
+/// them may remove a character to make room for anything. The rule is not
+/// broken here because nothing this produces is drawn in place of the
+/// command: the panes still draw every byte as itself, and what comes out of
+/// this is a name for a list beside them. The list says where a name resolves;
+/// the command says what the characters are.
+fn literal_word(word: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    out.push(c);
+                }
+                // An unterminated string is a command bash refuses to run at
+                // all, so there is no name in it to find.
+                if !closed {
+                    return None;
+                }
+            }
+            // The next character, whatever it is. A trailing backslash has no
+            // next character and is the same refusal.
+            '\\' => out.push(chars.next()?),
+            '"' | '$' | '`' => return None,
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+// ---- wrappers --------------------------------------------------------------
+
+/// One program whose own arguments end in another program's name.
+///
+/// Every field exists because getting it wrong names the **wrong**
+/// executable, which is the one failure this list must not have: a reader who
+/// has been told a command runs `ls` stops looking for what it really runs.
+/// So each wrapper carries its own option grammar rather than sharing a
+/// guess, and [`past`] refuses anything the grammar does not cover.
+struct Wrapper {
+    /// The word in command position.
+    name: &'static str,
+    /// Options that take no value.
+    solo: &'static [&'static str],
+    /// Options whose value is the next word, or is glued on after an `=` or
+    /// straight onto a short option (`-n5`).
+    valued: &'static [&'static str],
+    /// Whether `NAME=value` words before the command belong to its grammar.
+    /// `env FOO=1 ls` and `sudo FOO=1 ls` both run `ls`.
+    assignments: bool,
+    /// Words that are neither options nor the command, before the command.
+    /// One, for `timeout`'s duration; none for everything else.
+    positionals: usize,
+    /// Whether `--` ends its options.
+    dashdash: bool,
+    /// The option whose value is a script rather than a program name.
+    script: Option<&'static str>,
+    /// What the first word that is not an option is.
+    after: After,
+}
+
+/// What the first non-option word of a wrapper's arguments turns out to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum After {
+    /// The command it runs: `sudo ls`, `env ls`, `nice ls`.
+    Command,
+    /// Not a command at all. `bash script.sh` runs a *file*, and what is in
+    /// the file is not on screen — so the walk stops and says nothing rather
+    /// than naming the script as though it were a program.
+    Nothing,
+}
+
+/// The wrappers, and the reserved words that behave like them.
+///
+/// Two kinds in one table because the walk asks them one question: *is there
+/// another command word further along this segment, and where?* `sudo` and
+/// `if` answer it the same way and differ only in what is drawn, which is
+/// [`is_keyword`]'s business rather than this table's.
+///
+/// # What is missing from each grammar, and why that is safe
+///
+/// Every option list here is a **whitelist**, and [`past`] gives up on
+/// anything not in it. That is the whole safety argument: an option hatch has
+/// not heard of might take a value, and skipping one word where two were
+/// wanted lands on an argument and calls it a program. So the lists are short
+/// on purpose and the cases they do not cover come out as
+/// [`Invocation::Behind`], which says *hatch did not read this* in the window
+/// rather than saying something false.
+///
+/// Three deliberate omissions are worth naming, because each looks like an
+/// oversight:
+///
+/// * `sudo -i`, `sudo -s` and `doas -s` start a **shell**, and the words
+///   after them are a command line for that shell rather than an argv. They
+///   are left out, so they are read as an option hatch does not know and the
+///   wrapper is reported as unread.
+/// * `env -S 'cmd arg'` splits its own string into an argv. Same shape, same
+///   answer.
+/// * `command -v` and `command -V` do not run their argument at all, they
+///   print where it is. Listing what they name would be reporting a program
+///   as running when nothing runs, so they are left out too.
+///
+/// `nice -5` — the adjustment written as the option — is the other one. There
+/// is no way to tell it from an option this table has not heard of, so it is
+/// read as one.
+const WRAPPERS: &[Wrapper] = &[
+    Wrapper {
+        name: "sudo",
+        solo: &[
+            "-A", "--askpass", "-b", "--background", "-E", "--preserve-env", "-H", "--set-home",
+            "-k", "--reset-timestamp", "-n", "--non-interactive", "-P", "--preserve-groups",
+            "-S", "--stdin",
+        ],
+        valued: &[
+            "-C", "--close-from", "-D", "--chdir", "-g", "--group", "-h", "--host", "-p",
+            "--prompt", "-R", "--chroot", "-T", "--command-timeout", "-u", "--user",
+        ],
+        assignments: true,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "doas",
+        solo: &["-n", "-L"],
+        valued: &["-a", "-C", "-u"],
+        assignments: false,
+        positionals: 0,
+        dashdash: false,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "run0",
+        solo: &[
+            "--pipe", "--pty", "-P", "--no-ask-password", "--quiet", "-q", "--no-pager",
+        ],
+        valued: &[
+            "-u", "--user", "-g", "--group", "-M", "--machine", "-E", "--setenv", "-p",
+            "--property", "-D", "--chdir", "--nice", "--background", "--unit", "--slice",
+            "--description",
+        ],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "env",
+        solo: &["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"],
+        valued: &["-u", "--unset", "-C", "--chdir"],
+        assignments: true,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "nice",
+        solo: &[],
+        valued: &["-n", "--adjustment"],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "ionice",
+        solo: &["-t", "--ignore"],
+        valued: &["-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u",
+                  "--uid"],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "nohup",
+        solo: &[],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "setsid",
+        solo: &["-c", "--ctty", "-f", "--fork", "-w", "--wait"],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "stdbuf",
+        solo: &[],
+        valued: &["-i", "--input", "-o", "--output", "-e", "--error"],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        // The duration is the positional, and it is the whole reason this
+        // field exists: `timeout 5 ls` runs `ls`, and a wrapper walk with no
+        // notion of a positional would name `5`.
+        name: "timeout",
+        solo: &["--preserve-status", "--foreground", "-v", "--verbose"],
+        valued: &["-s", "--signal", "-k", "--kill-after"],
+        assignments: false,
+        positionals: 1,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "xargs",
+        solo: &[
+            "-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-p",
+            "--interactive", "--process-slot-var",
+        ],
+        valued: &[
+            "-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "-i",
+            "--replace", "-L", "-l", "--max-lines", "-n", "--max-args", "-P", "--max-procs",
+            "-s", "--max-chars",
+        ],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        // The reserved word, which is what a bare `time` is in command
+        // position. `/usr/bin/time` is a different program with a different
+        // grammar and is named by its path, so it is not this entry.
+        name: "time",
+        solo: &["-p"],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: false,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "command",
+        solo: &["-p"],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        name: "exec",
+        // `-c` here is "with an empty environment" and is not a script flag,
+        // which is why the script option is a field per wrapper and not a
+        // constant.
+        solo: &["-c", "-l"],
+        valued: &["-a"],
+        assignments: false,
+        positionals: 0,
+        dashdash: true,
+        script: None,
+        after: After::Command,
+    },
+    Wrapper {
+        // The one wrapper whose command is a *string* rather than an argv,
+        // and the one hatch itself writes: a `root: true` request is drawn as
+        // `run0 … -- bash -c '<the approved command>'`, so without this entry
+        // the list for every root request would be `run0` and `bash` and
+        // nothing about the command the reader came to read.
+        name: "bash",
+        solo: &[
+            "-l", "--login", "-i", "-e", "-u", "-x", "-v", "-n", "-p", "-r", "--norc",
+            "--noprofile", "--posix",
+        ],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: false,
+        script: Some("-c"),
+        after: After::Nothing,
+    },
+    Wrapper {
+        name: "sh",
+        solo: &["-l", "-i", "-e", "-u", "-x", "-v", "-n", "-p"],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: false,
+        script: Some("-c"),
+        after: After::Nothing,
+    },
+    // The reserved words that put a command after themselves. They have no
+    // options and nothing to skip; what they contribute is that the walk
+    // keeps going, so `if grep -q x f; then rm y; fi` lists `grep` and `rm`
+    // rather than nothing at all.
+    keyword("if"),
+    keyword("then"),
+    keyword("elif"),
+    keyword("else"),
+    keyword("while"),
+    keyword("until"),
+    keyword("do"),
+    keyword("{"),
+    keyword("!"),
+    keyword("coproc"),
+];
+
+/// A reserved word that is followed by a command and nothing else.
+const fn keyword(name: &'static str) -> Wrapper {
+    Wrapper {
+        name,
+        solo: &[],
+        valued: &[],
+        assignments: false,
+        positionals: 0,
+        dashdash: false,
+        script: None,
+        after: After::Command,
+    }
+}
+
+/// Where a wrapper's own command is, relative to the first of its arguments.
+enum Step {
+    /// The word this far along names the program the wrapper runs.
+    Command(usize),
+    /// The word this far along is a script to be read as a command line of
+    /// its own.
+    Script(usize),
+    /// The wrapper runs nothing further that is on screen: it ran out of
+    /// words (`env -i` alone), or what follows is a file rather than a
+    /// program (`bash script.sh`).
+    Nothing,
+    /// hatch could not read the arguments, so it does not know where the
+    /// command is and will not guess. See [`WRAPPERS`].
+    Lost,
+}
+
+/// Walk a wrapper's arguments to whatever it runs.
+///
+/// `words` is everything after the wrapper's own name. Options first, then a
+/// wrapper's positionals, then the command — which is the shape every entry
+/// in [`WRAPPERS`] has, because a program whose arguments do not have that
+/// shape is one this table has no way to describe and so does not contain.
+///
+/// The walk gives up rather than skipping an option it does not recognise,
+/// and that is the whole point of it. An unknown option might take a value:
+/// skipping one word where two were wanted lands on that value and reports it
+/// as the program, and a reader told a command runs `5` has been told
+/// something false in a window whose only job is to be believed.
+fn past(wrapper: &Wrapper, words: &[&str]) -> Step {
+    let mut index = 0;
+    let mut positionals = wrapper.positionals;
+    let mut options = true;
+
+    while let Some(word) = words.get(index) {
+        if options {
+            if wrapper.dashdash && *word == "--" {
+                options = false;
+                index += 1;
+                continue;
+            }
+            if wrapper.script == Some(*word) {
+                // The word after it, if there is one. `bash -c` with nothing
+                // after it is a shell that runs nothing.
+                return match index + 1 < words.len() {
+                    true => Step::Script(index + 1),
+                    false => Step::Nothing,
+                };
+            }
+            if let Some(step) = option(wrapper, word) {
+                match step {
+                    Skip::One => index += 1,
+                    Skip::Two => index += 2,
+                    Skip::Unknown => return Step::Lost,
+                }
+                continue;
+            }
+            if wrapper.assignments && is_assignment(word) {
+                index += 1;
+                continue;
+            }
+            // Not an option and not an assignment, so the options are over
+            // whether or not a `--` said so.
+            options = false;
+        }
+        if positionals > 0 {
+            positionals -= 1;
+            index += 1;
+            continue;
+        }
+        return match wrapper.after {
+            After::Command => Step::Command(index),
+            After::Nothing => Step::Nothing,
+        };
+    }
+    Step::Nothing
+}
+
+/// How many words an option takes, or `None` when the word is not one.
+enum Skip {
+    /// The option and nothing else: a flag, or a value glued onto it.
+    One,
+    /// The option and the word after it.
+    Two,
+    /// A word that looks like an option and is not in this wrapper's
+    /// grammar.
+    Unknown,
+}
+
+/// Read one word as an option of `wrapper`.
+///
+/// `None` for a word that does not begin with `-`, which is the caller's cue
+/// that the options are over. A bare `-` is not an option either: it is the
+/// conventional name for standard input and is a perfectly ordinary argument.
+fn option(wrapper: &Wrapper, word: &str) -> Option<Skip> {
+    if !word.starts_with('-') || word == "-" {
+        return None;
+    }
+    let known = |name: &str| match (wrapper.solo.contains(&name), wrapper.valued.contains(&name)) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
+    if word.starts_with("--") {
+        // `--setenv=PATH=/usr/bin` is one word: the head is the option and
+        // everything after the first `=` is its value, so the option is
+        // satisfied and the next word is not its value.
+        return Some(match word.split_once('=') {
+            Some((head, _)) => match known(head) {
+                Some(_) => Skip::One,
+                None => Skip::Unknown,
+            },
+            None => match known(word) {
+                Some(true) => Skip::One,
+                Some(false) => Skip::Two,
+                None => Skip::Unknown,
+            },
+        });
+    }
+    Some(match known(word) {
+        Some(true) => Skip::One,
+        Some(false) => Skip::Two,
+        // `-n5` and `-c2`: a short option with its value written onto it.
+        // Only a *valued* option may carry one, and only the two-character
+        // head is looked up, so a cluster of flags this table has not heard
+        // of is still unknown rather than half-read.
+        None => match word.is_char_boundary(2) && wrapper.valued.contains(&&word[..2]) {
+            true => Skip::One,
+            false => Skip::Unknown,
+        },
+    })
+}
+
+// ---- what the shell does for itself ----------------------------------------
+
+/// bash's reserved words.
+///
+/// Recognised for two reasons and drawn for neither. They are the reason a
+/// segment can have a command word further along than its first — see
+/// [`WRAPPERS`] — and they are the reason `if` does not appear in the window
+/// as a name that resolves to nothing. Reserved words are not programs, do
+/// not resolve and are not listed.
+const KEYWORDS: &[&str] = &[
+    "!", "[[", "]]", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac", "fi",
+    "for", "function", "if", "in", "select", "then", "time", "until", "while",
+];
+
+/// bash's builtins.
+///
+/// The list matters for one reason: **a builtin does not resolve to a path,
+/// and that is not a signal.** `cd`, `echo`, `export` and `:` are the most
+/// ordinary words in any command, and a list that marked them as *not found*
+/// would put a warning on nearly every request — and a list that cries wolf
+/// is a list nobody reads, which costs the reader the one case that was real.
+///
+/// Six of these are also files on disk: `echo`, `test`, `[`, `kill`, `printf`
+/// and `pwd` exist in `/usr/bin` on an ordinary system. **The builtin wins**,
+/// and hatch reports the builtin, because commands reach the shell as
+/// `bash -c '<command>'` and bash looks for a builtin before it looks at
+/// `PATH`. A window that named `/usr/bin/echo` would be naming a file that
+/// will not be executed. The one way to reach the file is to name it —
+/// `/usr/bin/echo` or `env echo` — and both of those are a different word in
+/// command position, so both come out right without a special case.
+///
+/// Aliases are not here and need no entry: `bash -c` is non-interactive,
+/// where `expand_aliases` is off, so an alias cannot change what a name means
+/// in a command hatch runs.
+const BUILTINS: &[&str] = &[
+    ".", ":", "[", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command",
+    "compgen", "complete", "compopt", "continue", "declare", "dirs", "disown", "echo", "enable",
+    "eval", "exec", "exit", "export", "false", "fc", "fg", "getopts", "hash", "help", "history",
+    "jobs", "kill", "let", "local", "logout", "mapfile", "popd", "printf", "pushd", "pwd",
+    "read", "readarray", "readonly", "return", "set", "shift", "shopt", "source", "suspend",
+    "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset",
+    "wait",
+];
+
+/// Whether the shell reads `name` as one of its reserved words.
+pub fn is_keyword(name: &str) -> bool {
+    KEYWORDS.contains(&name)
+}
+
+/// Whether the shell runs `name` itself rather than looking for a file.
+///
+/// See [`BUILTINS`] for what this is guarding against and for the six names
+/// that are both a builtin and a binary.
+pub fn is_builtin(name: &str) -> bool {
+    BUILTINS.contains(&name)
 }
 
 #[cfg(test)]
@@ -3267,3 +4059,4 @@ mod tests {
         assert_eq!(dollar_extent("$é"), 3, "a multibyte sigil is stepped over whole");
     }
 }
+

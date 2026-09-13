@@ -40,11 +40,14 @@
 //! they arrive defanged and are drawn as they arrive, per
 //! [`crate::protocol::Request`].
 
+use std::path::Path;
+
 use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError};
 use crate::render::diff::{Row, Side};
+use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::prompt_ui::theme::{self, Palette};
 use crate::render::{Span, SpanKind, Spans};
@@ -121,6 +124,11 @@ pub enum Shown {
         scan: ScanReport,
         /// The danger labels the daemon found, defanged for drawing.
         danger: Vec<String>,
+        /// What the command will run, as the daemon resolved it. Held as it
+        /// arrived rather than as a finished string: the two lines it can
+        /// become are built by [`roster_summary`] and [`roster_alarm`], which
+        /// are where its names and paths are defanged.
+        runs: Vec<Entry>,
         /// The working directory, defanged for drawing.
         cwd: String,
         /// Whether it was asked for as root.
@@ -163,7 +171,7 @@ impl Shown {
     /// The window closes on it rather than drawing part of it.
     pub fn of(payload: &Payload) -> Result<Shown, ProtocolError> {
         match payload {
-            Payload::Command { danger, cwd, root, interactive, caveat, .. } => {
+            Payload::Command { danger, runs, cwd, root, interactive, caveat, .. } => {
                 let annotated = payload.rendering()?;
                 // From the rebuilt spans, not from the payload's own `raw`
                 // field: the two are equal by construction, and taking it
@@ -174,6 +182,7 @@ impl Shown {
                 Ok(Shown::Command {
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
+                    runs: runs.clone(),
                     cwd: defang(&cwd.display().to_string()),
                     root: *root,
                     interactive: *interactive,
@@ -587,6 +596,272 @@ pub fn diff_caption(view: DiffView, rows: &[Row], longest: usize, column: usize)
     }
 }
 
+// ---- what the command will run ---------------------------------------------
+
+/// The most names the roster line draws before it says how many are left.
+///
+/// A cap because the number of distinct programs in a command is chosen by
+/// the agent, and this line sits *above* the panes: a request naming two
+/// hundred of them would push the command off the bottom of the window with a
+/// header, which is the shape of the attack [`HEADLINE_SHARE`] exists for one
+/// row higher up. Twelve is more than any command a person reads has and far
+/// fewer than it takes to matter.
+const ROSTER_NAMES: usize = 12;
+
+/// The most characters of one name or path the roster line draws.
+///
+/// Agent-chosen text again, for the same reason: a single name a kilobyte
+/// long would do what two hundred short ones would. Nothing is lost by this —
+/// the command itself is in the panes below, drawn in full and character for
+/// character — and what is shortened is hatch's own summary of it.
+const ROSTER_CHARS: usize = 56;
+
+/// Whether the roster is worth the row it costs.
+///
+/// Two ways to earn it, and an ordinary single-program request meets neither.
+///
+/// * **More than one thing runs.** One occurrence is `ls -la /etc`, where the
+///   word that runs is already underlined in the pane two rows below and the
+///   only thing the roster would add is a path. Two is where "read the whole
+///   command to find out what it runs" begins, and *two occurrences* rather
+///   than two distinct names is deliberate: `grep … | grep … | grep …` is one
+///   name and is exactly the case this list was built for.
+/// * **Something is remarkable** — see [`Entry::remarkable`]. A single command
+///   that resolves to nothing is worth a row on its own.
+///
+/// A line drawn on every request is a line a reader learns to skip, and a line
+/// a reader skips is not there when it finally says something. That is the
+/// same rule [`scan_summary`] follows for an all-ASCII command.
+fn roster_is_worth_a_row(runs: &[Entry]) -> bool {
+    runs.iter().map(|entry| entry.count).sum::<usize>() > 1
+        || runs.iter().any(Entry::remarkable)
+}
+
+/// The roster: every distinct thing the command runs and where it resolves,
+/// or `None` when there is nothing here a reader needs.
+///
+/// # Paths, not bare names
+///
+/// The name is already on screen — it is the word underlined in the pane — so
+/// a list of names would be a second copy of something the reader can see.
+/// What they cannot see is *which file* a name reaches, and that is the whole
+/// of what this adds. So the path is what is drawn.
+///
+/// It is drawn without costing a line each. Where every resolved name sits in
+/// one directory, which is the ordinary case, the directory is said once and
+/// the names are listed against it: `grep ×10, sed in /usr/bin` is the same
+/// claim as two absolute paths and fits where they would not. Where they do
+/// not share one — and a name resolving somewhere unexpected is exactly when
+/// they do not — each is drawn in full. The compact form and the fuller one
+/// are therefore chosen by the facts rather than by a threshold, and the case
+/// that needs the detail is the case that gets it.
+///
+/// # Why the label says when
+///
+/// Because the list is a snapshot and must not read as a guarantee. Every
+/// entry is what a `stat` said while this window was being drawn, and the
+/// binary behind a name can be replaced before the approval reaches an
+/// `execve` — see [`crate::render::roster`], which explains why hatch cannot
+/// close that gap the way [`crate::swap`] closes the equivalent one for a
+/// file's contents. Putting *when* in the label rather than in a sentence of
+/// its own costs no row and makes the honest version the only version drawn.
+pub fn roster_summary(runs: &[Entry]) -> Option<String> {
+    if !roster_is_worth_a_row(runs) {
+        return None;
+    }
+    let mut clauses = Vec::new();
+
+    let found: Vec<(&Entry, &Path)> = runs
+        .iter()
+        .filter_map(|entry| match &entry.found {
+            Resolution::Found { path, .. } => Some((entry, path.as_path())),
+            _ => None,
+        })
+        .collect();
+    if let Some((first, _)) = found.first() {
+        let _ = first;
+        let shared = found[0].1.parent().filter(|dir| {
+            found.iter().all(|(_, path)| path.parent() == Some(dir))
+        });
+        clauses.push(match shared {
+            // One directory, said once. The names against it are the same
+            // claim as the absolute paths and are what fits on a row.
+            Some(dir) => format!(
+                "{} in {}",
+                listed(found.iter().map(|(entry, _)| counted(&entry.name, entry.count))),
+                shortened(&dir.display().to_string())
+            ),
+            None => listed(
+                found
+                    .iter()
+                    .map(|(entry, path)| counted(&path.display().to_string(), entry.count)),
+            ),
+        });
+    }
+
+    let shell = of_kind(runs, |found| matches!(found, Resolution::Builtin));
+    if !shell.is_empty() {
+        // Named as bash's rather than as "built in", because what a reader
+        // needs from this is not the category but the reason there is no path
+        // beside it.
+        clauses.push(format!("bash's own {}", listed(shell.into_iter())));
+    }
+
+    let functions = of_kind(runs, |found| matches!(found, Resolution::Function));
+    if !functions.is_empty() {
+        clauses.push(format!(
+            "{}, defined by the command itself",
+            listed(functions.into_iter())
+        ));
+    }
+
+    (!clauses.is_empty())
+        .then(|| format!("Resolved as this window opened: {}.", clauses.join("; ")))
+}
+
+/// What the roster has to say out loud, or `None` when it has nothing.
+///
+/// The second half of "compact when nothing is remarkable, fuller when
+/// something is". [`roster_summary`] says where things are; this says what
+/// could not be placed, and it is drawn in [`Palette::warn`] so that the one
+/// request in a hundred that has something to say does not say it in the same
+/// grey as the ninety-nine that do not.
+///
+/// # None of this is a verdict
+///
+/// Every sentence here is a fact a person could check by hand and get the
+/// same answer to: a mode bit, an empty lookup, a word hatch did not read.
+/// Whether *this particular* writable directory should alarm a reader is a
+/// judgement, and judgements belong to [`crate::render::danger`] — the same
+/// boundary the redirection work drew when it declined to shout at
+/// `> /dev/null`. What the colour says is "this is the part of the list worth
+/// reading", not "this is dangerous".
+///
+/// # One line, however much there is
+///
+/// The four kinds are four clauses of one sentence rather than four rows,
+/// and each clause's list is capped the way the summary's is. A request that
+/// manages to be remarkable in every direction at once therefore costs the
+/// panes one row, not four.
+pub fn roster_alarm(runs: &[Entry]) -> Option<String> {
+    if !roster_is_worth_a_row(runs) {
+        return None;
+    }
+    let mut said = Vec::new();
+
+    let missing = of_kind(runs, |found| matches!(found, Resolution::Missing));
+    if !missing.is_empty() {
+        said.push(format!("No file to run was found for {}.", listed(missing.into_iter())));
+    }
+
+    let unread = of_kind(runs, |found| matches!(found, Resolution::Unread));
+    if !unread.is_empty() {
+        said.push(format!(
+            "hatch expands nothing, so it cannot say what {} names.",
+            listed(unread.into_iter())
+        ));
+    }
+
+    let writable = |pick: fn(&Writable) -> bool| {
+        runs.iter()
+            .filter_map(|entry| match &entry.found {
+                Resolution::Found { path, writable } if pick(writable) => {
+                    Some(shortened(&path.display().to_string()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let loose_file = writable(|writable| writable.file);
+    if !loose_file.is_empty() {
+        said.push(format!("Anyone can write {}.", listed(loose_file.into_iter())));
+    }
+    let loose_dir = writable(|writable| writable.directory);
+    if !loose_dir.is_empty() {
+        said.push(format!(
+            "Anyone can write the directory holding {}.",
+            listed(loose_dir.into_iter())
+        ));
+    }
+
+    let hidden: Vec<String> =
+        runs.iter().filter(|entry| entry.hides).map(|entry| shortened(&entry.name)).collect();
+    if !hidden.is_empty() {
+        said.push(format!(
+            "hatch could not read the arguments of {}, so what it runs is not in this list.",
+            listed(hidden.into_iter())
+        ));
+    }
+
+    (!said.is_empty()).then(|| said.join(" "))
+}
+
+/// The names of every entry whose resolution `pick` accepts, with counts, in
+/// roster order.
+fn of_kind(runs: &[Entry], pick: fn(&Resolution) -> bool) -> Vec<String> {
+    runs.iter()
+        .filter(|entry| pick(&entry.found))
+        .map(|entry| counted(&entry.name, entry.count))
+        .collect()
+}
+
+/// One name, with how many times it is in command position when that is more
+/// than once.
+///
+/// `×` rather than the word, because the count is the shortest thing on the
+/// line and the line is competing with the command for rows. `grep ×10` reads
+/// the way a tally does and takes four characters to say what "ten times"
+/// takes nine to.
+fn counted(name: &str, count: usize) -> String {
+    match count {
+        1 => shortened(name),
+        count => format!("{} ×{count}", shortened(name)),
+    }
+}
+
+/// `text`, short enough to sit on a line, defanged either way.
+///
+/// A path keeps its **end** and a name keeps its beginning, because the
+/// interesting half is in a different place in each: `…/opt/vendor/bin/grep`
+/// still says which program it is, and a truncated name is still recognisable
+/// from its front. Nothing the reader is approving is shortened by this — the
+/// command is in the panes below, drawn character for character — and what is
+/// shortened here is hatch's own summary of it.
+///
+/// Defanging is the last step rather than the first so the ellipsis is
+/// counted in characters of the drawn text: [`defang`] can lengthen a string,
+/// by turning one invisible codepoint into a printable label, so measuring
+/// before it would leave the cap meaning nothing. Both the agent's names and
+/// the machine's paths go through it, for the reason the rest of this module
+/// does: nothing reaches the screen undefanged, and an exception for text
+/// that came off the filesystem is how the rule stops being one.
+fn shortened(text: &str) -> String {
+    let defanged = defang(text);
+    let count = defanged.chars().count();
+    if count <= ROSTER_CHARS {
+        return defanged;
+    }
+    let keep = ROSTER_CHARS - 1;
+    match defanged.contains('/') {
+        true => format!("…{}", defanged.chars().skip(count - keep).collect::<String>()),
+        false => format!("{}…", defanged.chars().take(keep).collect::<String>()),
+    }
+}
+
+/// A comma-separated list, capped at [`ROSTER_NAMES`] with a count of what is
+/// left.
+///
+/// The count rather than a silent stop: a list that quietly ended would be
+/// claiming to be the whole roster, which is the one thing it must never do.
+fn listed(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    if items.len() <= ROSTER_NAMES {
+        return items.join(", ");
+    }
+    let shown = items[..ROSTER_NAMES].join(", ");
+    format!("{shown} and {} more", items.len() - ROSTER_NAMES)
+}
+
 // ---- drawing ---------------------------------------------------------------
 
 /// The colours the panes use, resolved against whatever theme is in force.
@@ -926,8 +1201,8 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, longest, caveat, .. } => {
-            draw_command_header(ui, scan, danger, caveat.as_deref());
+        Shown::Command { annotated, raw, scan, danger, runs, longest, caveat, .. } => {
+            draw_command_header(ui, scan, danger, runs, caveat.as_deref());
             draw_command(ui, annotated, raw, *longest);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
@@ -944,6 +1219,7 @@ fn draw_command_header(
     ui: &mut Ui,
     report: &ScanReport,
     danger: &[String],
+    runs: &[Entry],
     caveat: Option<&str>,
 ) {
     let palette = palette(ui);
@@ -973,6 +1249,23 @@ fn draw_command_header(
     // Warn and not danger: it is a statement about how the command will
     // behave, not a mark on what the command does, and spending the red on it
     // would spend it on every root request.
+    // What the command runs, and where each name leads. After the two lines
+    // above and before the caveat, because the narrowing is the order a
+    // reader wants: those are about the *text*, this is about what the text
+    // runs, and the caveat is about how it runs.
+    //
+    // Neither of these can move the panes about under a reader's hand. They
+    // are a function of the payload and nothing else — no measurement of a
+    // pane goes into them, which is what the line below the caption cannot
+    // say for itself — so a window that has drawn them once draws them
+    // identically on every frame after. See `rows_out_of_sight`, which has to
+    // be swept for the loop this cannot have.
+    if let Some(summary) = roster_summary(runs) {
+        ui.label(RichText::new(summary).color(palette.quiet).small());
+    }
+    if let Some(alarm) = roster_alarm(runs) {
+        ui.label(RichText::new(alarm).color(palette.warn).small());
+    }
     if let Some(caveat) = caveat {
         ui.label(RichText::new(caveat).color(palette.warn).small());
     }
@@ -2715,7 +3008,7 @@ mod tests {
 
     #[test]
     fn a_payload_whose_spans_do_not_tile_its_source_is_refused() {
-        let Payload::Command { display_line, raw, danger, cwd, root, interactive, .. } =
+        let Payload::Command { display_line, raw, danger, runs, cwd, root, interactive, .. } =
             a_command("rm -rf target")
         else {
             panic!("not a command")
@@ -2726,6 +3019,7 @@ mod tests {
             spans: vec![WireSpan { end: raw.len() - 1, kind: SpanKind::Plain, break_before: false }],
             raw,
             danger,
+            runs,
             cwd,
             root,
             interactive,
@@ -2737,7 +3031,7 @@ mod tests {
 
     #[test]
     fn a_payload_whose_one_line_form_disagrees_with_its_spans_is_refused() {
-        let Payload::Command { spans, raw, danger, cwd, root, interactive, .. } =
+        let Payload::Command { spans, raw, danger, runs, cwd, root, interactive, .. } =
             a_command("rm -rf target")
         else {
             panic!("not a command")
@@ -2747,6 +3041,7 @@ mod tests {
             spans,
             raw,
             danger,
+            runs,
             cwd,
             root,
             interactive,

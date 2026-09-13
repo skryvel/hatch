@@ -483,6 +483,20 @@ pub enum Payload {
         /// header list. Visual only: they never block, and an empty list is
         /// not a claim that the command is safe.
         danger: Vec<String>,
+        /// What the command will run, deduplicated and resolved: the
+        /// roster. Built by [`crate::render::roster::roster`] against the
+        /// environment the command is going to receive, and against the
+        /// filesystem as it was when the request was prepared.
+        ///
+        /// On the wire rather than worked out in the window because the
+        /// lookup needs the child `PATH`, and the child `PATH` is the
+        /// daemon's config; a window that resolved names against its own
+        /// environment would name files the command will never reach.
+        ///
+        /// Display only, like `danger`. An empty list is not a claim that a
+        /// command runs nothing — see [`Payload::with_runs`] for why it is
+        /// filled in by a separate call.
+        runs: Vec<crate::render::roster::Entry>,
         /// The working directory it will run in.
         ///
         /// A `PathBuf` rather than a `String`: JSON cannot carry a non-UTF-8
@@ -540,6 +554,7 @@ impl Payload {
             spans: wire_spans(spans),
             raw: spans.source().to_string(),
             danger,
+            runs: Vec::new(),
             cwd,
             root,
             interactive,
@@ -560,25 +575,48 @@ impl Payload {
     /// caveat to attach to one.
     pub fn with_caveat(self, caveat: Option<&str>) -> Payload {
         match self {
-            Payload::Command {
-                display_line,
-                spans,
-                raw,
-                danger,
-                cwd,
-                root,
-                interactive,
-                caveat: _,
-            } => Payload::Command {
-                display_line,
-                spans,
-                raw,
-                danger,
-                cwd,
-                root,
-                interactive,
-                caveat: caveat.map(str::to_string),
-            },
+            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive } => {
+                Payload::Command {
+                    caveat: caveat.map(str::to_string),
+                    display_line,
+                    spans,
+                    raw,
+                    danger,
+                    runs,
+                    cwd,
+                    root,
+                    interactive,
+                }
+            }
+            swap => swap,
+        }
+    }
+
+    /// The same payload, carrying the roster of what the command will run.
+    ///
+    /// Separate from [`Payload::command`] for the reason [`Payload::with_caveat`]
+    /// is: the call sites that build a payload without one keep saying so by
+    /// construction rather than by each of them remembering to pass an empty
+    /// list, and the two places that have a child environment and a working
+    /// directory to resolve against — [`crate::server::Daemon`] and
+    /// [`crate::preview`] — are the two that set it.
+    ///
+    /// A no-op on a swap payload: a swap runs no command.
+    pub fn with_runs(self, runs: Vec<crate::render::roster::Entry>) -> Payload {
+        match self {
+            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat } => {
+                Payload::Command {
+                    runs,
+                    display_line,
+                    spans,
+                    raw,
+                    danger,
+                    cwd,
+                    root,
+                    interactive,
+                    caveat,
+                }
+            }
             swap => swap,
         }
     }
@@ -1232,6 +1270,7 @@ mod tests {
                 "kind",
                 "raw",
                 "root",
+                "runs",
                 "spans"
             ]
         );
