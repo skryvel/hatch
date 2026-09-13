@@ -47,26 +47,33 @@
 //! # Where the model stops, and what it costs
 //!
 //! Five separators — `;`, `&&`, `||`, `|`, a literal newline — plus quoting,
-//! backslash escaping, comments, redirections and here-documents around them.
-//! The rest of shell grammar is outside the model, and the cost falls in both
-//! directions.
+//! backslash escaping, comments, redirections, here-documents and command
+//! substitution around them. The rest of shell grammar is outside the model,
+//! and the cost falls in both directions.
 //!
 //! ## Under-segmentation: structure the shell has that the screen does not
 //!
-//! Backgrounding (`&`), subshells (`(`, `)`) and command substitution
-//! (`` ` `` and `$(`) are not recognised. `sleep 60 & wait` draws as one
-//! segment though the shell runs two; `(cd /tmp; rm -rf x)` splits at the `;`
-//! but says nothing about the parentheses that nest it; `echo $(rm -rf /)`
-//! draws the whole substitution inside one segment. `$(a; b)` is the case
-//! worth naming for a later task: the `;` there really is a boundary, so it
-//! is drawn at the wrong nesting level rather than fabricated.
+//! Backgrounding (`&`) and subshells (`(`, `)`) are not recognised.
+//! `sleep 60 & wait` draws as one segment though the shell runs two, and
+//! `(cd /tmp; rm -rf x)` splits at the `;` but says nothing about the
+//! parentheses that nest it.
+//!
+//! Command substitution — `$(…)` and the older `` `…` `` — is recognised, and
+//! is deliberately drawn as *no* boundary at this level. `echo $(a; b)` is
+//! one segment: the `;` in it really is a separator, but it separates the two
+//! commands inside the substitution, and a break drawn here would put them on
+//! screen as two things this command line runs. The substitution is one word
+//! of one command; what is inside it is read by a pass of its own, which is
+//! where the `a` and the `b` in the roster come from. Before that pass
+//! existed the `;` was split on anyway — drawn at the wrong nesting level
+//! rather than fabricated — and this is the direction that was chosen when it
+//! was fixed.
 //!
 //! ## Over-segmentation: boundaries on screen the shell does not have
 //!
 //! A separator character that some unmodelled construct gives another meaning
 //! to is split on anyway. Each of these was checked against a real shell:
 //!
-//! * `echo $((1 || 0))` — arithmetic OR.
 //! * `[[ -n x || -n y ]]` — conditional OR.
 //! * `$'a\'b; c'` — ANSI-C quoting, where `\'` does not end the string, so
 //!   the `;` is data.
@@ -236,6 +243,53 @@
 //! on screen drawn as itself, at the same contrast as the line above it. What
 //! the choice costs is that the roster does not name a program inside such a
 //! body — and neither does the shell run one.
+//!
+//! # Command substitution, which is a command inside a command
+//!
+//! `$(…)` and its older spelling `` `…` `` hold shell, and the shell in them
+//! is not the shell around them. That is the opposite of a here-document and
+//! it is wrong in the opposite way: a body is text this module was reading as
+//! a program, and a substitution's interior is a program this module was
+//! reading as text — as part of the word it sits in, at the level it sits in.
+//!
+//! The cost was not silence. `x=$(podman ps -q)` put **`ps`** above the
+//! panes as the thing the command runs, one word late: the space inside the
+//! substitution was read as a word break, so `x=$(podman` looked like an
+//! ordinary assignment and was skipped, and the first word after it landed in
+//! command position. A roster whose whole job is answering *what does this
+//! run* naming the wrong program is worse than one naming none, because a
+//! reader who has been told the answer stops looking for it.
+//!
+//! So [`Scan`] carries the depth, [`Scanned::nesting`] says what reads it,
+//! and the shape is the one the rest of this page already uses. At this level
+//! a substitution is **one opaque word**: no boundary inside it, no word break
+//! inside it, no comment, no redirection and no string of this level's.
+//! [`substitutions`] then takes each interior and hands it to a fresh scan,
+//! which finds the command in it, the strings in it and the redirections in
+//! it at the level they belong to. `echo $(podman ps -q)` names `echo` and
+//! `podman`, and `x=$(podman ps -q)` names `podman` and nothing else.
+//!
+//! Two decisions inside that are worth naming, because either could have gone
+//! the other way.
+//!
+//! * **Both spellings, and only those two.** A backtick is the same construct
+//!   in an older hand and an agent still writes one, so leaving it out would
+//!   have left the identical wrong answer reachable by typing a different
+//!   character. A `(` with no `$` in front of it is a **subshell**, which is
+//!   not this and stays outside the model — see [`Scan::nest_at`].
+//! * **`$((…))` is arithmetic, not a command.** It is not special-cased and
+//!   it does not have to be: the level it opens holds `(1 + 2` rather than a
+//!   command line, and a word carrying a parenthesis is declined by the pass
+//!   that names what runs and by the pass that underlines it alike. So an
+//!   arithmetic expansion contributes nothing, which is what it should, and
+//!   one entry came off the over-segmentation list with it — the `||` of
+//!   `echo $((1 || 0))` is no longer drawn as a separator.
+//!
+//! The one pass that deliberately reads *through* a substitution is
+//! [`references`]: a `$HOME` inside one expands out of the same environment
+//! with the same value, and a reader wants it either way. Expansion is not a
+//! claim about command structure, which is what every other pass here is
+//! asking about.
 //!
 //! # Command position, and the wrappers in front of it
 //!
@@ -596,6 +650,49 @@ enum Quoting {
     Double,
 }
 
+/// Which spelling of command substitution opened a level of nesting, and so
+/// which character closes it.
+///
+/// One construct, two spellings, and the difference is whether they nest.
+/// `$(…)` does — the `)` that closes one level leaves the level above it open
+/// — and `` `…` `` does not, because the character that would open a second
+/// one is the character that closes the first. Keeping the spelling on the
+/// stack is what lets a `)` inside a `` `…` `` and a backtick inside a `$(…)`
+/// each be read as the ordinary character it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nest {
+    /// `$(` … `)`.
+    Paren,
+    /// `` ` `` … `` ` ``.
+    Backtick,
+}
+
+impl Nest {
+    /// The character that ends this spelling.
+    fn closer(self) -> char {
+        match self {
+            Nest::Paren => ')',
+            Nest::Backtick => '`',
+        }
+    }
+}
+
+/// One command substitution the scan is inside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nested {
+    /// Which spelling opened it, and so what closes it.
+    kind: Nest,
+    /// The quoting the substitution opened in, which is the quoting its
+    /// closing character has to be read in.
+    ///
+    /// Not `Normal`, because a substitution is perfectly ordinary inside a
+    /// double-quoted string: the `)` of `"$(ls)"` is in `Double` and closes
+    /// what the `$(` opened. Recorded rather than assumed, so that the `)` of
+    /// `$(ls 'a)b')` — which is in `Single` where its `$(` was in `Normal` —
+    /// closes nothing, which is what bash does with it.
+    quoting: Quoting,
+}
+
 /// One character of the command, together with the shell state it sits in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Scanned {
@@ -639,6 +736,48 @@ struct Scanned {
     /// comment, and whether a `$HOME` in it resolves is decided by how the
     /// delimiter was quoted rather than by the `$`.
     here: Option<Here>,
+    /// How many command substitutions deep this character is: `0` outside
+    /// every one, `1` for the `podman ps` of `echo $(podman ps)`, and higher
+    /// where one holds another.
+    ///
+    /// The fourth lexical fact threaded through this pass, and the one that
+    /// decides *whose* the other three are. A substitution is a command
+    /// inside a command: the text between its delimiters is shell, but it is
+    /// not this level's shell, and every pass below reads it at the wrong
+    /// level. The `;` of `$(a; b)` is a boundary of the nested command and
+    /// not of the one on screen; the space in `x=$(podman ps)` is not a word
+    /// break, because the whole substitution is one word of the assignment;
+    /// and the `>` of `$(ls > f)` redirects the nested command.
+    ///
+    /// So a character with a non-zero `nesting` belongs to [`substitutions`],
+    /// which hands the interior to a fresh scan of its own, and the passes at
+    /// this level step over it. That is how the roster came to say `ps` for
+    /// `x=$(podman ps -q)`: the space inside the substitution broke the word,
+    /// `x=$(podman` looked like an assignment and was skipped, and the next
+    /// word along — a word that only existed because the scanner had split
+    /// one — landed in command position.
+    ///
+    /// The delimiters themselves are reported *outside* what they delimit,
+    /// the way an opening quote is: the `$`, the `(` and the `)` of a `$(…)`
+    /// all carry the depth around it, so a run of characters at a depth is
+    /// exactly one substitution's interior.
+    nesting: usize,
+    /// True for both characters of a `\`+newline line continuation.
+    ///
+    /// The shell removes the pair before it reads a word, so the two
+    /// characters are neither a word break nor part of a word:
+    /// `ec\`+newline+`ho` is the single word `echo`, and a `\`+newline
+    /// standing between two blanks is no word at all. Without this the
+    /// newline was a character like any other and `cd /tmp && \`+newline+`
+    /// podman ps` reported a program named `"\n"`.
+    ///
+    /// A flag rather than a rule each pass applies for itself, because the
+    /// rule was already here once: [`Scan::next`] has to know that a
+    /// continued line has not ended before it can decide where a
+    /// here-document's body begins, and it asked `escaped` about the newline
+    /// to find out. Both now ask this, so the two passes cannot come to
+    /// disagree about which newlines end a line.
+    continuation: bool,
 }
 
 /// True for one of bash's metacharacters: a character that, unquoted,
@@ -836,6 +975,20 @@ struct Scan<'a> {
     /// The here-document `here` belongs to, kept because every line of a body
     /// has to be compared against the same delimiter.
     active: Option<HereDoc>,
+    /// The command substitutions the cursor is inside, innermost last.
+    ///
+    /// A stack, which is the one place this pass keeps more than a fixed
+    /// amount of state per character, and it is bounded by the command: a
+    /// `$(` can only push a level by spending two bytes on it. Nothing here
+    /// backtracks or rescans, so the walk is still one pass over an
+    /// agent-controlled string. What the depth *costs* is capped elsewhere —
+    /// [`SCRIPT_DEPTH`] is how far the passes that read an interior will
+    /// follow one down.
+    nesting: Vec<Nested>,
+    /// Set by a `$` whose next character is a `(`, so that the `(` after it
+    /// opens a substitution and a `(` anywhere else opens nothing. A subshell
+    /// is not a substitution and this pass still says nothing about one.
+    opening_nest: bool,
 }
 
 fn scan(command: &str) -> Scan<'_> {
@@ -853,6 +1006,8 @@ fn scan(command: &str) -> Scan<'_> {
         pending: VecDeque::new(),
         here: None,
         active: None,
+        nesting: Vec::new(),
+        opening_nest: false,
     }
 }
 
@@ -878,6 +1033,11 @@ impl Iterator for Scan<'_> {
                 comment: false,
                 redirect: None,
                 here: Some(here),
+                // A body is data, so nothing in one opens a substitution and
+                // nothing in one continues a line: both are claims about
+                // shell, and the shell is not reading this.
+                nesting: 0,
+                continuation: false,
             };
             self.cursor += ch.len_utf8();
             if ch == '\n' {
@@ -908,7 +1068,25 @@ impl Iterator for Scan<'_> {
             self.comment = true;
         }
 
-        let redirect = self.redirect_at(ch);
+        // Nesting before the redirection, because a redirection inside a
+        // substitution is the nested command's and not this one's. The
+        // comment flag is already settled and the quoting has not been
+        // advanced past this character, so both of these read the shell state
+        // *at* it -- the same reading every pass below gets.
+        let nesting = self.nest_at(ch);
+        let redirect = match nesting {
+            0 => self.redirect_at(ch),
+            // A `>` in `echo $(ls > f)` redirects `ls`, and the scan of the
+            // interior is where that is found. Whatever was waiting for a
+            // word at this level does not get one out of a substitution, so
+            // the state is dropped exactly as a comment drops it.
+            _ => {
+                self.redirecting = Redirecting::No;
+                self.opening = None;
+                None
+            }
+        };
+        let continuation = self.continuation_at(ch);
 
         let current = Scanned {
             offset: self.cursor,
@@ -918,6 +1096,8 @@ impl Iterator for Scan<'_> {
             comment: self.comment,
             redirect,
             here: None,
+            nesting,
+            continuation,
         };
 
         match (current.comment, self.escaped) {
@@ -970,7 +1150,12 @@ impl Iterator for Scan<'_> {
         // and a newline inside quotes is a character in a string. A comment
         // between the operator and the newline changes nothing: `cat <<EOF #
         // note` still takes a body, and bash agrees.
-        if ch == '\n' && !current.escaped && current.quoting == Quoting::Normal {
+        //
+        // The continuation is read off the flag rather than out of `escaped`
+        // a second time, because [`words`] has to ask the same question and
+        // two readings of it are two chances to disagree -- which is how a
+        // continued line came to put a program named `"\n"` in the roster.
+        if ch == '\n' && !current.continuation && current.quoting == Quoting::Normal {
             self.open_here();
         }
         Some(current)
@@ -978,6 +1163,107 @@ impl Iterator for Scan<'_> {
 }
 
 impl Scan<'_> {
+    /// How many command substitutions deep the character at the cursor is,
+    /// advancing the stack that decides it for the next one.
+    ///
+    /// Called from [`Scan::next`] after the comment flag for this character
+    /// has been settled and before the quoting state is advanced past it, so
+    /// what it reads is the shell state *at* this character -- the same
+    /// reading [`Scan::redirect_at`] gets, and for the same reason.
+    ///
+    /// # What opens one, and what does not
+    ///
+    /// * `$(` opens one and `` ` `` opens one. They are two spellings of the
+    ///   same construct; see [`Nest`] for the one way they differ.
+    /// * A `(` that no `$` introduces opens nothing. `(cd /tmp && rm x)` is a
+    ///   subshell, which this module has always said nothing about, and
+    ///   reading it as a substitution would be a second claim about a
+    ///   construct the passes below are written to leave alone.
+    /// * `$((` is arithmetic rather than a command, and the level it opens
+    ///   here contains `(1 + 2` rather than a command word. That is
+    ///   deliberate and it is the quiet answer: the interior's first word
+    ///   carries a parenthesis, and both the pass that names what runs and
+    ///   the pass that underlines it decline such a word -- so an arithmetic
+    ///   expansion contributes nothing rather than contributing `1`.
+    /// * Nothing inside `'…'`, inside a comment, inside a here-document's
+    ///   data or after a backslash opens anything. Those are the answers
+    ///   every other question in this scanner gets, asked of the same state.
+    ///
+    /// # Where one ends
+    ///
+    /// At the `)` or the backtick that matches it, read in the quoting the
+    /// substitution *opened* in -- see [`Nested::quoting`]. Where the scanner
+    /// cannot see, it is wrong in the direction of ending a substitution
+    /// early, and that direction is the safe one here for a reason worth
+    /// writing down: the interior is handed to a scan of its own, an interior
+    /// cut short is a prefix of the real one, and the word in command
+    /// position is at the front of a prefix as well as of the whole. So the
+    /// worst it costs is a command further along the interior, which is the
+    /// under-report this module chooses everywhere else.
+    fn nest_at(&mut self, ch: char) -> usize {
+        let depth = self.nesting.len();
+        // A comment is not shell, and an escaped character is itself: `\$(`,
+        // `` \` `` and `\)` are all ordinary text. A here-document's data
+        // never reaches here at all -- [`Scan::next`] returns before this is
+        // called.
+        if self.comment || self.escaped {
+            self.opening_nest = false;
+            return depth;
+        }
+        // A close before an open, so that the `)` of `$()` closes the level
+        // its `(` opened instead of being read as the beginning of anything.
+        if let Some(nest) = self.nesting.last()
+            && self.quoting == nest.quoting
+            && ch == nest.kind.closer()
+        {
+            self.nesting.pop();
+            self.opening_nest = false;
+            // The character that closes a substitution is reported outside
+            // it, exactly as the quote that closes a string is reported
+            // outside the string -- so a run of characters at one depth is
+            // exactly one interior, delimiters excluded.
+            return depth - 1;
+        }
+        if std::mem::take(&mut self.opening_nest) && ch == '(' {
+            self.nesting.push(Nested { kind: Nest::Paren, quoting: self.quoting });
+            return depth;
+        }
+        if self.quoting == Quoting::Single {
+            return depth;
+        }
+        match ch {
+            '`' => self.nesting.push(Nested { kind: Nest::Backtick, quoting: self.quoting }),
+            // One character of lookahead, and the `$` is ASCII, so the offset
+            // after it is a character boundary and a trailing `$` reads an
+            // empty slice rather than panicking.
+            '$' if self.command[self.cursor + 1..].starts_with('(') => self.opening_nest = true,
+            _ => {}
+        }
+        depth
+    }
+
+    /// Whether the character at the cursor is one of the two a `\`+newline
+    /// line continuation is made of.
+    ///
+    /// The backslash cannot be told from an ordinary escape without looking
+    /// at what follows it, and the newline cannot be told from the end of a
+    /// line without looking at what precedes it, so the pair is recognised
+    /// from both ends and reported on both characters. See
+    /// [`Scanned::continuation`] for what reads it.
+    fn continuation_at(&self, ch: char) -> bool {
+        // Inside `'…'` a backslash escapes nothing, so `'a\` + newline is two
+        // characters of a string. A comment runs to the end of its line
+        // whatever is at the end of it, and bash agrees.
+        if self.comment || self.quoting == Quoting::Single {
+            return false;
+        }
+        match ch {
+            '\n' => self.escaped,
+            '\\' => !self.escaped && self.command[self.cursor + 1..].starts_with('\n'),
+            _ => false,
+        }
+    }
+
     /// Which half of a redirection the character at the cursor belongs to,
     /// advancing the state that decides it for the next one.
     ///
@@ -1237,7 +1523,19 @@ fn boundaries(command: &str) -> Vec<Boundary> {
         // `echo hi # then && rm -rf /tmp` is text, and a break drawn there
         // claims a boundary the shell does not have. The newline that ends a
         // comment is reported outside it and still lands below.
-        if c.comment || c.offset < consumed || c.escaped || c.quoting != Quoting::Normal {
+        //
+        // A command substitution next, because a boundary inside one belongs
+        // to the command inside it: the `;` of `echo $(a; b)` really is a
+        // separator, and drawing it here would draw it at this level -- two
+        // segments on screen where the shell runs one command with one
+        // argument. The interior gets a pass of its own; see
+        // [`substitutions`].
+        if c.comment
+            || c.nesting > 0
+            || c.offset < consumed
+            || c.escaped
+            || c.quoting != Quoting::Normal
+        {
             continue;
         }
         if c.ch == '\n' {
@@ -1337,6 +1635,17 @@ fn dollar_extent(rest: &str) -> usize {
 /// any other; a quoted `<<'EOF'` expands nothing anywhere in the body, so a
 /// value shown beside one would be exactly the lie above. The delimiter line
 /// is not data and expands nothing either way.
+///
+/// A command substitution is the one lexical fact on [`Scanned`] this pass
+/// deliberately does not read. Every other pass here steps over an interior
+/// and leaves it to a scan of its own, because every other pass is asking
+/// about *command structure* and an interior's structure is not this level's.
+/// Expansion is not a question about structure: the `$HOME` of
+/// `echo $(ls $HOME)` is substituted out of the same environment at either
+/// depth, with the same value, and a reader looking at it wants the value
+/// either way. So this walk crosses a substitution as if it were not there,
+/// which is also what keeps the annotation from vanishing out of every
+/// `$(…)` in the window.
 /// Whether a `$` in this part of a here-document expands -- and `true` when it
 /// is not in one at all, which is every other character in the command.
 ///
@@ -1714,7 +2023,19 @@ fn segments(command: &str) -> Vec<Range<usize>> {
 /// also used to underline the `>out.txt` of `>out.txt cat`, where the word
 /// that names what runs is `cat` and comes after the redirection. Both are
 /// right now, and a `Command` region can no longer overlap a `Redirect` one.
+///
+/// A command substitution is the loudest correction of the four, and it is
+/// the one that goes the other way: **nothing** inside one breaks a word,
+/// because the whole substitution is one word of the command it sits in.
+/// `$(podman ps -q)` is a single word to the shell and so is
+/// `x=$(podman ps -q)`, and a pass that split them at the space inside did
+/// not merely miss the nested command -- it invented a word, `ps`, and handed
+/// it to the pass that names what runs. The interior's own words are found by
+/// the scan of the interior; see [`substitutions`].
 fn is_word_break(c: &Scanned) -> bool {
+    if c.nesting > 0 {
+        return false;
+    }
     c.comment
         || c.here.is_some()
         || c.redirect.is_some()
@@ -1766,12 +2087,24 @@ fn command_word(
 ) -> Option<Range<usize>> {
     // The first word that is not an assignment: `FOO=1 ls` runs `ls`. What
     // counts as a word, and which characters do not begin one, is
-    // [`words`]'s -- and it is the same answer [`command_positions`] works
-    // from, so the underline in the pane and the roster above it cannot come
-    // to disagree about which word names what runs.
+    // [`words`]'s -- and it is the same answer [`invoked`] works from, so the
+    // underline in the pane and the roster above it cannot come to disagree
+    // about which word names what runs.
     let words = words(scanned, at, segment);
-    let first = words.into_iter().find(|word| !is_assignment(&command[word.clone()]))?;
-    claimable(command, first)
+    let first = command_at(command, &words)?;
+    claimable(command, words[first].clone())
+}
+
+/// The index in `words` of the word that names what the segment runs, or
+/// `None` when every word of it is an assignment.
+///
+/// `FOO=1 BAR=2 ls` runs `ls`, and one line says so for all three passes that
+/// have to know: the underline [`command_word`] draws, the walk [`walk`]
+/// starts, and the point [`invoke_into`] splits a segment's substitutions at.
+/// Three readings of *where a command begins* is three chances for the window
+/// to say one thing and the roster another.
+fn command_at(command: &str, words: &[Range<usize>]) -> Option<usize> {
+    words.iter().position(|word| !is_assignment(&command[word.clone()]))
 }
 
 /// Every word of `segment`, in source order.
@@ -1799,7 +2132,29 @@ fn words(scanned: &[Scanned], at: &mut usize, segment: &Range<usize>) -> Vec<Ran
     let mut out = Vec::new();
     let mut word: Option<usize> = None;
     for c in run {
+        // Two kinds of character carry a word on without ever beginning one.
+        //
+        // A line continuation, because the shell removes it before it reads a
+        // word. Both other readings were tried and both are wrong: as a
+        // break, `ec\`+newline+`ho` becomes the two words `ec` and `ho` and
+        // the roster names `ec` -- the wrong program, which is the one answer
+        // this module may not give -- and as an ordinary character, a
+        // `\`+newline between two blanks becomes a word of its own and the
+        // roster names `"\n"`. Passing through leaves the first as the one
+        // word `ec\`+newline+`ho`, which [`literal_word`] reads as `echo`,
+        // and the second as no word at all.
+        //
+        // A command substitution's interior, because it is part of the word
+        // that holds it and is not a word of this command in its own right.
+        // Not beginning one is the half that has to be said out loud: the
+        // delimiter in front of an interior is usually an ordinary character
+        // of the word, but in `> `+backtick+`a` it is a redirection's target
+        // and therefore a break -- and a word begun after it would be the
+        // interior, claimed at this level and claimed again by the scan of
+        // the interior. Two regions on one range have no honest drawing.
+        let through = c.continuation || c.nesting > 0;
         match (is_word_break(c), word) {
+            (false, None) if through => {}
             (true, Some(start)) => {
                 out.push(start..c.offset);
                 word = None;
@@ -1816,12 +2171,40 @@ fn words(scanned: &[Scanned], at: &mut usize, segment: &Range<usize>) -> Vec<Ran
     out
 }
 
-/// `word`, unless this pass declines to call it the command: an assignment,
-/// or a word carrying a quote character.
+/// `word`, unless this pass declines to call it the command: an assignment, a
+/// word carrying a quote character, or a word carrying [`STRUCTURE`].
+///
+/// The second of those is [`walk`]'s refusal, written here so that the
+/// underline in the pane and the roster above it decline the same words.
 fn claimable(command: &str, word: Range<usize>) -> Option<Range<usize>> {
     let text = &command[word.clone()];
-    (!is_assignment(text) && !text.contains(['\'', '"'])).then_some(word)
+    (!is_assignment(text) && !text.contains(['\'', '"']) && !text.contains(STRUCTURE))
+        .then_some(word)
 }
+
+/// The characters that make a word shell structure rather than a name, for
+/// the two passes that have to decline the same words.
+///
+/// A `(` or a `)` is the `(cd` of a subshell, the `a)` of a `case` branch or
+/// the `(1 + 2` of an arithmetic expansion; a backtick or a `$(`…`)` is a
+/// command substitution. None of them is the name of a program, and a pass
+/// that read one as a name would put a finding on entirely ordinary shell —
+/// which is the list crying wolf.
+///
+/// Silence rather than [`Invocation::Unread`], and the same silence for both
+/// spellings of a substitution, which is the decision worth writing down.
+/// `` `date` `` and `$(date)` in command position are one construct in two
+/// hands, so they get one answer: the command *inside* them is reported at
+/// its own level by [`substitutions`], and the word itself is a value hatch
+/// cannot know without running something. Reporting it as a word hatch could
+/// not read as well would tell the reader twice about one construct, once in
+/// a voice that means *something here was not understood*.
+///
+/// For the pane the refusal is load-bearing rather than tasteful: the
+/// interior of `$(podman ps)` carries a `Command` region of its own, and
+/// claiming the word around it would lay a second region straight across the
+/// first. Two overlapping regions have no honest drawing.
+const STRUCTURE: [char; 3] = ['(', ')', '`'];
 
 /// The byte range of every quoted string in `command`, delimiters included,
 /// in source order.
@@ -1847,7 +2230,11 @@ fn quoted_strings(command: &str) -> Vec<Range<usize>> {
         // and none can span one. That is what keeps a `Quoted` region from
         // ever landing on top of the delimiter line's, and two overlapping
         // regions have no honest drawing.
-        if c.escaped || c.comment || c.here.is_some() {
+        // A quote inside a command substitution belongs to the scan of the
+        // interior, which finds it there and marks it there. Marking it twice
+        // is what this skip prevents, and two regions on one range have no
+        // honest drawing.
+        if c.escaped || c.comment || c.here.is_some() || c.nesting > 0 {
             continue;
         }
         match (open, c.quoting, c.ch) {
@@ -1880,7 +2267,10 @@ fn quoted_strings(command: &str) -> Vec<Range<usize>> {
 fn comments(command: &str) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();
     for c in scan(command) {
-        if !c.comment {
+        // A comment inside a command substitution is the interior's, found
+        // and marked by the scan of the interior -- the same skip
+        // [`quoted_strings`] makes and for the same reason.
+        if !c.comment || c.nesting > 0 {
             continue;
         }
         let end = c.offset + c.ch.len_utf8();
@@ -1957,18 +2347,102 @@ fn delimiter_lines(command: &str) -> Vec<Range<usize>> {
     out
 }
 
+/// One command substitution's interior, and whether the substitution is
+/// inside a quoted string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Substitution {
+    /// The bytes between the delimiters: the `podman ps` of `$(podman ps)`
+    /// and of `` `podman ps` ``. Real shell, and a command of its own, so it
+    /// is handed to a fresh scan rather than read at this level.
+    interior: Range<usize>,
+    /// True when the `$(` or the backtick that opened it is inside `"…"`.
+    ///
+    /// One pass acts on this and the other does not, which is the same split
+    /// [`claimable`] and [`readable_name`] already make about a quoted word.
+    /// [`invoked`] is choosing a *name* and follows a substitution either
+    /// way, because `echo "$(podman ps)"` runs `podman` whichever quotes are
+    /// around it. [`regions`] is choosing a *byte range to colour*, and the
+    /// range it would colour is inside a `Quoted` one -- two regions on one
+    /// range have no honest drawing, so it leaves the string to be drawn as
+    /// the string it is.
+    quoted: bool,
+}
+
+/// The interior of every command substitution in `command` that is not inside
+/// another one, in source order.
+///
+/// Read straight off the scanner's own depth, exactly as [`comments`] and
+/// [`redirections`] are read off its flags, and for the reason all three are:
+/// the passes that step over a substitution have to step over the same bytes
+/// the interior is taken from. A run of characters at a non-zero depth is one
+/// interior with its delimiters excluded -- see [`Scanned::nesting`], which is
+/// why the delimiters carry the depth around them -- so `$(a)$(b)` is two
+/// runs and `$(a $(b) c)` is one.
+///
+/// An unterminated substitution runs to the end of the command, which is what
+/// the scanner already believes about it and what it believes about an
+/// unterminated string. The empty `$()` yields nothing, because there is no
+/// run and there is no command in it either.
+fn substitutions(command: &str) -> Vec<Substitution> {
+    let mut out: Vec<Substitution> = Vec::new();
+    for c in scan(command) {
+        if c.nesting == 0 {
+            continue;
+        }
+        let end = c.offset + c.ch.len_utf8();
+        match out.last_mut() {
+            Some(last) if last.interior.end == c.offset => last.interior.end = end,
+            // The quoting at the first character of the interior is the
+            // quoting the substitution opened in: the `$(` cannot have
+            // changed it, and nothing inside has been read yet.
+            _ => out.push(Substitution {
+                interior: c.offset..end,
+                quoted: c.quoting != Quoting::Normal,
+            }),
+        }
+    }
+    out
+}
+
 /// Every region [`highlight`] wants to mark, in source order and never
 /// overlapping.
 fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
+    let mut out = Vec::new();
+    regions_into(command, 0, 0, &mut out);
+    out.sort_by_key(|(range, _)| range.start);
+    out
+}
+
+/// [`regions`] for one command, appending to `out` with every range shifted
+/// by `offset`, `depth` substitutions deep and unsorted.
+///
+/// The recursion is what draws the interior of a `$(…)`. It is the same shape
+/// [`invoke_into`] uses to follow a `bash -c` script and it is bounded the
+/// same way, by [`SCRIPT_DEPTH`]: the command is the agent's, and `$(` costs
+/// it two bytes to nest one level further.
+///
+/// A substitution inside a quoted string is not followed -- see
+/// [`Substitution::quoted`] for why that is this pass's answer and not
+/// [`invoked`]'s -- and the regions from one that is cannot overlap anything
+/// at this level, because every pass here steps over an interior and
+/// [`claimable`] declines the word that holds one.
+fn regions_into(
+    command: &str,
+    offset: usize,
+    depth: usize,
+    out: &mut Vec<(Range<usize>, SpanKind)>,
+) {
+    let shift = |range: Range<usize>| range.start + offset..range.end + offset;
     let scanned: Vec<Scanned> = scan(command).collect();
     let mut at = 0;
-    let mut out: Vec<(Range<usize>, SpanKind)> = segments(command)
-        .iter()
-        .filter_map(|segment| command_word(command, &scanned, &mut at, segment))
-        .map(|word| (word, SpanKind::Command))
-        .collect();
-    out.extend(quoted_strings(command).into_iter().map(|range| (range, SpanKind::Quoted)));
-    out.extend(comments(command).into_iter().map(|range| (range, SpanKind::Comment)));
+    out.extend(
+        segments(command)
+            .iter()
+            .filter_map(|segment| command_word(command, &scanned, &mut at, segment))
+            .map(|word| (shift(word), SpanKind::Command)),
+    );
+    out.extend(quoted_strings(command).into_iter().map(|range| (shift(range), SpanKind::Quoted)));
+    out.extend(comments(command).into_iter().map(|range| (shift(range), SpanKind::Comment)));
     // Both halves of a redirection, in the one kind: see [`Redirect`] for why
     // the destination is marked as loudly as the arrow and why it is marked
     // the same. A target carrying a quote character is declined, which is the
@@ -1981,13 +2455,20 @@ fn regions(command: &str) -> Vec<(Range<usize>, SpanKind)> {
     let marked = redirections(command).into_iter().filter(|(range, half)| {
         *half == Redirect::Operator || !command[range.clone()].contains(['\'', '"'])
     });
-    out.extend(marked.map(|(range, _)| (range, SpanKind::Redirect)));
+    out.extend(marked.map(|(range, _)| (shift(range), SpanKind::Redirect)));
     // The line that closes a here-document, in the kind that opened it. It
     // cannot overlap anything above: a body has no words and no strings in it,
     // and no redirection is recognised inside one.
-    out.extend(delimiter_lines(command).into_iter().map(|range| (range, SpanKind::Redirect)));
-    out.sort_by_key(|(range, _)| range.start);
-    out
+    out.extend(
+        delimiter_lines(command).into_iter().map(|range| (shift(range), SpanKind::Redirect)),
+    );
+    if depth + 1 >= SCRIPT_DEPTH {
+        return;
+    }
+    for nested in substitutions(command).into_iter().filter(|nested| !nested.quoted) {
+        let interior = nested.interior;
+        regions_into(&command[interior.clone()], offset + interior.start, depth + 1, out);
+    }
 }
 
 /// Mark the word that names what runs, and the quoted strings, so the
@@ -2102,12 +2583,18 @@ pub struct Invoked {
     pub defines: BTreeSet<String>,
 }
 
-/// How deep a `-c` script is followed.
+/// How deep a command inside a command is followed.
 ///
 /// `bash -c '…'` inside `bash -c '…'` is a real thing an agent can write and
 /// a real thing hatch itself produces one level of, and each level is a fresh
 /// scan of a string the level above it holds. Four is far past anything
 /// legible and is a number rather than a stack.
+///
+/// A `$(…)` is the same shape and is bounded by the same number, and here the
+/// bound is load-bearing rather than tidy: the command is the agent's, and
+/// `$(` buys a level of nesting for two bytes. Without a cap, a page of them
+/// would be a page of recursion in a process whose job is to put a window on
+/// screen, and a prompt window that dies is a denial.
 const SCRIPT_DEPTH: usize = 4;
 
 /// Everything `command` puts in command position, wrappers unwrapped.
@@ -2151,13 +2638,28 @@ const SCRIPT_DEPTH: usize = 4;
 /// 5.1 ms and a twenty-thousand-stage pipeline in 8.4 ms, against 0.35 ms for
 /// a thousand hops.
 ///
+/// # Command substitution, which is followed
+///
+/// `$(…)` and `` `…` `` hold a command, and the answer to *what does this
+/// run* includes it: `echo "$(podman ps -q)"` runs both `echo` and `podman`.
+/// The interior is handed to a scan of its own by [`substitutions`] and this
+/// pass recurses into it, exactly as it recurses into a `bash -c` script and
+/// with the same [`SCRIPT_DEPTH`] bound on how far down it will follow.
+///
+/// It is followed whether or not the substitution is inside quotes, because
+/// the quotes change nothing about what runs -- the difference the pane makes
+/// there is about which bytes may carry a colour, and is written down on
+/// [`Substitution::quoted`]. `echo $(podman ps)` and `echo "$(podman ps)"`
+/// give the same two names, which is the point: a reader cannot be expected
+/// to know that one pair of quotes hides a program from the list.
+///
 /// # Where it stops
 ///
-/// Inside `$(…)` and inside any of the constructs the module docs list as
-/// outside [`Scan`]'s model. Those are under-reports -- a command hatch does
-/// not list is a command the reader still sees in the pane -- and they are the
-/// same gaps every other pass in this module has, for the same reason: one
-/// scanner, one model.
+/// Inside a subshell, inside a `case` branch, and inside any of the other
+/// constructs the module docs list as outside [`Scan`]'s model. Those are
+/// under-reports -- a command hatch does not list is a command the reader
+/// still sees in the pane -- and they are the same gaps every other pass in
+/// this module has, for the same reason: one scanner, one model.
 ///
 /// A here-document body is not one of them, and used to be. Nothing in a body
 /// is listed because nothing in a body runs: the shell hands it to the command
@@ -2179,16 +2681,53 @@ pub fn invoked(command: &str) -> Invoked {
     out
 }
 
-/// [`invoked`], accumulating into `out`, `depth` scripts deep.
+/// [`invoked`], accumulating into `out`, `depth` nested commands deep.
+///
+/// # Source order across two levels
+///
+/// A segment's substitutions are reported around the word that names what the
+/// segment runs, in the order they are written: the `date` of
+/// `A=$(date) make` comes before `make` and the `podman` of
+/// `echo "$(podman ps)"` comes after `echo`. That is the order they are on
+/// screen in, which is the order the panes draw and the order the underlines
+/// come out in, so the roster and the pane cannot be read as disagreeing
+/// about which command came first.
+///
+/// The one place the two orders part is a wrapper: `sudo $(x) foo` names
+/// `sudo`, then `foo` -- the wrapper hop reaches the word it runs before this
+/// pass gets back to the substitution -- and the pane underlines `sudo`, `x`
+/// and `foo` as they lie. Nothing is missing from either, and the wrapper is
+/// the construct where the reader is already being told the second name came
+/// from following the first.
 fn invoke_into(command: &str, out: &mut Invoked, depth: usize) {
     if depth >= SCRIPT_DEPTH {
         return;
     }
     let scanned: Vec<Scanned> = scan(command).collect();
+    let nested = substitutions(command);
+    let mut next = 0;
     let mut at = 0;
     for segment in segments(command) {
         let words = words(&scanned, &mut at, &segment);
+        // Every substitution lies inside one segment, because a separator
+        // inside one is not a boundary at this level -- see [`boundaries`] --
+        // so this cursor walks each of them once and in order.
+        let here = nested[next..].partition_point(|nested| nested.interior.start < segment.end);
+        let here = &nested[next..next + here];
+        next += here.len();
+        // Where the word that names what this segment runs begins, which is
+        // where a substitution stops being in front of it. A segment of
+        // nothing but assignments -- `x=$(podman ps -q)` -- has no such word,
+        // and everything in it is in front of the nothing that follows.
+        let begins = command_at(command, &words).map_or(segment.end, |word| words[word].start);
+        let ahead = here.partition_point(|nested| nested.interior.start < begins);
+        for nested in &here[..ahead] {
+            invoke_into(&command[nested.interior.clone()], out, depth + 1);
+        }
         walk(command, &words, out, depth);
+        for nested in &here[ahead..] {
+            invoke_into(&command[nested.interior.clone()], out, depth + 1);
+        }
     }
 }
 
@@ -2203,7 +2742,7 @@ fn walk(command: &str, words: &[Range<usize>], out: &mut Invoked, depth: usize) 
     let text = |word: &Range<usize>| &command[word.clone()];
     // `FOO=1 BAR=2 ls` runs `ls`, and every wrapper that takes assignments
     // takes them in the same place, so this is the same skip [`past`] makes.
-    let mut index = words.iter().position(|word| !is_assignment(text(word))).unwrap_or(words.len());
+    let mut index = command_at(command, words).unwrap_or(words.len());
 
     loop {
         let Some(word) = words.get(index) else { return };
@@ -2215,14 +2754,13 @@ fn walk(command: &str, words: &[Range<usize>], out: &mut Invoked, depth: usize) 
             index += 1;
             continue;
         }
-        // Shell structure this pass does not model, and deliberately says
-        // nothing about: the `(` of a subshell, the `)` that closes one, the
-        // pattern of a `case` branch. None of them is a name and none of them
-        // is a word hatch failed to read -- reporting `(cd` or `a)` either
-        // way would put a finding on constructs that are perfectly ordinary,
-        // which is the list crying wolf. The segment simply contributes
-        // nothing; see [`invoked`], where the under-report is written down.
-        if text(word).contains(['(', ')']) {
+        // Shell structure this pass says nothing about: the `(` of a
+        // subshell, the `)` that closes one, the pattern of a `case` branch,
+        // and either spelling of a command substitution -- whose own commands
+        // have already been reported at their own level. See [`STRUCTURE`],
+        // which is where the refusal is argued and which [`claimable`] reads
+        // too, so the pane declines exactly the words this does.
+        if text(word).contains(STRUCTURE) {
             return;
         }
         let Some(name) = readable_name(text(word)) else {
@@ -2368,8 +2906,15 @@ fn literal_word(word: &str) -> Option<String> {
                 }
             }
             // The next character, whatever it is. A trailing backslash has no
-            // next character and is the same refusal.
-            '\\' => out.push(chars.next()?),
+            // next character and is the same refusal. A newline is the
+            // exception and is the one character a backslash does not stand
+            // in front of: the pair is a line continuation, which the shell
+            // removes before it reads the word, so `ec\`+newline+`ho` is the
+            // name `echo` and not a name with a newline in the middle of it.
+            '\\' => match chars.next()? {
+                '\n' => {}
+                escaped => out.push(escaped),
+            },
             '"' | '$' | '`' => return None,
             _ => out.push(c),
         }
@@ -3325,6 +3870,14 @@ mod tests {
         assert!(separators(&render_command("(cd /tmp)")).is_empty(), "subshells");
         assert!(separators(&render_command("echo `id`")).is_empty(), "backticks");
         assert!(separators(&render_command("echo $(id)")).is_empty(), "substitution");
+        // The one that moved here, and the one that moved on purpose. The `;`
+        // of `$(a; b)` is a real separator of the command inside the
+        // substitution, and it used to be drawn at this level -- two segments
+        // on screen where the shell runs one command with one argument. It is
+        // now drawn at no level, and the `a` and the `b` reach the reader
+        // through the roster instead.
+        assert!(separators(&render_command("echo $(a; b)")).is_empty(), "a nested separator");
+        assert!(separators(&render_command("echo `a && b`")).is_empty(), "and in a backtick");
     }
 
     #[test]
@@ -3335,7 +3888,12 @@ mod tests {
         // A separator character that some unmodelled construct gives another
         // meaning to is split on anyway. Each case was checked against a real
         // shell; this test is what stops the list drifting from the docs.
-        assert_eq!(separators(&render_command("echo $((1 || 0))")), vec!["||"], "arithmetic");
+        //
+        // Arithmetic used to be the first entry here: `echo $((1 || 0))` was
+        // split at the `||`. The `$(` opens a level of nesting now, and
+        // nothing inside one is a separator, so the entry came off the list
+        // rather than being documented better.
+        assert!(separators(&render_command("echo $((1 || 0))")).is_empty(), "arithmetic, retired");
         assert_eq!(separators(&render_command("[[ -n x || -n y ]]")), vec!["||"], "conditional");
         assert_eq!(separators(&render_command(r"$'a\'b; c'")), vec![";"], "ANSI-C quoting");
         assert_eq!(
@@ -5355,5 +5913,3 @@ mod tests {
         assert_eq!(dollar_extent("$é"), 3, "a multibyte sigil is stepped over whole");
     }
 }
-
-
