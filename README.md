@@ -567,7 +567,10 @@ saying why instead.
 time and a Kill button, and the output pane if streaming was ticked. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops. **Keep this window** is beside it while you are
-streaming, and what it does is below.
+streaming, and what it does is below. A file write has no Kill button, because
+it has no run to stop: an unelevated write is over in the frame it starts, and
+the one wait a root write has is the password dialog, whose own Cancel ends it
+with nothing written.
 
 **Unless you have told it not to.** Tick **Close when I decide**, left of the
 buttons, and the window goes as soon as you answer instead of staying to show
@@ -575,6 +578,13 @@ the run — because the point of answering is getting back to what you were
 doing, and a window you have to dismiss every time is a window you alt-tab away
 from every time. It is a preference rather than a per-request tick: it is
 remembered in `prefs.toml`, and the next window opens with it already set.
+
+A file write's window does not have the box. Its window already goes the
+instant there is nothing to show, so the only thing a tick could still do there
+is take away the report of a write that went wrong — and a preference ticked
+for commands must not do that to a file. The window does not act on the
+remembered tick either, and the next command window has it exactly as you left
+it.
 
 The control says what it costs, because it costs something real: **the Kill
 button goes with it**. Nothing can stop an approved command from a window that
@@ -603,8 +613,22 @@ whole life of an ordinary command is milliseconds, so a window that closed on
 the outcome closed at the moment the output it was asked to show arrived. It
 lingers for ten seconds instead, with the result on it and a countdown saying
 so, and **Keep this window** stops the countdown for good: no verdict, no
-deadline, just the output, a way to copy it and a way to close it. A run nobody
-asked to watch is unchanged and closes on the outcome as it always did.
+deadline, just the output, a way to copy it and a way to close it.
+
+**A window nobody asked to watch stays only when there is news.** Otherwise it
+closes on the outcome at once, because a result that is on screen for half a
+second before the window goes is the worst of both: too short to read, long
+enough to catch the eye. A write that landed as the diff described is not news
+— you read it and said yes — and neither is a command's exit status, whatever
+the number: `grep` finding nothing and `diff` finding a difference exit
+non-zero as answers, and the status goes to the agent that asked. What is news
+is what happened *to* the operation rather than what it said: a write refused
+because the file changed, or landed as something other than the window said; a
+command ended by a signal — the deadline, Kill, a crash — or one that could not
+start; a password dialog dismissed, or an elevation hatch cannot read. Those
+linger with the same countdown, Keep and Close, and a failed write keeps its
+diff on screen with the reason beside it. When a request carries several
+operations, the window stays if any one of them is news.
 
 **Keep is pressable before the command has finished, too.** A long run is
 exactly when you have gone to do something else, and asking you to be back at
@@ -879,7 +903,7 @@ load, but anything that can write it can change the child `PATH`, add
 refuses to touch it; a command is shown to you in full. `prefs.toml` is
 trusted on much narrower terms — it holds three checkboxes and no secret — but
 it is worth knowing what something able to write it could do: set
-`close_on_decide` and take the Kill button off every window, or set `terminal`
+`close_on_decide` and take Kill off every command window, or set `terminal`
 so that the next command opens with a tty ticked, which is the one of the three
 that changes how a command runs rather than what you see. Neither is silent —
 both boxes are on screen in the window that is asking, and the terminal's
@@ -1010,7 +1034,7 @@ writes down because you ticked them in it. Three keys —
 
 | Key | What ticking it remembers |
 |---|---|
-| `close_on_decide` | The window goes as soon as you answer, instead of staying to show the run |
+| `close_on_decide` | A command's window goes as soon as you answer, instead of staying to show the run |
 | `stream` | The window shows the output as it arrives |
 | `terminal` | The command gets a terminal of its own |
 
