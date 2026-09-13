@@ -959,7 +959,7 @@ pub struct RunContext {
 impl RunContext {
     /// The run context of whatever this window is showing, if it has one.
     ///
-    /// A `swap_file` request has none: it names an absolute path in its own
+    /// A file write has none: it names an absolute path in its own
     /// header and runs as whoever the plan says, which is a different claim
     /// drawn in a different place.
     pub fn of(shown: &Shown) -> Option<RunContext> {
@@ -2093,7 +2093,7 @@ impl PaneBox {
     }
 }
 
-/// What a `swap_file` request looks like.
+/// What a file write looks like.
 ///
 /// Not an empty pane, and not a summary either. An empty pane in this window
 /// reads as "nothing changes", which is the one thing it must never say by

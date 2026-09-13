@@ -1,4 +1,4 @@
-//! `swap_file`: everything decided before a human is asked anything, and
+//! A file write: everything decided before a human is asked anything, and
 //! everything decided again before a byte is written.
 //!
 //! [`validate`] is the set of refusals, and every one of them happens *before*
@@ -60,7 +60,7 @@
 //! ran first, the two refusals would differ — "protected" for
 //! `~/.config/hatch/config.toml`, "no such directory" for
 //! `~/.config/hatch/nope/x` — and
-//! `swap_file` would become a way to map hatch's own state, the user's
+//! a file write would become a way to map hatch's own state, the user's
 //! sandbox profiles and every `denylist_extra` entry without a single prompt.
 //! Consulting the denylist first collapses all of that to one answer that
 //! depends on nothing but the path. The cheap syscall-free check is also the
@@ -257,7 +257,7 @@ const CREATE_MODE: u32 = 0o644;
 /// rather than read whole; the plan needs one hash, not a copy.
 const HASH_CHUNK: usize = 64 * 1024;
 
-/// Why `swap_file` will not proceed, decided before any prompt is drawn.
+/// Why a file write will not proceed, decided before any prompt is drawn.
 ///
 /// Every variant is a user-facing message as much as a control-flow value: it
 /// is returned to the agent as the tool error, and recorded in the audit log
@@ -310,16 +310,16 @@ pub enum Refusal {
         target: PathBuf,
     },
     /// The path exists but is not a regular file — a directory, a device node,
-    /// a socket, a fifo. `swap_file` replaces the contents of a file; a rename
+    /// a socket, a fifo. A file write replaces the contents of a file; a rename
     /// over any of these either fails after the user has already answered, or,
     /// for a device node, succeeds and destroys it.
     NotARegularFile {
         /// What it is instead, as it appears in the message.
         what: &'static str,
     },
-    /// The parent directory does not exist. `swap_file` never creates
+    /// The parent directory does not exist. A file write never creates
     /// directories: choosing a mode and an owner for an implied directory is a
-    /// decision the user should see, and `run_command("mkdir -p …")` shows it.
+    /// decision the user should see, and a `mkdir -p` command shows it.
     MissingParent {
         /// The directory that is missing — the target's immediate parent, not
         /// the highest missing ancestor.

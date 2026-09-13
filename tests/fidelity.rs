@@ -254,7 +254,7 @@ fn what_a_variable_resolves_to_is_the_environment_it_was_given() {
 }
 
 // ---------------------------------------------------------------------------
-// The same two invariants, over a `swap_file` diff.
+// The same two invariants, over a file write's diff.
 //
 // A diff splits its input into lines and lays them out in two columns, which
 // gives invariant 1 two new ways to fail that a command rendering does not

@@ -1,6 +1,6 @@
 //! Side-by-side diff model over `Span`s.
 //!
-//! `swap_file` asks a human to approve replacing a file's entire contents, so
+//! A file write asks a human to approve replacing a file's entire contents, so
 //! the window shows two columns: left is what is on disk now, right is what
 //! the agent proposes. This module builds the model behind that view, and it
 //! carries invariants 1 and 1b across the line boundary that a diff
@@ -393,7 +393,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
-/// What the `swap_file` window has to draw.
+/// What a file write's window has to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileDiff {
     /// Both sides were text within the cap, so there is a real diff to read.

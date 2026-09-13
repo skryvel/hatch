@@ -1,4 +1,4 @@
-//! The five behaviours `swap_file` has to get right before a human is asked
+//! The five behaviours a file write has to get right before a human is asked
 //! anything, driven through the public API the daemon will use.
 //!
 //! Each refusal here happens *before* a prompt exists. Prompting for something

@@ -583,7 +583,7 @@ fn lead_new_session() -> std::io::Result<()> {
 ///
 /// The cost is real and accepted: a command killed here does not get to unlink
 /// its temporary files or flush a partial write. It is bounded by hatch's own
-/// design — a file `swap_file` writes is staged and renamed, so a killed run
+/// design — a file hatch writes is staged and renamed, so a killed run
 /// leaves the original file untouched — and it is the trade the interactive
 /// path may want to revisit, where the human is at a terminal watching.
 ///

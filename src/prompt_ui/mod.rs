@@ -140,7 +140,7 @@ pub(crate) fn numbered_title(number: u64) -> String {
 
 /// The size the window opens at.
 ///
-/// Wide enough for the side-by-side diff to be the view a `swap_file` request
+/// Wide enough for the side-by-side diff to be the view a file write
 /// actually gets: the two columns and their gutters are measured in
 /// characters of the monospace font, and at 900 points a column held few
 /// enough of them that ordinary source lines sent the whole diff to the
@@ -6038,7 +6038,7 @@ mod tests {
 
     #[test]
     fn a_swap_states_its_own_ownership_and_is_not_framed() {
-        // A `swap_file` request has no run context — it names an absolute
+        // A file write has no run context — it names an absolute
         // path and the owner the plan lands on, in its own header — and a
         // frame around it would be a second claim about the same thing in a
         // second vocabulary.

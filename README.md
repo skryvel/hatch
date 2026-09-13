@@ -113,14 +113,45 @@ hatch exposes two MCP tools. Both block until a human answers.
 
 | Tool | Parameters | On approval |
 |------|-----------|-------------|
+| `batch` | `title`, `reason`, `operations`, `stop_on_failure?` | Carries the operations out in order and reports each as done, failed or not attempted |
 | `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply. A run in a terminal returns one `transcript` instead of the two streams — see [Terminals](#terminals) |
-| `swap_file` | `title`, `path` (absolute), `content` **or** `patch`, `reason`, `root?` | Writes the file and returns the final `mode`, `owner` and `bytes` |
 
-`title` and `reason` are required on both. `title` is the first thing the
+Each operation of a batch is one of two kinds:
+
+| Operation | Fields | On approval |
+|-----------|--------|-------------|
+| file write | `path` (absolute), `content` **or** `patch`, `root?` | Writes the file and returns the final `mode`, `owner` and `bytes` |
+| command | `command`, `cwd?`, `root?`, `interactive?` | What `run_command` returns |
+
+`title` and `reason` are required on both tools. `title` is the first thing the
 person reads, so the tool descriptions ask the agent for the intent, not the
 syntax.
 
-`swap_file` takes what the file should contain in one of two forms, and exactly
+**A batch is one approval over several operations** — or it will be: this
+version takes one operation per batch, and says so in the tool description in
+as many words, so that a longer list coming back unrun reads as a temporary
+limit rather than a broken tool. The point of the shape is the incentive it
+removes. Three file writes used to cost three interruptions and one shell
+command with a here-document cost one, so an agent was pushed towards the form
+that shows the person a wall of shell instead of a diff, and skips the symlink
+check, the drift refusal and the stated mode and owner. `run_command` stays,
+as the shortcut for a batch of exactly one command: it is converted into one
+before its first field is checked, and goes through the same path.
+
+Operations run in the order they are listed, which is the order the window
+shows. What follows a failed operation is the agent's choice: by default the
+batch carries on, and `stop_on_failure` stops it at the first failure. The
+default is there because "failed" has no reliable meaning for a command —
+`grep` finding nothing and `diff` finding a difference both exit non-zero as
+answers — and hatch cannot tell those from real failures. Two things are not
+the agent's choice. An operation that ends in a state hatch cannot account for
+— killed, cut off at the execution deadline, an elevation whose result it
+could not read, a root write that may have left its file short — ends the run
+whatever was asked, and the rest are reported as not attempted. And nothing is
+ever rolled back: a command cannot be un-run, and restoring a file while a
+command's effects stayed would describe a state that never existed.
+
+A file write takes what the file should contain in one of two forms, and exactly
 one: `content` is the complete new contents, for creating a file or replacing
 one wholesale, and `patch` is a unified diff against the file as it is now, for
 editing one — which costs an agent the lines it touches instead of the whole
@@ -215,8 +246,11 @@ from this side. It prints; it never edits your client's configuration.
 
 ### Set the client's tool timeout
 
-One call can block for the approval wait *plus* the command's own runtime —
-900 seconds with the defaults, which are 600 s to decide and 300 s to run. Set
+One call can block for the approval wait *plus* the operations' own runtime —
+900 seconds with the defaults, which are 600 s to decide and 300 s to run. The
+approval wait is counted once, because one window covers a whole batch, and the
+execution time once per operation; at one operation per batch that is the same
+900. Set
 your client's MCP tool timeout to at least that. If the client gives up first,
 the agent sees an opaque transport failure instead of a clean verdict — and the
 request you were part way through reading vanishes from under you, because a
@@ -805,7 +839,7 @@ colouring its output, or stopping to ask something. The window says so, and
 hatch sets `PAGER` and `SYSTEMD_PAGER` so a root command cannot wait forever on
 a pager, but the difference is real and hatch does not paper over it.
 
-**The denylist is not containment.** `swap_file` refuses to write to hatch's
+**The denylist is not containment.** A file write refuses to touch hatch's
 own three directories and its binary, your firejail profiles
 (`~/.config/firejail`, `/etc/firejail`), your MCP client configuration
 (`~/.claude.json`, `~/.claude`), and anything you add in `denylist_extra`.
@@ -841,8 +875,8 @@ is not a failure to retry; something may have run. Check the machine.
 
 **The config file is trusted.** It is created 0600 and re-tightened on every
 load, but anything that can write it can change the child `PATH`, add
-`denylist_extra` entries or remove them, and read the bearer token. `swap_file`
-refuses to touch it; `run_command` is shown to you in full. `prefs.toml` is
+`denylist_extra` entries or remove them, and read the bearer token. A file write
+refuses to touch it; a command is shown to you in full. `prefs.toml` is
 trusted on much narrower terms — it holds three checkboxes and no secret — but
 it is worth knowing what something able to write it could do: set
 `close_on_decide` and take the Kill button off every window, or set `terminal`
@@ -851,7 +885,7 @@ that changes how a command runs rather than what you see. Neither is silent —
 both boxes are on screen in the window that is asking, and the terminal's
 capture warning is drawn whether or not its box is ticked — but a preference
 is a standing answer, and this file is where the standing answers live. Both
-files sit in directories held at 0700, and `swap_file` refuses both.
+files sit in directories held at 0700, and a file write refuses both.
 
 ## Configuration
 
@@ -877,7 +911,7 @@ exec_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 font_size = 18
 theme = "light"
 
-# Things swap_file must not rewrite behind a diff. Absolute, literal prefixes.
+# Things a file write must not rewrite behind a diff. Absolute, literal prefixes.
 denylist_extra = [
     "/etc/ssh",
     "/etc/sudoers.d",
@@ -945,7 +979,7 @@ the defaults, 1500 s for the config above, which raises the execution half.
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
 | `terminal` | `["konsole", "--nofork", "-e"]` | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e` |
-| `denylist_extra` | `[]` | Extra paths `swap_file` must refuse |
+| `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |
 | `theme` | `"dark"` | `"dark"` or `"light"` |
 | `[exec_env]` | `HOME`, `TERM` | The complete child environment |
@@ -1038,7 +1072,7 @@ says so at startup.
 ## The audit log
 
 Append-only JSONL at `$XDG_STATE_HOME/hatch/log/hatch-YYYY-MM.jsonl` — by
-default `~/.local/state/hatch/log/`. One line per outcome, flushed per record,
+default `~/.local/state/hatch/log/`. One line per operation, flushed per record,
 a new file each month, never rotated or pruned. `hatch log` renders the current
 month readably, with each line led by the number the window wore. A request
 hatch refused before anybody was asked never became a window, so it has no
@@ -1048,12 +1082,22 @@ Every outcome reaches it, including the ones the agent cannot tell apart. The
 log's verdicts are a superset of the agent-facing ones — `approve`, `deny`,
 `explain`, `simplify`, `self_run`, `stop_and_sync`, `timeout`,
 `elevation_failed`, `elevation_unclear`, `cancelled`, `disconnected`,
-`prompt_died`, `refused` —
+`prompt_died`, `not_attempted`, `refused` —
 because a user denial, a client that gave up and a window that crashed all
 answer the agent with "denied", and conflating them here would hide exactly the
 quiet failures the log exists to catch.
 
-A `swap_file` line records which of the two forms the request arrived in. The
+A batch of several operations is several lines, not one line holding a list,
+because the questions this file is for — what wrote to this file, what ran as
+root — are asked a line at a time, and a line carrying three operations would
+answer `"root":true` with the two that were not. The lines share what the
+decision owns: the same time, number, title, reason and note, an `operation`
+of `operations` placing each one, and `stop_on_failure`, the policy the batch
+ran under. `tool` names the kind of operation, `command` or `write`; lines
+written before batches say `run_command` or `swap_file`, and still read back as
+what they recorded.
+
+A write's line records which of the two forms the request arrived in. The
 change itself is the same either way — a patch is applied before anybody is
 asked — but what the agent sent is a fact about the request, and this is where
 facts about requests live. A line rendered for a person says `(from a patch)`

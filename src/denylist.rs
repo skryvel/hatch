@@ -1,4 +1,4 @@
-//! Self-protection path matching: the targets `swap_file` refuses before it
+//! Self-protection path matching: the targets a file write refuses before it
 //! ever draws a prompt.
 //!
 //! # What this defends, and what it does not
@@ -10,7 +10,7 @@
 //! should be read as one.
 //!
 //! What it closes is narrower, and worth closing anyway: the *file* route.
-//! `swap_file` replaces a file wholesale behind a diff, and a diff is read by
+//! A file write replaces a file wholesale behind a diff, and a diff is read by
 //! skimming. Burying a changed token, a new firejail exception or an added
 //! MCP server in forty otherwise plausible lines is a far easier sell than
 //! typing the command that does the same thing, because the command has to
@@ -89,7 +89,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// The paths `swap_file` will not write, whatever a human answers.
+/// The paths a file write will not touch, whatever a human answers.
 ///
 /// Cheap to build and self-contained, so a caller may keep one for the process
 /// or rebuild it per request from the live config — the latter being what makes
@@ -159,7 +159,7 @@ impl Denylist {
 
     /// Is `path` protected, or too ambiguous to judge?
     ///
-    /// True means `swap_file` must refuse without prompting. The two reasons
+    /// True means a file write must refuse without prompting. The two reasons
     /// are deliberately collapsed into one answer — see the module docs on the
     /// precondition — so a caller that wants to tell a user *why* has to check
     /// absoluteness itself first.

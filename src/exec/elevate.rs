@@ -137,7 +137,7 @@ pub trait Elevation: Send + Sync {
     /// `inner` is an argv and not a command string, because the two callers
     /// want different things in front of the elevation wrapper and only one
     /// of them wants a shell. A `run_command` request is a script and gets
-    /// `bash -c`; a root `swap_file` is `install` with four options and two
+    /// `bash -c`; a root file write is `install` with four options and two
     /// paths, and putting a shell under it would re-parse a path the window
     /// already committed to for no gain at all. This is the primitive and
     /// [`Self::compose_argv`] is the shell-shaped case of it.
@@ -672,7 +672,7 @@ impl Elevation for Run0 {
     ///   [`shell_argv`]'s `bash -c` and the command as one argument — the same
     ///   wrapper the unelevated path uses, so the command is never
     ///   concatenated into the line but travels as a single `execve` argument
-    ///   from here to the shell that reads it. For a root `swap_file` it is
+    ///   from here to the shell that reads it. For a root file write it is
     ///   `install` and its arguments, with no shell under them at all.
     ///
     /// Composed and not gated: whether this machine has `run0` at all is
@@ -1048,7 +1048,7 @@ mod tests {
         assert_eq!(argv.program(), Run0::PROGRAM);
         // The tail is the argv it was handed, untouched and unwrapped. A
         // `bash -c` under `install` would re-parse two paths the window has
-        // already committed to, and `swap_file` never displays a command line
+        // already committed to, and a file write never displays a command line
         // for a reader to notice it in.
         assert_eq!(&argv.as_slice()[argv.as_slice().len() - install.len()..], &install[..]);
         assert!(
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn a_direct_argv_says_where_it_begins_too() {
-        // A root `swap_file` has no shell under it, so the thing the break
+        // A root file write has no shell under it, so the thing the break
         // starts is `install` rather than `bash`. The offset is about the
         // seam between the wrapper and what it wraps, and knows nothing about
         // which of the two callers made it.

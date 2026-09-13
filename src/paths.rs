@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn every_directory_hatch_writes_to_is_handed_to_the_denylist() {
         // The list the daemon actually builds. A directory missing from here
-        // is a directory `swap_file` would agree to rewrite.
+        // is a directory a file write would agree to rewrite.
         let p = Paths::resolve(
             Path::new("/home/user"),
             var("/cfg"),

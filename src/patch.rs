@@ -1,6 +1,6 @@
 //! A unified diff, applied exactly where it says it applies.
 //!
-//! `swap_file` accepts either the complete new contents of a file or a patch
+//! A file write accepts either the complete new contents of a file or a patch
 //! against the contents it has now, and this module is the whole of the second
 //! form. What it produces is bytes. By the time anything else in hatch sees
 //! the request — the plan, the diff on screen, the hash the write is checked
