@@ -3405,6 +3405,296 @@ mod tests {
         );
     }
 
+    // ---- what the command will run ---------------------------------------
+
+    /// An entry that resolves to `path`, with nothing remarkable about it.
+    fn at(name: &str, count: usize, path: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            count,
+            found: Resolution::Found {
+                path: PathBuf::from(path),
+                writable: Writable::default(),
+            },
+            hides: false,
+        }
+    }
+
+    /// An entry with some other resolution.
+    fn leading(name: &str, found: Resolution) -> Entry {
+        Entry { name: name.to_string(), count: 1, found, hides: false }
+    }
+
+    #[test]
+    fn one_ordinary_program_is_not_worth_a_row_of_the_command() {
+        // A line drawn on every request is a line a reader learns to skip,
+        // and the word is already underlined in the pane two rows below. The
+        // only thing a roster would add here is the path, and that is not
+        // worth the row the panes would lose on every request anybody makes.
+        let one = vec![at("ls", 1, "/usr/bin/ls")];
+        assert_eq!(roster_summary(&one), None);
+        assert_eq!(roster_alarm(&one), None);
+    }
+
+    #[test]
+    fn a_name_repeated_earns_the_row_even_though_it_is_one_name() {
+        // Ten greps in a pipeline is the case the roster exists for, and it
+        // is *one* distinct name -- so the rule has to count occurrences and
+        // not rows, or it would skip exactly the case it was built for.
+        let summary = roster_summary(&[at("grep", 10, "/usr/bin/grep")]).expect("a roster");
+        assert!(summary.contains("grep ×10"), "{summary}");
+    }
+
+    #[test]
+    fn the_label_says_when_it_was_true_and_not_what_will_happen() {
+        // The list is a snapshot: the binary behind a name can be replaced
+        // between this lookup and the `execve`, and hatch is not in the path
+        // that does the lookup for real. Saying so in the label costs no row
+        // and leaves no version of the line that over-claims.
+        let summary =
+            roster_summary(&[at("ls", 1, "/usr/bin/ls"), at("grep", 1, "/usr/bin/grep")])
+                .expect("a roster");
+        assert!(summary.starts_with("Resolved when this window opened:"), "{summary}");
+    }
+
+    #[test]
+    fn one_directory_is_said_once_and_several_are_spelled_out() {
+        // The compact form and the fuller one, chosen by the facts rather
+        // than by a threshold. Everything in one directory is the ordinary
+        // case and fits a row; a name resolving somewhere unexpected is
+        // exactly when they do not share one, so the case that needs the
+        // detail is the case that gets it.
+        let together = roster_summary(&[at("grep", 10, "/usr/bin/grep"), at("sed", 1, "/usr/bin/sed")])
+            .expect("a roster");
+        assert_eq!(
+            together,
+            "Resolved when this window opened: grep ×10, sed in /usr/bin."
+        );
+
+        let apart = roster_summary(&[at("grep", 1, "/usr/bin/grep"), at("sed", 1, "/opt/bin/sed")])
+            .expect("a roster");
+        assert_eq!(
+            apart,
+            "Resolved when this window opened: /usr/bin/grep, /opt/bin/sed."
+        );
+    }
+
+    #[test]
+    fn the_shells_own_are_listed_without_a_path_because_they_have_none() {
+        // The trap the whole feature is shaped around: `cd` resolves to
+        // nothing on disk and that is not a signal.
+        let summary = roster_summary(&[
+            at("tar", 1, "/usr/bin/tar"),
+            leading("cd", Resolution::Builtin),
+            leading("echo", Resolution::Builtin),
+        ])
+        .expect("a roster");
+        assert_eq!(
+            summary,
+            "Resolved when this window opened: tar in /usr/bin; bash's own cd, echo."
+        );
+        assert_eq!(
+            roster_alarm(&[
+                leading("cd", Resolution::Builtin),
+                leading("echo", Resolution::Builtin),
+            ]),
+            None,
+            "and quietly"
+        );
+    }
+
+    #[test]
+    fn a_function_the_command_defines_is_said_to_be_its_own() {
+        let summary = roster_summary(&[
+            at("rsync", 1, "/usr/bin/rsync"),
+            leading("deploy", Resolution::Function),
+        ])
+        .expect("a roster");
+        assert!(summary.ends_with("deploy, defined by the command itself."), "{summary}");
+    }
+
+    #[test]
+    fn a_name_that_leads_nowhere_says_which_lookup_came_back_empty() {
+        // Two sentences for one resolution, because they are two different
+        // lookups. A release script that builds `target/release/service` and
+        // then runs it is the ordinary shape of a command whose own path is
+        // empty while the window is up, so that half is said with *when* in
+        // it rather than as an accusation.
+        let alarm = roster_alarm(&[
+            leading("frobnicate", Resolution::Missing),
+            leading("target/release/service", Resolution::Missing),
+        ])
+        .expect("something to say");
+        assert_eq!(
+            alarm,
+            "Nothing on the command's PATH answers to frobnicate. No file to run was at \
+             target/release/service when this window was drawn."
+        );
+    }
+
+    #[test]
+    fn a_word_hatch_does_not_expand_is_a_word_and_not_a_name() {
+        let alarm = roster_alarm(&[leading("$TOOL", Resolution::Unread)]).expect("something");
+        assert_eq!(alarm, "hatch expands nothing, so it cannot say what $TOOL names.");
+    }
+
+    #[test]
+    fn a_loose_binary_and_a_loose_directory_are_two_facts_and_two_sentences() {
+        // A writable file can be rewritten; a writable directory can have the
+        // file replaced under the same name. They are different, and a reader
+        // checking by hand would look at different things, so the window does
+        // not run them together.
+        let entries = vec![
+            Entry {
+                name: "grep".to_string(),
+                count: 1,
+                found: Resolution::Found {
+                    path: PathBuf::from("/opt/bin/grep"),
+                    writable: Writable { file: true, directory: false },
+                },
+                hides: false,
+            },
+            Entry {
+                name: "sed".to_string(),
+                count: 1,
+                found: Resolution::Found {
+                    path: PathBuf::from("/opt/bin/sed"),
+                    writable: Writable { file: false, directory: true },
+                },
+                hides: false,
+            },
+        ];
+        let alarm = roster_alarm(&entries).expect("something to say");
+        assert_eq!(
+            alarm,
+            "Anyone can write /opt/bin/grep. Anyone can write the directory holding \
+             /opt/bin/sed."
+        );
+        // A fact about a mode bit and not a verdict about a location: no word
+        // here says dangerous, unsafe or suspicious. That judgement is
+        // `render::danger`'s, and two passes with an opinion about the same
+        // thing is how a window comes to shout at `/dev/null`.
+        for verdict in ["danger", "unsafe", "suspicious", "malicious", "attack"] {
+            assert!(!alarm.to_lowercase().contains(verdict), "{alarm}");
+        }
+    }
+
+    #[test]
+    fn a_wrapper_hatch_could_not_read_says_the_list_is_incomplete() {
+        // The one thing a roster must never do is look complete when it is
+        // not. `sudo` resolved perfectly well and what is missing is the
+        // program behind it, which a reader told only about `/usr/bin/sudo`
+        // would have no way to know.
+        let entries = vec![Entry { hides: true, ..at("sudo", 1, "/usr/bin/sudo") }];
+        let alarm = roster_alarm(&entries).expect("something to say");
+        assert_eq!(
+            alarm,
+            "hatch could not read the arguments of sudo, so what it runs is not in this list."
+        );
+        assert!(roster_summary(&entries).is_some(), "and the wrapper itself is still placed");
+    }
+
+    #[test]
+    fn a_roster_longer_than_the_window_says_how_many_it_is_not_drawing() {
+        // The number of distinct programs is chosen by the agent and this
+        // line sits above the panes, so a request naming two hundred of them
+        // would push the command off the bottom with a header. The count
+        // rather than a silent stop: a list that quietly ended would be
+        // claiming to be the whole roster.
+        let many: Vec<Entry> =
+            (0..40).map(|n| at(&format!("tool{n}"), 1, &format!("/usr/bin/tool{n}"))).collect();
+        let summary = roster_summary(&many).expect("a roster");
+        assert!(summary.contains(&format!("and {} more", 40 - ROSTER_NAMES)), "{summary}");
+        assert!(!summary.contains("tool39"), "{summary}");
+    }
+
+    #[test]
+    fn a_name_longer_than_the_line_is_shortened_at_the_end_that_says_least() {
+        // A path keeps its end, because that is where the program's name is;
+        // a bare name keeps its beginning. Nothing the reader is approving is
+        // shortened by this -- the command is in the panes below, drawn
+        // character for character.
+        let long = "a".repeat(ROSTER_CHARS * 2);
+        assert!(shortened(&long).ends_with('…'), "a name keeps its front");
+        assert_eq!(shortened(&long).chars().count(), ROSTER_CHARS);
+
+        let deep = format!("/usr/{}/grep", "x".repeat(ROSTER_CHARS * 2));
+        assert!(shortened(&deep).starts_with('…'), "a path keeps its end");
+        assert!(shortened(&deep).ends_with("/grep"), "which is the half that names it");
+        assert_eq!(shortened(&deep).chars().count(), ROSTER_CHARS);
+    }
+
+    #[test]
+    fn a_name_from_the_command_is_defanged_before_it_is_drawn() {
+        // The name came out of the agent's own text. It is not a span and has
+        // no chip machinery to protect it, so it is defanged where it is
+        // turned into something drawable -- the same rule the working
+        // directory and the danger labels follow.
+        let entries = vec![leading("gnp\u{202E}txt.exe", Resolution::Missing)];
+        let alarm = roster_alarm(&entries).expect("something to say");
+        assert!(!alarm.contains('\u{202E}'), "a bidi override reached the screen: {alarm:?}");
+        assert!(alarm.contains("[RLO]"), "{alarm}");
+    }
+
+    #[test]
+    fn the_window_draws_the_roster_it_was_sent() {
+        // The wiring guard. Every other test here drives the two format
+        // functions directly, and a format function that is correct but
+        // unwired shows the reader nothing.
+        let payload = a_command("cd /tmp && tar -xzf x.tgz | wc -l").with_runs(vec![
+            leading("cd", Resolution::Builtin),
+            at("tar", 1, "/usr/bin/tar"),
+            at("wc", 1, "/usr/bin/wc"),
+        ]);
+        let drawn = settled_text(&payload, a_window());
+        let line = drawn
+            .iter()
+            .map(|(line, _)| line)
+            .find(|line| line.starts_with("Resolved when this window opened:"))
+            .unwrap_or_else(|| panic!("no roster in {drawn:?}"));
+        assert_eq!(line, "Resolved when this window opened: tar, wc in /usr/bin; bash's own cd.");
+    }
+
+    #[test]
+    fn the_roster_is_the_same_line_on_every_frame_at_every_width() {
+        // It cannot move the panes about under a reader's hand, and the
+        // reason is structural rather than lucky: it is a function of the
+        // payload and nothing else, where the line below the caption is
+        // measured off the very panes its own height decides -- see
+        // `rows_out_of_sight`, which has to be swept for the loop this cannot
+        // have. Swept anyway, because that is the claim.
+        let payload = a_command("cd /tmp && tar -xzf x.tgz | wc -l").with_runs(vec![
+            leading("cd", Resolution::Builtin),
+            at("tar", 1, "/usr/bin/tar"),
+            leading("frobnicate", Resolution::Missing),
+        ]);
+        let ctx = a_drawing_context();
+        let mut seen: Option<Vec<String>> = None;
+        for width in (600..1500).step_by(37) {
+            let size = egui::vec2(width as f32, 700.0);
+            let frames = frames_in(&ctx, &payload, size, SETTLED);
+            let lines: Vec<Vec<String>> = frames
+                .iter()
+                .map(|frame| {
+                    frame
+                        .iter()
+                        .map(|(line, _)| line.clone())
+                        .filter(|line| {
+                            line.starts_with("Resolved when this window opened:")
+                                || line.starts_with("Nothing on the command's PATH")
+                        })
+                        .collect()
+                })
+                .collect();
+            let last = lines.last().expect("some frames").clone();
+            assert_eq!(last.len(), 2, "at {width}: {last:?}");
+            match &seen {
+                Some(first) => assert_eq!(&last, first, "the roster changed at {width}"),
+                None => seen = Some(last),
+            }
+        }
+    }
+
     #[test]
     fn an_ordinary_command_gets_no_scan_line() {
         assert_eq!(scan_summary(&scan("rm -rf target")), None);
