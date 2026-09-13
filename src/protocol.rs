@@ -905,8 +905,9 @@ pub enum Verdict {
         /// What the user typed, returned to the agent.
         note: String,
     },
-    /// Do not run it; the user will do it themselves and the agent should ask
-    /// them for the output rather than retrying.
+    /// Do not carry it out; the user will do it themselves, and the agent
+    /// should not retry it. What the agent is asked for depends on what was
+    /// taken over: a command's output, or word that a file's change is made.
     SelfRun {
         /// What the user typed, returned to the agent.
         note: String,

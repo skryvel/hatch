@@ -55,7 +55,8 @@ pub enum LogVerdict {
     Explain,
     /// The user asked the agent for a simpler request.
     Simplify,
-    /// The user took the operation over and ran it themselves.
+    /// The user took the operation over to do themselves: to run the command
+    /// or to make the change to the file.
     SelfRun,
     /// The user stopped the work to talk to the agent, without saying
     /// anything about the request itself.

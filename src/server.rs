@@ -3459,7 +3459,18 @@ fn abandoned(verdict: LogVerdict, details: Vec<LogDetail>) -> Outcome {
 ///
 /// The note the user typed is returned verbatim in the text *and* stored on
 /// the audit line, so the person's own words are what the agent acts on.
+///
+/// "I'll do it myself" is one verdict with two sentences, as it is one button
+/// with two labels. A person who runs a command has output to hand back; one
+/// who writes a file by hand has none, and an agent told to ask for it asks
+/// for something that does not exist. The window words its button for the
+/// operation it draws, and this words the answer for the operations it
+/// declines: a request that is nothing but writes gets the write's sentence,
+/// and one with a command in it the command's, because that is the one with
+/// output the agent may need.
 fn declined(verdict: Verdict, details: Vec<LogDetail>) -> Outcome {
+    let writes_only = !details.is_empty()
+        && details.iter().all(|detail| matches!(detail, LogDetail::SwapFile(_)));
     let (log_verdict, note, message) = match verdict {
         Verdict::Deny { note } => (
             LogVerdict::Deny,
@@ -3475,6 +3486,14 @@ fn declined(verdict: Verdict, details: Vec<LogDetail>) -> Outcome {
             LogVerdict::Simplify,
             note.clone(),
             format!("not run — the user asks for a more legible form: {note}"),
+        ),
+        Verdict::SelfRun { note } if writes_only => (
+            LogVerdict::SelfRun,
+            note.clone(),
+            format!(
+                "not written — the user will make this change themselves; do not retry it, and \
+                 ask them to tell you when it is done: {note}"
+            ),
         ),
         Verdict::SelfRun { note } => (
             LogVerdict::SelfRun,
@@ -5141,6 +5160,37 @@ later"), "");
                     "the user's own words belong on the line"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn a_write_the_person_takes_over_asks_them_to_say_when_it_is_done() {
+            // The window's button says "I'll write it myself", and a person
+            // who edits a file by hand has no output to give back. An agent
+            // told to ask for it asks for something that does not exist.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::SelfRun {
+                note: "I have it open already".to_string(),
+            })]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            let result =
+                within(harness.daemon.batch(swap_of(&target, "after\n", false), Caller::quiet()))
+                    .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = result_text(&result);
+            assert!(
+                text.contains("not written — the user will make this change themselves"),
+                "{text}"
+            );
+            assert!(text.contains("do not retry it"), "{text}");
+            assert!(text.contains("tell you when it is done"), "{text}");
+            assert!(!text.contains("output"), "a write has no output to ask for: {text}");
+            assert!(!text.contains("run this"), "nobody runs a file: {text}");
+            assert!(text.contains("I have it open already"), "{text}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            assert_eq!(harness.verdict(), "self_run", "one verdict, whatever it is worded as");
         }
 
         #[tokio::test]
@@ -8594,6 +8644,42 @@ later"), "");
         let stray = declined(crate::protocol::approved(false), vec![a_run_detail()]);
         assert_eq!(stray.result.is_error, Some(true));
         assert!(result_text(&stray.result).contains("mishandled"));
+    }
+
+    #[test]
+    fn taking_over_is_worded_for_what_is_taken_over() {
+        use crate::protocol::Verdict;
+
+        let a_write_detail = || {
+            LogDetail::SwapFile(SwapDetail {
+                path: "/tmp/conf.toml".to_string(),
+                root: false,
+                form: SwapForm::Content,
+                hash_before: None,
+                hash_after: None,
+                mode: None,
+                owner: None,
+                bytes: None,
+            })
+        };
+        let said = |details: Vec<LogDetail>| {
+            let outcome = declined(Verdict::SelfRun { note: "mine".to_string() }, details);
+            assert!(outcome.effects.iter().all(|effect| effect.verdict == LogVerdict::SelfRun));
+            result_text(&outcome.result)
+        };
+
+        let write = said(vec![a_write_detail(), a_write_detail()]);
+        assert!(write.contains("not written — the user will make this change themselves"), "{write}");
+        assert!(!write.contains("output"), "{write}");
+
+        let command = said(vec![a_run_detail()]);
+        assert!(command.contains("will run this themselves"), "{command}");
+        assert!(command.contains("ask them for the output"), "{command}");
+
+        // A command anywhere in it has output the agent may need, so the
+        // command's sentence is the one that leaves nothing out.
+        let mixed = said(vec![a_write_detail(), a_run_detail()]);
+        assert_eq!(mixed, command, "a request with a command in it lost the output");
     }
 
     #[test]

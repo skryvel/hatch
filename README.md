@@ -176,7 +176,7 @@ Deletes and renames are deliberately not file operations. They are
 screen as a verb rather than hidden in a JSON field.
 
 There are six answers a person can give: approve, deny, ask the agent to
-explain first, ask for a form that is easier to read, take the job over and run
+explain first, ask for a form that is easier to read, take the job over and do
 it themselves, or stop the work to talk. The last five all return a non-fatal
 tool error carrying a free-text note, so the agent can read the note and come
 back with something better instead of seeing a broken server. An approval
