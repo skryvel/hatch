@@ -1495,7 +1495,7 @@ mod tests {
             Outcome::ElevationFailed { message: "the password dialog was cancelled".to_string() },
             Outcome::Unclear { message: "the run was ended at its deadline".to_string() },
             Outcome::Written,
-            Outcome::Failed { message: "the file changed after the request was approved".to_string() },
+            Outcome::Failed { message: "the file changed between hatch reading it and going to write it".to_string() },
         ] {
             let message = DaemonMsg::Finished(outcome);
             let encoded = encode(&message).expect("encodes");

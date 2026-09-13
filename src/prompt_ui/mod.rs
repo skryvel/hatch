@@ -7297,7 +7297,7 @@ mod tests {
             Outcome::Signal { signal: 9 },
             Outcome::ElevationFailed { message: "the dialog was dismissed".to_string() },
             Outcome::Unclear { message: "the run was ended at its deadline".to_string() },
-            Outcome::Failed { message: "the file changed after the request was approved".to_string() },
+            Outcome::Failed { message: "the file changed between hatch reading it and going to write it".to_string() },
         ]
     }
 
@@ -7392,13 +7392,13 @@ mod tests {
         let mut app = a_write_window();
         app.state.decide(app.approval());
         app.state.handle(DaemonMsg::Finished(Outcome::Failed {
-            message: "the file changed after the request was approved".to_string(),
+            message: "the file changed between hatch reading it and going to write it".to_string(),
         }));
 
         let drawn = window_text_sized(&mut app, opening_size());
 
         assert!(
-            drawn.contains("Failed — the file changed after the request was approved"),
+            drawn.contains("Failed — the file changed between hatch reading it and going to write it"),
             "the window does not say why: {drawn}"
         );
         assert!(drawn.contains("closing in"), "{drawn}");

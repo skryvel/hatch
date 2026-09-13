@@ -1006,9 +1006,9 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          is for — `cat` it, `grep` it, list a directory. Writing one is not. The difference is \
          what the person is asked to check: a write in a `batch` shows them a diff, the mode \
          and owner the file will land at, and a target hatch has confirmed is not a symlink and \
-         has not changed since you read it. A `cat > file` here-document, a `sed -i`, a `tee` \
-         or a `>>` shows them a shell command whose effect on the file they have to work out \
-         in their head, and none of those checks happen at all. This holds even when the shell \
+         has not changed since hatch read it to draw that diff. A `cat > file` here-document, a \
+         `sed -i`, a `tee` or a `>>` shows them a shell command whose effect on the file they \
+         have to work out in their head, and none of those checks happen at all. This holds even when the shell \
          one-liner is shorter, and even for a single line in a config.\n\
          \n\
          Fields:\n\
@@ -1058,9 +1058,9 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          and not a `run_command` with a redirect, a `tee`, a here-document or a `sed -i`. A write \
          is the form a person can actually check: they read a diff rather than reconstructing \
          what a shell line would do, they see the mode and owner the file will land at, and the \
-         write is refused outright if the target is a symlink or the file changed after you \
-         read it, so an edit someone else made in the meantime is reported to you instead of \
-         being overwritten. For a single command, `run_command` is the shortcut.\n\
+         write is refused outright if the target is a symlink or the file changed between \
+         hatch reading it and writing it, so an edit someone else makes in the meantime is \
+         reported to you instead of being overwritten. For a single command, `run_command` is the shortcut.\n\
          \n\
          Every call opens a window on a person's screen and waits for them to read it and \
          decide. One call can block for up to {total} seconds: up to {approval}s waiting for \
@@ -1092,7 +1092,7 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          Operations run in the order you list them, and the person sees them in that order. \
          You get back what became of every one: done, failed, or not attempted. A write fails \
          when it is refused at the moment of writing — most often because the file changed \
-         after the person read the diff — or when its password dialog is dismissed. A command \
+         after hatch read it to draw the diff — or when its password dialog is dismissed. A command \
          fails when it exits with a non-zero status, cannot be started, is killed, runs out of \
          time, or its password dialog is dismissed. By default the batch carries on past a \
          failed operation and runs the rest; set `stop_on_failure` to stop at the first failure \
@@ -4641,7 +4641,7 @@ mod tests {
             "`stop_on_failure`",
             "carries on past a failed operation",
             "exits with a non-zero status",
-            "changed after the person read the diff",
+            "changed after hatch read it to draw the diff",
             "sees which you chose",
             "killed, ran out of time",
             "Nothing is ever rolled back",
@@ -6442,7 +6442,7 @@ later"), "");
             .await;
 
             assert_eq!(result.is_error, Some(true));
-            assert!(result_text(&result).contains("changed after the request was approved"), "{}", result_text(&result));
+            assert!(result_text(&result).contains("changed between hatch reading it and going to write it"), "{}", result_text(&result));
             assert_eq!(
                 std::fs::read_to_string(&target).unwrap(),
                 "somebody else got there first\n"
@@ -7172,7 +7172,7 @@ later"), "");
 
                 let text = result_text(&result);
                 assert!(text.contains("a write to") && text.contains(": failed"), "{text}");
-                assert!(text.contains("changed after the request was approved"), "{text}");
+                assert!(text.contains("changed between hatch reading it and going to write it"), "{text}");
                 assert_eq!(result.is_error, Some(true), "a write that did not happen is an error");
                 assert_eq!(
                     std::fs::read_to_string(&target).unwrap(),
@@ -8126,8 +8126,12 @@ later"), "");
             let result = within(call).await.unwrap();
             assert_eq!(result.is_error, Some(true));
             let text = result_text(&result);
-            assert!(text.contains("changed after the request was approved"), "{text}");
+            assert!(text.contains("changed between hatch reading it and going to write it"), "{text}");
             assert!(text.contains("asking again is safe"), "{text}");
+            // The file moved while the window was up, before anybody answered.
+            // Told it moved after the approval, an agent would go looking for
+            // whoever edited the file after the person said yes.
+            assert!(!text.contains("after the request was approved"), "{text}");
             assert_eq!(
                 std::fs::read_to_string(&target).unwrap(),
                 "somebody else got there first\n",
@@ -8147,7 +8151,7 @@ later"), "");
                 _ => None,
             });
             let told = told.unwrap_or_else(|| panic!("the window was not told it did not land: {sent:?}"));
-            assert!(told.contains("changed after the request was approved"), "{told}");
+            assert!(told.contains("changed between hatch reading it and going to write it"), "{told}");
             assert!(text.contains(&told), "the window and the agent were told different things");
             // Still one record, and still an approval: the user did approve.
             assert_eq!(harness.verdict(), "approve");

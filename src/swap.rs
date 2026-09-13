@@ -596,7 +596,7 @@ pub struct SwapPlan {
     /// "the file appeared between the plan and the apply", and an empty file
     /// hashes to `e3b0c442…` — the same value a hash-of-nothing convention
     /// would store for absence. The two would then be indistinguishable, and a
-    /// file created under the target's name after the user approved a *create*
+    /// file created under the target's name after hatch planned a *create*
     /// would be silently overwritten by a plan that never saw it, at a mode
     /// and owner chosen for a file that did not exist. With `Option`, absence
     /// compares equal only to absence.
@@ -786,6 +786,17 @@ pub enum ApplyError {
     /// differs" would let a file the user never saw be destroyed by a plan
     /// that was made when nothing was there.
     ///
+    /// # On when it moved
+    ///
+    /// The message places the change between hatch reading the file and hatch
+    /// going to write it, and no more precisely than that. The first hash is
+    /// taken when the request is prepared, before the window opens; the second
+    /// after the verdict. A file edited while the window was up and one edited
+    /// after the person said yes look the same from here, and the first is the
+    /// usual one: the person approved a diff that had already gone stale.
+    /// "After the request was approved" would tell the agent the second
+    /// happened, and the agent acts on what it is told.
+    ///
     /// # On naming the hashes
     ///
     /// The message states both. That is a disclosure — it tells the agent the
@@ -855,25 +866,26 @@ impl fmt::Display for ApplyError {
             ),
             ApplyError::Drift { expected: None, found: Some(found) } => write!(
                 f,
-                "a file appeared at this path after the request was approved (it is now sha256 \
-                 {found}); nothing was written and it was not touched"
+                "a file appeared at this path between hatch finding nothing there and going to \
+                 write it (it is now sha256 {found}); nothing was written and it was not touched"
             ),
             ApplyError::Drift { expected: Some(expected), found: None } => write!(
                 f,
-                "the file was deleted after the request was approved (it was sha256 {expected}); \
-                 nothing was written"
+                "the file was deleted between hatch reading it and going to write it (it was \
+                 sha256 {expected}); nothing was written"
             ),
             ApplyError::Drift { expected: Some(expected), found: Some(found) } => write!(
                 f,
-                "the file changed after the request was approved: it was sha256 {expected} and is \
-                 now sha256 {found}; nothing was written, because the diff that was approved is \
-                 not the change this would make"
+                "the file changed between hatch reading it and going to write it: it was sha256 \
+                 {expected} and is now sha256 {found}; nothing was written, because the diff that \
+                 was approved is not the change this would make"
             ),
             // Not reachable while the only constructor is a comparison that
             // found a difference, since `None` and `None` are equal. Worded so
             // that it still says the true and useful thing if it ever is.
             ApplyError::Drift { expected: None, found: None } => f.write_str(
-                "the file changed after the request was approved; nothing was written",
+                "the file changed between hatch reading it and going to write it; nothing was \
+                 written",
             ),
             ApplyError::Collision => f.write_str(
                 "a file appeared at this path in the instant before the write; nothing was \
@@ -1098,8 +1110,8 @@ fn remedy(kind: ErrorKind) -> Option<&'static str> {
             Some("the disk quota for the user hatch runs as is exhausted")
         }
         ErrorKind::NotFound => Some(
-            "the directory was there when the request was approved and is not now; ask again if \
-             it is meant to be recreated",
+            "the directory was there when hatch checked the path and is not now; ask again if it \
+             is meant to be recreated",
         ),
         // EXDEV. Unreachable while the temporary file is a neighbour of the
         // target, and worth saying plainly if it ever is reached, because it
@@ -2609,6 +2621,12 @@ mod tests {
 
         for message in [appeared, deleted, changed, neither] {
             assert!(message.contains("nothing was written"), "{message}");
+            // When it moved, as far as hatch saw it: after the read and before
+            // the write. The approval is somewhere in between and hatch cannot
+            // say on which side of it the file moved, so no message may.
+            assert!(message.contains("between hatch"), "{message}");
+            assert!(message.contains("going to write it"), "{message}");
+            assert!(!message.contains("after the request was approved"), "{message}");
         }
     }
 
@@ -2664,7 +2682,8 @@ mod tests {
         assert!(remedy(ErrorKind::ReadOnlyFilesystem).unwrap().contains("read-only"));
         assert!(remedy(ErrorKind::StorageFull).unwrap().contains("full"));
         assert!(remedy(ErrorKind::QuotaExceeded).unwrap().contains("quota"));
-        assert!(remedy(ErrorKind::NotFound).unwrap().contains("was there when"));
+        assert!(remedy(ErrorKind::NotFound).unwrap().contains("was there when hatch checked"));
+        assert!(!remedy(ErrorKind::NotFound).unwrap().contains("approved"), "hatch did not see when");
         assert!(remedy(ErrorKind::CrossesDevices).unwrap().contains("atomic"));
         assert_eq!(remedy(ErrorKind::Interrupted), None, "no guess where there is no answer");
     }
