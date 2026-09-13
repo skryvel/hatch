@@ -1930,6 +1930,13 @@ fn redirections(command: &str) -> Vec<(Range<usize>, Redirect)> {
 /// first place. Giving it a colour of its own would be a second name for one
 /// fact, and giving it none would leave the block with a marked top and an
 /// unmarked bottom.
+///
+/// The two ends are not always the same colour, and the reason is a rule that
+/// was already here: [`regions`] declines a redirection target carrying a
+/// quote character, so the `'EOF'` of `<<'EOF'` is drawn as the quoted string
+/// it is and the line that ends the body is drawn as the delimiter. Both are
+/// marked, which is what the block needs; what a quoted delimiter costs is
+/// that they are marked as two different true things.
 fn delimiter_lines(command: &str) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();
     for c in scan(command) {

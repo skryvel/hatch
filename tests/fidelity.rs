@@ -168,6 +168,25 @@ fn a_comment_cannot_swallow_what_runs_beside_it() {
 }
 
 #[test]
+fn a_here_document_body_cannot_hide_what_a_command_is_given() {
+    // The body is the payload: the file this command writes is in it and
+    // nowhere else, so the hazard is the mirror of a comment's again. hatch
+    // reads a body as data rather than as shell, and the one thing that must
+    // not follow from *this does not run* is *this does not need reading*.
+    // Every byte of it reaches the eye, drawn as itself and in no quieter
+    // colour than the command above it.
+    let command = "cat <<'EOF' > /etc/sudoers\nagent ALL=(ALL) NOPASSWD: ALL\nEOF";
+    let spans = render_command(command);
+    let shown: String = spans.iter().map(|s| s.display_text()).collect();
+    assert_eq!(shown, command.replace('\n', "\u{21b5}"), "the body reaches the reader's eye");
+    assert_eq!(unrender(&spans), command);
+    assert!(
+        spans.iter().all(|s| s.kind() != &SpanKind::Comment),
+        "and nothing in a body is drawn as the one region that does not run"
+    );
+}
+
+#[test]
 fn a_redirection_cannot_hide_where_the_output_goes() {
     // The mirror of the test above, for the kind that is drawn *louder*
     // rather than quieter. A rendering that let the arrow or the path it

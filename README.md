@@ -350,6 +350,32 @@ of them should alarm you is a question about the path. Recognising them fixed a
 segmentation bug on the way — `>|` is one operator, and hatch used to split the
 command at the `|` inside it. `hatch preview redirect` is the sample.
 
+**A here-document body is data, and hatch stops reading it as a program.** In
+
+```sh
+cat <<'EOF' > /tmp/x
+hello
+EOF
+```
+
+the line above the panes used to read *"nothing on the command's PATH answers
+to hello, EOF"* — an alarm on one of the plainest things an agent writes, which
+is how an alarm stops being read anywhere. Every first word of every body line
+was a program, a `;` in a body was a segment boundary, a `#` in one began a
+comment, and a `$HOME` in one was resolved to a value the shell never
+substitutes. None of that happens now. The rules are bash's: the body starts
+after the newline that ends the operator's line and not at the operator, so
+`cat <<EOF | grep x` still pipes; it ends on a line that is *exactly* the
+delimiter; `<<-` strips leading tabs and not spaces; several can open on one
+line and their bodies follow in order; and quoting the delimiter — `<<'EOF'`,
+`<<"EOF"`, `<<\EOF`, even `<<EO'F'` — turns expansion off for the whole body,
+while leaving it unquoted keeps `$HOME` real and worth showing. A body that is
+never terminated runs to the end of the command, because that is what bash does
+with it. The body itself is drawn plain, at full contrast and in no colour of
+its own: it is usually the whole point of the command, so it is the last text
+that should be dimmed, and the delimiter at each end is what says where it
+stops. `hatch preview heredoc` is the sample.
+
 **One line says what the command runs.** Ten `grep`s in a pipeline means
 reading the whole command to learn what it invokes, and asking "what does this
 run" of `sudo foo` used to get the answer `sudo`. So above the panes, before
@@ -574,10 +600,11 @@ hatch preview root                # the root window: the ROOT block and the fram
 hatch preview long                # a command taller and wider than the window
 hatch preview comment             # comments, beside the separators they are not
 hatch preview redirect            # redirections, and the two things that look like one
+hatch preview heredoc             # a here-document body, drawn as the data it is
 hatch preview --theme light       # the other palette, for this window only
 ```
 
-`hatch preview [command|chips|swap|root|long|comment|redirect]` opens the real approval
+`hatch preview [command|chips|swap|root|long|comment|redirect|heredoc]` opens the real approval
 window on a sample request, reading the same config `hatch prompt` reads. It is
 how you see what your `font_size`, `theme` and `terminal` settings actually
 render as without having to get an agent to knock on the door. The `long` sample is
@@ -731,8 +758,8 @@ It **under-reports** where real structure is not one of those: `&`
 backgrounding, subshells, command substitution — `sleep 60 & wait` draws as one
 segment, and `(cd /tmp; rm -rf x)` splits at the `;` without showing what nests
 it. It **over-reports** where unmodelled syntax puts a separator character in
-data: `$(( ))`, `[[ ]]`, `$'…\'…'`, here-document bodies, and `;;` in a
-`case` — each draws a boundary the shell does not have. Comments and the `>|`
+data: `$(( ))`, `[[ ]]`, `$'…\'…'` and `;;` in a `case` — each draws a
+boundary the shell does not have. Comments, here-document bodies and the `>|`
 operator used to be on that list and are not any more.
 Neither direction breaks an invariant: every byte is still on screen, drawn as
 itself. **Segment numbering is a reading aid, not an execution plan.** A fuller

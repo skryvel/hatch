@@ -1356,6 +1356,7 @@ mod tests {
             "printf '\u{202E}gnp.exe'",
             "ünïcödé — ✓",
             "make -j4   # then && rm -rf /tmp",
+            "cat <<'EOF' > /tmp/x\nhello\nEOF",
             "make 2>&1 >| /etc/passwd",
         ] {
             let spans = rendering(command);

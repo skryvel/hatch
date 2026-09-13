@@ -193,13 +193,24 @@ pub enum Scenario {
     /// destination that resolves out of the environment is directly below one
     /// that does not.
     Redirect,
+    /// A command that writes a file with a here-document: the body drawn as
+    /// the data it is, between the two lines that delimit it.
+    ///
+    /// Its own sample for the reason [`Scenario::Comment`] is, and it is the
+    /// same kind of comparison. Everything in the body would have been read as
+    /// shell before: a `&&`, a `#`, a `$HOME` and a first word that is not a
+    /// program. Each has a live one within a row or two of it -- a real `&&`
+    /// on the last line, a real command word at the top, and a `$HOME` that
+    /// resolves above one that does not -- so the two readings are on screen
+    /// at once and the difference between them is what the sample is for.
+    Heredoc,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 7] {
+    pub(crate) fn all() -> [Scenario; 8] {
         [
             Scenario::Command,
             Scenario::Chips,
@@ -208,6 +219,7 @@ impl Scenario {
             Scenario::Long,
             Scenario::Comment,
             Scenario::Redirect,
+            Scenario::Heredoc,
         ]
     }
 }
@@ -459,6 +471,33 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Heredoc => {
+            let asked = Asked::Command {
+                // Four things to look at, and each of them is a pair. The
+                // `&&` and the `#` in the body are data and the `&&` on the
+                // last line is a boundary; the `$HOME` on the first line
+                // resolves and the one in the body does not, because the
+                // delimiter is quoted; `cat` and `nginx` are words that name
+                // programs and `server` at the start of a body line is a word
+                // in a config file. The line that ends the body is drawn as
+                // the delimiter it is rather than as a program called
+                // `NGINXCONF`, which is what the roster above the panes used
+                // to call it.
+                command: HEREDOC_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Write the reverse-proxy site file and reload nginx".to_string(),
+                reason: "The new service is listening on 8080 and nothing in front of it \
+                         routes there yet."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
         Scenario::Chips => {
             let asked = Asked::Command {
                 // The second line is the whole argument for the rendering.
@@ -593,6 +632,36 @@ make -j4 > build.log 2>&1
 grep -F ' > ' build.log | tee warnings.txt
 install -m 0644 warnings.txt /srv/reports/ 2>> install.log
 printf 'done\\n' >| $HOME/reports/service.txt";
+
+/// The command behind [`Scenario::Heredoc`].
+///
+/// Written as a block for the reason [`COMMENT_SAMPLE`] is, and here it is not
+/// even a choice: a here-document *is* its line breaks. The body ends on a line
+/// that is exactly the delimiter, so a sample written with `\n` escapes would
+/// be a sample whose one load-bearing property nobody could see.
+///
+/// It is a file somebody might really write, and every line of the body is a
+/// line that used to be read as shell. `server {` put `server` in the roster as
+/// a program nothing answers to; the `&&` in the comment was a segment
+/// boundary the shell does not have; the `#` began a comment over data; and the
+/// `$HOME` was resolved to this machine's home directory although the
+/// delimiter is quoted and the shell substitutes nothing in the body at all.
+/// The `$HOME` on the first line is the control: it is on the operator's line,
+/// it really does expand, and it is drawn with its value two rows above the one
+/// that is not.
+///
+/// The last line is the other control. Its `&&` is a real boundary and its
+/// `systemctl` is a real command, both a row under a body that contains the
+/// same shapes and means none of them.
+const HEREDOC_SAMPLE: &str = "\
+cat <<'NGINXCONF' > $HOME/sites/service.conf
+server {
+    listen 80;
+    # proxy_pass && upstream are set by the deploy, not $HOME
+    location / { proxy_pass http://127.0.0.1:8080; }
+}
+NGINXCONF
+nginx -t && systemctl --user reload nginx";
 
 /// The command behind [`Scenario::Long`].
 ///
@@ -1051,6 +1120,48 @@ mod tests {
             Shown::of(&sample.payload)
                 .unwrap_or_else(|e| panic!("{scenario:?} cannot be drawn: {e}"));
         }
+    }
+
+    #[test]
+    fn the_heredoc_sample_reads_its_body_as_data_and_the_lines_around_it_as_shell() {
+        // The point of that scenario, and the regression it exists to hold
+        // down. Every shape in the body has a live twin within two rows of it,
+        // and the roster is the loudest half: it used to name `server`,
+        // `location`, `}` and `NGINXCONF` as programs nothing on the `PATH`
+        // answers to, on a command that writes a config file and reloads a
+        // service.
+        let staging = tempfile::tempdir().expect("a staging directory");
+        let sample = build(Scenario::Heredoc, &a_config(), platform().as_ref(), staging.path())
+            .expect("the heredoc sample builds");
+        let Payload::Command { runs, .. } = &sample.payload else {
+            panic!("the heredoc sample is a command");
+        };
+        let rendering = sample.payload.rendering().expect("the sample is a drawable command");
+
+        let named: Vec<&str> = runs.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(named, vec!["cat", "nginx", "systemctl"], "the body names nothing");
+
+        let of_kind = |kind: &crate::render::SpanKind| -> Vec<&str> {
+            rendering.iter().filter(|span| span.kind() == kind).map(|s| s.text()).collect()
+        };
+        assert_eq!(
+            of_kind(&crate::render::SpanKind::Separator),
+            vec!["&&"],
+            "the only boundary is the one on the last line"
+        );
+        assert!(
+            of_kind(&crate::render::SpanKind::Comment).is_empty(),
+            "the `#` in the body is data"
+        );
+        // One `$HOME` resolved and one left alone, which is the pair the
+        // sample is built around: the delimiter is quoted, so the shell
+        // substitutes nothing in the body.
+        let values: Vec<Option<String>> = rendering
+            .iter()
+            .filter_map(|span| span.variable().map(|(_, value)| value.map(str::to_string)))
+            .collect();
+        assert_eq!(values.len(), 1, "only the reference on the operator's line expands");
+        assert!(values[0].is_some(), "and it is shown with the value the command will get");
     }
 
     #[test]
