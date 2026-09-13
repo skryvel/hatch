@@ -4932,6 +4932,17 @@ mod tests {
             "cat<f",
             "a && b || c | d",
             "cd /tmp; make -j4",
+            // A command inside a command is two drawings of one claim as
+            // well, and the first of these is the case that made the roster
+            // say `ps`. The pane underlines the word inside the substitution
+            // and the roster names it, in the order they are written.
+            "x=$(podman ps -q)",
+            "echo $(podman ps -q)",
+            "echo `podman ps`",
+            "$(podman ps) | wc -l",
+            "A=$(date) make",
+            "echo $(a; b)",
+            "cd /tmp && \\\n  podman ps",
         ] {
             let spans = render_command(command);
             let underlined: Vec<String> =
