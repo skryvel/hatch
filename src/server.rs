@@ -3785,6 +3785,31 @@ mod tests {
                 );
             }
 
+            // The schema is the only thing an agent reads before it writes a
+            // call, so a `swap_file` that advertises one form offers one. Both
+            // are optional there and neither can be required: which of them a
+            // call must carry is a rule about the pair, and the one place it
+            // is enforced is `SwapRequest::of`, where a refusal can be a
+            // sentence.
+            let swap = tools
+                .iter()
+                .find(|t| t["name"] == "swap_file")
+                .expect("swap_file is listed");
+            let schema = &swap["inputSchema"];
+            for form in ["content", "patch"] {
+                assert!(
+                    !schema["properties"][form].is_null(),
+                    "swap_file does not advertise {form}: {schema}"
+                );
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .map(|r| r.iter().any(|name| name == form))
+                        .unwrap_or(false),
+                    "{form} is required on its own, which refuses the other form: {schema}"
+                );
+            }
+
             task.abort();
         })
         .await
