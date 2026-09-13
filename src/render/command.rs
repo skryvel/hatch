@@ -168,6 +168,42 @@
 //! know that what follows is a body rather than shell — so everything the
 //! lists above say about a heredoc body is as true as it was.
 //!
+//! # Command position, and the wrappers in front of it
+//!
+//! [`invoked`] answers the question the window puts above the panes: *what
+//! does this run*. It is the same reading of the same text every pass here
+//! makes -- the command word of a segment is the first word that is neither
+//! an assignment nor a redirection, which is [`is_assignment`]'s answer and
+//! [`is_word_break`]'s -- so the word the annotated pane underlines is the
+//! word the list is built from. [`command_word`] and [`invoked`] ask one
+//! [`words`] for that reason, and a test asserts the two agree.
+//!
+//! What it adds is that a command word is often not the last word worth
+//! reading. `sudo foo` runs two programs and the honest answer names both,
+//! and the same is true of `env`, `nice`, `timeout`, `xargs`, `run0` and the
+//! rest of [`WRAPPERS`] -- including `bash -c`, which is the wrapper hatch
+//! writes itself for every `root: true` request. Each of them has its own
+//! argument grammar, and skipping the wrong number of arguments means naming
+//! the wrong executable, which is worse than naming the wrapper: a reader who
+//! has been told what a command runs stops looking for what it really runs.
+//! So the grammars are whitelists and [`past`] gives up rather than guessing,
+//! and what a reader gets then is the wrapper's name and a sentence saying
+//! the command behind it was not read. Under-claiming is this module's safe
+//! direction and this is the same move [`annotate_variables`] makes for a `$`
+//! it cannot resolve.
+//!
+//! The trap on the other side is the shell's own vocabulary. `cd` resolves to
+//! no file anywhere, and a list that reported it as missing would draw a
+//! warning on the most ordinary command there is -- so [`is_builtin`] and
+//! [`is_keyword`] are here, with the argument for each written out on the
+//! tables themselves. Where the two lists are the point is the six names that
+//! are a builtin *and* a binary: `bash -c` runs the builtin, so hatch reports
+//! the builtin.
+//!
+//! Resolution -- which file a name reaches, and who else may write it -- is
+//! deliberately not here. It touches the filesystem, and this module is a
+//! pure reading of text; see [`super::roster`], which is the other half.
+//!
 //! # Variables: the window resolves against the environment that will run
 //!
 //! [`annotate_variables`] tags each `$NAME` and hangs on it the value the

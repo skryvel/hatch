@@ -29,9 +29,10 @@
 //!
 //! # Text that is not the command
 //!
-//! Three strings reach this module from outside the span model and so cannot
-//! be protected by chips: a variable's resolved value, the working directory,
-//! and a swap's path. Each is [`defang`]ed here, at the point it is turned
+//! Four kinds of string reach this module from outside the span model and so
+//! cannot be protected by chips: a variable's resolved value, the working
+//! directory, a swap's path, and the names and paths of the roster — see
+//! [`roster_summary`]. Each is [`defang`]ed here, at the point it is turned
 //! into something drawable. The daemon already defangs the first of those in
 //! [`crate::render::command::annotate_variables`], and defanging is
 //! idempotent — every label it produces is printable ASCII — so doing it

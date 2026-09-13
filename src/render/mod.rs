@@ -53,11 +53,17 @@ pub use span::{Span, SpanBuilder, SpanKind, Spans, covers_exactly, unrender, var
 /// no overload that supplies a default, because every available default is a
 /// guess.
 ///
-/// The renderers still to come — binary annotation, danger markers — refine
-/// this result the same way. That order is deliberate: `tests/fidelity.rs`
-/// passed before there was anything to break, so no later renderer can be
-/// written without it, and wiring each pass in here is what puts it under
-/// those properties.
+/// The renderer still to come — danger markers — refines this result the same
+/// way. That order is deliberate: `tests/fidelity.rs` passed before there was
+/// anything to break, so no later renderer can be written without it, and
+/// wiring each pass in here is what puts it under those properties.
+///
+/// [`roster`] is the one pass about a command that is deliberately *not* one
+/// of these. It produces no spans and touches no character: it answers what
+/// the command runs and where each name resolves, which is a list beside the
+/// panes rather than a mark on the text, and it reaches the filesystem, which
+/// nothing on this path does. Its input is the same string these spans tile,
+/// so the two cannot come to describe different requests.
 pub fn render_command(command: &str, env: &BTreeMap<String, String>) -> Spans {
     render_command_breaking_at(command, env, None)
 }

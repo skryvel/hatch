@@ -66,6 +66,12 @@ same thing.*
   be executed, and annotated beside it — segments numbered, `$HOME` shown with
   the value the command will really receive, the binary that runs underlined. A
   file write arrives as a diff, with the mode and owner it will land at.
+- **What it runs, in one place, before you start reading.** A line above the
+  panes lists every distinct thing the command puts in command position, with a
+  repeat count and the file each name reaches — `grep ×10, sed in /usr/bin;
+  bash's own cd`. Wrappers are unwrapped, so `sudo foo` is two programs and not
+  one, and a wrapper hatch cannot read past says so instead of guessing. A name
+  that leads nowhere, or to somewhere anyone can write, is said out loud.
 - **Nothing hides.** Invisible characters, right-to-left overrides and
   non-breaking spaces are drawn as labels rather than rendered, so a filename
   that reads `gnp.txt.exe` cannot pretend to be one. A command taller or wider
@@ -343,6 +349,39 @@ verdict: `> /dev/null` and `> /etc/passwd` get the same colour, because which
 of them should alarm you is a question about the path. Recognising them fixed a
 segmentation bug on the way — `>|` is one operator, and hatch used to split the
 command at the `|` inside it. `hatch preview redirect` is the sample.
+
+**One line says what the command runs.** Ten `grep`s in a pipeline means
+reading the whole command to learn what it invokes, and asking "what does this
+run" of `sudo foo` used to get the answer `sudo`. So above the panes, before
+you start on the command itself: *"Resolved when this window opened: git ×5,
+cargo ×4, rsync, curl ×2 in /usr/bin; bash's own set, cd, echo."* Deduplicated,
+counted, and resolved against the `PATH` the command will actually be given —
+which for a root request is the one travelling through `run0 --setenv=`.
+
+Sixteen wrappers are unwrapped — `sudo`, `doas`, `env`, `nice`, `ionice`,
+`nohup`, `setsid`, `stdbuf`, `timeout`, `xargs`, `time`, `command`, `exec`,
+`run0`, and `bash`/`sh` with `-c`, which is how a root request's own command is
+read — each with its own option grammar. The grammars are whitelists: an option
+hatch has not heard of might take a value, and skipping one word where two were
+wanted names an argument as a program. So `sudo -X ls` gives up rather than
+guessing, and the window says *"hatch could not read the arguments of sudo, so
+what it runs is not in this list."*
+
+Builtins are the trap this is shaped around. `cd` is on no `PATH` anywhere, and
+a list that called it missing would draw a warning on the most ordinary command
+there is — so bash's builtins and reserved words are recognised, `echo` and
+`test` and `[` are reported as the builtins bash actually runs rather than as
+the files of the same name in `/usr/bin`, and a function the command defines
+for itself resolves to the command. What does earn a second line, in orange, is
+a name nothing answers to, a word hatch will not expand, a wrapper it could not
+read, or a binary sitting where anyone can write it. That last one is a fact
+about a mode bit and not a verdict: whether a particular writable directory
+should alarm you is a question hatch does not answer.
+
+The line is a **snapshot** and says so. It is what a lookup found while the
+window was being drawn; the binary can be replaced before the command runs,
+because the lookup that decides that is bash's own at exec time. The label
+carries the honest version so there is no other version to read.
 
 **What is off the end of a pane is said in words.** Everything else here
 assumes the reader saw the text, and a pane showing twenty-four rows of a
@@ -735,11 +774,15 @@ an easier sell than typing the command that does the same thing. A
 the actual control. Read the denylist as closing the *file* route, never as a
 boundary.
 
-**The window does not yet resolve what a command will invoke.** There is no
-list of binaries a pipeline runs, no absolute-path resolution of the first
-word, no warning when a name resolves somewhere agent-writable, and no danger
-markers for shapes like `rm -rf` or `curl … | sh`. The fixed `PATH` above is
-the mitigation that exists; reading the command is the rest of it.
+**The roster is a snapshot, and there are no danger markers.** The list of
+what a command runs is what a `stat` said while the window was being drawn, and
+the binary behind a name can be replaced between that lookup and the moment the
+command runs — the lookup that decides what really runs is bash's, at exec
+time, and hatch is not in that path. The window says *when* it looked rather
+than implying it knows what will happen. The roster also states facts and never
+verdicts: it says a binary sits in a directory anyone can write to, and it does
+not say whether that should alarm you. There are still no danger markers for
+shapes like `rm -rf` or `curl … | sh`.
 
 **Approved output reaches the agent whole.** There is no way to approve `cat`
 on a file with one secret in it and hold the secret back — approving a command
@@ -984,11 +1027,12 @@ Stated so you do not go looking:
 - **Editing a command in the window** before approving it. Today the answers
   are deny, or ask for something simpler and wait.
 - **Trimming output** before it returns to the agent.
-- **Unwrapping nested commands** — `sh -c '…'`, `ssh host '…'`,
-  `docker exec … '…'` — into a readable tree. The payload of a wrapper is
-  currently drawn as an inert string, correctly and unhelpfully.
-- **Marking redirections** as structure. `> /etc/passwd` is drawn as ordinary
-  argument text.
+- **Drawing a nested command as a tree.** The roster above the panes reads
+  through `bash -c '…'` and `sh -c '…'` to name what is inside, and reads
+  through the fourteen other wrappers it knows; `ssh host '…'` and
+  `docker exec … '…'` it does not. Either way the payload is still *drawn* as
+  one inert string in the panes, correctly and unhelpfully — the panes have no
+  nesting in them.
 - **macOS and anything else.** Elevation and the window hints sit behind a
   small platform seam with a refusing implementation for other systems, so a
   port is a port and not a rewrite. It has not been done.
