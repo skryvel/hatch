@@ -3457,6 +3457,7 @@ mod tests {
             ("title", MAX_FIELD_BYTES),
             ("path", MAX_FIELD_BYTES),
             ("content", MAX_CONTENT_BYTES),
+            ("patch", MAX_PATCH_BYTES),
             ("reason", MAX_FIELD_BYTES),
         ] {
             assert!(
@@ -3490,6 +3491,19 @@ mod tests {
             SwapRequest::of(swap_params("path", "a".repeat(2 * 1024))).is_ok(),
             "a deep path is ordinary work"
         );
+        assert!(
+            SwapRequest::of(swap_params("patch", "a".repeat(100 * 1024))).is_ok(),
+            "a large patch of a large file is ordinary work"
+        );
+    }
+
+    #[test]
+    fn the_two_forms_of_a_swap_are_capped_at_the_same_number() {
+        // Not a coincidence to be preserved by hand: the two forms say the
+        // same thing, so how a request is encoded must not change how much of
+        // a file a person can be asked to read. A larger allowance for the
+        // patch would make it a way around the cap on `content`.
+        assert_eq!(MAX_PATCH_BYTES, MAX_CONTENT_BYTES);
     }
 
     #[test]
@@ -3603,6 +3617,29 @@ mod tests {
             assert!(run.contains(reach), "run_command does not name {reach:?}: {run}");
         }
         assert!(swap.contains("sed -i"), "swap_file does not name the habit it replaces: {swap}");
+    }
+
+    #[test]
+    fn the_swap_description_points_an_edit_at_the_cheap_form() {
+        // The description is where the choice between the two forms is
+        // actually made: a description that argued against the incentive
+        // would lose, so it has to make the cheap path the obvious one and
+        // say plainly which is which. Both names, both jobs, and the rule
+        // that exactly one of them belongs in a call.
+        let swap = tool_descriptions(&test_config())
+            .for_tool("swap_file")
+            .expect("swap_file is described")
+            .to_string();
+
+        assert!(swap.contains("Send `patch`"), "the cheap form is not the obvious one: {swap}");
+        for claim in ["create", "replace one wholesale", "both is an error"] {
+            assert!(swap.contains(claim), "the description does not say {claim:?}: {swap}");
+        }
+        // What a refusal will cost it, said before it costs anything.
+        assert!(
+            swap.contains("never searches nearby"),
+            "an agent must learn the no-fuzz rule here, not from a refusal: {swap}"
+        );
     }
 
     #[test]
@@ -4634,6 +4671,12 @@ later"), "");
             }
         }
 
+        /// The same request said the other way, so that a test can hold the
+        /// two forms side by side.
+        fn patch_of(path: &Path, patch: &str) -> SwapFileParams {
+            SwapFileParams { content: None, patch: Some(patch.to_string()), ..swap_of(path, "", false) }
+        }
+
         /// Every frame the one window was sent.
         fn frames(harness: &Harness) -> Vec<crate::protocol::DaemonMsg> {
             harness.prompter.recorded()[0].sent.clone()
@@ -5396,6 +5439,7 @@ later"), "");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
             let record = harness.only_record();
             assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["form"], "content", "the whole-file form is recorded too: {record}");
             assert_eq!(record["bytes"], 6);
             assert_eq!(
                 record["hash_before"],
@@ -5439,6 +5483,130 @@ later"), "");
             .await;
 
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+        }
+
+        // --- the same request, encoded the other way --------------------------
+
+        #[tokio::test]
+        async fn a_patch_and_the_whole_file_it_produces_open_the_same_window() {
+            // The claim the second form stands on, and the only test that can
+            // make it: one file, one state, two encodings, and the payloads
+            // compared field for field -- the plan, the hash the write will be
+            // re-checked against, every row of the diff. Both requests are
+            // denied, so the file is the same file for the second as it was
+            // for the first.
+            //
+            // If this ever fails, a person is being shown something that
+            // depends on how the agent chose to spell its request, which is
+            // the one thing about a patch that must never reach the window.
+            let deny = || Reply::verdict(Verdict::Deny { note: "not now".to_string() });
+            let harness = Harness::new(vec![deny(), deny()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            let before = "one\ntwo\nthree\nfour\nfive\n";
+            std::fs::write(&target, before).unwrap();
+
+            within(harness.daemon.swap_file(
+                patch_of(&target, "@@ -2,3 +2,3 @@\n two\n-three\n+THREE\n four\n"),
+                Caller::quiet(),
+            ))
+            .await;
+            within(harness.daemon.swap_file(
+                swap_of(&target, "one\ntwo\nTHREE\nfour\nfive\n", false),
+                Caller::quiet(),
+            ))
+            .await;
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), 2, "both forms must reach a window");
+            assert_eq!(
+                seen[0].payload, seen[1].payload,
+                "a patch and the contents it produces are one request by the time a window opens"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                before,
+                "two denials must leave the file exactly as it was"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_approved_patch_writes_what_it_produced_and_the_log_says_it_was_a_patch() {
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\nkeep\n").unwrap();
+
+            let result = within(harness.daemon.swap_file(
+                patch_of(&target, "@@ -1,2 +1,2 @@\n-before\n+after\n keep\n"),
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\nkeep\n");
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "approve");
+            assert_eq!(record["form"], "patch", "the log records how the request arrived: {record}");
+            assert_eq!(record["bytes"], 11, "the bytes that landed, not the bytes that were sent");
+        }
+
+        #[tokio::test]
+        async fn a_patch_that_does_not_apply_is_refused_before_anybody_is_asked() {
+            // No window is scripted, so opening one would panic: the point of
+            // the refusal is that the person is never interrupted for a
+            // request hatch already knows it cannot honour.
+            let harness = Harness::new(Vec::new());
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"one\ntwo\n").unwrap();
+
+            let result = within(harness.daemon.swap_file(
+                patch_of(&target, "@@ -2 +2 @@\n-three\n+THREE\n"),
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = result_text(&result);
+            for needle in ["hunk 1", "line 2", "`three`", "`two`", "never searches"] {
+                assert!(text.contains(needle), "the agent cannot fix this without {needle}: {text}");
+            }
+            assert!(
+                text.contains("Nothing was rendered") && text.contains("not a decision by the user"),
+                "a refusal must not read as a person saying no: {text}"
+            );
+            assert!(harness.prompter.seen().is_empty(), "a refused patch cost somebody a window");
+            assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "one\ntwo\n");
+        }
+
+        #[tokio::test]
+        async fn a_call_with_both_forms_or_with_neither_is_refused_at_the_boundary() {
+            // Refused before the call is a request at all, which is why there
+            // is no record: nothing was rendered, and the log would have
+            // nothing to say about a file nobody was asked to write.
+            let cases = [
+                (Some("x\n".to_string()), Some("@@ -1 +1 @@\n-a\n+x\n".to_string()), "both"),
+                (None, None, "neither"),
+            ];
+            for (content, patch, needle) in cases {
+                let harness = Harness::new(Vec::new());
+                let elsewhere = tempfile::tempdir().unwrap();
+                let target = elsewhere.path().join("target.conf");
+                std::fs::write(&target, b"a\n").unwrap();
+                let params = SwapFileParams { content, patch, ..swap_of(&target, "", false) };
+
+                let result = within(harness.daemon.swap_file(params, Caller::quiet())).await;
+
+                assert_eq!(result.is_error, Some(true), "{needle}");
+                let text = result_text(&result);
+                assert!(text.contains(needle), "the refusal must say which mistake: {text}");
+                assert!(text.contains("nothing ran"), "{text}");
+                assert!(harness.prompter.seen().is_empty(), "{needle} reached a window");
+                assert!(harness.logged().is_empty(), "{needle} was logged as a request: {text}");
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\n");
+            }
         }
 
         // --- the live view ----------------------------------------------------

@@ -638,6 +638,38 @@ mod tests {
     }
 
     #[test]
+    fn which_form_a_swap_arrived_in_is_written_down_and_shown_only_when_it_is_news() {
+        // The JSON says it either way, because a reader of the file needs an
+        // answer rather than an absence. The line a person reads says it only
+        // for the patch: a note on every line is read by nobody.
+        let content = swap_record();
+        let json = serde_json::to_string(&content).unwrap();
+        assert!(json.contains("\"form\":\"content\""), "{json}");
+        assert!(!content.summary().contains("patch"), "{}", content.summary());
+
+        let mut patched = swap_record();
+        if let LogDetail::SwapFile(detail) = &mut patched.detail {
+            detail.form = SwapForm::Patch;
+        }
+        let json = serde_json::to_string(&patched).unwrap();
+        assert!(json.contains("\"form\":\"patch\""), "{json}");
+        assert!(patched.summary().contains("(from a patch)"), "{}", patched.summary());
+    }
+
+    #[test]
+    fn a_record_written_before_there_was_a_patch_form_reads_back_as_the_form_it_was() {
+        // `hatch log` parses every line of a file that outlives the build that
+        // wrote it. A line from before the second form existed was a whole-file
+        // write, and the default has to say so rather than inventing a third
+        // state for it.
+        let line = r#"{"ts":"2026-09-06T12:00:00+02:00","title":"t","reason":"r",
+            "verdict":"approve","tool":"swap_file","path":"/etc/hosts","root":false}"#;
+        let record: AuditRecord = serde_json::from_str(line).expect("an older line still parses");
+        let LogDetail::SwapFile(detail) = record.detail else { panic!("a swap record") };
+        assert_eq!(detail.form, SwapForm::Content);
+    }
+
+    #[test]
     fn the_tool_name_is_written_on_every_record() {
         let run = serde_json::to_string(&sample_record(LogVerdict::Approve)).unwrap();
         assert!(run.contains("\"tool\":\"run_command\""), "{run}");
