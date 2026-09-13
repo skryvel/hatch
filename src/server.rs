@@ -36,9 +36,10 @@
 //! `Daemon::decide` is the whole of it, and the order of its steps is the
 //! design rather than an implementation detail.
 //!
-//! 1. **Validate and render.** Everything hatch can refuse without asking
-//!    anybody is refused here: a protected path, a symlink, a missing parent,
-//!    a working directory that is not one, a request for something this build
+//! 1. **Validate and render**, every operation of the request. Everything
+//!    hatch can refuse without asking anybody is refused here: a protected
+//!    path, a symlink, a missing parent, a patch that does not apply, a
+//!    working directory that is not one, a request for something this build
 //!    cannot do. Prompting for a request that is going to be refused spends
 //!    the scarcest resource in the design — a person's attention — on nothing,
 //!    so no refusal ever reaches the queue.
@@ -54,9 +55,14 @@
 //!    deciding, which arrives on the same await as the verdict. Every one of
 //!    those denies.
 //! 5. **Release the lock at the verdict**, not at completion, and then carry
-//!    the operation out. From here the deny rule no longer applies: a window
-//!    that dies now costs the Kill button and the live view, and nothing else.
-//! 6. **Write exactly one audit line.**
+//!    the operations out, in order, each to its end before the next. From
+//!    here the deny rule no longer applies: a window that dies now costs the
+//!    Kill button and the live view, and nothing else.
+//! 6. **Write one audit line for each operation**, from one place.
+//!
+//! `run_command` is not a second copy of any of this. It is a batch of one
+//! command, converted before its first field is checked, so every step above
+//! is the same step for both tools.
 //!
 //! ## The second gate, and the three things it can leave behind
 //!
@@ -83,13 +89,22 @@
 //!   claims; this is the absence of one, and the only honest answer when the
 //!   evidence that separates them is missing.
 //!
-//! ## Why there is exactly one audit line
+//! ## Why every operation gets exactly one audit line
 //!
 //! Not because every exit path remembers to write one. `Outcome` is the
 //! return type of the flow, so a path that ends without saying how it ended
 //! does not compile, and `Daemon::serve` is the single place that turns one
-//! into a record. Seven exit paths that each remember to log would be seven
-//! chances to forget.
+//! into records — one per operation, for the reason given in
+//! [`crate::audit`]. Seven exit paths that each remember to log would be
+//! seven chances to forget.
+//!
+//! ## What follows a failed operation
+//!
+//! Whatever the agent chose, within a line it cannot move. See [`Status`] for
+//! what failure is for each kind of operation, [`Failure`] for the two kinds
+//! and why only one of them is the agent's to decide about, and
+//! [`BatchParams::stop_on_failure`] for why that choice is the agent's at all.
+//! Nothing that ran is ever undone.
 //!
 //! ## What the agent is told
 //!
@@ -173,11 +188,11 @@ use crate::{exec, protocol, swap};
 /// output for the same reason: past that size a human is no longer reading a
 /// diff, they are scrolling past one.
 pub const MAX_FIELD_BYTES: usize = 4 * 1024;
-/// Cap on `run_command`'s `command`. See [`MAX_FIELD_BYTES`].
+/// Cap on a command's `command`. See [`MAX_FIELD_BYTES`].
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
-/// Cap on `swap_file`'s `content`. See [`MAX_FIELD_BYTES`].
+/// Cap on a write's `content`. See [`MAX_FIELD_BYTES`].
 pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
-/// Cap on `swap_file`'s `patch`, and on the file that patch produces.
+/// Cap on a write's `patch`, and on the file that patch produces.
 ///
 /// One number for both ends of it, and it is [`MAX_CONTENT_BYTES`]: the two
 /// forms say the same thing, so how a request was encoded must not change how
@@ -191,11 +206,28 @@ pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
 /// [`crate::patch::apply`], which takes the cap rather than compiling one in.
 pub const MAX_PATCH_BYTES: usize = MAX_CONTENT_BYTES;
 
+/// How many operations one `batch` may carry, for now.
+///
+/// One, and the number is a statement about this build rather than about the
+/// design. Everything behind the boundary is shaped for a list: the request a
+/// window receives, the loop that carries operations out, the policy that
+/// decides what follows a failure, the log line each operation gets. What is
+/// not built yet is a window that can show several operations to a person in
+/// a way they can actually check, and approving operations nobody could read
+/// is the one thing hatch will not do to get a feature out. So the list is
+/// capped at the length the window can honestly draw.
+///
+/// The cap is what the tool description quotes, and it is what the blocking
+/// bound is computed from — see [`Config::client_timeout_secs`] — so raising
+/// it moves both, and neither can be left behind saying the old number.
+pub const MAX_OPERATIONS: usize = 1;
+
 /// Parameters of `run_command`.
 ///
 /// Every field is agent-controlled and every one of them except `root` and
 /// `interactive` is rendered to a human, so each is length-checked at the
-/// boundary before it reaches a renderer.
+/// boundary before it reaches a renderer — the same boundary a `batch` goes
+/// through, because this call becomes one. See [`BatchParams::from`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunCommandParams {
     /// The one-line intent, as the user should read it.
@@ -204,8 +236,7 @@ pub struct RunCommandParams {
     pub command: String,
     /// Why this is needed now.
     pub reason: String,
-    /// Request root. Accepted because it is part of the tool contract;
-    /// refused for now.
+    /// Run the command as root.
     #[serde(default)]
     pub root: bool,
     /// Absolute working directory. Defaults to the child environment's
@@ -219,35 +250,98 @@ pub struct RunCommandParams {
     /// terminal and is denied one hangs rather than failing. The person can
     /// add a terminal to a request that did not ask for one — they can often
     /// see a prompt coming that the agent could not — and that is the only
-    /// direction the control moves in. See
-    /// [`crate::protocol::Verdict::Approve`].
+    /// direction the control moves in.
     #[serde(default)]
     pub interactive: bool,
 }
 
-/// Parameters of `swap_file`. See [`RunCommandParams`].
+/// `run_command` is a batch of exactly one command, and this is the whole of
+/// the difference between the two tools.
 ///
-/// `content` and `patch` are two encodings of one thing — what the file should
-/// contain — and exactly one of them belongs in a call. This struct can hold
-/// neither and it can hold both, which is the only place in hatch where that
-/// is true: see [`SwapRequest::of`] for why the wire type is allowed to be
-/// wrong and why nothing past it can be.
+/// A conversion of the *wire* parameters, before any of them is checked,
+/// rather than a second constructor of the checked [`Batch`]. That placement
+/// is what makes "one path" true all the way out to the edge: the caps, the
+/// refusals and their wording are [`Batch::of`]'s whichever tool was called,
+/// so no rule can be added to one of them and forgotten in the other.
+impl From<RunCommandParams> for BatchParams {
+    fn from(params: RunCommandParams) -> BatchParams {
+        let RunCommandParams { title, command, reason, root, cwd, interactive } = params;
+        BatchParams {
+            title,
+            reason,
+            operations: vec![OperationParams {
+                path: None,
+                content: None,
+                patch: None,
+                command: Some(command),
+                cwd,
+                interactive: Some(interactive),
+                root,
+            }],
+            // Moot with one operation, and false for the reason it is the
+            // default: see `BatchParams::stop_on_failure`.
+            stop_on_failure: false,
+        }
+    }
+}
+
+/// Parameters of `batch`. See [`RunCommandParams`] on why every string in
+/// here is length-checked before anything renders it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SwapFileParams {
-    /// The one-line intent, as the user should read it.
+pub struct BatchParams {
+    /// The one-line intent of the whole batch, as the user should read it.
     pub title: String,
-    /// Absolute path of the file to write.
-    pub path: String,
-    /// The complete new contents.
-    #[serde(default)]
-    pub content: Option<String>,
-    /// A unified diff against the file's current contents.
-    #[serde(default)]
-    pub patch: Option<String>,
     /// Why this is needed now.
     pub reason: String,
-    /// Request root. Accepted because it is part of the tool contract;
-    /// refused for now.
+    /// What to do, in the order to do it. One operation for now.
+    pub operations: Vec<OperationParams>,
+    /// Stop at the first operation that fails, instead of running the rest.
+    ///
+    /// # Why the agent chooses, and why the default is to carry on
+    ///
+    /// "Failure" has no reliable definition for a command. `grep` finding
+    /// nothing, `diff` finding a difference and `test -f` answering no all
+    /// exit non-zero, and in each case the status is the *answer* the command
+    /// was run for. A policy fixed in hatch would either halt batches on
+    /// answers or carry on past real failures, and hatch cannot tell which
+    /// one it is looking at. The agent wrote the commands and can; so the
+    /// choice is the agent's, it is shown to the person before they approve
+    /// — see [`crate::protocol::Request::stop_on_failure`] — and experience
+    /// will say whether carrying on is the right default.
+    ///
+    /// Two things are not the agent's to choose. An operation that ends in a
+    /// state hatch cannot account for ends the run whatever this says — see
+    /// [`Failure::Unsettled`] — and nothing is ever rolled back.
+    #[serde(default)]
+    pub stop_on_failure: bool,
+}
+
+/// One operation of a `batch`, as it arrived: a file write or a command.
+///
+/// Every field is optional here, which is the only place in hatch where an
+/// operation can be both kinds or neither: see [`Batch::of`] for why the wire
+/// type is allowed to be wrong and why nothing past it can be.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct OperationParams {
+    /// A file write: absolute path of the file to write.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// A file write: the complete new contents.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// A file write: a unified diff against the file's current contents.
+    #[serde(default)]
+    pub patch: Option<String>,
+    /// A command: the command, as a shell would run it.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// A command: absolute working directory. Defaults to `HOME`.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// A command: whether it needs a terminal of its own.
+    #[serde(default)]
+    pub interactive: Option<bool>,
+    /// Carry this operation out as root.
     #[serde(default)]
     pub root: bool,
 }
@@ -255,7 +349,7 @@ pub struct SwapFileParams {
 /// What the agent sent to say what the file should contain.
 ///
 /// The type that makes "exactly one of two" unrepresentable. Past
-/// [`SwapRequest::of`] there is no value in hatch that can carry both forms or
+/// [`Batch::of`] there is no value in hatch that can carry both forms or
 /// neither, so no later code has to check for it, and none of it can forget
 /// to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,82 +372,223 @@ impl SwapSource {
     }
 }
 
-/// One `swap_file` call, once the boundary has had it.
+/// One `batch` call, once the boundary has had it.
 ///
-/// The difference between this and [`SwapFileParams`] is the whole of the
-/// one-of-two rule: the wire type is shaped by what JSON can express, and this
-/// one by what a request can be.
+/// The difference between this and [`BatchParams`] is the whole of the rules
+/// about what an operation can be: the wire type is shaped by what JSON can
+/// express, and this one by what a request can be.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwapRequest {
+pub struct Batch {
     /// The one-line intent, as the user should read it.
     pub title: String,
-    /// Absolute path of the file to write, as the agent spelled it.
-    pub path: String,
-    /// What the file should contain, in whichever form was sent.
-    pub source: SwapSource,
     /// Why this is needed now.
     pub reason: String,
-    /// Request root.
-    pub root: bool,
+    /// The operations, in the order they will run. Never empty, and never
+    /// longer than [`MAX_OPERATIONS`].
+    pub operations: Vec<Operation>,
+    /// Whether to stop at the first operation that fails.
+    pub stop_on_failure: bool,
 }
 
-impl SwapRequest {
-    /// Length-check every agent-controlled string of a `swap_file` call and
-    /// settle which of the two forms it is in, or refuse it at the boundary.
+/// One operation, once the boundary has had it: exactly one kind, carrying
+/// exactly the fields that kind has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operation {
+    /// Replace or create one file.
+    Write {
+        /// Absolute path of the file to write, as the agent spelled it.
+        path: String,
+        /// What the file should contain, in whichever form was sent.
+        source: SwapSource,
+        /// Write it as root.
+        root: bool,
+    },
+    /// Run one command through a shell.
+    Command {
+        /// The command line, as the agent wrote it.
+        command: String,
+        /// Where to run it, when the agent said.
+        cwd: Option<String>,
+        /// Whether the agent asked for a terminal.
+        interactive: bool,
+        /// Run it as root.
+        root: bool,
+    },
+}
+
+impl Batch {
+    /// Length-check every agent-controlled string of a call, settle what kind
+    /// each operation is and which form each write is in, or refuse the call
+    /// at the boundary.
     ///
-    /// # Why the rule is enforced here and not by the type on the wire
+    /// # Why the rules are enforced here and not by the type on the wire
     ///
-    /// An enum of two variants expresses "exactly one" exactly, and it cannot
-    /// be the wire type. `#[serde(untagged)]` over `{ content }` and
-    /// `{ patch }` accepts a call carrying *both* — it matches the first
-    /// variant and ignores the second field — and the `deny_unknown_fields`
-    /// that would stop it is not allowed on a flattened enum. Deserialisation
-    /// could be hand-written to refuse, but a serde error surfaces as a
+    /// An enum expresses "a write or a command" exactly, and "`content` or
+    /// `patch`" too, and neither can be the wire type. `#[serde(untagged)]`
+    /// accepts a value carrying *both* shapes — it matches the first variant
+    /// and ignores the rest — and the `deny_unknown_fields` that would stop it
+    /// is not allowed on a flattened enum. A tagged enum would make the agent
+    /// spell out a kind that the fields already say. And deserialisation could
+    /// be hand-written to refuse, but a serde error surfaces as a
     /// protocol-level "invalid params" with no room for a sentence in it, and
     /// every refusal hatch makes is a sentence: an agent that cannot tell a
     /// limit from a person saying no reports a denial that never happened.
     ///
-    /// So the wire type is permissive by one field, this is the only way past
-    /// it, and [`SwapSource`] is what everything downstream sees. The rule is
-    /// checked once, in one place, and is unrepresentable everywhere else.
-    pub fn of(params: SwapFileParams) -> Result<SwapRequest, String> {
+    /// So the wire type is permissive, this is the only way past it, and
+    /// [`Operation`] and [`SwapSource`] are what everything downstream sees.
+    /// Each rule is checked once, in one place, and is unrepresentable
+    /// everywhere else.
+    ///
+    /// # The order of the checks
+    ///
+    /// The count comes before anything inside the operations. A batch over
+    /// the cap is not going to run however well-formed its third operation
+    /// is, and the agent's next move depends on hearing that first.
+    pub fn of(params: BatchParams) -> Result<Batch, String> {
         within_cap("title", &params.title, MAX_FIELD_BYTES)?;
-        within_cap("path", &params.path, MAX_FIELD_BYTES)?;
         within_cap("reason", &params.reason, MAX_FIELD_BYTES)?;
-        let source = match (params.content, params.patch) {
-            (Some(content), None) => {
-                within_cap("content", &content, MAX_CONTENT_BYTES)?;
-                SwapSource::Content(content)
-            }
-            (None, Some(patch)) => {
-                within_cap("patch", &patch, MAX_PATCH_BYTES)?;
-                SwapSource::Patch(patch)
-            }
-            (Some(_), Some(_)) => {
-                return Err(at_the_boundary(
-                    "`swap_file` takes either `content` or `patch`, and this call carries both",
-                    "They are two ways of saying what the file should contain, and hatch will \
-                     not guess which one was meant: send `content` alone to replace the file \
-                     outright, or `patch` alone to edit it.",
-                ));
-            }
-            (None, None) => {
-                return Err(at_the_boundary(
-                    "`swap_file` needs either `content` or `patch`, and this call carries \
-                     neither",
-                    "Send `content` — the complete new contents — to create a file or replace \
-                     one outright, or `patch` — a unified diff against the file as it is now — \
-                     to edit one.",
-                ));
-            }
-        };
-        Ok(SwapRequest {
+        let count = params.operations.len();
+        if count == 0 {
+            return Err(at_the_boundary(
+                "this batch carries no operations",
+                "Send at least one: a file write, with `path` and `content` or `patch`, or a \
+                 command, with `command`.",
+            ));
+        }
+        if count > MAX_OPERATIONS {
+            return Err(over_the_operation_cap(count));
+        }
+        let operations = params
+            .operations
+            .into_iter()
+            .enumerate()
+            .map(|(index, operation)| {
+                // A field named on its own where there is only one operation
+                // it could belong to, which is also the spelling a
+                // `run_command` call's own fields have; and by its place in
+                // the list where there is more than one, which is the
+                // spelling the agent's JSON has.
+                let field = |name: &str| match count {
+                    1 => name.to_string(),
+                    _ => format!("operations[{index}].{name}"),
+                };
+                Operation::of(operation, &field)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Batch {
             title: params.title,
-            path: params.path,
-            source,
             reason: params.reason,
-            root: params.root,
+            operations,
+            stop_on_failure: params.stop_on_failure,
         })
+    }
+}
+
+impl Operation {
+    /// Settle what one operation is, or refuse the call it is part of.
+    ///
+    /// `field` spells a field's name the way the agent would find it in what
+    /// it sent. See [`Batch::of`].
+    fn of(params: OperationParams, field: &dyn Fn(&str) -> String) -> Result<Operation, String> {
+        let OperationParams { path, content, patch, command, cwd, interactive, root } = params;
+        match (path, command) {
+            (Some(_), Some(_)) => Err(at_the_boundary(
+                &format!(
+                    "an operation carries both `{}` and `{}`",
+                    field("path"),
+                    field("command")
+                ),
+                "An operation is a file write or a command, never both at once. Send them as two \
+                 operations, in the order they should happen.",
+            )),
+            (None, None) => Err(at_the_boundary(
+                &format!(
+                    "an operation carries neither `{}` nor `{}`",
+                    field("path"),
+                    field("command")
+                ),
+                "A file write needs `path`, and `content` or `patch`; a command needs `command`.",
+            )),
+            (Some(path), None) => {
+                // A field that belongs to the other kind is refused rather
+                // than ignored. hatch will not guess whether a write carrying
+                // `cwd` was meant to be a command, and an ignored field is a
+                // part of the call the agent believes was honoured.
+                if let Some(stray) = [("cwd", cwd.is_some()), ("interactive", interactive.is_some())]
+                    .into_iter()
+                    .find_map(|(name, present)| present.then_some(name))
+                {
+                    return Err(at_the_boundary(
+                        &format!(
+                            "a file write carries `{}`, which only a command has",
+                            field(stray)
+                        ),
+                        "A write lands at the path it names and runs nothing, so there is no \
+                         working directory or terminal for it to use. Leave the field out, or \
+                         send the command it was meant for as an operation of its own.",
+                    ));
+                }
+                within_cap(&field("path"), &path, MAX_FIELD_BYTES)?;
+                let source = match (content, patch) {
+                    (Some(content), None) => {
+                        within_cap(&field("content"), &content, MAX_CONTENT_BYTES)?;
+                        SwapSource::Content(content)
+                    }
+                    (None, Some(patch)) => {
+                        within_cap(&field("patch"), &patch, MAX_PATCH_BYTES)?;
+                        SwapSource::Patch(patch)
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(at_the_boundary(
+                            &format!(
+                                "a file write takes either `{}` or `{}`, and this one carries both",
+                                field("content"),
+                                field("patch")
+                            ),
+                            "They are two ways of saying what the file should contain, and hatch \
+                             will not guess which one was meant: send `content` alone to replace \
+                             the file outright, or `patch` alone to edit it.",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(at_the_boundary(
+                            &format!(
+                                "a file write needs either `{}` or `{}`, and this one carries \
+                                 neither",
+                                field("content"),
+                                field("patch")
+                            ),
+                            "Send `content` — the complete new contents — to create a file or \
+                             replace one outright, or `patch` — a unified diff against the file \
+                             as it is now — to edit one.",
+                        ));
+                    }
+                };
+                Ok(Operation::Write { path, source, root })
+            }
+            (None, Some(command)) => {
+                if let Some(stray) = [("content", content.is_some()), ("patch", patch.is_some())]
+                    .into_iter()
+                    .find_map(|(name, present)| present.then_some(name))
+                {
+                    return Err(at_the_boundary(
+                        &format!("a command carries `{}`, which only a file write has", field(stray)),
+                        "To write a file, send the write as an operation of its own, with `path`; \
+                         a command that is handed file contents does nothing with them.",
+                    ));
+                }
+                within_cap(&field("command"), &command, MAX_COMMAND_BYTES)?;
+                if let Some(cwd) = &cwd {
+                    within_cap(&field("cwd"), cwd, MAX_FIELD_BYTES)?;
+                }
+                Ok(Operation::Command {
+                    command,
+                    cwd,
+                    interactive: interactive.unwrap_or(false),
+                    root,
+                })
+            }
+        }
     }
 }
 
@@ -382,17 +617,6 @@ fn within_cap(field: &str, value: &str, cap: usize) -> Result<(), String> {
     ))
 }
 
-/// Length-check every agent-controlled string of a `run_command` call.
-fn check_run_command(params: &RunCommandParams) -> Result<(), String> {
-    within_cap("title", &params.title, MAX_FIELD_BYTES)?;
-    within_cap("command", &params.command, MAX_COMMAND_BYTES)?;
-    within_cap("reason", &params.reason, MAX_FIELD_BYTES)?;
-    if let Some(cwd) = &params.cwd {
-        within_cap("cwd", cwd, MAX_FIELD_BYTES)?;
-    }
-    Ok(())
-}
-
 /// What the agent is told when a call is malformed in a way hatch can see
 /// without looking at anything outside it.
 ///
@@ -407,6 +631,32 @@ fn at_the_boundary(what: &str, fix: &str) -> String {
     )
 }
 
+/// What the agent is told when a batch is longer than this build takes.
+///
+/// Not [`at_the_boundary`], and the difference is the point. That skeleton
+/// opens with "refused", and a tool that accepts a list and then refuses
+/// every list longer than one reads as broken — an agent that meets that once
+/// goes back to writing files with here-documents, which is the habit this
+/// tool exists to replace. So the sentence says what is true: nothing about
+/// the operations was judged, the limit is this build's and temporary, and the
+/// way forward is the same operations sent one per call — with the one wrong
+/// way forward named, because it is the one the agent is most likely to take.
+fn over_the_operation_cap(count: usize) -> String {
+    let cap = match MAX_OPERATIONS {
+        1 => "one operation".to_string(),
+        n => format!("{n} operations"),
+    };
+    format!(
+        "hatch has not run this batch: it carries {count} operations, and this version of \
+         hatch takes {cap} per batch for now. That is a temporary limit of this build — longer \
+         batches are coming — and not a judgement of anything in them: nothing was rendered, \
+         nobody was asked, nobody decided anything and nothing ran. Send the operations as \
+         batches of one, in the order you listed them. Do not fold the file writes into a \
+         `run_command` here-document to get round this: a write sent as a write is shown to \
+         the person as a diff and checked against the file when it lands, and one inside a \
+         shell command is neither."
+    )
+}
 
 // ---- what the transport knows and a tool handler cannot --------------------
 
@@ -676,16 +926,16 @@ impl SessionManager for WatchedSessions {
 /// the user's config and is only known at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDescriptions {
+    batch: String,
     run_command: String,
-    swap_file: String,
 }
 
 impl ToolDescriptions {
     /// The runtime description for `name`, or `None` if the tool has none.
     pub fn for_tool(&self, name: &str) -> Option<&str> {
         match name {
+            "batch" => Some(&self.batch),
             "run_command" => Some(&self.run_command),
-            "swap_file" => Some(&self.swap_file),
             _ => None,
         }
     }
@@ -700,19 +950,41 @@ impl ToolDescriptions {
 /// 1. Use them only when the work must happen on the host. Anything doable in
 ///    the workspace belongs in the workspace.
 /// 2. Each call interrupts a person and may block for the **whole** bound —
-///    the approval wait *plus* the command's own runtime. Quoting the
+///    the approval wait *plus* the operations' own runtime. Quoting the
 ///    approval timeout alone understates it by more than three times and
 ///    teaches the agent that these calls are cheap.
-/// 3. Batch related work into one call.
+/// 3. Gather related work into one call.
 /// 4. `title` is the intent a human reads first, not the syntax; `reason` is
 ///    why it is needed now.
+///
+/// And the two descriptions have a division of labour to keep, because the
+/// incentive runs the wrong way. One command costs one interruption through
+/// either tool, and a file written with a here-document inside that command
+/// costs nothing extra — while giving up the diff, the landing mode and
+/// owner, the symlink check and the drift refusal. So `batch` claims anything
+/// that touches a file, `run_command` sends a file edit to `batch` by name,
+/// and both name the shell habits that are the way around it.
+///
+/// Each quotes its own bound. `run_command` is one command however large a
+/// batch may grow, so its number is the approval wait and one execution; the
+/// batch's is the approval wait and one execution per operation it may
+/// carry. At a cap of one they are the same number, and a test holds them to
+/// their own formulas rather than to each other.
 pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
-    let total = config.client_timeout_secs();
     let approval = config.timeout_secs;
     let exec = config.exec_timeout_secs;
+    let one = config.blocking_bound_secs(1);
+    let total = config.client_timeout_secs();
+    let cap = match MAX_OPERATIONS {
+        1 => "One operation per batch for now; more later.".to_string(),
+        n => format!("Up to {n} operations per batch for now; more later."),
+    };
 
     let run_command = format!(
-        "Run a shell command on the host machine, outside your sandbox.\n\
+        "Run one shell command on the host machine, outside your sandbox.\n\
+         \n\
+         This is the shortcut for a `batch` of exactly one command: the same window, the same \
+         checks, the same answer. Use `batch` for anything that writes a file.\n\
          \n\
          Use this only when the work has to happen on the host: installing a system package, \
          restarting a service, reading or changing something outside your workspace, inspecting \
@@ -720,23 +992,24 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          tools, do it there — that is faster and it interrupts nobody.\n\
          \n\
          Every call opens a window on a person's screen and waits for them to read the command \
-         and decide. One call can block for up to {total} seconds: up to {approval}s waiting for \
+         and decide. One call can block for up to {one} seconds: up to {approval}s waiting for \
          that decision, then up to {exec}s while the command runs. Plan for that. Batch related \
-         work into a single command — chain it with `&&`, or write a short script — instead of \
-         making a run of separate calls, because each extra call is another interruption.\n\
+         commands into a single command — chain them with `&&`, or write a short script — \
+         instead of making a run of separate calls, because each extra call is another \
+         interruption.\n\
          \n\
          The person may refuse the command, ask you to explain it, ask for a form of it that \
          is easier to read, or decide to run it themselves. You get back what actually \
          happened, which is not always what you asked for.\n\
          \n\
-         **To change a file, use `swap_file` instead.** Reading one here is exactly what this \
-         tool is for — `cat` it, `grep` it, list a directory. Writing one is not. The difference \
-         is what the person is asked to check: `swap_file` shows them a diff, the mode and owner \
-         the file will land at, and a target hatch has confirmed is not a symlink and has not \
-         changed since you read it. A `cat > file` here-document, a `sed -i`, a `tee` or a `>>` \
-         shows them a shell command whose effect on the file they have to work out in their \
-         head, and none of those checks happen at all. This holds even when the shell one-liner \
-         is shorter, and even for a single line in a config.\n\
+         **To change a file, use `batch` instead.** Reading one here is exactly what this tool \
+         is for — `cat` it, `grep` it, list a directory. Writing one is not. The difference is \
+         what the person is asked to check: a write in a `batch` shows them a diff, the mode \
+         and owner the file will land at, and a target hatch has confirmed is not a symlink and \
+         has not changed since you read it. A `cat > file` here-document, a `sed -i`, a `tee` \
+         or a `>>` shows them a shell command whose effect on the file they have to work out \
+         in their head, and none of those checks happen at all. This holds even when the shell \
+         one-liner is shorter, and even for a single line in a config.\n\
          \n\
          Fields:\n\
          - title: the intent in one plain line. It is the first thing the person reads, so write \
@@ -758,7 +1031,7 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          permission error without it is a normal result you may retry with it. It costs the \
          person a second interruption: after they approve in hatch's window, the system asks \
          them for a password in a dialog of its own, and dismissing that dialog stops the \
-         command. Both of those waits are inside the {total} seconds above. A root command may \
+         command. Both of those waits are inside the {one} seconds above. A root command may \
          also be given a terminal where an ordinary one is not, so it may colour its output.\n\
          \n\
          Two answers mean the command did not run and you may ask again: the person refused it, \
@@ -767,57 +1040,80 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          the person to check instead."
     );
 
-    let swap_file = format!(
-        "Write a file on the host machine, outside your sandbox: edit it, replace it whole, or \
-         create it.\n\
+    let batch = format!(
+        "Write files and run commands on the host machine, outside your sandbox: a list of \
+         operations that one person reads and approves at once.\n\
          \n\
-         Use this only when the file has to live on the host: a config under /etc, a dotfile in \
-         the person's home directory, a service unit. For files inside your own workspace, write \
-         them directly — never through this tool.\n\
+         **{cap}** The list is the tool's real shape, but this version of hatch takes a batch \
+         of one operation, and a longer list comes back unrun with a message saying so. Until \
+         then, send each operation as a batch of its own.\n\
          \n\
-         **This is the tool for editing configuration.** Whenever what you want is \"this file \
-         should now say X\" — a unit, a dotfile, something under /etc — come here, and not to \
-         `run_command` with a redirect or a `sed -i`. It is the form a person can actually \
-         check: they read a diff rather than reconstructing what a shell line would do, and the \
-         write is refused outright if the file changed after you read it, so an edit someone \
-         else made in the meantime is reported to you instead of being overwritten.\n\
+         Use this only when the work has to happen on the host: a config under /etc, a dotfile \
+         in the person's home directory, a service unit, a command that has to run outside your \
+         workspace. For anything inside your own workspace, use your ordinary tools — never \
+         this one.\n\
          \n\
-         The person sees a diff of the change before anything is written, and approves or \
-         rejects it. One call can block for up to {total} seconds while they read and decide, so \
-         gather related edits into as few calls as you can.\n\
+         **This is the tool for anything that touches a file.** Whenever what you want is \"this \
+         file should now say X\" — a unit, a dotfile, something under /etc — send a write here, \
+         and not a `run_command` with a redirect, a `tee`, a here-document or a `sed -i`. A write \
+         is the form a person can actually check: they read a diff rather than reconstructing \
+         what a shell line would do, they see the mode and owner the file will land at, and the \
+         write is refused outright if the target is a symlink or the file changed after you \
+         read it, so an edit someone else made in the meantime is reported to you instead of \
+         being overwritten. For a single command, `run_command` is the shortcut.\n\
          \n\
-         **Editing a file that is already there? Send `patch`.** It costs you the lines you \
-         touch instead of the whole file, which for a small change in a large one is most of \
-         what the call costs you at all. Send `content` — the complete new contents — to create \
-         a file or to replace one wholesale. Exactly one of the two: both is an error, and so is \
-         neither.\n\
+         Every call opens a window on a person's screen and waits for them to read it and \
+         decide. One call can block for up to {total} seconds: up to {approval}s waiting for \
+         that decision, then up to {exec}s for each operation while it runs. Plan for that, and \
+         gather related work into as few calls as you can, because each call is another \
+         interruption. The person may refuse, ask you to explain, ask for a form that is easier \
+         to read, or decide to do it themselves; you get back what actually happened.\n\
          \n\
-         Read the file first — `run_command` with `cat` — so that what you send is an edit of \
-         what is really there. A patch is an ordinary unified diff (`@@` hunks, ` ` context, `-` \
-         and `+` lines) against the file as it is now, and hatch applies it itself before \
-         anybody is asked: what the person approves is the bytes it produces, exactly as with \
-         `content`. It applies only where its hunk headers say it does, and hatch never searches \
-         nearby for a better fit — a hunk whose context does not match is refused, naming the \
-         line and what was found there, and nothing is written and nobody is interrupted.\n\
+         Each operation is a file write or a command, never both:\n\
+         - A file write has `path` — the absolute path of the file — and exactly one of `patch` \
+         or `content`. **Editing a file that is already there? Send `patch`**: a unified diff \
+         against the file as it is now, which costs you the lines you touch instead of the \
+         whole file. Send `content` — the complete new contents — to create a file or to \
+         replace one wholesale. Both is an error, and so is neither. Read the file first — \
+         `run_command` with `cat` — so that what you send is an edit of what is really there. \
+         hatch applies a patch itself before anybody is asked, and what the person approves is \
+         the bytes it produces, exactly as with `content`. A patch applies only where its hunk \
+         headers say it does, and hatch never searches nearby for a better fit: a hunk whose \
+         context does not match is refused, naming the line and what was found there, and \
+         nothing is written and nobody is interrupted.\n\
+         - A command has `command`, and optionally `cwd` and `interactive`, which mean what they \
+         mean in `run_command`.\n\
+         - Either kind takes `root`: true carries that operation out as root, and costs the \
+         person a password dialog of its own after they approve; dismissing it means that \
+         operation does not happen. A root write keeps the file's existing owner and mode, or \
+         creates it owned by root — the window states which, and the write either matches what \
+         it stated or does not happen.\n\
+         \n\
+         Operations run in the order you list them, and the person sees them in that order. \
+         You get back what became of every one: done, failed, or not attempted. A write fails \
+         when it is refused at the moment of writing — most often because the file changed \
+         after the person read the diff — or when its password dialog is dismissed. A command \
+         fails when it exits with a non-zero status, cannot be started, is killed, runs out of \
+         time, or its password dialog is dismissed. By default the batch carries on past a \
+         failed operation and runs the rest; set `stop_on_failure` to stop at the first failure \
+         instead. Choose on purpose: many commands exit non-zero as an answer — `grep` finding \
+         nothing, `diff` finding a difference — and \"write the config, then reload\" reloads \
+         against the old file if the write failed and the batch carried on. The person sees \
+         which you chose before approving. Either way, nothing runs after an operation that was \
+         killed, ran out of time, or ended in a state hatch cannot account for; those leave \
+         the rest not attempted. Nothing is ever rolled back.\n\
          \n\
          Fields:\n\
-         - title: the intent in one plain line. It is the first thing the person reads, so write \
-         \"Point the editor at the new font\", not the path and the bytes. The point, not the \
-         syntax.\n\
-         - path: absolute path of the file to write.\n\
-         - content: the complete new contents of the file. For a file you are creating, or a \
-         wholesale replacement.\n\
-         - patch: a unified diff against the file's current contents. For an edit to a file that \
-         exists — the cheap form, and the one to reach for.\n\
+         - title: the intent of the whole batch in one plain line. It is the first thing the \
+         person reads, so write \"Point the editor at the new font\", not the path and the \
+         bytes. The point, not the syntax.\n\
          - reason: why this is needed now, in a sentence or two.\n\
-         - root: true writes the file as root, for a path this user cannot write. The person \
-         approves the same diff either way, and then the system asks them for a password in a \
-         dialog of its own; dismissing it means nothing is written. A root write keeps the \
-         file's existing owner and mode, or creates it owned by root — the window states which, \
-         and the write either matches what it stated or does not happen."
+         - operations: the list, in the order to carry it out. {cap}\n\
+         - stop_on_failure: true stops at the first operation that fails. Optional; false by \
+         default."
     );
 
-    ToolDescriptions { run_command, swap_file }
+    ToolDescriptions { batch, run_command }
 }
 
 /// The MCP server. One is built per client session by the transport's
@@ -862,27 +1158,28 @@ impl Hatch {
     // token, the progress token and the connection this call arrived on, which
     // between them are three of the four ways a request ends without a
     // verdict.
-    #[tool(description = "Run a shell command on the host, outside the sandbox.")]
-    async fn run_command(
+    #[tool(description = "Write files and run commands on the host, outside the sandbox.")]
+    async fn batch(
         &self,
-        Parameters(params): Parameters<RunCommandParams>,
+        Parameters(params): Parameters<BatchParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         // `Ok`, always: every outcome a person or a clock can produce is a
         // recoverable tool error the agent can read. `Err(ErrorData)` is
         // reserved for parameters rmcp could not deserialise at all, which it
         // rejects before reaching here.
-        Ok(self.daemon.run_command(params, Caller::of(&context)).await)
+        Ok(self.daemon.batch(params, Caller::of(&context)).await)
     }
 
-    // See the note on `run_command`: this description is a placeholder.
-    #[tool(description = "Write a file on the host, outside the sandbox.")]
-    async fn swap_file(
+    // See the note on `batch`: this description is a placeholder, and the
+    // handler is one line because the tool is a batch of one command.
+    #[tool(description = "Run a shell command on the host, outside the sandbox.")]
+    async fn run_command(
         &self,
-        Parameters(params): Parameters<SwapFileParams>,
+        Parameters(params): Parameters<RunCommandParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(self.daemon.swap_file(params, Caller::of(&context)).await)
+        Ok(self.daemon.run_command(params, Caller::of(&context)).await)
     }
 }
 
@@ -1152,73 +1449,89 @@ impl Drop for Progress {
     }
 }
 
-/// How one request ended: the line for the log and the answer for the agent,
+/// How one request ended: the lines for the log and the answer for the agent,
 /// as one value.
 ///
-/// This type is why there is exactly one audit record per request. Every exit
+/// This type is why every request is recorded, and recorded once. Every exit
 /// from the flow — a refusal, a denial, a timeout, a cancellation, a dropped
-/// client, a dead window, a command that ran — is a `return` of one of these,
+/// client, a dead window, a batch that ran — is a `return` of one of these,
 /// so the flow cannot end without saying how it ended, and
 /// `Daemon::serve` appends in the single place that receives it. Seven exit
 /// paths that each remember to log would be seven chances to forget; a return
 /// type cannot be forgotten.
+///
+/// One record per operation, all of them written from that one place: see
+/// [`crate::audit`] for why a batch is several lines rather than one line
+/// holding a list. `effects` is never shorter than the request, so an
+/// operation cannot go unrecorded by being the one a path forgot.
 struct Outcome {
-    verdict: LogVerdict,
+    /// How each operation ended and what is known about it, in order: one
+    /// entry for every operation the request carried.
+    effects: Vec<Effect>,
     /// What the user typed, when a user typed anything.
     note: Option<String>,
-    /// The tool-specific half of the record, as complete as this outcome
-    /// knows how to make it.
-    detail: LogDetail,
     /// What the agent gets back.
     result: CallToolResult,
 }
 
+/// One operation's line in the log, as complete as its outcome knows how to
+/// make it.
+struct Effect {
+    verdict: LogVerdict,
+    detail: LogDetail,
+}
+
 impl Outcome {
-    /// An outcome that carries a recoverable tool error.
+    /// An outcome that carries a recoverable tool error, and gives every
+    /// operation the same verdict.
     ///
     /// Every non-approval is one of these. Never `Err(ErrorData)`: that is a
     /// protocol error, and MCP clients render protocol errors opaquely, so an
     /// agent would be told the server is broken instead of being told what the
-    /// person decided.
+    /// person decided. One verdict for all of them, because a decision that
+    /// was not an approval was a decision about the whole request: nobody
+    /// denies the second operation of a batch and approves the first.
     fn refusing(
         verdict: LogVerdict,
         note: Option<String>,
-        detail: LogDetail,
+        details: Vec<LogDetail>,
         message: String,
     ) -> Outcome {
         Outcome {
-            verdict,
+            effects: details.into_iter().map(|detail| Effect { verdict, detail }).collect(),
             note,
-            detail,
             result: CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
 }
 
-/// One request as it arrived, before anything has been validated.
-enum Asked {
-    Run(RunCommandParams),
-    Swap(SwapRequest),
-}
-
-impl Asked {
-    /// The two agent-written lines every window and every log record carries,
-    /// defanged: the agent chooses this text and it frames the whole decision,
-    /// so a bidi override in it would reorder everything the reader sees.
-    fn headline(&self) -> (String, String) {
-        match self {
-            Asked::Run(p) => (defang(&p.title), defang(&p.reason)),
-            Asked::Swap(p) => (defang(&p.title), defang(&p.reason)),
-        }
-    }
-}
-
-/// A request that has passed validation and been rendered: everything needed
-/// to show it, and everything needed to carry it out if it is approved.
+/// An operation that has passed validation and been rendered: everything
+/// needed to show it, and everything needed to carry it out if it is
+/// approved.
 struct Job {
     payload: Payload,
     detail: LogDetail,
     work: Work,
+}
+
+/// An operation hatch will not put in front of anybody, and the line that
+/// records it.
+struct Refusal {
+    detail: LogDetail,
+    message: String,
+}
+
+/// The two ways preparing one operation can end.
+///
+/// An enum rather than a `Result`, for the reason [`Prepared`] is one: a
+/// refused operation is an ordinary answer and not an error.
+enum Rendered {
+    /// Validated and rendered. Boxed, because a rendering and its diff rows
+    /// are several times the size of a refusal, and every refusal would
+    /// otherwise be moved about at that size.
+    Ready(Box<Job>),
+    /// Refused, with what to record and what to say.
+    Refused(Refusal),
 }
 
 /// What an approval authorises.
@@ -1257,37 +1570,44 @@ struct RunPlan {
 }
 
 impl Daemon {
-    /// Run one `run_command` call to its end.
+    /// Run one `run_command` call to its end: as the batch of one command it
+    /// is.
+    ///
+    /// There is no second path behind this. The conversion happens before a
+    /// single field is checked, so everything a `batch` call goes through —
+    /// the caps, the refusals, the window, the execution, the log — is what
+    /// this call goes through, because it is one. See
+    /// [`BatchParams::from`](From::from).
     pub async fn run_command(&self, params: RunCommandParams, caller: Caller) -> CallToolResult {
+        self.batch(BatchParams::from(params), caller).await
+    }
+
+    /// Run one `batch` call to its end.
+    pub async fn batch(&self, params: BatchParams, caller: Caller) -> CallToolResult {
         // The caps run before anything else touches these strings. Rendering
         // is where the super-linear work lives, so checking afterwards would
-        // check nothing.
+        // check nothing. The shape rules — what an operation is, which form a
+        // write is in, how many there are — ride along because they are the
+        // same kind of refusal.
         //
         // A call refused here is deliberately *not* an audit line. It never
         // became a request: nothing was rendered, no window was opened, and
-        // the record would have to carry the very field that is too large to
-        // handle in the first place.
-        match check_run_command(&params) {
-            Ok(()) => self.serve(Asked::Run(params), caller).await,
+        // the record would have to carry the very field that is too large or
+        // too malformed to handle in the first place.
+        match Batch::of(params) {
+            Ok(batch) => self.serve(batch, caller).await,
             Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
         }
     }
 
-    /// Run one `swap_file` call to its end.
-    pub async fn swap_file(&self, params: SwapFileParams, caller: Caller) -> CallToolResult {
-        // See `run_command` on why this is here and why it is not logged. The
-        // one-of-two rule rides along with the caps because it is the same
-        // kind of refusal: the call never became a request, so there is
-        // nothing to render and nothing to record.
-        match SwapRequest::of(params) {
-            Ok(request) => self.serve(Asked::Swap(request), caller).await,
-            Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
-        }
-    }
-
-    /// One request, and the one place an audit record is written.
-    async fn serve(&self, asked: Asked, caller: Caller) -> CallToolResult {
-        let (title, reason) = asked.headline();
+    /// One request, and the one place its audit records are written.
+    async fn serve(&self, batch: Batch, caller: Caller) -> CallToolResult {
+        // The two agent-written lines every window and every log record
+        // carries, defanged: the agent chooses this text and it frames the
+        // whole decision, so a bidi override in it would reorder everything
+        // the reader sees.
+        let (title, reason) = (defang(&batch.title), defang(&batch.reason));
+        let stop_on_failure = batch.stop_on_failure;
         // An out-parameter rather than a field on `Outcome`, and that is the
         // point of it: the number is drawn in one place, half way through
         // `decide`, and every one of the eight ways out of that function
@@ -1296,28 +1616,36 @@ impl Daemon {
         // A request refused before the queue never opens a window, never
         // draws a number, and leaves this `None`.
         let mut number = None;
-        let outcome = self.decide(asked, caller, &title, &reason, &mut number).await;
+        let outcome = self.decide(batch, caller, &title, &reason, &mut number).await;
 
         // The only `append` in the crate's request path. See `Outcome`.
-        let record = AuditRecord {
-            ts: Local::now(),
-            number,
-            title,
-            reason,
-            operation: 1,
-            operations: 1,
-            stop_on_failure: false,
-            verdict: outcome.verdict,
-            note: outcome.note,
-            detail: outcome.detail,
-        };
-        if let Err(error) = self.audit.append(&record) {
-            // The operation has already happened, or has already been refused.
-            // Turning a log failure into a tool error would report an outcome
-            // that is not the one the user got; the honest thing is to say so
-            // where the daemon's own output goes and answer the agent with
-            // what actually happened.
-            eprintln!("hatch could not write an audit record: {error:#}");
+        //
+        // One timestamp for every line of the request, taken once: the lines
+        // record one decision, and two of its operations a second apart in
+        // the file would read as two.
+        let ts = Local::now();
+        let operations = outcome.effects.len();
+        for (index, Effect { verdict, detail }) in outcome.effects.into_iter().enumerate() {
+            let record = AuditRecord {
+                ts,
+                number,
+                title: title.clone(),
+                reason: reason.clone(),
+                operation: index + 1,
+                operations,
+                stop_on_failure,
+                verdict,
+                note: outcome.note.clone(),
+                detail,
+            };
+            if let Err(error) = self.audit.append(&record) {
+                // The operation has already happened, or has already been
+                // refused. Turning a log failure into a tool error would
+                // report an outcome that is not the one the user got; the
+                // honest thing is to say so where the daemon's own output
+                // goes and answer the agent with what actually happened.
+                eprintln!("hatch could not write an audit record: {error:#}");
+            }
         }
         outcome.result
     }
@@ -1333,20 +1661,31 @@ impl Daemon {
     /// this function returns.
     async fn decide(
         &self,
-        asked: Asked,
+        batch: Batch,
         caller: Caller,
         title: &str,
         reason: &str,
         number: &mut Option<u64>,
     ) -> Outcome {
-        // Step 1. Validate and render. A refusal never reaches a person:
-        // prompting for something that is going to be refused spends the
-        // scarcest resource in the design on nothing.
-        let job = match self.prepare(asked) {
-            Prepared::Ready(job) => job,
+        let Batch { operations, stop_on_failure, .. } = batch;
+
+        // Step 1. Validate and render, every operation of it. A refusal never
+        // reaches a person: prompting for something that is going to be
+        // refused spends the scarcest resource in the design on nothing.
+        let jobs = match self.prepare(operations) {
+            Prepared::Ready(jobs) => jobs,
             Prepared::Refused(refused) => return refused,
         };
-        let Job { payload, mut detail, work } = job;
+        // Taken apart in order, and kept in order: the payloads go to the
+        // window, and the details and the work stay here, index for index.
+        let mut payloads = Vec::with_capacity(jobs.len());
+        let mut details = Vec::with_capacity(jobs.len());
+        let mut works = Vec::with_capacity(jobs.len());
+        for Job { payload, detail, work } in jobs {
+            payloads.push(payload);
+            details.push(detail);
+            works.push(work);
+        }
 
         // Started here and stopped by its own `Drop`, so it covers the queue
         // wait, the approval wait and the execution, and cannot outlive any
@@ -1360,23 +1699,24 @@ impl Daemon {
         let admission = tokio::select! {
             admission = self.queue.acquire() => admission,
             () = caller.cancelled.cancelled() => {
-                return abandoned(LogVerdict::Cancelled, detail);
+                return abandoned(LogVerdict::Cancelled, details);
             }
             () = caller.hung_up() => {
-                return abandoned(caller.abandonment(), detail);
+                return abandoned(caller.abandonment(), details);
             }
         };
         let badge = admission.queue_depth();
         // The request is a window from here on, so this is where it gets its
-        // number: the same one the title bar wears and the audit record
-        // carries. See `queue::Admission::number` for why the counter is the
+        // number: the same one the title bar wears and the audit records
+        // carry. See `queue::Admission::number` for why the counter is the
         // queue's and why it starts again at one on every run.
         *number = Some(admission.number());
         let (permit, depths) = admission.into_parts();
 
         // Step 3. The window, and only now the clock. The deadline is computed
         // before the window is opened so that the countdown it draws and the
-        // timer that enforces it are the same instant.
+        // timer that enforces it are the same instant. It is one deadline for
+        // the whole batch, because it is one window and one decision.
         progress.enter(Phase::AwaitingApproval);
         let window = Duration::from_secs(self.config.timeout_secs);
         let expires_at = tokio::time::Instant::now() + window;
@@ -1386,8 +1726,8 @@ impl Daemon {
             deadline: Utc::now() + chrono::Duration::seconds(self.config.timeout_secs as i64),
             queue_depth: badge,
             number: *number,
-            operations: vec![payload],
-            stop_on_failure: false,
+            operations: payloads,
+            stop_on_failure,
         };
         let mut session = match self.prompter.prompt(request, depths).await {
             Ok(session) => session,
@@ -1395,7 +1735,7 @@ impl Daemon {
                 return Outcome::refusing(
                     LogVerdict::PromptDied,
                     None,
-                    detail,
+                    details,
                     format!(
                         "hatch could not open the approval window, so nobody was asked and \
                          nothing ran: {error:#}. This is not a decision by the user."
@@ -1422,7 +1762,7 @@ impl Daemon {
                 return Outcome::refusing(
                     LogVerdict::PromptDied,
                     None,
-                    detail,
+                    details,
                     format!(
                         "{gone}, so nothing ran. The window was closed or its process died \
                          before anyone decided; this is not a decision by the user, and you may \
@@ -1435,7 +1775,7 @@ impl Daemon {
                 return Outcome::refusing(
                     LogVerdict::Timeout,
                     None,
-                    detail,
+                    details,
                     format!(
                         "timed out awaiting the user after {}s. Nobody answered the window, so \
                          nothing ran and nobody decided anything. You may ask again, or find \
@@ -1446,16 +1786,16 @@ impl Daemon {
             }
             Ending::Cancelled => {
                 session.close().await;
-                return abandoned(LogVerdict::Cancelled, detail);
+                return abandoned(LogVerdict::Cancelled, details);
             }
             Ending::HungUp => {
                 session.close().await;
-                return abandoned(caller.abandonment(), detail);
+                return abandoned(caller.abandonment(), details);
             }
         };
 
         // Step 5. A verdict has arrived, so the lock is released now — not
-        // when the command it authorised finishes. A five-minute upgrade must
+        // when the operations it authorised finish. A five-minute upgrade must
         // not hold every other agent behind it.
         drop(permit);
 
@@ -1465,33 +1805,60 @@ impl Daemon {
             }
             other => {
                 session.close().await;
-                return declined(other, detail);
+                return declined(other, details);
             }
         };
 
-        // From here the deny rule no longer applies. The command is
+        // From here the deny rule no longer applies. Every operation is
         // authorised: a window that dies now loses the Kill button and the
-        // live view, and nothing else. Killing it could leave a half-finished
-        // state the user never asked for.
-        // Still step 5, and for a root operation there is a second gate
-        // inside it: the user has approved, and the system is about to ask
-        // them for a password in a dialog of its own. That wait can be the
-        // longest part of the whole call, so the client's ticker has to
-        // describe it rather than claim the command is running.
-        progress.enter(match work.elevated() {
-            true => Phase::Elevating,
-            false => Phase::Executing,
-        });
-        let (verdict, result, windup) = match work {
-            Work::Run(run) => {
-                self.run_it(&run, stream, terminal, closing, &session, &mut detail).await
+        // live view, and nothing else. Killing what it authorised could leave
+        // a half-finished state the user never asked for — and so, for the
+        // same reason, a window dying between two operations does not stop
+        // the second. It was approved with the first.
+        //
+        // In order, one at a time, and each to its end before the next
+        // starts. What happens after one fails is `Step::ends_the_run`'s to
+        // say, and nothing that has run is ever undone: a command cannot be
+        // un-run, and restoring a file while leaving a command's effects in
+        // place would describe a state that never existed.
+        let mut reached = Vec::with_capacity(works.len());
+        let mut effects = Vec::with_capacity(works.len());
+        let mut windup = Windup::Close;
+        let mut stopped_at = None;
+        for (index, (work, mut detail)) in works.into_iter().zip(details).enumerate() {
+            if stopped_at.is_some() {
+                reached.push(Reached::NotAttempted { label: label_of(&detail) });
+                effects.push(Effect { verdict: LogVerdict::NotAttempted, detail });
+                continue;
             }
-            Work::Swap { path, content, plan, root } => {
-                self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
+            // For a root operation there is a second gate inside this step:
+            // the user has approved, and the system is about to ask them for
+            // a password in a dialog of its own. That wait can be the longest
+            // part of the whole call, so the client's ticker has to describe
+            // it rather than claim the operation is running.
+            progress.enter(match work.elevated() {
+                true => Phase::Elevating,
+                false => Phase::Executing,
+            });
+            let step = match work {
+                Work::Run(run) => {
+                    self.run_it(&run, stream, terminal, closing, &session, &mut detail).await
+                }
+                Work::Swap { path, content, plan, root } => {
+                    self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
+                }
+            };
+            note_prompt_death(&session, closing, &mut detail);
+            if step.ends_the_run(stop_on_failure) {
+                stopped_at = Some(index);
             }
-        };
+            // The last operation that ran decides what becomes of the window,
+            // because it is the one whose ending the window was shown last.
+            windup = step.windup;
+            reached.push(Reached::Ran { label: label_of(&detail), status: step.status, result: step.result });
+            effects.push(Effect { verdict: step.verdict, detail });
+        }
 
-        note_prompt_death(&session, closing, &mut detail);
         match windup {
             Windup::Close => {
                 // The window closes on the frame that was just sent; this
@@ -1509,20 +1876,20 @@ impl Daemon {
 
         // Not `LogVerdict::Approve` unconditionally. An approval that hit a
         // dismissed password dialog is an approval whose operation never
-        // happened, and one whose elevation hatch could not read is an
-        // approval it cannot report either way; both are their own verdicts,
-        // and the log is where anyone later asks what actually ran as root.
+        // happened, one whose elevation hatch could not read is an approval it
+        // cannot report either way, and one the run never reached was never
+        // tried; each is its own verdict, and the log is where anyone later
+        // asks what actually ran as root.
         //
         // The note goes to both places it goes for every other verdict: into
-        // the result the agent reads, and onto the audit line. `None` rather
+        // the result the agent reads, and onto the audit lines. `None` rather
         // than an empty string when nobody typed anything, because the field
         // means "what the user typed, if anything" and a run of empty notes
         // down the log would say they typed nothing five different ways.
         Outcome {
-            verdict,
+            effects,
             note: (!note.is_empty()).then(|| note.clone()),
-            detail,
-            result: with_note(result, &note),
+            result: with_note(report(reached, stop_on_failure), &note),
         }
     }
 }
@@ -1540,14 +1907,228 @@ impl Work {
 /// The two ways preparation can end.
 ///
 /// An enum rather than a `Result`, because both arms are ordinary and neither
-/// is an error: a refusal is a complete outcome with its own audit line, and
+/// is an error: a refusal is a complete outcome with its own audit lines, and
 /// it is as large as a success, which `Result` would make every caller pay for
 /// on the way past.
 enum Prepared {
-    /// Validated and rendered, ready to be shown to a person.
-    Ready(Job),
+    /// Every operation validated and rendered, ready to be shown to a person.
+    Ready(Vec<Job>),
     /// Refused before anyone was interrupted.
     Refused(Outcome),
+}
+
+// ---- what one operation came to --------------------------------------------
+
+/// How one operation that was attempted ended: what the log says, what the
+/// agent reads, what becomes of the window, and whether it failed.
+struct Step {
+    verdict: LogVerdict,
+    result: CallToolResult,
+    windup: Windup,
+    status: Status,
+}
+
+/// Whether an operation did what was approved.
+///
+/// # What failure is, for each kind of operation
+///
+/// **A command** is done when it exits with status zero. It has failed when
+///
+/// * it exits with any other status — the failure the policy exists for,
+///   because the status may equally be the answer it was run to get;
+/// * it ends on a signal nobody in hatch sent, such as a segmentation fault;
+/// * it cannot be started at all: nothing ran;
+/// * its password dialog is dismissed, or elevation is not possible: nothing
+///   ran;
+/// * the person presses Kill, or hatch ends it at the execution deadline; or
+/// * it was elevated, and hatch cannot say whether it ran.
+///
+/// **A file write** is done when the file landed as the window described it —
+/// including a root write hatch could not re-examine afterwards, which is
+/// reported as such. It has failed when
+///
+/// * the write is refused at the moment of writing: the file changed since
+///   the diff was drawn, a create found something already there, the target
+///   became a symlink or a protected path. The file is untouched.
+/// * a root write's password dialog is dismissed, or elevation is not
+///   possible: nothing was written;
+/// * a root write's `install` ran and failed, which can leave the file short;
+/// * a root write landed, and what is on disk is not what was approved; or
+/// * a root write was elevated, and hatch cannot say whether it happened.
+///
+/// A patch that does not apply is not on either list, and cannot be. A patch
+/// is applied when the request is prepared, before anybody is asked, and what
+/// is approved and written is the bytes it produced; a file that changed
+/// under a patch after that is a file that changed, and is refused as drift.
+/// A patch that does not apply at preparation refuses the whole request
+/// before there is a window, which is not an operation failing but a request
+/// never becoming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Done,
+    Failed(Failure),
+}
+
+/// The two kinds of failure, told apart by what they leave behind.
+///
+/// This is the distinction the stop policy turns on, and the reason the
+/// policy is not the whole story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// hatch can say what state the operation left: nothing happened — a
+    /// write refused for drift, a password dialog dismissed, a command that
+    /// could not start — or a command ran to its end and said how it went,
+    /// with a status or a crash.
+    ///
+    /// Whether the run carries on past one of these is the agent's choice,
+    /// [`BatchParams::stop_on_failure`], because only the agent knows whether
+    /// the status was a failure or an answer.
+    Settled,
+    /// The operation was cut short, or hatch cannot tell what it did: a
+    /// command the person killed, a command hatch ended at the execution
+    /// deadline, an elevation whose result hatch could not read, a root write
+    /// that may have left its file neither version, a write that landed as
+    /// something other than what was approved.
+    ///
+    /// Nothing runs after one of these, whatever the agent chose. Carrying on
+    /// would run approved operations against a state that is not only
+    /// unpictured by the person who approved them but unknown to hatch
+    /// itself, and a Kill in particular is a person intervening — running the
+    /// next operation past it would overrule them.
+    Unsettled,
+}
+
+impl Step {
+    /// Whether nothing more should run after this.
+    ///
+    /// A failure that left an unknown state ends the run under either policy;
+    /// one that left a known state ends it only when the agent asked for that.
+    fn ends_the_run(&self, stop_on_failure: bool) -> bool {
+        match self.status {
+            Status::Done => false,
+            Status::Failed(Failure::Settled) => stop_on_failure,
+            Status::Failed(Failure::Unsettled) => true,
+        }
+    }
+}
+
+/// What became of one operation of an approved request, for the report.
+enum Reached {
+    /// It was attempted, and this is how that went.
+    Ran { label: String, status: Status, result: CallToolResult },
+    /// The run ended before it got there.
+    NotAttempted { label: String },
+}
+
+/// How an operation is named in a report of several: its kind, and for a
+/// write the file, because that is what an agent sorting out which of three
+/// writes failed needs to see first.
+fn label_of(detail: &LogDetail) -> String {
+    match detail {
+        LogDetail::RunCommand(_) => "a command".to_string(),
+        LogDetail::SwapFile(swap) => format!("a write to {}", swap.path),
+    }
+}
+
+/// The text of a result, whichever blocks it was made of.
+fn text_of(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text().map(|text| text.text.as_str()))
+        .collect()
+}
+
+/// What the agent reads about an approved request, once every operation has
+/// run, failed or been passed over.
+///
+/// # One operation
+///
+/// Exactly what that operation said, unchanged. With one operation, how the
+/// operation ended and how the request ended are the same fact, and a header
+/// announcing "operation 1 of 1: failed" above an exit status would say it
+/// twice — and would change the answer every existing `run_command` caller
+/// already knows how to read, for no information at all.
+///
+/// # Several
+///
+/// A sentence naming the policy, then every operation in order under a
+/// heading that says what became of it: `done`, `failed` or `not attempted`,
+/// and for the last, why. Every operation is reported, including the ones
+/// that never ran, because an agent that is told about two of three
+/// operations will assume something about the third.
+///
+/// # `isError`
+///
+/// Set when any part of the approved request was not carried out: an
+/// operation whose own report is an error, or an operation never attempted.
+/// A command that ran to a non-zero exit is not one of those — its report is
+/// its answer, as it has always been for `run_command` — so a batch whose
+/// last command exits 1 is `failed` in its heading and not an error, and a
+/// batch that stopped before its last operation is an error whatever the
+/// operation that stopped it said.
+fn report(mut reached: Vec<Reached>, stop_on_failure: bool) -> CallToolResult {
+    if reached.len() == 1
+        && matches!(reached[0], Reached::Ran { .. })
+        && let Some(Reached::Ran { result, .. }) = reached.pop()
+    {
+        return result;
+    }
+
+    let count = reached.len();
+    let mut text = format!(
+        "{count} operations, carried out in the order given; this batch was to {}.\n",
+        match stop_on_failure {
+            true => "stop at the first operation that failed",
+            false => "carry on past any operation that failed",
+        }
+    );
+    let mut is_error = false;
+    // The last operation that ran, and how. Everything after the one that
+    // ended the run is `NotAttempted`, so when one of those is reached this
+    // is the operation that ended it.
+    let mut last_ran: Option<(usize, Status)> = None;
+    for (index, entry) in reached.into_iter().enumerate() {
+        let position = index + 1;
+        match entry {
+            Reached::Ran { label, status, result } => {
+                is_error |= result.is_error == Some(true);
+                last_ran = Some((position, status));
+                let word = match status {
+                    Status::Done => "done",
+                    Status::Failed(_) => "failed",
+                };
+                text.push_str(&format!(
+                    "\noperation {position} of {count}, {label}: {word}\n{}\n",
+                    text_of(&result).trim_end()
+                ));
+            }
+            Reached::NotAttempted { label } => {
+                is_error = true;
+                let why = match last_ran {
+                    Some((at, Status::Failed(Failure::Unsettled))) => format!(
+                        "operation {at} was cut short or left a state hatch cannot account for, \
+                         and nothing runs after that whichever way the batch was set"
+                    ),
+                    Some((at, _)) => format!(
+                        "operation {at} failed and this batch was set to stop at the first failure"
+                    ),
+                    // Not a state the loop can produce -- the first operation
+                    // is always attempted -- and said plainly rather than
+                    // dressed up as one of the two above if it ever is.
+                    None => "the run ended before any operation started".to_string(),
+                };
+                text.push_str(&format!(
+                    "\noperation {position} of {count}, {label}: not attempted, because {why}. \
+                     It did not run.\n"
+                ));
+            }
+        }
+    }
+    match is_error {
+        true => CallToolResult::error(vec![ContentBlock::text(text)]),
+        false => CallToolResult::success(vec![ContentBlock::text(text)]),
+    }
 }
 
 /// What becomes of the window once the operation it authorised is over.
@@ -1600,35 +2181,89 @@ fn refusal_text(reason: &str) -> String {
 }
 
 impl Daemon {
-    /// Validate and render one request, or refuse it.
+    /// Validate and render every operation of one request, or refuse it.
     ///
     /// Every refusal that can be known without asking a person is known here:
     /// an unsupported request, a working directory that is not one, a path
-    /// hatch protects, a symlink, a missing parent, content nothing can draw
-    /// a diff of. All of them return an outcome carrying
-    /// [`LogVerdict::Refused`], and all of them return it before the queue is
-    /// touched.
-    fn prepare(&self, asked: Asked) -> Prepared {
-        match asked {
-            Asked::Run(params) => self.prepare_run(params),
-            Asked::Swap(params) => self.prepare_swap(params),
+    /// hatch protects, a symlink, a missing parent, a patch that does not
+    /// apply, content nothing can draw a diff of. All of them return an
+    /// outcome carrying [`LogVerdict::Refused`], and all of them return it
+    /// before the queue is touched.
+    ///
+    /// One refused operation refuses the request. A person cannot be asked to
+    /// approve a sequence with a hole in it, and approving the operations
+    /// around the hole would run a script nobody wrote. Every operation is
+    /// still prepared, though, and every refusal among them is reported at
+    /// once: an agent told about the first of two problems finds the second
+    /// on its next call, and each call is an interruption.
+    ///
+    /// Every operation is prepared against the machine as it is *now*, before
+    /// any of them has run. That is what the window shows and what each write
+    /// is re-checked against, so a later operation cannot lean on an earlier
+    /// one having happened: a write into a directory a command before it
+    /// creates is refused here for its missing parent, and a write to a file a
+    /// command before it changes fails at the moment of writing, as drift.
+    fn prepare(&self, operations: Vec<Operation>) -> Prepared {
+        let count = operations.len();
+        let mut jobs = Vec::with_capacity(count);
+        let mut details = Vec::with_capacity(count);
+        let mut refusals = Vec::new();
+        for (index, operation) in operations.into_iter().enumerate() {
+            let prepared = match operation {
+                Operation::Command { command, cwd, interactive, root } => {
+                    self.prepare_run(command, cwd, interactive, root)
+                }
+                Operation::Write { path, source, root } => self.prepare_swap(path, source, root),
+            };
+            match prepared {
+                Rendered::Ready(job) => {
+                    details.push(job.detail.clone());
+                    jobs.push(*job);
+                }
+                Rendered::Refused(Refusal { detail, message }) => {
+                    details.push(detail);
+                    refusals.push((index + 1, message));
+                }
+            }
         }
+        if refusals.is_empty() {
+            return Prepared::Ready(jobs);
+        }
+        // One operation's refusal reads exactly as it always has. Several say
+        // which operation each belongs to, since the sentences alone name a
+        // path or a directory and not a place in the list.
+        let message = match (count, refusals.as_slice()) {
+            (1, [(_, message)]) => message.clone(),
+            _ => refusals
+                .iter()
+                .map(|(position, message)| format!("operation {position} of {count}: {message}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        };
+        Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, details, message))
     }
 
-    fn prepare_run(&self, params: RunCommandParams) -> Prepared {
+    /// Validate and render one command, or refuse it.
+    fn prepare_run(
+        &self,
+        command: String,
+        given_cwd: Option<String>,
+        interactive: bool,
+        root: bool,
+    ) -> Rendered {
         let env = build_child_env(&self.config);
         // `$HOME` as the child will see it, not as the daemon sees it: the
         // window states the directory, and a directory taken from a different
         // environment than the one the command runs in would be a stated fact
         // that is not true.
-        let cwd = match &params.cwd {
+        let cwd = match &given_cwd {
             Some(given) => PathBuf::from(given),
             None => PathBuf::from(env.get("HOME").map_or("/", String::as_str)),
         };
         let detail = |cwd: &Path| {
             LogDetail::RunCommand(RunDetail {
-                command: params.command.clone(),
-                root: params.root,
+                command: command.clone(),
+                root,
                 cwd: cwd.display().to_string(),
                 // Settled by the verdict, not by the call: see `RunDetail`.
                 interactive: None,
@@ -1639,9 +2274,7 @@ impl Daemon {
                 prompt: None,
             })
         };
-        let refuse = |message: String| {
-            Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(&cwd), message))
-        };
+        let refuse = |message: String| Rendered::Refused(Refusal { detail: detail(&cwd), message });
 
         // Absolute, because a relative directory is resolved against hatch's
         // own working directory, which is not the one the request was written
@@ -1683,8 +2316,8 @@ impl Daemon {
         // that is the one the command will actually have — resolving against
         // the spawner's would put a value on screen that the command never
         // sees. See `crate::exec::elevate::Run0::spawner_env`.
-        let (argv, spawn_env, line, break_at, caveat) = if params.root {
-            let elevated = match self.elevation.argv(&params.command, &env) {
+        let (argv, spawn_env, line, break_at, caveat) = if root {
+            let elevated = match self.elevation.argv(&command, &env) {
                 Ok(elevated) => elevated,
                 // Nothing was rendered and nobody was asked: this build
                 // cannot elevate here at all, which is a fact about the
@@ -1710,16 +2343,16 @@ impl Daemon {
             (
                 // A direct argv, never a string handed to another shell: the
                 // rendering below is a rendering *of these three arguments*.
-                vec!["bash".to_string(), "-c".to_string(), params.command.clone()],
+                vec!["bash".to_string(), "-c".to_string(), command.clone()],
                 env.clone(),
-                params.command.clone(),
+                command.clone(),
                 // Nothing to break before: the line an unelevated request
                 // draws is the command the agent wrote and nothing else.
                 None,
                 None,
             )
         };
-        let render_env = match params.root {
+        let render_env = match root {
             true => self.elevation.child_env(&env),
             false => env.clone(),
         };
@@ -1735,24 +2368,24 @@ impl Daemon {
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
         let payload =
-            Payload::command(&spans, Vec::new(), cwd.clone(), params.root, params.interactive)
+            Payload::command(&spans, Vec::new(), cwd.clone(), root, interactive)
                 .with_caveat(caveat)
                 .with_runs(runs);
-        Prepared::Ready(Job {
+        Rendered::Ready(Box::new(Job {
             detail: detail(&cwd),
             payload,
             work: Work::Run(RunPlan {
                 argv,
                 env: spawn_env,
                 cwd,
-                elevated: params.root,
-                asked_for_a_terminal: params.interactive,
+                elevated: root,
+                asked_for_a_terminal: interactive,
             }),
-        })
+        }))
     }
 
-    /// Turn one `swap_file` request into the bytes it proposes, the plan for
-    /// where they land and the diff a person will read — or refuse it.
+    /// Turn one file write into the bytes it proposes, the plan for where
+    /// they land and the diff a person will read — or refuse it.
     ///
     /// # Where a patch stops being a patch
     ///
@@ -1764,8 +2397,7 @@ impl Daemon {
     /// cannot tell the two forms apart, because by then there is nothing to
     /// tell apart. What a person approves is bytes, never an instruction for
     /// producing bytes; see [`crate::patch`].
-    fn prepare_swap(&self, request: SwapRequest) -> Prepared {
-        let SwapRequest { path: spelling, source, root, .. } = request;
+    fn prepare_swap(&self, spelling: String, source: SwapSource, root: bool) -> Rendered {
         let path = PathBuf::from(&spelling);
         let form = source.form();
         let detail = |hash_before: Option<String>| {
@@ -1780,9 +2412,7 @@ impl Daemon {
                 bytes: None,
             })
         };
-        let refuse = |message: String| {
-            Prepared::Refused(Outcome::refusing(LogVerdict::Refused, None, detail(None), message))
-        };
+        let refuse = |message: String| Rendered::Refused(Refusal { detail: detail(None), message });
 
         // Before the denylist and before the filesystem, because it is the
         // one refusal here that is about the machine rather than about the
@@ -1854,25 +2484,23 @@ impl Daemon {
             // nothing changes, which is the one thing it must never say, so
             // the request is refused until the summary form exists.
             FileDiff::Unrenderable { .. } => {
-                return Prepared::Refused(Outcome::refusing(
-                    LogVerdict::Refused,
-                    None,
-                    detail(plan.hash_before.clone()),
-                    not_yet(
+                return Rendered::Refused(Refusal {
+                    detail: detail(plan.hash_before.clone()),
+                    message: not_yet(
                         "show a diff of this file",
                         "One side of it is binary or larger than the display cap, and hatch will \
                          not ask anyone to approve a change it cannot draw. Send a smaller, \
                          textual replacement.",
                     ),
-                ));
+                });
             }
         };
 
-        Prepared::Ready(Job {
+        Rendered::Ready(Box::new(Job {
             detail: detail(plan.hash_before.clone()),
             payload: Payload::swap(path.clone(), plan.clone(), &rows),
             work: Work::Swap { path, content, plan, root },
-        })
+        }))
     }
 }
 
@@ -1893,7 +2521,7 @@ impl Daemon {
         closing: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> (LogVerdict, CallToolResult, Windup) {
+    ) -> Step {
         let RunPlan { argv, env, cwd, elevated, asked_for_a_terminal } = run;
         let elevated = *elevated;
         // Either half is enough. The window is built so that a request which
@@ -1986,15 +2614,15 @@ impl Daemon {
                 // "was signalled", and both would be a plausible-looking lie
                 // about a command that never started. The window is closed
                 // instead, and the agent is told the truth.
-                return (
+                return Step {
                     // The elevation program failing to start is an elevation
                     // failure and nothing else: nothing was elevated, so
                     // nothing ran, and the log has a verdict that says so.
-                    match elevated {
+                    verdict: match elevated {
                         true => LogVerdict::ElevationFailed,
                         false => LogVerdict::Approve,
                     },
-                    CallToolResult::error(vec![ContentBlock::text(format!(
+                    result: CallToolResult::error(vec![ContentBlock::text(format!(
                         "the user approved this, but hatch could not start it, so nothing ran: \
                          {error}"
                     ))]),
@@ -2002,8 +2630,10 @@ impl Daemon {
                     // running". Nothing will ever tell it otherwise, so it is
                     // closed here rather than handed to a reader who would be
                     // watching a command that never started.
-                    Windup::Close,
-                );
+                    windup: Windup::Close,
+                    // A failure that left nothing behind: nothing started.
+                    status: Status::Failed(Failure::Settled),
+                };
             }
         };
 
@@ -2013,30 +2643,31 @@ impl Daemon {
         // produced it. `None` here is "no interpretation needed", not "it
         // worked".
         let root = elevated.then(|| self.read_root(&output, env));
+        // The exit code, only when it is the command's. An elevated run that
+        // was refused ends with a status too — the same 1 a failing command
+        // produces — and reading that number as the command's would put a
+        // command's result on a command that never ran.
+        let exit = match &root {
+            Some(RootOutcome::Ran { exit }) => *exit,
+            Some(_) => None,
+            None => output.exit_code,
+        };
 
         if let LogDetail::RunCommand(run) = detail {
-            // The exit code is recorded only when it is the command's. An
-            // elevated run that was refused ends with a status too — the same
-            // 1 a failing command produces — and writing that number under
-            // `exit_code` would put a command's result in the log for a
-            // command that never ran.
-            run.exit_code = match &root {
-                Some(RootOutcome::Ran { exit }) => *exit,
-                Some(_) => None,
-                None => output.exit_code,
-            };
+            run.exit_code = exit;
             run.duration_ms = Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
             run.killed_by_user = Some(output.killed_by_user);
             run.timed_out = Some(output.timed_out);
             run.interactive = Some(terminal);
         }
-        let (verdict, result, frame) = match root {
+        let (verdict, result, frame, status) = match root {
             // Unelevated, or elevated and the command demonstrably ran: the
             // status is the command's and is reported as it always was.
             None | Some(RootOutcome::Ran { .. }) => (
                 LogVerdict::Approve,
                 CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))]),
                 finished_frame(&output),
+                run_status(&output, exit),
             ),
             Some(outcome) => {
                 let (verdict, message, frame) = elevation_ending(&outcome);
@@ -2065,7 +2696,12 @@ impl Daemon {
                         line => format!("{message}\n\n{line}"),
                     },
                 };
-                (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Some(frame))
+                (
+                    verdict,
+                    CallToolResult::error(vec![ContentBlock::text(text)]),
+                    Some(frame),
+                    elevation_status(&outcome),
+                )
             }
         };
         // A streamed run's window stays: the reader ticked a box asking to
@@ -2084,7 +2720,7 @@ impl Daemon {
             }
             None => Windup::Close,
         };
-        (verdict, result, windup)
+        Step { verdict, result, windup, status }
     }
 
     /// What an elevated run that has finished actually means.
@@ -2142,7 +2778,7 @@ impl Daemon {
         root: bool,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> (LogVerdict, CallToolResult, Windup) {
+    ) -> Step {
         if root {
             return self.swap_as_root(path, content, plan, session, detail).await;
         }
@@ -2178,7 +2814,17 @@ impl Daemon {
         // A swap writes a file and says nothing. There is no output to hold up
         // and no stream checkbox to have ticked, so its window closes on the
         // outcome as every window used to.
-        (LogVerdict::Approve, result, Windup::Close)
+        Step {
+            verdict: LogVerdict::Approve,
+            result,
+            windup: Windup::Close,
+            // Every `ApplyError` guarantees the file was not touched, so a
+            // refused write is a failure that left nothing behind.
+            status: match landed {
+                true => Status::Done,
+                false => Status::Failed(Failure::Settled),
+            },
+        }
     }
 
     /// Apply an approved file replacement as root: stage the bytes, then let
@@ -2197,7 +2843,7 @@ impl Daemon {
         plan: &SwapPlan,
         session: &PromptSession,
         detail: &mut LogDetail,
-    ) -> (LogVerdict, CallToolResult, Windup) {
+    ) -> Step {
         let env = build_child_env(&self.config);
 
         // Re-check, then stage. Nothing is written anywhere until both checks
@@ -2210,11 +2856,14 @@ impl Daemon {
                     .outbox()
                     .finished(protocol::Outcome::Exit { code: 1 })
                     .await;
-                return (
-                    LogVerdict::Approve,
-                    CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
-                    Windup::Close,
-                );
+                // The re-check refused before anything was staged or
+                // elevated: the file is untouched, as with any refused write.
+                return Step {
+                    verdict: LogVerdict::Approve,
+                    result: CallToolResult::error(vec![ContentBlock::text(describe_apply(&error))]),
+                    windup: Windup::Close,
+                    status: Status::Failed(Failure::Settled),
+                };
             }
         };
         // Destructured, not consumed: `staged.staged` is the drop guard that
@@ -2312,9 +2961,9 @@ impl Daemon {
                         .outbox()
                         .finished(protocol::Outcome::Exit { code: 1 })
                         .await;
-                    return (
-                        LogVerdict::Approve,
-                        CallToolResult::error(vec![ContentBlock::text(format!(
+                    return Step {
+                        verdict: LogVerdict::Approve,
+                        result: CallToolResult::error(vec![ContentBlock::text(format!(
                             "the write happened, but what is on disk is not what was approved. \
                              The window said {described}, and {} is now {found}. Something \
                              changed the target between the check and the write, or the owner \
@@ -2322,22 +2971,27 @@ impl Daemon {
                              before doing anything else.",
                             path.display(),
                         ))]),
-                        Windup::Close,
-                    );
+                        windup: Windup::Close,
+                        // Something landed, and it is not the thing on the
+                        // screen: whatever runs next runs against a file
+                        // nobody approved.
+                        status: Status::Failed(Failure::Unsettled),
+                    };
                 }
                 record_landing(detail, content, plan);
                 let _ = session
                     .outbox()
                     .finished(protocol::Outcome::Exit { code: 0 })
                     .await;
-                (
-                    LogVerdict::Approve,
-                    CallToolResult::success(vec![ContentBlock::text(format!(
+                Step {
+                    verdict: LogVerdict::Approve,
+                    result: CallToolResult::success(vec![ContentBlock::text(format!(
                         "wrote {described} as root{}",
                         confirmation_note(&landed)
                     ))]),
-                    Windup::Close,
-                )
+                    windup: Windup::Close,
+                    status: Status::Done,
+                }
             }
             // Elevation succeeded and `install` itself failed: a read-only
             // mount, an immutable attribute, an owner that does not resolve.
@@ -2348,9 +3002,9 @@ impl Daemon {
                     .outbox()
                     .finished(protocol::Outcome::Exit { code: exit.unwrap_or(1) })
                     .await;
-                (
-                    LogVerdict::Approve,
-                    CallToolResult::error(vec![ContentBlock::text(format!(
+                Step {
+                    verdict: LogVerdict::Approve,
+                    result: CallToolResult::error(vec![ContentBlock::text(format!(
                         "the user approved this and the elevation succeeded, but the write \
                          failed: {} exited {}. {} Read the file before asking again — unlike \
                          an unelevated write, a root write is not a rename, so a write that \
@@ -2363,8 +3017,11 @@ impl Daemon {
                         },
                         first_line(&output.stderr),
                     ))]),
-                    Windup::Close,
-                )
+                    windup: Windup::Close,
+                    // `install` truncates rather than renaming, so a write
+                    // that failed part way can leave the file neither version.
+                    status: Status::Failed(Failure::Unsettled),
+                }
             }
             outcome => {
                 let note = root_write_note(&outcome, path, &output.stderr);
@@ -2385,14 +3042,19 @@ impl Daemon {
         session: &PromptSession,
         outcome: &RootOutcome,
         tail: &str,
-    ) -> (LogVerdict, CallToolResult, Windup) {
+    ) -> Step {
         let (verdict, message, frame) = elevation_ending(outcome);
         let _ = session.outbox().finished(frame).await;
         let text = match tail.trim().is_empty() {
             true => message,
             false => format!("{message}\n\n{}", tail.trim()),
         };
-        (verdict, CallToolResult::error(vec![ContentBlock::text(text)]), Windup::Close)
+        Step {
+            verdict,
+            result: CallToolResult::error(vec![ContentBlock::text(text)]),
+            windup: Windup::Close,
+            status: elevation_status(outcome),
+        }
     }
 }
 
@@ -2558,6 +3220,38 @@ fn finished_frame(output: &Output) -> Option<protocol::Outcome> {
     }
 }
 
+/// Whether a command that ran did what it was asked, and if it did not, what
+/// it left.
+///
+/// `exit` is the command's own status, already separated from an elevation's
+/// — see `run_it`. A run hatch cut short is unsettled whatever status it
+/// ended with, because the status of a killed process says how it was
+/// killed and nothing about how far it got. See [`Status`] for the rest.
+fn run_status(output: &Output, exit: Option<i32>) -> Status {
+    if output.timed_out || output.killed_by_user {
+        return Status::Failed(Failure::Unsettled);
+    }
+    match exit {
+        Some(0) => Status::Done,
+        _ => Status::Failed(Failure::Settled),
+    }
+}
+
+/// What an elevation that did not end in the operation running leaves.
+///
+/// The same split [`elevation_ending`] makes, from the same facts: a denied
+/// or impossible elevation ran nothing, and an unclear one may have run
+/// anything. `Ran` does not reach here on any path that is working, and is
+/// treated as the unclear case it would be if it did.
+fn elevation_status(outcome: &RootOutcome) -> Status {
+    match outcome {
+        RootOutcome::Denied | RootOutcome::Failed { .. } => Status::Failed(Failure::Settled),
+        RootOutcome::Unclear { .. } | RootOutcome::Ran { .. } => {
+            Status::Failed(Failure::Unsettled)
+        }
+    }
+}
+
 /// What the agent reads about a command that ran.
 ///
 /// The two streams are kept apart, because a diagnostic the command wrote to
@@ -2686,7 +3380,7 @@ fn with_note(mut result: CallToolResult, note: &str) -> CallToolResult {
 /// The agent very often never reads this at all — for a disconnect its
 /// connection is gone by definition — so it is written for the case where it
 /// does: a cancelled call whose client is still there.
-fn abandoned(verdict: LogVerdict, detail: LogDetail) -> Outcome {
+fn abandoned(verdict: LogVerdict, details: Vec<LogDetail>) -> Outcome {
     let how = match verdict {
         LogVerdict::Cancelled => "your client cancelled this call",
         _ => "the connection carrying this call was lost",
@@ -2694,7 +3388,7 @@ fn abandoned(verdict: LogVerdict, detail: LogDetail) -> Outcome {
     Outcome::refusing(
         verdict,
         None,
-        detail,
+        details,
         format!(
             "{how} before anyone decided, so the approval window was closed and nothing ran. \
              Nobody refused this."
@@ -2706,7 +3400,7 @@ fn abandoned(verdict: LogVerdict, detail: LogDetail) -> Outcome {
 ///
 /// The note the user typed is returned verbatim in the text *and* stored on
 /// the audit line, so the person's own words are what the agent acts on.
-fn declined(verdict: Verdict, detail: LogDetail) -> Outcome {
+fn declined(verdict: Verdict, details: Vec<LogDetail>) -> Outcome {
     let (log_verdict, note, message) = match verdict {
         Verdict::Deny { note } => (
             LogVerdict::Deny,
@@ -2754,7 +3448,7 @@ fn declined(verdict: Verdict, detail: LogDetail) -> Outcome {
             "hatch mishandled an approval and did not run it; nothing happened".to_string(),
         ),
     };
-    Outcome::refusing(log_verdict, Some(note), detail, message)
+    Outcome::refusing(log_verdict, Some(note), details, message)
 }
 
 /// Record where the window was while the approved operation ran.
@@ -3227,10 +3921,12 @@ mod tests {
     #[test]
     fn tool_descriptions_state_the_full_blocking_bound() {
         let config = Config::default();
-        let text = tool_descriptions(&config).for_tool("run_command").unwrap().to_string();
-        assert!(text.contains("900"), "the blocking bound must be the full one: {text}");
+        for name in ["run_command", "batch"] {
+            let text = tool_descriptions(&config).for_tool(name).unwrap().to_string();
+            assert!(text.contains("900"), "the blocking bound must be the full one: {text}");
+            assert!(text.contains("only when"), "the description must narrow when to reach for it");
+        }
         assert_eq!(config.client_timeout_secs(), 900, "the bound the description quotes");
-        assert!(text.contains("only when"), "the description must narrow when to reach for it");
     }
 
     // --- the auth layer -------------------------------------------------
@@ -3412,28 +4108,51 @@ mod tests {
         p
     }
 
-    fn swap_params(field: &str, value: String) -> SwapFileParams {
-        let mut p = SwapFileParams {
-            title: "t".to_string(),
-            path: "/p".to_string(),
-            content: Some("c".to_string()),
+    /// A `run_command` call put through the boundary it shares with `batch`.
+    fn check_run_command(params: RunCommandParams) -> Result<Batch, String> {
+        Batch::of(BatchParams::from(params))
+    }
+
+    /// One file write, on its own in a batch, with nothing in it set.
+    fn a_write() -> OperationParams {
+        OperationParams {
+            path: None,
+            content: None,
             patch: None,
-            reason: "r".to_string(),
+            command: None,
+            cwd: None,
+            interactive: None,
             root: false,
+        }
+    }
+
+    /// A batch of one file write with `field` set to `value`.
+    fn write_params(field: &str, value: String) -> BatchParams {
+        let mut operation = OperationParams {
+            path: Some("/p".to_string()),
+            content: Some("c".to_string()),
+            ..a_write()
+        };
+        let mut p = BatchParams {
+            title: "t".to_string(),
+            reason: "r".to_string(),
+            operations: Vec::new(),
+            stop_on_failure: false,
         };
         match field {
             "title" => p.title = value,
-            "path" => p.path = value,
-            "content" => p.content = Some(value),
+            "path" => operation.path = Some(value),
+            "content" => operation.content = Some(value),
             // Filling one form empties the other, because a call carrying both
             // is refused for that before any length is looked at.
             "patch" => {
-                p.content = None;
-                p.patch = Some(value);
+                operation.content = None;
+                operation.patch = Some(value);
             }
             "reason" => p.reason = value,
             other => panic!("no such field {other}"),
         }
+        p.operations.push(operation);
         p
     }
 
@@ -3446,17 +4165,17 @@ mod tests {
             ("cwd", MAX_FIELD_BYTES),
         ] {
             assert!(
-                check_run_command(&run_params(field, "a".repeat(cap))).is_ok(),
+                check_run_command(run_params(field, "a".repeat(cap))).is_ok(),
                 "exactly at the cap is allowed: {field}"
             );
-            let refusal = check_run_command(&run_params(field, "a".repeat(cap + 1)))
+            let refusal = check_run_command(run_params(field, "a".repeat(cap + 1)))
                 .expect_err(&format!("one byte over the cap must be refused: {field}"));
             assert!(refusal.contains(field), "the refusal must name the field: {refusal}");
         }
     }
 
     #[test]
-    fn every_capped_field_of_swap_file_is_checked() {
+    fn every_capped_field_of_a_file_write_is_checked() {
         for (field, cap) in [
             ("title", MAX_FIELD_BYTES),
             ("path", MAX_FIELD_BYTES),
@@ -3465,10 +4184,10 @@ mod tests {
             ("reason", MAX_FIELD_BYTES),
         ] {
             assert!(
-                SwapRequest::of(swap_params(field, "a".repeat(cap))).is_ok(),
+                Batch::of(write_params(field, "a".repeat(cap))).is_ok(),
                 "exactly at the cap is allowed: {field}"
             );
-            let refusal = SwapRequest::of(swap_params(field, "a".repeat(cap + 1)))
+            let refusal = Batch::of(write_params(field, "a".repeat(cap + 1)))
                 .expect_err(&format!("one byte over the cap must be refused: {field}"));
             assert!(refusal.contains(field), "the refusal must name the field: {refusal}");
         }
@@ -3480,23 +4199,23 @@ mod tests {
         // sizes are part of the tool contract, so they are pinned here rather
         // than left to drift.
         assert!(
-            check_run_command(&run_params("command", "a".repeat(8 * 1024))).is_ok(),
+            check_run_command(run_params("command", "a".repeat(8 * 1024))).is_ok(),
             "an 8 KB inline script is ordinary work"
         );
         assert!(
-            check_run_command(&run_params("title", "a".repeat(2 * 1024))).is_ok(),
+            check_run_command(run_params("title", "a".repeat(2 * 1024))).is_ok(),
             "a long but sane title is ordinary work"
         );
         assert!(
-            SwapRequest::of(swap_params("content", "a".repeat(100 * 1024))).is_ok(),
+            Batch::of(write_params("content", "a".repeat(100 * 1024))).is_ok(),
             "a 100 KB config file is ordinary work"
         );
         assert!(
-            SwapRequest::of(swap_params("path", "a".repeat(2 * 1024))).is_ok(),
+            Batch::of(write_params("path", "a".repeat(2 * 1024))).is_ok(),
             "a deep path is ordinary work"
         );
         assert!(
-            SwapRequest::of(swap_params("patch", "a".repeat(100 * 1024))).is_ok(),
+            Batch::of(write_params("patch", "a".repeat(100 * 1024))).is_ok(),
             "a large patch of a large file is ordinary work"
         );
     }
@@ -3516,9 +4235,9 @@ mod tests {
         // would let four times as much through.
         let astral = "\u{1f600}".repeat(MAX_FIELD_BYTES / 4);
         assert_eq!(astral.chars().count(), MAX_FIELD_BYTES / 4);
-        assert!(check_run_command(&run_params("title", astral.clone())).is_ok());
+        assert!(check_run_command(run_params("title", astral.clone())).is_ok());
         let one_over = format!("{astral}\u{1f600}");
-        assert!(check_run_command(&run_params("title", one_over)).is_err());
+        assert!(check_run_command(run_params("title", one_over)).is_err());
     }
 
     #[test]
@@ -3538,9 +4257,14 @@ mod tests {
         // The cap refuses; it never shortens. A command the user approved must
         // be the command the agent sent.
         let long = "a".repeat(MAX_COMMAND_BYTES + 1);
-        let params = run_params("command", long.clone());
-        assert!(check_run_command(&params).is_err());
-        assert_eq!(params.command, long, "the input must be left exactly as it came in");
+        let refusal = check_run_command(run_params("command", long.clone()));
+        assert!(refusal.is_err());
+        let params = BatchParams::from(run_params("command", long.clone()));
+        assert_eq!(
+            params.operations[0].command.as_deref(),
+            Some(long.as_str()),
+            "the input must be left exactly as it came in"
+        );
     }
 
     #[tokio::test]
@@ -3563,9 +4287,187 @@ mod tests {
         let text = result_text(&within(daemon.run_command(at_the_cap, Caller::quiet())).await);
         assert!(!text.contains("byte limit"), "the cap must not answer: {text}");
 
-        let at_the_cap = swap_params("content", "a".repeat(MAX_CONTENT_BYTES));
-        let text = result_text(&within(daemon.swap_file(at_the_cap, Caller::quiet())).await);
+        let at_the_cap = write_params("content", "a".repeat(MAX_CONTENT_BYTES));
+        let text = result_text(&within(daemon.batch(at_the_cap, Caller::quiet())).await);
         assert!(!text.contains("byte limit"), "the cap must not answer: {text}");
+    }
+
+    // --- what an operation can be -----------------------------------------
+
+    #[test]
+    fn run_command_is_a_batch_of_exactly_one_command_and_nothing_else() {
+        // The alias is the conversion, so the conversion is what is pinned:
+        // every field lands where the batch reads it, nothing lands anywhere
+        // else, and the result is the batch a `batch` call spelling the same
+        // command would have made. If `run_command` ever grows a field the
+        // batch does not carry, this is where it has nowhere to go.
+        let params = RunCommandParams {
+            title: "Install ripgrep".to_string(),
+            command: "pacman -S ripgrep".to_string(),
+            reason: "the search is slow".to_string(),
+            root: true,
+            cwd: Some("/srv".to_string()),
+            interactive: true,
+        };
+        let batch = check_run_command(params).expect("an ordinary call passes the boundary");
+        assert_eq!(
+            batch,
+            Batch {
+                title: "Install ripgrep".to_string(),
+                reason: "the search is slow".to_string(),
+                operations: vec![Operation::Command {
+                    command: "pacman -S ripgrep".to_string(),
+                    cwd: Some("/srv".to_string()),
+                    interactive: true,
+                    root: true,
+                }],
+                stop_on_failure: false,
+            }
+        );
+
+        let spelled_as_a_batch = Batch::of(BatchParams {
+            title: "Install ripgrep".to_string(),
+            reason: "the search is slow".to_string(),
+            operations: vec![OperationParams {
+                command: Some("pacman -S ripgrep".to_string()),
+                cwd: Some("/srv".to_string()),
+                interactive: Some(true),
+                root: true,
+                ..a_write()
+            }],
+            stop_on_failure: false,
+        })
+        .expect("and so does the same call spelled as a batch");
+        assert_eq!(batch, spelled_as_a_batch);
+    }
+
+    #[test]
+    fn a_batch_over_the_operation_cap_is_told_the_limit_is_temporary_and_not_a_refusal() {
+        // A tool that takes a list and turns away every list longer than one
+        // reads as broken, and an agent that meets that once goes back to
+        // writing files with here-documents. So the sentence has to say the
+        // three things that make it survivable: the limit is this build's and
+        // temporary, nobody judged anything, and what to send instead -- and
+        // it must not open with the word every other boundary refusal opens
+        // with.
+        let over = MAX_OPERATIONS + 2;
+        let mut params = write_params("content", "c".to_string());
+        params.operations = vec![params.operations[0].clone(); over];
+        let message = Batch::of(params).expect_err("over the cap does not pass");
+
+        assert!(message.contains(&over.to_string()), "the count it carried is not named: {message}");
+        for claim in ["temporary", "nothing ran", "nobody decided anything", "batches of one"] {
+            assert!(message.contains(claim), "the message does not say {claim:?}: {message}");
+        }
+        assert!(!message.contains("refused"), "a temporary limit reads as a refusal: {message}");
+        assert!(!message.contains("denied"), "{message}");
+        assert!(
+            message.contains("here-document"),
+            "the one wrong way round the limit is not named: {message}"
+        );
+
+        // Checked before anything inside the operations: an over-cap batch
+        // whose operations are also malformed hears about the cap, because
+        // that is the thing standing between it and running at all.
+        let mut malformed = write_params("content", "c".to_string());
+        malformed.operations = vec![a_write(); over];
+        let message = Batch::of(malformed).expect_err("still over the cap");
+        assert!(message.contains("temporary"), "{message}");
+
+        // And an empty list is not the cap: it is a call with nothing in it.
+        let mut empty = write_params("content", "c".to_string());
+        empty.operations.clear();
+        let message = Batch::of(empty).expect_err("an empty batch does not pass");
+        assert!(message.contains("no operations"), "{message}");
+        assert!(message.contains("nothing ran"), "{message}");
+    }
+
+    #[test]
+    fn an_operation_is_a_write_or_a_command_and_carries_only_that_kinds_fields() {
+        let with = |edit: &dyn Fn(&mut OperationParams)| {
+            let mut operation = a_write();
+            edit(&mut operation);
+            let mut params = write_params("content", "c".to_string());
+            params.operations = vec![operation];
+            Batch::of(params)
+        };
+        type Edit<'a> = &'a dyn Fn(&mut OperationParams);
+        let cases: [(&str, Edit); 8] = [
+            ("both `path` and `command`", &|o| {
+                o.path = Some("/etc/hosts".into());
+                o.content = Some("x".into());
+                o.command = Some("true".into());
+            }),
+            ("neither `path` nor `command`", &|o| o.root = true),
+            ("carries `cwd`", &|o| {
+                o.path = Some("/etc/hosts".into());
+                o.content = Some("x".into());
+                o.cwd = Some("/".into());
+            }),
+            ("carries `interactive`", &|o| {
+                o.path = Some("/etc/hosts".into());
+                o.content = Some("x".into());
+                o.interactive = Some(false);
+            }),
+            ("carries `content`", &|o| {
+                o.command = Some("true".into());
+                o.content = Some("x".into());
+            }),
+            ("carries `patch`", &|o| {
+                o.command = Some("true".into());
+                o.patch = Some("@@ -1 +1 @@\n-a\n+b\n".into());
+            }),
+            ("carries both", &|o| {
+                o.path = Some("/etc/hosts".into());
+                o.content = Some("x".into());
+                o.patch = Some("@@ -1 +1 @@\n-a\n+b\n".into());
+            }),
+            ("carries neither", &|o| o.path = Some("/etc/hosts".into())),
+        ];
+        for (needle, edit) in cases {
+            let refusal = with(edit).expect_err(&format!("{needle} passed the boundary"));
+            assert!(refusal.contains(needle), "the refusal does not say {needle:?}: {refusal}");
+            assert!(refusal.contains("nothing ran"), "{refusal}");
+            assert!(refusal.contains("not a decision by the user"), "{refusal}");
+        }
+
+        // And the two well-formed shapes pass, with `interactive` left out
+        // meaning no terminal rather than being refused.
+        assert!(matches!(
+            with(&|o| {
+                o.path = Some("/etc/hosts".into());
+                o.patch = Some("@@ -1 +1 @@\n-a\n+b\n".into());
+            })
+            .map(|b| b.operations),
+            Ok(ops) if matches!(ops[..], [Operation::Write { source: SwapSource::Patch(_), .. }])
+        ));
+        assert!(matches!(
+            with(&|o| o.command = Some("true".into())).map(|b| b.operations),
+            Ok(ops) if matches!(ops[..], [Operation::Command { interactive: false, .. }])
+        ));
+    }
+
+    #[test]
+    fn a_field_of_one_of_several_operations_is_named_by_its_place_in_the_list() {
+        // Past the cap this is unreachable through the tool, and it is the
+        // wording the day the cap lifts: "`content` is too large" is no use
+        // to an agent that sent three contents. One operation keeps the
+        // spelling a `run_command` call's own field has.
+        let over = OperationParams {
+            path: Some("/etc/hosts".into()),
+            content: Some("a".repeat(MAX_CONTENT_BYTES + 1)),
+            ..a_write()
+        };
+        let named = |count: usize, index: usize| {
+            move |name: &str| match count {
+                1 => name.to_string(),
+                _ => format!("operations[{index}].{name}"),
+            }
+        };
+        let alone = Operation::of(over.clone(), &named(1, 0)).expect_err("over the cap");
+        assert!(alone.contains("`content` is"), "{alone}");
+        let third = Operation::of(over, &named(3, 2)).expect_err("over the cap");
+        assert!(third.contains("`operations[2].content` is"), "{third}");
     }
 
     fn result_text(result: &CallToolResult) -> String {
@@ -3581,12 +4483,16 @@ mod tests {
 
     #[test]
     fn declares_exactly_the_two_tools() {
-        let names: Vec<String> = Hatch::new(bare_daemon(test_config()))
+        // `swap_file` is not among them. Every guarantee it carried is a
+        // property of writing a file on this host and is tested below through
+        // `batch`; what is gone is a second way to ask for it.
+        let mut names: Vec<String> = Hatch::new(bare_daemon(test_config()))
             .described_tools()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names, ["run_command", "swap_file"]);
+        names.sort_unstable();
+        assert_eq!(names, ["batch", "run_command"]);
     }
 
     #[test]
@@ -3603,47 +4509,86 @@ mod tests {
     }
 
     #[test]
-    fn each_tool_sends_a_file_edit_to_the_other_one() {
+    fn each_tool_sends_a_file_edit_to_the_batch() {
         // An agent that writes a config with `cat > file` or `sed -i` has not
         // done anything hatch forbids — but it has swapped a diff, a landing
         // mode, a symlink check and a drift check for a shell line the reader
         // has to simulate in their head. The descriptions are the only place
-        // that choice is made, so both sides name the other tool: one says
-        // where a file edit belongs, the other says it is the place.
+        // that choice is made, so both sides say it: one says where a file
+        // edit belongs, the other says it is the place.
         let descriptions = tool_descriptions(&test_config());
         let run = descriptions.for_tool("run_command").expect("run_command is described");
-        let swap = descriptions.for_tool("swap_file").expect("swap_file is described");
+        let batch = descriptions.for_tool("batch").expect("batch is described");
 
-        assert!(run.contains("use `swap_file` instead"), "run_command does not send a file edit on: {run}");
-        assert!(swap.contains("tool for editing configuration"), "swap_file does not claim configs: {swap}");
-        // The shapes an agent actually reaches for, named rather than implied.
+        assert!(run.contains("use `batch` instead"), "run_command does not send a file edit on: {run}");
+        assert!(
+            batch.contains("tool for anything that touches a file"),
+            "batch does not claim file writes: {batch}"
+        );
+        // The shapes an agent actually reaches for, named rather than implied,
+        // on both sides.
         for reach in ["sed -i", "here-document", "tee"] {
             assert!(run.contains(reach), "run_command does not name {reach:?}: {run}");
+            assert!(batch.contains(reach), "batch does not name {reach:?}: {batch}");
         }
-        assert!(swap.contains("sed -i"), "swap_file does not name the habit it replaces: {swap}");
+        // And the division of labour is stated from the other end too: a
+        // single command has a shortcut, and the shortcut says what it is.
+        assert!(batch.contains("`run_command` is the shortcut"), "{batch}");
+        assert!(run.contains("shortcut for a `batch` of exactly one command"), "{run}");
     }
 
     #[test]
-    fn the_swap_description_points_an_edit_at_the_cheap_form() {
+    fn the_batch_description_points_an_edit_at_the_cheap_form() {
         // The description is where the choice between the two forms is
         // actually made: a description that argued against the incentive
         // would lose, so it has to make the cheap path the obvious one and
         // say plainly which is which. Both names, both jobs, and the rule
-        // that exactly one of them belongs in a call.
-        let swap = tool_descriptions(&test_config())
-            .for_tool("swap_file")
-            .expect("swap_file is described")
+        // that exactly one of them belongs in a write.
+        let batch = tool_descriptions(&test_config())
+            .for_tool("batch")
+            .expect("batch is described")
             .to_string();
 
-        assert!(swap.contains("Send `patch`"), "the cheap form is not the obvious one: {swap}");
-        for claim in ["create", "replace one wholesale", "both is an error"] {
-            assert!(swap.contains(claim), "the description does not say {claim:?}: {swap}");
+        assert!(batch.contains("Send `patch`"), "the cheap form is not the obvious one: {batch}");
+        for claim in ["create", "replace one wholesale", "Both is an error"] {
+            assert!(batch.contains(claim), "the description does not say {claim:?}: {batch}");
         }
         // What a refusal will cost it, said before it costs anything.
         assert!(
-            swap.contains("never searches nearby"),
-            "an agent must learn the no-fuzz rule here, not from a refusal: {swap}"
+            batch.contains("never searches nearby"),
+            "an agent must learn the no-fuzz rule here, not from a refusal: {batch}"
         );
+    }
+
+    #[test]
+    fn the_batch_description_says_the_cap_is_temporary_and_what_follows_a_failure() {
+        // Two things an agent can only learn from this text before it costs
+        // a round trip. The cap, in the words the brief for this tool fixed:
+        // one operation for now, more later -- so a list that comes back
+        // unrun reads as the limit it is, not as a tool that is broken. And
+        // the execution contract: order, the three outcomes, the default, the
+        // option that changes it, the failures no option runs past, and that
+        // nothing is undone.
+        let batch = tool_descriptions(&test_config())
+            .for_tool("batch")
+            .expect("batch is described")
+            .to_string();
+
+        assert_eq!(MAX_OPERATIONS, 1, "the wording below is the wording for a cap of one");
+        assert!(batch.contains("One operation per batch for now; more later."), "{batch}");
+        for claim in [
+            "in the order you list them",
+            "done, failed, or not attempted",
+            "`stop_on_failure`",
+            "carries on past a failed operation",
+            "exits with a non-zero status",
+            "changed after the person read the diff",
+            "sees which you chose",
+            "killed, ran out of time",
+            "Nothing is ever rolled back",
+        ] {
+            assert!(batch.contains(claim), "the description does not say {claim:?}: {batch}");
+        }
     }
 
     #[test]
@@ -3663,34 +4608,44 @@ mod tests {
     #[test]
     fn each_tool_gets_its_own_description() {
         let descriptions = tool_descriptions(&Config::default());
-        assert_ne!(descriptions.for_tool("run_command"), descriptions.for_tool("swap_file"));
+        assert_ne!(descriptions.for_tool("run_command"), descriptions.for_tool("batch"));
+        assert_eq!(descriptions.for_tool("swap_file"), None, "a removed tool is still described");
         assert_eq!(descriptions.for_tool("nothing_of_the_sort"), None);
     }
 
     #[test]
     fn the_blocking_bound_follows_the_config() {
         // Guards against interpolating the approval timeout alone, which
-        // understates the bound by more than three times.
+        // understates the bound by more than three times -- and, for the
+        // batch, against counting one execution for a call that may carry
+        // several.
         let config = Config { timeout_secs: 11, exec_timeout_secs: 700, ..Config::default() };
-        for name in ["run_command", "swap_file"] {
-            let text = tool_descriptions(&config).for_tool(name).unwrap().to_string();
-            assert!(text.contains("711"), "{name} must state the full bound: {text}");
+        let descriptions = tool_descriptions(&config);
+        let run = descriptions.for_tool("run_command").unwrap();
+        let batch = descriptions.for_tool("batch").unwrap();
+        assert!(run.contains("711"), "run_command must state the full bound: {run}");
+        let batch_bound = 11 + 700 * MAX_OPERATIONS as u64;
+        assert!(
+            batch.contains(&format!("up to {batch_bound} seconds")),
+            "batch must state the bound for its largest call: {batch}"
+        );
+        for text in [run, batch] {
+            assert!(text.contains("11s"), "the approval half must be named too: {text}");
+            assert!(text.contains("700s"), "the execution half must be named too: {text}");
         }
-        let text = tool_descriptions(&config).for_tool("run_command").unwrap().to_string();
-        assert!(text.contains("11s"), "the approval half must be named too: {text}");
-        assert!(text.contains("700s"), "the execution half must be named too: {text}");
+        assert!(batch.contains("700s for each operation"), "{batch}");
     }
 
     #[test]
     fn both_descriptions_narrow_when_to_reach_for_the_tool() {
         let descriptions = tool_descriptions(&Config::default());
-        for name in ["run_command", "swap_file"] {
+        for name in ["run_command", "batch"] {
             let text = descriptions.for_tool(name).unwrap();
             assert!(text.contains("only when"), "{name} must say when not to: {text}");
             assert!(text.contains("workspace"), "{name} must point at the workspace: {text}");
         }
         assert!(
-            descriptions.for_tool("run_command").unwrap().contains("Batch"),
+            descriptions.for_tool("run_command").unwrap().contains("Batch related commands"),
             "run_command must ask for one command rather than a chain of calls"
         );
     }
@@ -3779,7 +4734,9 @@ mod tests {
 
             let names: Vec<&str> =
                 tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-            assert_eq!(names, ["run_command", "swap_file"], "both tools must be offered");
+            let mut sorted = names.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, ["batch", "run_command"], "both tools must be offered");
             for tool in &tools {
                 let description = tool["description"].as_str().unwrap();
                 assert!(
@@ -3790,27 +4747,45 @@ mod tests {
             }
 
             // The schema is the only thing an agent reads before it writes a
-            // call, so a `swap_file` that advertises one form offers one. Both
-            // are optional there and neither can be required: which of them a
-            // call must carry is a rule about the pair, and the one place it
-            // is enforced is `SwapRequest::of`, where a refusal can be a
-            // sentence.
-            let swap = tools
-                .iter()
-                .find(|t| t["name"] == "swap_file")
-                .expect("swap_file is listed");
-            let schema = &swap["inputSchema"];
-            for form in ["content", "patch"] {
+            // call, so a batch whose operations advertise one form of write,
+            // or one kind of operation, offers one. Every field of an
+            // operation is optional there and none can be required: which of
+            // them an operation must carry is a rule about the set, and the
+            // one place it is enforced is `Batch::of`, where a refusal can be
+            // a sentence.
+            let batch = tools.iter().find(|t| t["name"] == "batch").expect("batch is listed");
+            let schema = &batch["inputSchema"];
+            let required = |at: &serde_json::Value, name: &str| {
+                at["required"].as_array().is_some_and(|r| r.iter().any(|field| field == name))
+            };
+            for field in ["title", "reason", "operations"] {
+                assert!(required(schema, field), "a batch without {field} is accepted: {schema}");
+            }
+            assert!(
+                !required(schema, "stop_on_failure"),
+                "the policy has a default and must not be demanded: {schema}"
+            );
+            // The operation's own schema, wherever the generator put it.
+            let items = &schema["properties"]["operations"]["items"];
+            let operation = match items["$ref"].as_str() {
+                Some(reference) => {
+                    let name = reference.rsplit('/').next().expect("a named definition");
+                    match &schema["$defs"][name] {
+                        serde_json::Value::Null => &schema["definitions"][name],
+                        found => found,
+                    }
+                }
+                None => items,
+            };
+            for field in ["path", "content", "patch", "command", "cwd", "interactive", "root"] {
                 assert!(
-                    !schema["properties"][form].is_null(),
-                    "swap_file does not advertise {form}: {schema}"
+                    !operation["properties"][field].is_null(),
+                    "an operation does not advertise {field}: {schema}"
                 );
                 assert!(
-                    !schema["required"]
-                        .as_array()
-                        .map(|r| r.iter().any(|name| name == form))
-                        .unwrap_or(false),
-                    "{form} is required on its own, which refuses the other form: {schema}"
+                    !required(operation, field),
+                    "{field} is required on its own, which refuses every operation without it: \
+                     {schema}"
                 );
             }
 
@@ -4139,7 +5114,7 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"before\n").unwrap();
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", false), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", false), Caller::quiet()),
             )
             .await;
             let text = result_text(&result);
@@ -4618,14 +5593,17 @@ later"), "");
         async fn refusals_happen_before_any_prompt_is_shown() {
             let harness = Harness::new(Vec::new());
             let protected = harness.paths.config_file();
-            let result = within(harness.daemon.swap_file(
-                SwapFileParams {
+            let result = within(harness.daemon.batch(
+                BatchParams {
                     title: "take hatch over".to_string(),
-                    path: protected.display().to_string(),
-                    content: Some("x".to_string()),
-                    patch: None,
                     reason: "because a test asked".to_string(),
-                    root: false,
+                    operations: vec![OperationParams {
+                        path: Some(protected.display().to_string()),
+                        content: Some("x".to_string()),
+                        root: false,
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
                 },
                 Caller::quiet(),
             ))
@@ -4689,21 +5667,66 @@ later"), "");
             params
         }
 
-        fn swap_of(path: &Path, content: &str, root: bool) -> SwapFileParams {
-            SwapFileParams {
-                title: "change it".to_string(),
-                path: path.display().to_string(),
-                content: Some(content.to_string()),
-                patch: None,
-                reason: "because a test asked".to_string(),
-                root,
-            }
+        /// A batch of one file write, in the whole-file form.
+        fn swap_of(path: &Path, content: &str, root: bool) -> BatchParams {
+            write_of(path, Some(content), None, root)
         }
 
         /// The same request said the other way, so that a test can hold the
         /// two forms side by side.
-        fn patch_of(path: &Path, patch: &str) -> SwapFileParams {
-            SwapFileParams { content: None, patch: Some(patch.to_string()), ..swap_of(path, "", false) }
+        fn patch_of(path: &Path, patch: &str) -> BatchParams {
+            write_of(path, None, Some(patch), false)
+        }
+
+        /// A batch of one file write carrying whichever forms it is given,
+        /// including both and neither.
+        fn write_of(
+            path: &Path,
+            content: Option<&str>,
+            patch: Option<&str>,
+            root: bool,
+        ) -> BatchParams {
+            BatchParams {
+                title: "change it".to_string(),
+                reason: "because a test asked".to_string(),
+                operations: vec![OperationParams {
+                    path: Some(path.display().to_string()),
+                    content: content.map(str::to_string),
+                    patch: patch.map(str::to_string),
+                    ..a_write()
+                }],
+                stop_on_failure: false,
+            }
+            .with_root(root)
+        }
+
+        /// A batch of the operations of several, in order, as one request.
+        ///
+        /// The tool refuses this past the cap, so it is handed to the daemon
+        /// behind the boundary: see `a_batch_of_several` for why that is a
+        /// fair test of the path the cap guards and not a way around it.
+        fn several(stop_on_failure: bool, batches: Vec<BatchParams>) -> Batch {
+            let mut operations = Vec::new();
+            for params in batches {
+                let one = Batch::of(params).expect("each operation passes the boundary alone");
+                operations.extend(one.operations);
+            }
+            Batch {
+                title: "several things".to_string(),
+                reason: "because a test asked".to_string(),
+                operations,
+                stop_on_failure,
+            }
+        }
+
+        impl BatchParams {
+            /// The same batch with every operation's `root` set to `root`.
+            fn with_root(mut self, root: bool) -> BatchParams {
+                for operation in &mut self.operations {
+                    operation.root = root;
+                }
+                self
+            }
         }
 
         /// Every frame the one window was sent.
@@ -4762,10 +5785,10 @@ later"), "");
 
                 // Denied, so nothing runs and nothing is written: this test
                 // is about what the window was shown, not about what came
-                // afterwards.
-                let prompter = Arc::new(StubPrompter::new(vec![Reply::verdict(Verdict::Deny {
-                    note: String::new(),
-                })]));
+                // afterwards. Two answers, because a command is asked for
+                // twice -- see below.
+                let deny = || Reply::verdict(Verdict::Deny { note: String::new() });
+                let prompter = Arc::new(StubPrompter::new(vec![deny(), deny()]));
                 let daemon = Arc::new(Daemon::new(
                     &paths,
                     config.clone(),
@@ -4781,7 +5804,13 @@ later"), "");
                 )
                 .unwrap_or_else(|e| panic!("{scenario:?} could not be built: {e:#}"));
 
-                match &sample.asked {
+                // Every sample as the one operation of a batch, which is the
+                // shape every request now has. A command sample is sent a
+                // second time through `run_command`, so that the windows the
+                // README shows are held to both of the tools that open them:
+                // the alias has to open the window the batch does, field for
+                // field, or it is not an alias.
+                let operation = match &sample.asked {
                     crate::preview::Asked::Command { command, cwd, root, interactive } => {
                         daemon
                             .run_command(
@@ -4795,39 +5824,56 @@ later"), "");
                                 },
                                 Caller::quiet(),
                             )
-                            .await
+                            .await;
+                        OperationParams {
+                            command: Some(command.clone()),
+                            cwd: Some(cwd.display().to_string()),
+                            interactive: Some(*interactive),
+                            root: *root,
+                            ..a_write()
+                        }
                     }
-                    crate::preview::Asked::Swap { path, content, root } => {
-                        daemon
-                            .swap_file(
-                                SwapFileParams {
-                                    title: sample.title.clone(),
-                                    path: path.display().to_string(),
-                                    content: Some(content.clone()),
-                                    patch: None,
-                                    reason: sample.reason.clone(),
-                                    root: *root,
-                                },
-                                Caller::quiet(),
-                            )
-                            .await
-                    }
+                    crate::preview::Asked::Write { path, content, root } => OperationParams {
+                        path: Some(path.display().to_string()),
+                        content: Some(content.clone()),
+                        root: *root,
+                        ..a_write()
+                    },
                 };
+                daemon
+                    .batch(
+                        BatchParams {
+                            title: sample.title.clone(),
+                            reason: sample.reason.clone(),
+                            operations: vec![operation],
+                            stop_on_failure: false,
+                        },
+                        Caller::quiet(),
+                    )
+                    .await;
 
                 let recorded = prompter.recorded();
+                let expected = match &sample.asked {
+                    crate::preview::Asked::Command { .. } => 2,
+                    crate::preview::Asked::Write { .. } => 1,
+                };
                 assert_eq!(
                     recorded.len(),
-                    1,
-                    "{scenario:?} never reached a window: the daemon refused a request the \
-                     preview draws"
+                    expected,
+                    "{scenario:?} did not reach a window every time: the daemon refused a \
+                     request the preview draws"
                 );
-                let request = &recorded[0].request;
-                assert_eq!(
-                    request.operations, vec![sample.payload.clone()],
-                    "{scenario:?}: the preview and the daemon built different payloads"
-                );
-                assert_eq!(request.title, sample.title, "{scenario:?}");
-                assert_eq!(request.reason, sample.reason, "{scenario:?}");
+                for window in &recorded {
+                    let request = &window.request;
+                    assert_eq!(
+                        request.operations,
+                        vec![sample.payload.clone()],
+                        "{scenario:?}: the preview and the daemon built different payloads"
+                    );
+                    assert!(!request.stop_on_failure, "{scenario:?}");
+                    assert_eq!(request.title, sample.title, "{scenario:?}");
+                    assert_eq!(request.reason, sample.reason, "{scenario:?}");
+                }
             }
         }
 
@@ -5155,7 +6201,7 @@ later"), "");
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()),
             )
             .await;
 
@@ -5198,7 +6244,7 @@ later"), "");
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()),
             )
             .await;
 
@@ -5244,7 +6290,7 @@ later"), "");
             });
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()),
             )
             .await;
 
@@ -5275,7 +6321,7 @@ later"), "");
             std::fs::write(&target, b"before\n").unwrap();
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()),
             )
             .await;
 
@@ -5310,7 +6356,7 @@ later"), "");
             });
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()),
             )
             .await;
 
@@ -5341,12 +6387,11 @@ later"), "");
             std::fs::write(&target, b"before\n").unwrap();
             // An owner this process cannot give the file, so the real
             // `install` the double runs fails the way a read-only mount would.
-            let mut params = swap_of(&target, "after\n", true);
-            params.path = target.display().to_string();
+            let params = swap_of(&target, "after\n", true);
             std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o500))
                 .unwrap();
 
-            let result = within(harness.daemon.swap_file(params, Caller::quiet())).await;
+            let result = within(harness.daemon.batch(params, Caller::quiet())).await;
             std::fs::set_permissions(elsewhere.path(), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
 
@@ -5375,7 +6420,7 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"before\n").unwrap();
 
-            within(harness.daemon.swap_file(swap_of(&target, "after\n", true), Caller::quiet()))
+            within(harness.daemon.batch(swap_of(&target, "after\n", true), Caller::quiet()))
                 .await;
 
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
@@ -5393,7 +6438,7 @@ later"), "");
             let protected = harness.paths.config_file();
 
             let result = within(
-                harness.daemon.swap_file(swap_of(&protected, "x", true), Caller::quiet()),
+                harness.daemon.batch(swap_of(&protected, "x", true), Caller::quiet()),
             )
             .await;
 
@@ -5416,7 +6461,9 @@ later"), "");
                 vec![approve()],
                 Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
             );
-            let ceiling = harness.daemon.config().client_timeout_secs();
+            // The bound for a call of one command, which is the number
+            // `run_command`'s description quotes whatever a batch may carry.
+            let ceiling = harness.daemon.config().blocking_bound_secs(1);
             assert_eq!(
                 ceiling,
                 harness.daemon.config().timeout_secs + harness.daemon.config().exec_timeout_secs
@@ -5451,14 +6498,17 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"before\n").unwrap();
 
-            let result = within(harness.daemon.swap_file(
-                SwapFileParams {
+            let result = within(harness.daemon.batch(
+                BatchParams {
                     title: "change it".to_string(),
-                    path: target.display().to_string(),
-                    content: Some("after\n".to_string()),
-                    patch: None,
                     reason: "because a test asked".to_string(),
-                    root: false,
+                    operations: vec![OperationParams {
+                        path: Some(target.display().to_string()),
+                        content: Some("after\n".to_string()),
+                        root: false,
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
                 },
                 Caller::quiet(),
             ))
@@ -5498,14 +6548,17 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"before\n").unwrap();
 
-            within(harness.daemon.swap_file(
-                SwapFileParams {
+            within(harness.daemon.batch(
+                BatchParams {
                     title: "change it".to_string(),
-                    path: target.display().to_string(),
-                    content: Some("after\n".to_string()),
-                    patch: None,
                     reason: "because a test asked".to_string(),
-                    root: false,
+                    operations: vec![OperationParams {
+                        path: Some(target.display().to_string()),
+                        content: Some("after\n".to_string()),
+                        root: false,
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
                 },
                 Caller::quiet(),
             ))
@@ -5535,12 +6588,12 @@ later"), "");
             let before = "one\ntwo\nthree\nfour\nfive\n";
             std::fs::write(&target, before).unwrap();
 
-            within(harness.daemon.swap_file(
+            within(harness.daemon.batch(
                 patch_of(&target, "@@ -2,3 +2,3 @@\n two\n-three\n+THREE\n four\n"),
                 Caller::quiet(),
             ))
             .await;
-            within(harness.daemon.swap_file(
+            within(harness.daemon.batch(
                 swap_of(&target, "one\ntwo\nTHREE\nfour\nfive\n", false),
                 Caller::quiet(),
             ))
@@ -5566,7 +6619,7 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"before\nkeep\n").unwrap();
 
-            let result = within(harness.daemon.swap_file(
+            let result = within(harness.daemon.batch(
                 patch_of(&target, "@@ -1,2 +1,2 @@\n-before\n+after\n keep\n"),
                 Caller::quiet(),
             ))
@@ -5590,7 +6643,7 @@ later"), "");
             let target = elsewhere.path().join("target.conf");
             std::fs::write(&target, b"one\ntwo\n").unwrap();
 
-            let result = within(harness.daemon.swap_file(
+            let result = within(harness.daemon.batch(
                 patch_of(&target, "@@ -2 +2 @@\n-three\n+THREE\n"),
                 Caller::quiet(),
             ))
@@ -5616,7 +6669,7 @@ later"), "");
             // is no record: nothing was rendered, and the log would have
             // nothing to say about a file nobody was asked to write.
             let cases = [
-                (Some("x\n".to_string()), Some("@@ -1 +1 @@\n-a\n+x\n".to_string()), "both"),
+                (Some("x\n"), Some("@@ -1 +1 @@\n-a\n+x\n"), "both"),
                 (None, None, "neither"),
             ];
             for (content, patch, needle) in cases {
@@ -5624,9 +6677,9 @@ later"), "");
                 let elsewhere = tempfile::tempdir().unwrap();
                 let target = elsewhere.path().join("target.conf");
                 std::fs::write(&target, b"a\n").unwrap();
-                let params = SwapFileParams { content, patch, ..swap_of(&target, "", false) };
+                let params = write_of(&target, content, patch, false);
 
-                let result = within(harness.daemon.swap_file(params, Caller::quiet())).await;
+                let result = within(harness.daemon.batch(params, Caller::quiet())).await;
 
                 assert_eq!(result.is_error, Some(true), "{needle}");
                 let text = result_text(&result);
@@ -5636,6 +6689,641 @@ later"), "");
                 assert!(harness.logged().is_empty(), "{needle} was logged as a request: {text}");
                 assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\n");
             }
+        }
+
+        // --- what writing a file on this host guarantees, through `batch` ------
+        //
+        // These were properties of `swap_file`, and not one of them was about
+        // the tool: each is a property of writing a file on this host, so each
+        // is asked of the tool that now writes files. The module tests in
+        // `swap.rs`, `patch.rs` and `tests/swap_apply.rs` pin the mechanisms;
+        // these pin that the tool an agent calls still reaches them.
+
+        #[tokio::test]
+        async fn a_write_through_a_symlink_is_refused_before_anybody_is_asked() {
+            // No window is scripted, so opening one would panic.
+            let harness = Harness::new(Vec::new());
+            let elsewhere = tempfile::tempdir().unwrap();
+            let real = elsewhere.path().join("real.conf");
+            std::fs::write(&real, b"before\n").unwrap();
+            let link = elsewhere.path().join("link.conf");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            let result = within(harness.daemon.batch(swap_of(&link, "after\n", false), Caller::quiet()))
+                .await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("symbolic link"), "the refusal does not say why: {text}");
+            assert!(text.contains("not a decision by the user"), "{text}");
+            assert!(harness.prompter.seen().is_empty(), "a symlinked target reached a window");
+            assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), "before\n");
+        }
+
+        #[tokio::test]
+        async fn a_protected_file_reached_through_a_symlinked_directory_is_still_refused() {
+            // `.../link/secret.toml` is not lexically inside the protected
+            // directory, and it is the same file. The canonicalised-parent
+            // check is what sees that, and this is that check reached through
+            // the tool with the daemon's own denylist rather than one built by
+            // hand.
+            let protected = tempfile::tempdir().unwrap();
+            let canonical = std::fs::canonicalize(protected.path()).unwrap();
+            let harness = Harness::configured(Vec::new(), |config| {
+                config.denylist_extra = vec![canonical.display().to_string()];
+            });
+            let secret = protected.path().join("secret.toml");
+            std::fs::write(&secret, b"token = 1\n").unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let link = elsewhere.path().join("link");
+            std::os::unix::fs::symlink(protected.path(), &link).unwrap();
+
+            for target in [link.join("secret.toml"), link.join("brand-new.toml")] {
+                let result =
+                    within(harness.daemon.batch(swap_of(&target, "x\n", false), Caller::quiet()))
+                        .await;
+                let text = result_text(&result);
+                assert_eq!(result.is_error, Some(true), "{text}");
+                assert!(text.contains("hatch protects this path"), "{target:?}: {text}");
+            }
+            assert!(harness.prompter.seen().is_empty(), "a protected path reached a window");
+            assert_eq!(std::fs::read_to_string(&secret).unwrap(), "token = 1\n");
+            assert!(!protected.path().join("brand-new.toml").exists());
+        }
+
+        #[tokio::test]
+        async fn a_replacement_lands_at_the_mode_and_owner_the_file_already_had() {
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let owner = std::fs::metadata(&target).unwrap();
+
+            let result =
+                within(harness.daemon.batch(swap_of(&target, "after\n", false), Caller::quiet()))
+                    .await;
+
+            let text = result_text(&result);
+            assert_ne!(result.is_error, Some(true), "{text}");
+            let Payload::Swap { plan, .. } = &harness.prompter.seen()[0].operations[0] else {
+                panic!("a write opened a window that is not a write's");
+            };
+            assert_eq!(plan.landing_mode, 0o640, "the window did not state the inherited mode");
+            let landed = std::fs::metadata(&target).unwrap();
+            assert_eq!(landed.mode() & 0o7777, 0o640, "the mode the window stated did not land");
+            assert_eq!((landed.uid(), landed.gid()), (owner.uid(), owner.gid()));
+            assert!(text.contains("mode 0640"), "{text}");
+            let record = harness.only_record();
+            assert_eq!(record["mode"], "0640", "{record}");
+            assert_eq!(
+                record["owner"],
+                format!("{}:{}", plan.landing_owner, plan.landing_group),
+                "{record}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_create_whose_file_appeared_under_review_leaves_what_appeared() {
+            // The window drew a create, against nothing. Somebody puts a file
+            // there while it is being read. The write must not replace it:
+            // the re-check refuses it as drift, and `RENAME_NOREPLACE` is what
+            // holds the same line for the instant after the re-check -- a
+            // window this test cannot hit on purpose, and `swap.rs` pins.
+            let harness = Harness::new(vec![approve().after(Duration::from_millis(300))]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("new.conf");
+
+            let appearing = target.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                std::fs::write(&appearing, b"theirs\n").unwrap();
+            });
+            let result =
+                within(harness.daemon.batch(swap_of(&target, "ours\n", false), Caller::quiet()))
+                    .await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("the write did not happen"), "{text}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs\n", "a create destroyed a file");
+            assert_eq!(
+                std::fs::read_dir(elsewhere.path()).unwrap().count(),
+                1,
+                "the refused write left a temporary file behind"
+            );
+            assert_eq!(harness.verdict(), "approve", "the user did approve it");
+        }
+
+        #[tokio::test]
+        async fn every_way_a_patch_is_refused_reaches_the_agent_before_anybody_is_asked() {
+            // `patch.rs` has the whole list; these are the four that are about
+            // what an agent sends rather than about the arithmetic of a hunk,
+            // and each has to arrive through the tool as a refusal the agent
+            // can act on -- with no window, and a file left alone.
+            let cases: [(&str, &str, &str); 4] = [
+                ("one\ntwo\n", "--- a/f\n+++ b/f\n", "no `@@` hunk"),
+                ("one\ntwo\n", "Here is the patch:\n@@ -1 +1 @@\n-one\n+ONE\n", "Here is the patch:"),
+                (
+                    "one\ntwo\n",
+                    "@@ -1 +1 @@\n-one\n+ONE\n--- a/other\n+++ b/other\n@@ -1 +1 @@\n-x\n+X\n",
+                    "second file",
+                ),
+                ("one\ntwo\n", "@@ -2 +2 @@\n-three\n+THREE\n", "never searches"),
+            ];
+            for (before, patch, needle) in cases {
+                let harness = Harness::new(Vec::new());
+                let elsewhere = tempfile::tempdir().unwrap();
+                let target = elsewhere.path().join("target.conf");
+                std::fs::write(&target, before).unwrap();
+
+                let result =
+                    within(harness.daemon.batch(patch_of(&target, patch), Caller::quiet())).await;
+
+                let text = result_text(&result);
+                assert_eq!(result.is_error, Some(true), "{needle}: {text}");
+                assert!(
+                    text.to_lowercase().contains(&needle.to_lowercase()),
+                    "the refusal does not say {needle:?}: {text}"
+                );
+                assert!(text.contains("not a decision by the user"), "{text}");
+                assert!(harness.prompter.seen().is_empty(), "{needle}: a refused patch cost a window");
+                assert_eq!(harness.verdict(), LogVerdict::Refused.as_str());
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+            }
+
+            // And the one refusal that is about the result rather than the
+            // patch: a few bytes of hunk that would produce a file past the
+            // cap on what a person can be asked to read.
+            let harness = Harness::new(Vec::new());
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, "a\n").unwrap();
+            let huge = "y".repeat(MAX_CONTENT_BYTES);
+            let patch = format!("@@ -1 +1,2 @@\n a\n+{huge}\n");
+            let result = within(harness.daemon.batch(patch_of(&target, &patch), Caller::quiet())).await;
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains(&format!("{MAX_CONTENT_BYTES}-byte")), "{text}");
+            assert!(harness.prompter.seen().is_empty());
+        }
+
+        // --- the alias ---------------------------------------------------------
+
+        #[tokio::test]
+        async fn run_command_and_a_batch_of_one_command_are_the_same_request_end_to_end() {
+            // The window, the answer and the log, compared between the two
+            // tools for the same command. The preview test holds the window to
+            // both for every sample; this holds what comes after the approval
+            // -- the result text and every field of the record -- because an
+            // alias that opened the same window and then ran a second path
+            // would pass that one.
+            let command = "echo to out; echo to err >&2; exit 3";
+            let harness = Harness::new(vec![approve(), approve()]);
+            let aliased =
+                within(harness.daemon.run_command(run_of(command), Caller::quiet())).await;
+            let batched = within(harness.daemon.batch(
+                BatchParams {
+                    title: "a test".to_string(),
+                    reason: "because a test asked".to_string(),
+                    operations: vec![OperationParams {
+                        command: Some(command.to_string()),
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen[0].operations, seen[1].operations, "the two tools opened different windows");
+            assert_eq!(seen[0].stop_on_failure, seen[1].stop_on_failure);
+
+            // Everything but the one line that is a measurement.
+            let without_duration = |result: &CallToolResult| {
+                result_text(result)
+                    .lines()
+                    .filter(|line| !line.starts_with("duration: "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert_eq!(aliased.is_error, batched.is_error);
+            assert_eq!(without_duration(&aliased), without_duration(&batched));
+            assert!(without_duration(&aliased).starts_with("exit code: 3"), "{aliased:?}");
+
+            let mut records = harness.logged();
+            assert_eq!(records.len(), 2, "{records:?}");
+            for record in &mut records {
+                let object = record.as_object_mut().expect("a record is an object");
+                for measured in ["ts", "number", "duration_ms"] {
+                    object.remove(measured);
+                }
+            }
+            assert_eq!(records[0], records[1], "the two tools wrote different records");
+            assert_eq!(records[0]["tool"], "command");
+            assert_eq!(records[0]["operations"], 1);
+        }
+
+        // --- a batch of several, behind the cap ----------------------------------
+        //
+        // The tool refuses these today, and the day it stops refusing them the
+        // path they take must not be one that has never run. So they are handed
+        // to `Daemon::serve` directly, with every operation first put through
+        // the boundary on its own -- which is everything `Batch::of` does
+        // except count. From there on it is the real flow: the queue, the
+        // window, the verdict, the execution loop, the report and the log.
+
+        /// Whether `path` exists, for a command that leaves a mark.
+        fn marked(path: &Path) -> bool {
+            path.exists()
+        }
+
+        /// A batch of one command, for `several`.
+        fn command_of(command: &str) -> BatchParams {
+            BatchParams::from(run_of(command))
+        }
+
+        #[tokio::test]
+        async fn several_operations_run_in_the_order_they_were_listed_and_all_are_reported() {
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let journal = elsewhere.path().join("journal");
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+
+            // The third operation reads what the second wrote, so the journal
+            // can only come out this way if the order held.
+            let batch = several(
+                false,
+                vec![
+                    command_of(&format!("echo first >> {}", journal.display())),
+                    swap_of(&target, "second\n", false),
+                    command_of(&format!("cat {} >> {}", target.display(), journal.display())),
+                ],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_ne!(result.is_error, Some(true), "{text}");
+            assert_eq!(std::fs::read_to_string(&journal).unwrap(), "first\nsecond\n");
+            for heading in [
+                "3 operations, carried out in the order given",
+                "carry on past any operation that failed",
+                "operation 1 of 3, a command: done",
+                &format!("operation 2 of 3, a write to {}: done", target.display()),
+                "operation 3 of 3, a command: done",
+            ] {
+                assert!(text.contains(heading), "the report does not say {heading:?}: {text}");
+            }
+
+            // The window was shown all three, in order, and the policy.
+            let shown = &harness.prompter.seen()[0];
+            assert!(matches!(
+                shown.operations.as_slice(),
+                [Payload::Command { .. }, Payload::Swap { .. }, Payload::Command { .. }]
+            ));
+            assert!(!shown.stop_on_failure);
+
+            // One line per operation, sharing everything the decision owns.
+            let records = harness.logged();
+            assert_eq!(records.len(), 3, "{records:?}");
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record["operation"], index + 1, "{record}");
+                assert_eq!(record["operations"], 3, "{record}");
+                assert_eq!(record["stop_on_failure"], false, "{record}");
+                assert_eq!(record["verdict"], "approve", "{record}");
+                assert_eq!(record["number"], records[0]["number"], "{record}");
+                assert_eq!(record["ts"], records[0]["ts"], "one decision, one moment: {record}");
+            }
+            assert_eq!(
+                records.iter().map(|r| r["tool"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["command", "write", "command"]
+            );
+            assert_eq!(records[1]["path"], target.display().to_string());
+        }
+
+        #[tokio::test]
+        async fn by_default_a_failed_operation_does_not_stop_the_ones_after_it() {
+            // `exit 1` stands for every command whose status is an answer:
+            // under the default the batch goes on, the failure is reported as
+            // one, and the call is not an error, because everything approved
+            // was carried out.
+            let harness = Harness::new(vec![approve()]);
+            let marker = harness.dir.path().join("ran");
+            let batch = several(
+                false,
+                vec![command_of("exit 1"), command_of(&format!("touch {}", marker.display()))],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(marked(&marker), "the operation after a failure did not run: {text}");
+            assert!(text.contains("operation 1 of 2, a command: failed\nexit code: 1"), "{text}");
+            assert!(text.contains("operation 2 of 2, a command: done"), "{text}");
+            assert_ne!(result.is_error, Some(true), "{text}");
+            let verdicts: Vec<_> =
+                harness.logged().iter().map(|r| r["verdict"].as_str().unwrap().to_string()).collect();
+            assert_eq!(verdicts, ["approve", "approve"]);
+        }
+
+        #[tokio::test]
+        async fn asked_to_stop_a_batch_stops_at_the_first_failure_and_says_what_it_did_not_do() {
+            let harness = Harness::new(vec![approve()]);
+            let marker = harness.dir.path().join("ran");
+            let batch = several(
+                true,
+                vec![command_of("exit 1"), command_of(&format!("touch {}", marker.display()))],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(!marked(&marker), "an operation ran past a failure it was told to stop at");
+            assert!(text.contains("stop at the first operation that failed"), "{text}");
+            assert!(text.contains("operation 1 of 2, a command: failed"), "{text}");
+            assert!(
+                text.contains(
+                    "operation 2 of 2, a command: not attempted, because operation 1 failed and \
+                     this batch was set to stop at the first failure"
+                ),
+                "{text}"
+            );
+            assert_eq!(result.is_error, Some(true), "approved work was left undone: {text}");
+            assert!(harness.prompter.seen()[0].stop_on_failure, "the window was not told");
+
+            let records = harness.logged();
+            assert_eq!(records[0]["verdict"], "approve");
+            assert_eq!(records[1]["verdict"], "not_attempted", "{records:?}");
+            assert!(records[1].get("exit_code").is_none(), "{records:?}");
+            assert!(records.iter().all(|r| r["stop_on_failure"] == true), "{records:?}");
+        }
+
+        #[tokio::test]
+        async fn a_write_refused_for_drift_is_a_failure_the_policy_decides_about() {
+            // "Write the config, then reload": the example the window has to
+            // let a reader picture. Under the default the reload runs against
+            // the file somebody else wrote; asked to stop, it does not.
+            for stop_on_failure in [false, true] {
+                let harness = Harness::new(vec![approve().after(Duration::from_millis(300))]);
+                let elsewhere = tempfile::tempdir().unwrap();
+                let target = elsewhere.path().join("target.conf");
+                std::fs::write(&target, b"before\n").unwrap();
+                let marker = elsewhere.path().join("reloaded");
+
+                let drifting = target.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    std::fs::write(&drifting, b"somebody else got there first\n").unwrap();
+                });
+                let batch = several(
+                    stop_on_failure,
+                    vec![
+                        swap_of(&target, "after\n", false),
+                        command_of(&format!("touch {}", marker.display())),
+                    ],
+                );
+                let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+                let text = result_text(&result);
+                assert!(text.contains("a write to") && text.contains(": failed"), "{text}");
+                assert!(text.contains("changed after the request was approved"), "{text}");
+                assert_eq!(result.is_error, Some(true), "a write that did not happen is an error");
+                assert_eq!(
+                    std::fs::read_to_string(&target).unwrap(),
+                    "somebody else got there first\n"
+                );
+                assert_eq!(
+                    marked(&marker),
+                    !stop_on_failure,
+                    "stop_on_failure {stop_on_failure}: {text}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_command_the_person_killed_ends_the_batch_whatever_it_asked_for() {
+            // A Kill is a person intervening. Running the next operation past
+            // it would overrule them, so the default does not reach this.
+            let harness =
+                Harness::new(vec![approve().then_kills_after(Duration::from_millis(150))]);
+            let marker = harness.dir.path().join("ran");
+            let batch = several(
+                false,
+                vec![command_of("sleep 30"), command_of(&format!("touch {}", marker.display()))],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(!marked(&marker), "an operation ran past a Kill: {text}");
+            assert!(text.contains("killed: the user pressed Kill"), "{text}");
+            assert!(text.contains("operation 1 was cut short"), "{text}");
+            assert!(text.contains("whichever way the batch was set"), "{text}");
+            assert_eq!(result.is_error, Some(true), "{text}");
+            let records = harness.logged();
+            assert_eq!(records[0]["killed_by_user"], true, "{records:?}");
+            assert_eq!(records[1]["verdict"], "not_attempted", "{records:?}");
+        }
+
+        #[tokio::test]
+        async fn a_command_cut_off_at_the_execution_deadline_ends_the_batch_too() {
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.exec_timeout_secs = 1;
+            });
+            let marker = harness.dir.path().join("ran");
+            let batch = several(
+                false,
+                vec![command_of("sleep 5"), command_of(&format!("touch {}", marker.display()))],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(!marked(&marker), "an operation ran past a timed-out one: {text}");
+            assert!(text.contains("timed out"), "{text}");
+            assert!(text.contains("not attempted"), "{text}");
+            assert_eq!(harness.logged()[0]["timed_out"], true);
+        }
+
+        #[tokio::test]
+        async fn an_elevation_hatch_cannot_read_ends_the_batch_and_a_dismissed_one_does_not() {
+            // The two elevation endings sit on either side of the line the
+            // policy cannot move. A dismissed password dialog ran nothing: a
+            // failure with a known state, and the default carries on past it.
+            // An unclear one may have run anything, and nothing follows it.
+            for (outcome, carries_on) in [
+                (RootOutcome::Denied, true),
+                (
+                    RootOutcome::Unclear {
+                        exit: Some(1),
+                        message: "hatch cannot read this mechanism's diagnostics".to_string(),
+                    },
+                    false,
+                ),
+            ] {
+                let harness = rooted(vec![approve()], Arc::new(Rehearsed::recording(outcome.clone())));
+                let marker = harness.dir.path().join("ran");
+                let mut first = command_of("true");
+                first.operations[0].root = true;
+                let batch =
+                    several(false, vec![first, command_of(&format!("touch {}", marker.display()))]);
+                let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+                let text = result_text(&result);
+                assert_eq!(marked(&marker), carries_on, "{outcome:?}: {text}");
+                let second = harness.logged()[1]["verdict"].as_str().unwrap().to_string();
+                assert_eq!(second == "not_attempted", !carries_on, "{outcome:?}: {second}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_window_that_dies_between_two_operations_does_not_stop_the_second() {
+            // Invariant 3, for a batch: the second operation was approved with
+            // the first, and a window that goes away costs the Kill button and
+            // the live view and nothing else.
+            let harness = Harness::new(vec![approve().then_dies()]);
+            let (one, two) = (harness.dir.path().join("one"), harness.dir.path().join("two"));
+            let batch = several(
+                false,
+                vec![
+                    command_of(&format!("sleep 0.3; touch {}", one.display())),
+                    command_of(&format!("touch {}", two.display())),
+                ],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            assert!(marked(&one) && marked(&two), "{}", result_text(&result));
+            let records = harness.logged();
+            assert!(records.iter().all(|r| r["verdict"] == "approve"), "{records:?}");
+            assert_eq!(records[1]["prompt"], "died", "{records:?}");
+        }
+
+        #[tokio::test]
+        async fn one_refused_operation_refuses_the_batch_and_every_refusal_is_named() {
+            // No window is scripted. A sequence with a hole in it is not a
+            // thing anybody can approve, and both holes are reported at once,
+            // because the second would otherwise cost the next call.
+            let harness = Harness::new(Vec::new());
+            let protected = harness.paths.config_file();
+            let mut elsewhere = command_of("true");
+            elsewhere.operations[0].cwd = Some("/no/such/directory/anywhere".to_string());
+            let batch = several(
+                false,
+                vec![swap_of(&protected, "x", false), command_of("true"), elsewhere],
+            );
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            assert!(text.contains("operation 1 of 3: hatch refused"), "{text}");
+            assert!(text.contains("operation 3 of 3: hatch refused"), "{text}");
+            assert!(!text.contains("operation 2 of 3"), "a sound operation was reported as refused: {text}");
+            assert!(harness.prompter.seen().is_empty(), "a refused batch reached a window");
+            let records = harness.logged();
+            assert_eq!(records.len(), 3, "{records:?}");
+            assert!(records.iter().all(|r| r["verdict"] == "refused"), "{records:?}");
+            assert!(records.iter().all(|r| r.get("number").is_none()), "{records:?}");
+        }
+
+        #[tokio::test]
+        async fn a_denial_is_one_decision_and_every_operation_carries_it() {
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Deny { note: "not both".to_string() })]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let target = elsewhere.path().join("target.conf");
+            std::fs::write(&target, b"before\n").unwrap();
+            let batch =
+                several(true, vec![swap_of(&target, "after\n", false), command_of("true")]);
+            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert!(text.contains("denied by user: not both"), "{text}");
+            assert!(!text.contains("operation 1"), "a denial was reported operation by operation: {text}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
+            let records = harness.logged();
+            assert_eq!(records.len(), 2, "{records:?}");
+            for record in &records {
+                assert_eq!(record["verdict"], "deny", "{record}");
+                assert_eq!(record["note"], "not both", "{record}");
+                assert_eq!(record["number"], 1, "{record}");
+            }
+        }
+
+        #[test]
+        fn a_report_of_one_operation_is_that_operations_own_answer() {
+            // With one operation the heading would say twice what the text
+            // below it already says, and change the answer every existing
+            // `run_command` caller reads.
+            let result = CallToolResult::success(vec![ContentBlock::text("exit code: 3\n".to_string())]);
+            let reported = report(
+                vec![Reached::Ran {
+                    label: "a command".to_string(),
+                    status: Status::Failed(Failure::Settled),
+                    result: result.clone(),
+                }],
+                true,
+            );
+            assert_eq!(reported, result);
+        }
+
+        #[test]
+        fn a_failure_that_left_a_known_state_is_the_policys_and_one_that_did_not_is_not() {
+            let step = |status| Step {
+                verdict: LogVerdict::Approve,
+                result: CallToolResult::success(Vec::new()),
+                windup: Windup::Close,
+                status,
+            };
+            for stop_on_failure in [false, true] {
+                assert!(!step(Status::Done).ends_the_run(stop_on_failure));
+                assert!(step(Status::Failed(Failure::Unsettled)).ends_the_run(stop_on_failure));
+                assert_eq!(
+                    step(Status::Failed(Failure::Settled)).ends_the_run(stop_on_failure),
+                    stop_on_failure
+                );
+            }
+
+            // And which of the two each ending of a command is.
+            let ended = |exit_code, timed_out, killed_by_user| Output {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code,
+                signal: None,
+                timed_out,
+                killed_by_user,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                transcript: None,
+                transcript_truncated: false,
+            };
+            assert_eq!(run_status(&ended(Some(0), false, false), Some(0)), Status::Done);
+            assert_eq!(
+                run_status(&ended(Some(1), false, false), Some(1)),
+                Status::Failed(Failure::Settled),
+                "a non-zero status may be an answer, so it is the policy's"
+            );
+            assert_eq!(
+                run_status(&ended(None, false, false), None),
+                Status::Failed(Failure::Settled),
+                "a crash is the command ending on its own terms"
+            );
+            assert_eq!(
+                run_status(&ended(Some(0), true, false), Some(0)),
+                Status::Failed(Failure::Unsettled),
+                "a run hatch cut off is not done whatever status it died with"
+            );
+            assert_eq!(
+                run_status(&ended(None, false, true), None),
+                Status::Failed(Failure::Unsettled)
+            );
+            assert_eq!(elevation_status(&RootOutcome::Denied), Status::Failed(Failure::Settled));
+            assert_eq!(
+                elevation_status(&RootOutcome::Failed { message: String::new() }),
+                Status::Failed(Failure::Settled)
+            );
+            assert_eq!(
+                elevation_status(&RootOutcome::Unclear { exit: None, message: String::new() }),
+                Status::Failed(Failure::Unsettled)
+            );
         }
 
         // --- the live view ----------------------------------------------------
@@ -6102,8 +7790,11 @@ later"), "");
 
         #[tokio::test]
         async fn both_tools_are_reachable_over_the_wire() {
-            // `swap_file` has its own body, and a body that answers with
-            // nothing at all would still leave every unit test green.
+            // `batch` has a body of its own in the router, and a body that
+            // answers with nothing at all would still leave every unit test
+            // green. The call is a write, spelled as JSON the way an agent
+            // spells one, so the wire's own reading of an operation is what
+            // is under test and not a Rust value built beside it.
             let (harness, _) = wired(60, vec![approve()]);
             let served = serve(Arc::clone(&harness.daemon)).await;
             let elsewhere = tempfile::tempdir().unwrap();
@@ -6114,10 +7805,12 @@ later"), "");
                 Some(&served.session),
                 call_of(
                     2,
-                    "swap_file",
+                    "batch",
                     serde_json::json!({
-                        "title": "write it", "path": target.display().to_string(),
-                        "content": "hello\n", "reason": "because a test asked"
+                        "title": "write it", "reason": "because a test asked",
+                        "operations": [
+                            { "path": target.display().to_string(), "content": "hello\n" }
+                        ]
                     }),
                 ),
             )
@@ -6337,22 +8030,8 @@ later"), "");
 
             let call = {
                 let daemon = Arc::clone(&harness.daemon);
-                let path = target.display().to_string();
-                tokio::spawn(async move {
-                    daemon
-                        .swap_file(
-                            SwapFileParams {
-                                title: "change it".to_string(),
-                                path,
-                                content: Some("after\n".to_string()),
-                                patch: None,
-                                reason: "because a test asked".to_string(),
-                                root: false,
-                            },
-                            Caller::quiet(),
-                        )
-                        .await
-                })
+                let params = swap_of(&target, "after\n", false);
+                tokio::spawn(async move { daemon.batch(params, Caller::quiet()).await })
             };
             while harness.prompter.seen().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -6461,14 +8140,17 @@ later"), "");
             // window that stayed anyway would be an empty viewer.
             let harness = Harness::new(vec![Reply::verdict(approved(true))]);
             let target = harness.dir.path().join("swapped");
-            within(harness.daemon.swap_file(
-                SwapFileParams {
+            within(harness.daemon.batch(
+                BatchParams {
                     title: "write a file".to_string(),
-                    path: target.display().to_string(),
-                    content: Some("hello\n".to_string()),
-                    patch: None,
                     reason: "because a test asked".to_string(),
-                    root: false,
+                    operations: vec![OperationParams {
+                        path: Some(target.display().to_string()),
+                        content: Some("hello\n".to_string()),
+                        root: false,
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
                 },
                 Caller::quiet(),
             ))
@@ -6699,8 +8381,8 @@ later"), "");
         let mut sentences = Vec::new();
         for verdict in &refusing {
             let (needle, logged) = expected_of(verdict);
-            let outcome = declined(verdict.clone(), a_run_detail());
-            assert_eq!(outcome.verdict, logged, "{verdict:?}");
+            let outcome = declined(verdict.clone(), vec![a_run_detail()]);
+            assert_eq!(outcome.effects[0].verdict, logged, "{verdict:?}");
             assert_eq!(outcome.result.is_error, Some(true), "{verdict:?}");
             let text = result_text(&outcome.result);
             assert!(text.contains(needle), "{verdict:?} said {text}");
@@ -6726,7 +8408,7 @@ later"), "");
         // An approval must never be reported as a refusal. It cannot arrive
         // here, and if it ever did the answer says so rather than inventing a
         // denial nobody made.
-        let stray = declined(crate::protocol::approved(false), a_run_detail());
+        let stray = declined(crate::protocol::approved(false), vec![a_run_detail()]);
         assert_eq!(stray.result.is_error, Some(true));
         assert!(result_text(&stray.result).contains("mishandled"));
     }
@@ -6734,10 +8416,10 @@ later"), "");
     #[test]
     fn a_lost_client_and_a_cancelled_call_read_differently() {
         use crate::audit::LogVerdict;
-        let cancelled = abandoned(LogVerdict::Cancelled, a_run_detail());
-        let dropped = abandoned(LogVerdict::Disconnected, a_run_detail());
-        assert_eq!(cancelled.verdict, LogVerdict::Cancelled);
-        assert_eq!(dropped.verdict, LogVerdict::Disconnected);
+        let cancelled = abandoned(LogVerdict::Cancelled, vec![a_run_detail()]);
+        let dropped = abandoned(LogVerdict::Disconnected, vec![a_run_detail()]);
+        assert_eq!(cancelled.effects[0].verdict, LogVerdict::Cancelled);
+        assert_eq!(dropped.effects[0].verdict, LogVerdict::Disconnected);
         assert_eq!(cancelled.result.is_error, Some(true));
         assert_eq!(dropped.result.is_error, Some(true));
         assert!(result_text(&cancelled.result).contains("cancelled"));

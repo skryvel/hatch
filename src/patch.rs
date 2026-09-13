@@ -331,8 +331,8 @@ impl fmt::Display for PatchError {
             }
             PatchError::SecondFile { line, text } => write!(
                 f,
-                "line {line} of `patch`, `{text}`, starts a second file; swap_file writes the \
-                 one file `path` names, so send one file's hunks per call"
+                "line {line} of `patch`, `{text}`, starts a second file; a write changes the \
+                 one file its `path` names, so send each file's hunks as a write of its own"
             ),
             PatchError::Trailing { line, text } => write!(
                 f,

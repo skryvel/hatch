@@ -143,7 +143,7 @@ const SHOT_SLACK: i64 = 1;
 
 /// The directory a sample writes its own files into.
 ///
-/// `swap_file` is planned against the filesystem — [`swap::plan`] stats the
+/// A file write is planned against the filesystem — [`swap::plan`] stats the
 /// target, inherits its mode and owner and hashes it — so the swap sample
 /// needs a file that really exists, or it would be previewing a *create* and
 /// the metadata panel a replacement fills in would be empty. The file is the
@@ -224,7 +224,8 @@ impl Scenario {
     }
 }
 
-/// What one sample asks for, in the words an agent's own request would use.
+/// What one sample asks for, in the words an agent's own request would use:
+/// the one operation of a batch.
 ///
 /// Kept beside the payload rather than thrown away once the payload is built,
 /// and that is the whole warrant for this subcommand: a test can hand these
@@ -234,15 +235,15 @@ impl Scenario {
 /// shape of claim this project has been bitten by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Asked {
-    /// A `run_command` request.
+    /// A command, as `run_command` or a batch would send it.
     Command {
         command: String,
         cwd: PathBuf,
         root: bool,
         interactive: bool,
     },
-    /// A `swap_file` request.
-    Swap { path: PathBuf, content: String, root: bool },
+    /// A file write in the whole-file form, as a batch would send it.
+    Write { path: PathBuf, content: String, root: bool },
 }
 
 /// One sample, complete except for when it is sent.
@@ -286,7 +287,7 @@ impl Sample {
 
 // ---- building a sample the way the daemon builds a request -----------------
 
-/// The payload for a `run_command` sample.
+/// The payload for a command sample.
 ///
 /// A transcription of `Daemon::prepare_run`'s second half, in its order and
 /// with its comments' reasoning intact: the elevated case draws the whole
@@ -334,13 +335,13 @@ fn command_payload(
         .with_runs(runs))
 }
 
-/// The payload for a `swap_file` sample.
+/// The payload for a file write sample.
 ///
 /// `Daemon::prepare_swap`'s order, minus the two refusals that are about the
 /// request rather than the rendering: the denylist and the working directory
 /// have nothing to say about a file this module wrote itself.
 fn swap_payload(asked: &Asked, cap: usize) -> anyhow::Result<Payload> {
-    let Asked::Swap { path, content, root } = asked else {
+    let Asked::Write { path, content, root } = asked else {
         anyhow::bail!("a swap payload was asked for a command");
     };
     let content = content.as_bytes();
@@ -530,7 +531,7 @@ pub(crate) fn build(
             }
         }
         Scenario::Swap => {
-            let asked = Asked::Swap {
+            let asked = Asked::Write {
                 path: stage_sample_file(staging)?,
                 content: SWAP_AFTER.to_string(),
                 root: false,

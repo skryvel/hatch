@@ -358,7 +358,7 @@ impl fmt::Display for Refusal {
                  does not mean the directory above, so hatch refuses it rather than guessing",
             ),
             Refusal::Denied => f.write_str(
-                "hatch protects this path and will not replace it with swap_file",
+                "hatch protects this path and will not write to it",
             ),
             Refusal::Symlink { target } => write!(
                 f,
@@ -368,11 +368,11 @@ impl fmt::Display for Refusal {
             ),
             Refusal::NotARegularFile { what } => write!(
                 f,
-                "the path is {what}: swap_file replaces the contents of a regular file"
+                "the path is {what}: a file write replaces the contents of a regular file"
             ),
             Refusal::MissingParent { parent } => write!(
                 f,
-                "the directory {} does not exist, and swap_file never creates directories",
+                "the directory {} does not exist, and a file write never creates directories",
                 parent.display()
             ),
             Refusal::ParentNotADirectory { parent } => {
@@ -643,12 +643,12 @@ pub fn plan(path: &Path, content: &[u8], root: bool) -> anyhow::Result<SwapPlan>
 
     match existing {
         Some(md) if md.file_type().is_symlink() => bail!(
-            "{} is a symbolic link; swap_file must refuse it in validation rather than plan a \
-             write through it",
+            "{} is a symbolic link; a write to it must be refused in validation rather than \
+             planned through it",
             path.display()
         ),
         Some(md) if !md.is_file() => bail!(
-            "{} is {}; swap_file must refuse it in validation rather than plan a write over it",
+            "{} is {}; a write to it must be refused in validation rather than planned over it",
             path.display(),
             describe(&md)
         ),
@@ -2007,7 +2007,7 @@ mod tests {
         // The one message that must not be helpful. It is the same sentence
         // whatever the path is, so two probes cannot be told apart.
         let a = Refusal::Denied.to_string();
-        assert_eq!(a, "hatch protects this path and will not replace it with swap_file");
+        assert_eq!(a, "hatch protects this path and will not write to it");
         assert!(!a.contains("exist"), "{a}");
     }
 

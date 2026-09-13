@@ -227,9 +227,21 @@ impl Config {
     }
 
     /// The longest a client call can block: the approval wait followed by a
-    /// full-length execution.
+    /// full-length execution of every operation the largest batch may carry.
     pub fn client_timeout_secs(&self) -> u64 {
-        self.timeout_secs + self.exec_timeout_secs
+        self.blocking_bound_secs(crate::server::MAX_OPERATIONS)
+    }
+
+    /// The longest a call carrying `operations` operations can block.
+    ///
+    /// The approval deadline is counted once and the execution timeout once
+    /// per operation, because that is how each is enforced: one window covers
+    /// the whole batch, and every operation that runs a process runs it under
+    /// a deadline of its own. A description that multiplied the approval wait
+    /// would overstate the bound, and one that counted a single execution for
+    /// a batch would understate it by every operation after the first.
+    pub fn blocking_bound_secs(&self, operations: usize) -> u64 {
+        self.timeout_secs + operations as u64 * self.exec_timeout_secs
     }
 }
 
@@ -486,12 +498,18 @@ pub fn client_json(config: &Config) -> String {
 /// here, and both terms are named alongside it: a reader who has raised one
 /// of them in `config.toml` can see their own number in the arithmetic and
 /// knows the total is theirs and not the default.
+///
+/// The execution term is per operation, so where a batch may carry more than
+/// one the arithmetic says so; at one operation it reads as it always did.
 pub fn client_timeout_note(config: &Config) -> String {
+    let execution = match crate::server::MAX_OPERATIONS {
+        1 => format!("execution {}s", config.exec_timeout_secs),
+        n => format!("execution {}s for each of up to {n} operations", config.exec_timeout_secs),
+    };
     format!(
-        "Set your client's MCP tool timeout to at least {}s\n(approval {}s + execution {}s).",
+        "Set your client's MCP tool timeout to at least {}s\n(approval {}s + {execution}).",
         config.client_timeout_secs(),
         config.timeout_secs,
-        config.exec_timeout_secs
     )
 }
 
@@ -653,7 +671,19 @@ mod tests {
     #[test]
     fn client_blocking_bound_is_approval_plus_execution() {
         let c = Config::default();
-        assert_eq!(c.client_timeout_secs(), c.timeout_secs + c.exec_timeout_secs);
+        // One approval wait, one execution per operation the largest batch
+        // may carry -- which, while a batch carries one, is the sum it has
+        // always been.
+        assert_eq!(
+            c.client_timeout_secs(),
+            c.timeout_secs + crate::server::MAX_OPERATIONS as u64 * c.exec_timeout_secs
+        );
+        assert_eq!(c.blocking_bound_secs(1), c.timeout_secs + c.exec_timeout_secs);
+        assert_eq!(
+            c.blocking_bound_secs(3),
+            c.timeout_secs + 3 * c.exec_timeout_secs,
+            "the approval wait is paid once however many operations there are"
+        );
     }
 
     // ---- the registration, in both of its spellings ----------------------
