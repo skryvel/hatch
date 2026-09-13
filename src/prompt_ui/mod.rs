@@ -1078,8 +1078,14 @@ impl PromptState {
     /// Kill can stop a command and can never start one, so the only reason to
     /// withhold it is honesty: a button that did nothing would be a window
     /// claiming a power over a command that has not been approved.
+    ///
+    /// Withheld from a write for the same reason. The window draws no Kill
+    /// button for one — see [`Shown::runs`] — and this is the state machine
+    /// agreeing, so a Kill frame cannot leave a write window by some path the
+    /// drawing did not think of.
     pub fn request_kill(&self) -> Option<PromptMsg> {
-        (self.phase == Phase::Running).then_some(PromptMsg::Kill)
+        (self.phase == Phase::Running && self.shown().is_some_and(Shown::runs))
+            .then_some(PromptMsg::Kill)
     }
 
     /// Append a chunk, dropping the oldest ones once the cap is passed.
@@ -1472,8 +1478,17 @@ impl PromptApp {
     /// [`PromptApp::stream`], for the reason that field gives — a remembered
     /// "show me the output" must survive one command that happens to want a
     /// terminal.
+    ///
+    /// And minus a payload that has no output at all. A write prints nothing,
+    /// and a remembered tick used to reach its approval anyway: the window
+    /// recorded a watched run, went on to linger over a result nobody had
+    /// asked to see, and was killed by the daemon half a second into it --
+    /// which is a flash, and an empty viewer saying "it printed nothing"
+    /// about a file.
     fn streams(&self) -> bool {
-        self.stream && !self.in_a_terminal()
+        self.stream
+            && !self.in_a_terminal()
+            && self.state.shown().is_some_and(Shown::streamable)
     }
 
     /// The approval this window would send, however it was asked for.
@@ -1506,8 +1521,34 @@ impl PromptApp {
     /// useful there. [`PromptApp::streams`] is already false whenever there is
     /// a terminal, so a terminal run reads as true here without having to say
     /// so twice.
+    ///
+    /// # Not on a write
+    ///
+    /// A write window does not draw the box, and so it does not act on the
+    /// preference either: a standing tick no control on the screen admits to
+    /// would be the window doing something nobody in front of it chose. Not
+    /// drawing it is also the right answer on its merits rather than only
+    /// the consistent one. The box trades what a window would have shown
+    /// after the verdict for getting it out of the way, and a write window
+    /// already goes the instant there is nothing to show — see "After the
+    /// command" — so the only thing a tick could still do there is take away
+    /// the report of a write that went wrong. A preference set for commands
+    /// must not do that to a file.
+    ///
+    /// The stored answer is untouched, so the next command window opens with
+    /// the box as the reader left it. See [`PromptApp::runs`].
     fn closes_on_decide(&self) -> bool {
-        self.close_on_decide && !self.streams()
+        self.close_on_decide && !self.streams() && self.runs()
+    }
+
+    /// Whether approving this window leaves a run behind it, which is the
+    /// question every control that exists for a run asks before it is
+    /// drawn: the close box, Kill, and the sentences about output.
+    ///
+    /// See [`Shown::runs`]. `false` before a request has arrived, when there
+    /// is nothing to draw any of them for.
+    fn runs(&self) -> bool {
+        self.state.shown().is_some_and(Shown::runs)
     }
 
     /// Which set of keys this window is willing to hear, this frame.
@@ -1864,11 +1905,13 @@ impl PromptApp {
     /// does not work. So it points at the sentence that is already there: see
     /// [`REFUSAL_NOTICE`].
     ///
-    /// The one case with nothing to point at is a payload that offers no
-    /// stream box at all — a file swap writes bytes and prints nothing, so
-    /// there is no control on the window for Alt+S to be refused *by*. That
-    /// chord is inert there, and a window cannot flash a sentence it is not
-    /// drawing.
+    /// The one case with nothing to point at is a payload that offers no box
+    /// at all. A file write prints nothing and leaves no run behind, so it
+    /// has neither the stream box nor the close box, and there is no control
+    /// on the window for Alt+S or Alt+C to be refused *by*. Both chords are
+    /// inert there, and a window cannot flash a sentence it is not drawing —
+    /// nor, which matters more for Alt+C, write down a preference through a
+    /// box it is not drawing.
     fn flip(&mut self, toggle: guard::Toggle) {
         // Only while there is something to decide. In every later phase these
         // boxes are gone from the window along with the question they belonged
@@ -1886,9 +1929,10 @@ impl PromptApp {
                     false => self.refused = Some((toggle, Instant::now())),
                 }
             }
-            guard::Toggle::Close => match self.streams() {
-                false => self.set_close_on_decide(!self.closes_on_decide()),
-                true => self.refused = Some((toggle, Instant::now())),
+            guard::Toggle::Close => match self.runs() && !self.streams() {
+                true => self.set_close_on_decide(!self.closes_on_decide()),
+                // Dead, or never drawn. Either way nothing is written down.
+                false => self.refused = Some((toggle, Instant::now())),
             },
         }
     }
@@ -2126,8 +2170,21 @@ impl PromptApp {
                     .small(),
                 );
             });
+        } else if !self.runs() {
+            ui.vertical_centered(|ui| ui.label("Approved. Writing the file."));
         } else {
             ui.vertical_centered(|ui| ui.label("Approved. It is running now."));
+        }
+        // A write has nothing below its sentence. It prints nothing, so a line
+        // saying its output is not being streamed would be a sentence about a
+        // command; and it offers neither Keep, which exists for output, nor
+        // Kill, for the reason `Shown::runs` gives. The one wait a write can
+        // have is a root write's password dialog, and the sentence above
+        // already names the stop for that — which ends it with nothing written,
+        // where Kill on the `install` behind it would end it with hatch unable
+        // to say whether the file was.
+        if !self.runs() {
+            return;
         }
         if self.streams() {
             let text = self.state.output_text();
@@ -2646,11 +2703,15 @@ impl PromptApp {
         decided: &mut Option<Verdict>,
     ) -> (egui::Response, egui::Rect) {
         let height = primary_button(ui).y;
+        let runs = self.runs();
         // `Hatch::ALL`, measured and then drawn: one list, in one order or
         // the other. Two lists is how a button ends up in one arrangement and
         // not the other.
-        let needed =
-            row_width(ui, Hatch::ALL.iter().map(|hatch| hatch.label()), egui::TextStyle::Small);
+        let needed = row_width(
+            ui,
+            Hatch::ALL.iter().map(|hatch| hatch.label(runs)),
+            egui::TextStyle::Small,
+        );
         // Past Deny on one side and short of Approve on the other, each with
         // the same gap the two of them keep between themselves: a pointer
         // sliding off either lands on the panel, never on a button and never
@@ -2658,11 +2719,28 @@ impl PromptApp {
         // moved into it, and that is why that control costs no row — this
         // panel is 1280 points wide and the two buttons that matter are 400 of
         // them in the middle of it.
-        let flanks = [self.close_width(ui) + PRIMARY_GAP, needed + PRIMARY_GAP];
+        //
+        // # On a write
+        //
+        // There is no close control — see [`PromptApp::closes_on_decide`] —
+        // and the flank is measured as nothing and left empty rather than
+        // given to something else. What that gives back is the one row the
+        // control ever cost, which is the row above the buttons it takes on a
+        // window too narrow to hold it beside them. What it does not do is
+        // move Approve and Deny: the centre is placed from the row's own width
+        // and not from its flanks, and nothing under this row changes either,
+        // so the two buttons are at the same place on a write window as on a
+        // command window of the same size. A reader who has learnt where
+        // Approve is has learnt it for both.
+        let close = match runs {
+            true => self.close_width(ui) + PRIMARY_GAP,
+            false => 0.0,
+        };
+        let flanks = [close, needed + PRIMARY_GAP];
         // Asked before anything is drawn and then asked again, because a close
         // control with nowhere to sit beside Approve goes *above* the row —
         // which moves the row. Both calls only measure; see [`Places`].
-        if flanked_row(ui, height, width, flanks).flanks[0].is_none() {
+        if runs && flanked_row(ui, height, width, flanks).flanks[0].is_none() {
             // First, because it says what pressing one of the buttons under it
             // is going to do to this window.
             ui.vertical_centered(|ui| self.close_box(ui));
@@ -2671,7 +2749,7 @@ impl PromptApp {
         let places = flanked_row(ui, height, width, flanks);
         ui.advance_cursor_after_rect(places.row);
 
-        if let Some(left) = places.flanks[0] {
+        if runs && let Some(left) = places.flanks[0] {
             // Centred against the buttons rather than hung from the top of the
             // row: two lines of text level with one tall button, which is what
             // the eye reads as one row.
@@ -2712,7 +2790,7 @@ impl PromptApp {
                 order.reverse();
             }
             for hatch in order {
-                if secondary(ui, hatch.label()).clicked() {
+                if secondary(ui, hatch.label(runs)).clicked() {
                     *decided = Some(hatch.verdict(note));
                 }
             }
@@ -2908,16 +2986,26 @@ impl Hatch {
     /// drawing, or drawn in one arrangement and not the other.
     const ALL: [Hatch; 4] = [Hatch::Explain, Hatch::Simplify, Hatch::SelfRun, Hatch::StopAndSync];
 
-    /// What the button says.
+    /// What the button says, on a window whose approval would leave a run
+    /// behind (`runs`) or one that would write a file.
     ///
     /// Short on purpose: all four measure against the room left beside
     /// Approve and Deny, and a label that outgrows it costs every one of them
     /// their place on that row. See [`PromptApp::verdict_buttons`].
-    fn label(self) -> &'static str {
+    ///
+    /// One of the four is worded for the operation. Nobody runs a file, and a
+    /// button that offers to on a diff is a sentence about some other window.
+    /// The verdict is the same one either way: what it tells the agent is
+    /// that the person will do this themselves, whatever "this" is. The two
+    /// labels differ by two letters, which is what the two hatches nearer
+    /// the centre shift by between the two kinds of window; Approve and Deny
+    /// are placed without reference to any of them and do not move at all.
+    fn label(self, runs: bool) -> &'static str {
         match self {
             Hatch::Explain => "Explain first",
             Hatch::Simplify => "Ask for something simpler",
-            Hatch::SelfRun => "I'll run it myself",
+            Hatch::SelfRun if runs => "I'll run it myself",
+            Hatch::SelfRun => "I'll write it myself",
             Hatch::StopAndSync => "Stop, let's sync",
         }
     }
@@ -6274,7 +6362,7 @@ mod tests {
             let drawn = window_text_sized(&mut app, size);
             for hatch in Hatch::ALL {
                 assert!(
-                    drawn.contains(hatch.label()),
+                    drawn.contains(hatch.label(true)),
                     "{hatch:?} is not on a {size:?} window: {drawn}"
                 );
             }
@@ -6857,6 +6945,203 @@ mod tests {
             PrefsFile::at(&paths).read(),
             Prefs { close_on_decide: true, stream: false, terminal: true },
             "this window trampled what the one beside it saved"
+        );
+    }
+
+    // ---- a write, and what it does not inherit from a command --------------
+
+    /// A request to write one file, the way the daemon renders one.
+    fn a_write_request() -> Request {
+        let mut request = a_request(90);
+        request.title = "set the port".to_string();
+        request.operations = vec![Payload::swap(
+            PathBuf::from("/tmp/conf.toml"),
+            crate::swap::SwapPlan {
+                kind: crate::swap::PlanKind::Replace,
+                landing_mode: 0o644,
+                landing_owner: crate::swap::Principal { id: 1000, name: Some("u".into()) },
+                landing_group: crate::swap::Principal { id: 1000, name: Some("u".into()) },
+                hash_before: Some("aa".into()),
+                size_delta: 2,
+            },
+            &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
+        )];
+        request
+    }
+
+    /// A window awaiting a verdict on a file write, remembering whatever
+    /// `prefs` holds.
+    fn a_write_window_remembering(
+        prefs: PrefsFile,
+    ) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app =
+            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()), prefs);
+        app.state.handle(DaemonMsg::Request(Box::new(a_write_request())));
+        assert_eq!(app.state.phase(), Phase::AwaitingVerdict);
+        (app, sink)
+    }
+
+    /// The same, with nowhere to remember anything.
+    fn a_write_window() -> PromptApp {
+        a_write_window_remembering(PrefsFile::none()).0
+    }
+
+    #[test]
+    fn a_write_window_draws_no_close_box_and_says_nothing_about_a_kill_button() {
+        // The bug: "The Kill button goes with it", under a diff. A write has
+        // no Kill button to lose, and a sentence about one is a sentence
+        // about some other window. At both arrangements, because the narrow
+        // one used to put the box on a row of its own above the buttons.
+        for size in [opening_size(), egui::vec2(520.0, 700.0)] {
+            let drawn = window_text_sized(&mut a_write_window(), size);
+            for said in [CLOSE_LABEL, CLOSE_COST, CLOSE_WATCHING, CLOSE_WATCHING_ALWAYS, "Kill"] {
+                assert!(!drawn.contains(said), "a {size:?} write window says {said:?}: {drawn}");
+            }
+            assert!(drawn.contains("Approve") && drawn.contains("Deny"), "{drawn}");
+        }
+    }
+
+    #[test]
+    fn a_write_window_neither_changes_nor_obeys_the_close_preference_it_does_not_show() {
+        // The preference is the reader's and outlives this window. Not drawing
+        // the box must not write to it, and must not act on it either: a
+        // window that closed on a tick nobody could see would be deciding
+        // something no control on it admits to.
+        let (_root, paths) = a_prefs_file();
+        let stored = Prefs { close_on_decide: true, stream: true, terminal: false };
+        PrefsFile::at(&paths).write(&stored);
+        let (mut app, sink) = a_write_window_remembering(PrefsFile::at(&paths));
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        a_settled_frame(&mut app, &ctx, now);
+        // The chord for the box that is not there, and the one for the other
+        // box that is not there.
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::C, egui::Modifiers::ALT)], now);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::S, egui::Modifiers::ALT)], now);
+        assert_eq!(PrefsFile::at(&paths).read(), stored, "a write window wrote a preference down");
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], now);
+        let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
+        assert!(out.contains("\"verdict\":\"approve\""), "the chord did not approve: {out}");
+        assert!(out.contains("\"closing\":false"), "it approved as a window that is going: {out}");
+        assert!(out.contains("\"stream\":false"), "it approved as a watched run: {out}");
+        assert_eq!(app.state.phase(), Phase::Running, "it went on a preference it does not show");
+        assert_eq!(PrefsFile::at(&paths).read(), stored, "approving wrote a preference down");
+
+        // And the next command window still has both, as they were left.
+        let (next, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(next.streams() && next.close_on_decide, "the next command window forgot");
+    }
+
+    #[test]
+    fn a_remembered_stream_does_not_turn_a_write_into_a_run_somebody_is_watching() {
+        // The other half of the flash. A stream tick remembered from commands
+        // reached a write's approval, so the window recorded a watched run and
+        // lingered over it — an empty viewer claiming the file "printed
+        // nothing" — until the daemon, which knows a write has nothing to
+        // show, killed it half a second in.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { stream: true, ..Prefs::default() });
+        let (mut app, _sink) = a_write_window_remembering(PrefsFile::at(&paths));
+
+        assert!(!app.streams(), "a write window says it will stream a write");
+        let frame = app.state.decide(app.approval());
+        assert!(
+            matches!(frame, Some(PromptMsg::Verdict(Verdict::Approve { stream: false, .. }))),
+            "{frame:?}"
+        );
+        assert!(!app.state.streaming(), "the window recorded a write as a watched run");
+        assert!(app.stream, "and the remembered answer underneath it was lost");
+    }
+
+    #[test]
+    fn a_running_write_offers_no_kill_and_says_nothing_about_output() {
+        let mut app = a_write_window();
+        app.state.decide(approved(false));
+        assert_eq!(app.state.phase(), Phase::Running);
+
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(drawn.contains("Writing the file"), "the window does not say what it is doing: {drawn}");
+        for said in ["Kill", "streamed", "running", "Keep this window"] {
+            assert!(!drawn.contains(said), "a running write says {said:?}: {drawn}");
+        }
+        assert_eq!(app.state.request_kill(), None, "a Kill frame could still leave a write window");
+    }
+
+    #[test]
+    fn the_escape_hatch_a_write_offers_is_worded_for_a_write() {
+        let drawn = window_text_sized(&mut a_write_window(), opening_size());
+        assert!(drawn.contains("I'll write it myself"), "{drawn}");
+        assert!(!drawn.contains("run it myself"), "a write window offers to run a file: {drawn}");
+
+        let command = window_text_sized(&mut a_window_showing("ls"), opening_size());
+        assert!(command.contains("I'll run it myself"), "{command}");
+    }
+
+    #[test]
+    fn approve_and_deny_are_in_the_same_place_on_a_write_window_as_on_a_command_window() {
+        // The close control's flank is left empty on a write, and on a narrow
+        // window the row it used to take above the buttons is given back to
+        // the panes. Neither may move the two buttons that decide: a reader
+        // who has learnt where Approve is has learnt it for both windows.
+        for width in [opening_size().x, 900.0, 700.0, 520.0] {
+            let size = egui::vec2(width, 700.0);
+            let primary = |app: &mut PromptApp| {
+                let buttons = button_rects(&window_shapes(app, size));
+                let tallest = buttons.iter().map(|r| r.height()).fold(0.0_f32, f32::max);
+                let mut primary: Vec<egui::Rect> =
+                    buttons.into_iter().filter(|r| r.height() >= tallest - 0.5).collect();
+                primary.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                primary
+            };
+            let command = primary(&mut a_window_showing("rm -rf /var/tmp/build"));
+            let write = primary(&mut a_write_window());
+            assert_eq!(command.len(), 2, "at {width} points: {command:?}");
+            assert_eq!(write, command, "at {width} points the buttons moved between the two");
+        }
+    }
+
+    #[test]
+    fn a_narrow_write_window_gives_back_the_row_the_close_control_took() {
+        // Between the note field and the buttons is where the close control
+        // goes when it cannot sit beside Approve, so on a narrow command
+        // window that distance grows by a row. On a write there is no control
+        // to put there, and the distance is what it is on a wide window.
+        // Measured from the field itself, because the label naming it moves
+        // above it on a narrow window and would be measuring that instead.
+        let gap = |app: &mut PromptApp, width: f32| {
+            let shapes = window_shapes(app, egui::vec2(width, 700.0));
+            let buttons = button_rects(&shapes);
+            let tallest = buttons.iter().map(|r| r.height()).fold(0.0_f32, f32::max);
+            let approve = buttons
+                .iter()
+                .filter(|r| r.height() >= tallest - 0.5)
+                .map(|r| r.top())
+                .fold(f32::INFINITY, f32::min);
+            // The note field is the one short box on the pane surface that
+            // sits above the buttons.
+            let field = filled_rects(&shapes)
+                .into_iter()
+                .filter(|(rect, fill)| {
+                    *fill == theme::DARK.surface && rect.height() < 60.0 && rect.bottom() <= approve
+                })
+                .map(|(rect, _)| rect.bottom())
+                .fold(f32::NEG_INFINITY, f32::max);
+            approve - field
+        };
+
+        let grown = |app: &mut PromptApp| gap(app, 520.0) - gap(app, opening_size().x);
+        let command = grown(&mut a_window_showing("ls"));
+        let write = grown(&mut a_write_window());
+        assert!(command > 20.0, "the close control never went above the buttons: {command}");
+        assert!(
+            write.abs() < 2.0,
+            "a narrow write window still spends {write} points where the close control was"
         );
     }
 }

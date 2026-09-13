@@ -225,6 +225,20 @@ impl Shown {
     pub fn streamable(&self) -> bool {
         matches!(self, Shown::Command { .. })
     }
+
+    /// Whether an approval of this leaves a run behind it: a process a Kill
+    /// button can reach, going on for as long as it takes.
+    ///
+    /// The same answer as [`Shown::streamable`] today and a different
+    /// question, which is why it has a name of its own. A write is carried
+    /// out by hatch rather than run, and it is over as soon as it has
+    /// happened: the only wait in it is a root write's password dialog, and
+    /// that dialog's own Cancel is the stop the window already names. So
+    /// every control that exists for a run — Kill, and the box that trades
+    /// Kill away — asks this, and is not drawn where it answers `false`.
+    pub fn runs(&self) -> bool {
+        matches!(self, Shown::Command { .. })
+    }
 }
 
 // ---- the countdown ---------------------------------------------------------
