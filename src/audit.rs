@@ -254,6 +254,16 @@ pub struct SwapDetail {
     pub path: String,
     /// Whether the write was requested as root.
     pub root: bool,
+    /// Which of `swap_file`'s two forms the request arrived in.
+    ///
+    /// Not a fact about the change — a patch is applied before anybody is
+    /// asked, so the bytes, the plan and the diff on screen are the same
+    /// either way — but a fact about the *request*, and this file is where
+    /// facts about requests live. Somebody reading a line back needs to know
+    /// what the agent actually sent, not least because the two forms fail
+    /// differently: only one of them can be refused for not applying.
+    #[serde(default)]
+    pub form: SwapForm,
     /// The target's hash before the write; absent when it did not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash_before: Option<String>,
@@ -268,6 +278,26 @@ pub struct SwapDetail {
     /// Bytes written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+}
+
+/// How a `swap_file` request said what the file should contain.
+///
+/// Written on every record rather than only when it is news, because the JSON
+/// is what a later reader parses and a missing key there is a question rather
+/// than an answer. [`Default`] is the whole-file form, so a line from a build
+/// that predates the patch form reads back as what it was.
+///
+/// The *rendered* line is the other way round and mentions only the patch, on
+/// the rule the rest of this file follows: a note that appears on every line
+/// is read by nobody, which would take the one that matters down with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapForm {
+    /// `content`: the complete new contents of the file.
+    #[default]
+    Content,
+    /// `patch`: a unified diff, applied at render time. See [`crate::patch`].
+    Patch,
 }
 
 /// The append-only writer over a log directory.
@@ -427,6 +457,9 @@ impl LogDetail {
             LogDetail::SwapFile(swap) => {
                 let mut s =
                     format!("{} {}", if swap.root { "#" } else { "$" }, visible(&swap.path));
+                if swap.form == SwapForm::Patch {
+                    s.push_str("  (from a patch)");
+                }
                 if let Some(bytes) = swap.bytes {
                     s.push_str(&format!("  ({bytes} bytes"));
                     if let Some(mode) = &swap.mode {
@@ -576,6 +609,7 @@ mod tests {
             detail: LogDetail::SwapFile(SwapDetail {
                 path: "/etc/hosts".to_string(),
                 root: true,
+                form: SwapForm::Content,
                 hash_before: Some("9f3a".to_string()),
                 hash_after: None,
                 mode: None,
@@ -802,6 +836,7 @@ mod tests {
             detail: LogDetail::SwapFile(SwapDetail {
                 path: "/etc/hosts".to_string(),
                 root: true,
+                form: SwapForm::Content,
                 hash_before: Some("9f3a".to_string()),
                 hash_after: Some("11bc".to_string()),
                 mode: Some("0644".to_string()),

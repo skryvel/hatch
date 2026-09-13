@@ -139,7 +139,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::audit::{AuditLog, AuditRecord, LogDetail, LogVerdict, PromptEnd, RunDetail, SwapDetail};
+use crate::audit::{
+    AuditLog, AuditRecord, LogDetail, LogVerdict, PromptEnd, RunDetail, SwapDetail, SwapForm,
+};
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
 use crate::exec::elevate::{Elevation, RootOutcome};
@@ -175,6 +177,19 @@ pub const MAX_FIELD_BYTES: usize = 4 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// Cap on `swap_file`'s `content`. See [`MAX_FIELD_BYTES`].
 pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
+/// Cap on `swap_file`'s `patch`, and on the file that patch produces.
+///
+/// One number for both ends of it, and it is [`MAX_CONTENT_BYTES`]: the two
+/// forms say the same thing, so how a request was encoded must not change how
+/// much of a file a person can be asked to read. A larger allowance for the
+/// patch would make the second form a way around the cap on the first, and a
+/// smaller one would refuse an honest patch of a file `content` may replace
+/// outright.
+///
+/// The *output* needs a check of its own for a reason the input cap cannot
+/// cover: a few hundred bytes of hunks can name a great deal of file. See
+/// [`crate::patch::apply`], which takes the cap rather than compiling one in.
+pub const MAX_PATCH_BYTES: usize = MAX_CONTENT_BYTES;
 
 /// Parameters of `run_command`.
 ///
@@ -211,6 +226,12 @@ pub struct RunCommandParams {
 }
 
 /// Parameters of `swap_file`. See [`RunCommandParams`].
+///
+/// `content` and `patch` are two encodings of one thing — what the file should
+/// contain — and exactly one of them belongs in a call. This struct can hold
+/// neither and it can hold both, which is the only place in hatch where that
+/// is true: see [`SwapRequest::of`] for why the wire type is allowed to be
+/// wrong and why nothing past it can be.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SwapFileParams {
     /// The one-line intent, as the user should read it.
@@ -218,13 +239,122 @@ pub struct SwapFileParams {
     /// Absolute path of the file to write.
     pub path: String,
     /// The complete new contents.
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    /// A unified diff against the file's current contents.
+    #[serde(default)]
+    pub patch: Option<String>,
     /// Why this is needed now.
     pub reason: String,
     /// Request root. Accepted because it is part of the tool contract;
     /// refused for now.
     #[serde(default)]
     pub root: bool,
+}
+
+/// What the agent sent to say what the file should contain.
+///
+/// The type that makes "exactly one of two" unrepresentable. Past
+/// [`SwapRequest::of`] there is no value in hatch that can carry both forms or
+/// neither, so no later code has to check for it, and none of it can forget
+/// to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapSource {
+    /// The complete new contents of the file.
+    Content(String),
+    /// A unified diff, applied to the file's current contents before anybody
+    /// is asked anything. See [`crate::patch`].
+    Patch(String),
+}
+
+impl SwapSource {
+    /// How this arrived, for the audit log — the one place the difference
+    /// survives.
+    fn form(&self) -> SwapForm {
+        match self {
+            SwapSource::Content(_) => SwapForm::Content,
+            SwapSource::Patch(_) => SwapForm::Patch,
+        }
+    }
+}
+
+/// One `swap_file` call, once the boundary has had it.
+///
+/// The difference between this and [`SwapFileParams`] is the whole of the
+/// one-of-two rule: the wire type is shaped by what JSON can express, and this
+/// one by what a request can be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapRequest {
+    /// The one-line intent, as the user should read it.
+    pub title: String,
+    /// Absolute path of the file to write, as the agent spelled it.
+    pub path: String,
+    /// What the file should contain, in whichever form was sent.
+    pub source: SwapSource,
+    /// Why this is needed now.
+    pub reason: String,
+    /// Request root.
+    pub root: bool,
+}
+
+impl SwapRequest {
+    /// Length-check every agent-controlled string of a `swap_file` call and
+    /// settle which of the two forms it is in, or refuse it at the boundary.
+    ///
+    /// # Why the rule is enforced here and not by the type on the wire
+    ///
+    /// An enum of two variants expresses "exactly one" exactly, and it cannot
+    /// be the wire type. `#[serde(untagged)]` over `{ content }` and
+    /// `{ patch }` accepts a call carrying *both* — it matches the first
+    /// variant and ignores the second field — and the `deny_unknown_fields`
+    /// that would stop it is not allowed on a flattened enum. Deserialisation
+    /// could be hand-written to refuse, but a serde error surfaces as a
+    /// protocol-level "invalid params" with no room for a sentence in it, and
+    /// every refusal hatch makes is a sentence: an agent that cannot tell a
+    /// limit from a person saying no reports a denial that never happened.
+    ///
+    /// So the wire type is permissive by one field, this is the only way past
+    /// it, and [`SwapSource`] is what everything downstream sees. The rule is
+    /// checked once, in one place, and is unrepresentable everywhere else.
+    pub fn of(params: SwapFileParams) -> Result<SwapRequest, String> {
+        within_cap("title", &params.title, MAX_FIELD_BYTES)?;
+        within_cap("path", &params.path, MAX_FIELD_BYTES)?;
+        within_cap("reason", &params.reason, MAX_FIELD_BYTES)?;
+        let source = match (params.content, params.patch) {
+            (Some(content), None) => {
+                within_cap("content", &content, MAX_CONTENT_BYTES)?;
+                SwapSource::Content(content)
+            }
+            (None, Some(patch)) => {
+                within_cap("patch", &patch, MAX_PATCH_BYTES)?;
+                SwapSource::Patch(patch)
+            }
+            (Some(_), Some(_)) => {
+                return Err(at_the_boundary(
+                    "`swap_file` takes either `content` or `patch`, and this call carries both",
+                    "They are two ways of saying what the file should contain, and hatch will \
+                     not guess which one was meant: send `content` alone to replace the file \
+                     outright, or `patch` alone to edit it.",
+                ));
+            }
+            (None, None) => {
+                return Err(at_the_boundary(
+                    "`swap_file` needs either `content` or `patch`, and this call carries \
+                     neither",
+                    "Send `content` — the complete new contents — to create a file or replace \
+                     one outright, or `patch` — a unified diff against the file as it is now — \
+                     to edit one.",
+                ));
+            }
+        };
+        Ok(SwapRequest {
+            title: params.title,
+            path: params.path,
+            source,
+            reason: params.reason,
+            root: params.root,
+        })
+    }
 }
 
 /// Refuse a field that is over its cap, with the text the agent will read.
@@ -263,13 +393,18 @@ fn check_run_command(params: &RunCommandParams) -> Result<(), String> {
     Ok(())
 }
 
-/// Length-check every agent-controlled string of a `swap_file` call.
-fn check_swap_file(params: &SwapFileParams) -> Result<(), String> {
-    within_cap("title", &params.title, MAX_FIELD_BYTES)?;
-    within_cap("path", &params.path, MAX_FIELD_BYTES)?;
-    within_cap("content", &params.content, MAX_CONTENT_BYTES)?;
-    within_cap("reason", &params.reason, MAX_FIELD_BYTES)?;
-    Ok(())
+/// What the agent is told when a call is malformed in a way hatch can see
+/// without looking at anything outside it.
+///
+/// The same skeleton [`within_cap`] uses and for the same reason: an agent
+/// that reads a boundary refusal as a person saying no will report a denial
+/// that never happened and stop trying. `what` names what is wrong with the
+/// call; `fix` says what to send instead.
+fn at_the_boundary(what: &str, fix: &str) -> String {
+    format!(
+        "hatch refused this call at its own boundary: {what}. Nothing was rendered, nobody was \
+         asked, and nothing ran — this is hatch's own rule, not a decision by the user. {fix}"
+    )
 }
 
 
@@ -633,8 +768,8 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
     );
 
     let swap_file = format!(
-        "Write a file on the host machine, outside your sandbox, replacing it whole or creating \
-         it.\n\
+        "Write a file on the host machine, outside your sandbox: edit it, replace it whole, or \
+         create it.\n\
          \n\
          Use this only when the file has to live on the host: a config under /etc, a dotfile in \
          the person's home directory, a service unit. For files inside your own workspace, write \
@@ -651,16 +786,29 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          rejects it. One call can block for up to {total} seconds while they read and decide, so \
          gather related edits into as few calls as you can.\n\
          \n\
-         There is no partial edit: send the complete new contents. Read the file first — \
-         `run_command` with `cat` — so what you send is an edit of what is really there and the \
-         diff shows your change and nothing else.\n\
+         **Editing a file that is already there? Send `patch`.** It costs you the lines you \
+         touch instead of the whole file, which for a small change in a large one is most of \
+         what the call costs you at all. Send `content` — the complete new contents — to create \
+         a file or to replace one wholesale. Exactly one of the two: both is an error, and so is \
+         neither.\n\
+         \n\
+         Read the file first — `run_command` with `cat` — so that what you send is an edit of \
+         what is really there. A patch is an ordinary unified diff (`@@` hunks, ` ` context, `-` \
+         and `+` lines) against the file as it is now, and hatch applies it itself before \
+         anybody is asked: what the person approves is the bytes it produces, exactly as with \
+         `content`. It applies only where its hunk headers say it does, and hatch never searches \
+         nearby for a better fit — a hunk whose context does not match is refused, naming the \
+         line and what was found there, and nothing is written and nobody is interrupted.\n\
          \n\
          Fields:\n\
          - title: the intent in one plain line. It is the first thing the person reads, so write \
          \"Point the editor at the new font\", not the path and the bytes. The point, not the \
          syntax.\n\
          - path: absolute path of the file to write.\n\
-         - content: the complete new contents of the file.\n\
+         - content: the complete new contents of the file. For a file you are creating, or a \
+         wholesale replacement.\n\
+         - patch: a unified diff against the file's current contents. For an edit to a file that \
+         exists — the cheap form, and the one to reach for.\n\
          - reason: why this is needed now, in a sentence or two.\n\
          - root: true writes the file as root, for a path this user cannot write. The person \
          approves the same diff either way, and then the system asks them for a password in a \
@@ -1050,7 +1198,7 @@ impl Outcome {
 /// One request as it arrived, before anything has been validated.
 enum Asked {
     Run(RunCommandParams),
-    Swap(SwapFileParams),
+    Swap(SwapRequest),
 }
 
 impl Asked {
@@ -1127,9 +1275,12 @@ impl Daemon {
 
     /// Run one `swap_file` call to its end.
     pub async fn swap_file(&self, params: SwapFileParams, caller: Caller) -> CallToolResult {
-        // See `run_command` on why this is here and why it is not logged.
-        match check_swap_file(&params) {
-            Ok(()) => self.serve(Asked::Swap(params), caller).await,
+        // See `run_command` on why this is here and why it is not logged. The
+        // one-of-two rule rides along with the caps because it is the same
+        // kind of refusal: the call never became a request, so there is
+        // nothing to render and nothing to record.
+        match SwapRequest::of(params) {
+            Ok(request) => self.serve(Asked::Swap(request), caller).await,
             Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
         }
     }
@@ -1596,13 +1747,28 @@ impl Daemon {
         })
     }
 
-    fn prepare_swap(&self, params: SwapFileParams) -> Prepared {
-        let path = PathBuf::from(&params.path);
-        let content = params.content.into_bytes();
+    /// Turn one `swap_file` request into the bytes it proposes, the plan for
+    /// where they land and the diff a person will read — or refuse it.
+    ///
+    /// # Where a patch stops being a patch
+    ///
+    /// Here, and that placement is the whole of what makes the second form
+    /// safe. A patch is applied against the bytes on disk *now*, before
+    /// anybody is asked anything, and what comes out is an ordinary
+    /// `Vec<u8>`. Everything below this point — the plan, the rows, the work
+    /// an approval authorises, the hash the write is re-checked against —
+    /// cannot tell the two forms apart, because by then there is nothing to
+    /// tell apart. What a person approves is bytes, never an instruction for
+    /// producing bytes; see [`crate::patch`].
+    fn prepare_swap(&self, request: SwapRequest) -> Prepared {
+        let SwapRequest { path: spelling, source, root, .. } = request;
+        let path = PathBuf::from(&spelling);
+        let form = source.form();
         let detail = |hash_before: Option<String>| {
             LogDetail::SwapFile(SwapDetail {
-                path: params.path.clone(),
-                root: params.root,
+                path: spelling.clone(),
+                root,
+                form,
                 hash_before,
                 hash_after: None,
                 mode: None,
@@ -1620,30 +1786,60 @@ impl Daemon {
         // the path turns out to be, and finding that out after the user has
         // read a diff spends their attention on a write that was never going
         // to happen.
-        if params.root && let Err(unavailable) = self.elevation.available(&build_child_env(&self.config)) {
+        if root && let Err(unavailable) = self.elevation.available(&build_child_env(&self.config)) {
             return refuse(refusal_text(&unavailable.to_string()));
         }
         if let Err(refusal) = swap::validate(&path, &self.denylist) {
             return refuse(refusal_text(&refusal.to_string()));
         }
 
-        let plan = match swap::plan(&path, &content, params.root) {
+        // The file as it stands, read once and used twice: it is what a patch
+        // is applied to, and it is the left-hand side of the diff on screen.
+        // Reading it a second time for the second job would let those two be
+        // different files, and the person would then approve a diff whose left
+        // side is not what the right side was made from.
+        //
+        // Absence is not an error here. `validate` has already refused
+        // everything that is *wrong* about the path; what is left is a file
+        // that exists and a file that does not, and a create is an ordinary
+        // request with nothing on the left.
+        let on_disk = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Vec::new()
+            }
+            Err(error) => {
+                return refuse(refusal_text(&format!(
+                    "{} cannot be read: {error}",
+                    path.display()
+                )));
+            }
+        };
+
+        let content = match source {
+            SwapSource::Content(text) => text.into_bytes(),
+            SwapSource::Patch(text) => match crate::patch::apply(&on_disk, &text, MAX_PATCH_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => return refuse(refusal_text(&error.to_string())),
+            },
+        };
+
+        let plan = match swap::plan(&path, &content, root) {
             Ok(plan) => plan,
             Err(error) => return refuse(refusal_text(&format!("{error:#}"))),
         };
+        // The plan and not the read decides whether there is a file to diff
+        // against, because the plan is the stat the write is checked against:
+        // a create is drawn against nothing, whatever a read that raced it
+        // happened to turn up.
         let before = match plan.kind {
             PlanKind::Create => Vec::new(),
-            PlanKind::Replace => match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return Prepared::Refused(Outcome::refusing(
-                        LogVerdict::Refused,
-                        None,
-                        detail(plan.hash_before.clone()),
-                        refusal_text(&format!("{} cannot be read: {error}", path.display())),
-                    ));
-                }
-            },
+            PlanKind::Replace => on_disk,
         };
 
         let rows = match diff_files(&before, &content, self.config.output_cap_bytes) {
@@ -1671,7 +1867,7 @@ impl Daemon {
         Prepared::Ready(Job {
             detail: detail(plan.hash_before.clone()),
             payload: Payload::swap(path.clone(), plan.clone(), &rows),
-            work: Work::Swap { path, content, plan, root: params.root },
+            work: Work::Swap { path, content, plan, root },
         })
     }
 }
@@ -3216,14 +3412,21 @@ mod tests {
         let mut p = SwapFileParams {
             title: "t".to_string(),
             path: "/p".to_string(),
-            content: "c".to_string(),
+            content: Some("c".to_string()),
+            patch: None,
             reason: "r".to_string(),
             root: false,
         };
         match field {
             "title" => p.title = value,
             "path" => p.path = value,
-            "content" => p.content = value,
+            "content" => p.content = Some(value),
+            // Filling one form empties the other, because a call carrying both
+            // is refused for that before any length is looked at.
+            "patch" => {
+                p.content = None;
+                p.patch = Some(value);
+            }
             "reason" => p.reason = value,
             other => panic!("no such field {other}"),
         }
@@ -3257,10 +3460,10 @@ mod tests {
             ("reason", MAX_FIELD_BYTES),
         ] {
             assert!(
-                check_swap_file(&swap_params(field, "a".repeat(cap))).is_ok(),
+                SwapRequest::of(swap_params(field, "a".repeat(cap))).is_ok(),
                 "exactly at the cap is allowed: {field}"
             );
-            let refusal = check_swap_file(&swap_params(field, "a".repeat(cap + 1)))
+            let refusal = SwapRequest::of(swap_params(field, "a".repeat(cap + 1)))
                 .expect_err(&format!("one byte over the cap must be refused: {field}"));
             assert!(refusal.contains(field), "the refusal must name the field: {refusal}");
         }
@@ -3280,11 +3483,11 @@ mod tests {
             "a long but sane title is ordinary work"
         );
         assert!(
-            check_swap_file(&swap_params("content", "a".repeat(100 * 1024))).is_ok(),
+            SwapRequest::of(swap_params("content", "a".repeat(100 * 1024))).is_ok(),
             "a 100 KB config file is ordinary work"
         );
         assert!(
-            check_swap_file(&swap_params("path", "a".repeat(2 * 1024))).is_ok(),
+            SwapRequest::of(swap_params("path", "a".repeat(2 * 1024))).is_ok(),
             "a deep path is ordinary work"
         );
     }
@@ -4353,7 +4556,8 @@ later"), "");
                 SwapFileParams {
                     title: "take hatch over".to_string(),
                     path: protected.display().to_string(),
-                    content: "x".to_string(),
+                    content: Some("x".to_string()),
+                    patch: None,
                     reason: "because a test asked".to_string(),
                     root: false,
                 },
@@ -4423,7 +4627,8 @@ later"), "");
             SwapFileParams {
                 title: "change it".to_string(),
                 path: path.display().to_string(),
-                content: content.to_string(),
+                content: Some(content.to_string()),
+                patch: None,
                 reason: "because a test asked".to_string(),
                 root,
             }
@@ -4526,7 +4731,8 @@ later"), "");
                                 SwapFileParams {
                                     title: sample.title.clone(),
                                     path: path.display().to_string(),
-                                    content: content.clone(),
+                                    content: Some(content.clone()),
+                                    patch: None,
                                     reason: sample.reason.clone(),
                                     root: *root,
                                 },
@@ -5177,7 +5383,8 @@ later"), "");
                 SwapFileParams {
                     title: "change it".to_string(),
                     path: target.display().to_string(),
-                    content: "after\n".to_string(),
+                    content: Some("after\n".to_string()),
+                    patch: None,
                     reason: "because a test asked".to_string(),
                     root: false,
                 },
@@ -5222,7 +5429,8 @@ later"), "");
                 SwapFileParams {
                     title: "change it".to_string(),
                     path: target.display().to_string(),
-                    content: "after\n".to_string(),
+                    content: Some("after\n".to_string()),
+                    patch: None,
                     reason: "because a test asked".to_string(),
                     root: false,
                 },
@@ -5939,7 +6147,8 @@ later"), "");
                             SwapFileParams {
                                 title: "change it".to_string(),
                                 path,
-                                content: "after\n".to_string(),
+                                content: Some("after\n".to_string()),
+                                patch: None,
                                 reason: "because a test asked".to_string(),
                                 root: false,
                             },
@@ -6059,7 +6268,8 @@ later"), "");
                 SwapFileParams {
                     title: "write a file".to_string(),
                     path: target.display().to_string(),
-                    content: "hello\n".to_string(),
+                    content: Some("hello\n".to_string()),
+                    patch: None,
                     reason: "because a test asked".to_string(),
                     root: false,
                 },
