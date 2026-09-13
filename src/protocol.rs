@@ -337,6 +337,14 @@ pub enum DaemonMsg {
     Elevating,
     /// How the command ended. The last frame the daemon sends.
     ///
+    /// Strictly, how one *operation* ended: the daemon sends one for each
+    /// operation it attempts, in the order of [`Request::operations`], and the
+    /// output and elevation frames before it belong to that operation. A
+    /// request carries one operation today, so the one `Finished` is also the
+    /// last frame, and the window is entitled to close on it. No index rides
+    /// along because the order already is one -- operations run in sequence
+    /// and never overlap.
+    ///
     /// What the window does with it is the window's own business and is not on
     /// the wire: a run nobody asked to watch closes here, and one the reader
     /// ticked the stream box on stays for a few seconds with the result on it.
@@ -449,15 +457,42 @@ pub struct Request {
     /// [`crate::queue::Admission::number`] for where a real one comes from
     /// and why it starts again at one on every run of the daemon.
     pub number: Option<u64>,
-    /// What is being asked for.
-    pub payload: Payload,
+    /// What is being asked for: every operation this one approval covers, in
+    /// the order the daemon will carry them out.
+    ///
+    /// A list, and a list even while it only ever holds one. hatch takes one
+    /// operation per call for now -- see [`crate::server::MAX_OPERATIONS`] --
+    /// and the window draws exactly one, but the request is shaped like the
+    /// batch it is. When a window learns to draw several, that is a change to
+    /// the window and not to this channel.
+    ///
+    /// The order is a guarantee and not a presentation. The daemon runs the
+    /// operations in exactly this order, so a window that draws them in this
+    /// order is drawing the sequence that will happen; one that sorted them,
+    /// grouped writes apart from commands, or put the root operation first
+    /// would be asking for approval of a different script.
+    pub operations: Vec<Payload>,
+    /// Whether the daemon stops at the first operation that fails, or carries
+    /// on and runs the rest.
+    ///
+    /// The agent's choice, carried here because it is part of what is being
+    /// approved. Continuing past a failure runs approved operations in a
+    /// state the reader may not have pictured -- "write the config, then
+    /// reload" reloads against the old file if the write was refused for
+    /// drift -- so which of the two it is has to be something a person can
+    /// see before they say yes, not something decided out of their sight.
+    /// With one operation there is nothing after it to stop or to run, and
+    /// the window says nothing about it: see
+    /// [`crate::prompt_ui::PromptState::sequencing`].
+    pub stop_on_failure: bool,
 }
 
-/// The operation itself, already rendered.
+/// One operation, already rendered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Payload {
-    /// A `run_command` request.
+    /// A command: the one `run_command` asks for, or one operation of a
+    /// `batch`.
     Command {
         /// The rendering as one line: every span's `display_text`
         /// concatenated, so chips read as their labels and line breaks are
@@ -524,7 +559,7 @@ pub enum Payload {
         /// null, not an absent key. See the type's own note on defaults.
         caveat: Option<String>,
     },
-    /// A `swap_file` request.
+    /// A file write: one operation of a `batch`.
     Swap {
         /// The file to be replaced or created.
         path: PathBuf,
@@ -1056,13 +1091,14 @@ mod tests {
             deadline: Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap(),
             queue_depth: 0,
             number: Some(47),
-            payload: Payload::command(
+            operations: vec![Payload::command(
                 &rendering("rm -rf /tmp/build"),
                 vec!["rm -rf".to_string()],
                 PathBuf::from("/home/user"),
                 false,
                 false,
-            ),
+            )],
+            stop_on_failure: false,
         }
     }
 
@@ -1253,11 +1289,24 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["deadline", "number", "payload", "queue_depth", "reason", "title", "type"]
+            [
+                "deadline",
+                "number",
+                "operations",
+                "queue_depth",
+                "reason",
+                "stop_on_failure",
+                "title",
+                "type"
+            ]
         );
 
-        let mut payload: Vec<&str> =
-            json["payload"].as_object().expect("an object").keys().map(String::as_str).collect();
+        let mut payload: Vec<&str> = json["operations"][0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         payload.sort_unstable();
         assert_eq!(
             payload,
@@ -1280,7 +1329,7 @@ mod tests {
     fn a_missing_field_is_a_decode_error_and_not_a_default() {
         let encoded = encode(&DaemonMsg::Request(Box::new(sample_request()))).expect("encodes");
         let mut json: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
-        for field in ["title", "reason", "deadline", "queue_depth", "payload"] {
+        for field in ["title", "reason", "deadline", "queue_depth", "operations", "stop_on_failure"] {
             let mut short = json.clone();
             short.as_object_mut().expect("an object").remove(field);
             let line = serde_json::to_string(&short).expect("re-encodes");
@@ -1609,5 +1658,36 @@ mod tests {
         let Payload::Swap { plan, path, .. } = back else { panic!("a swap payload") };
         assert_eq!(plan, sample_plan());
         assert_eq!(path, PathBuf::from("/etc/hosts"));
+    }
+
+    #[test]
+    fn the_operations_cross_in_the_order_they_will_run_and_with_the_policy_they_run_under() {
+        // Order is a guarantee, so it is the one property of the list worth
+        // asserting on its own: a write and then the command that reads it
+        // must not arrive as the command and then the write. Two of each
+        // kind, interleaved, so a trip that grouped them by kind would fail
+        // as surely as one that reversed them.
+        let write = |path: &str| Payload::swap(PathBuf::from(path), sample_plan(), &[]);
+        let command = |line: &str| {
+            Payload::command(&rendering(line), Vec::new(), PathBuf::from("/"), false, false)
+        };
+        let operations = vec![
+            write("/etc/service/one.conf"),
+            command("systemctl reload service"),
+            write("/etc/service/two.conf"),
+            command("systemctl status service"),
+        ];
+        for stop_on_failure in [true, false] {
+            let mut request = sample_request();
+            request.operations = operations.clone();
+            request.stop_on_failure = stop_on_failure;
+
+            let encoded = encode(&DaemonMsg::Request(Box::new(request))).expect("encodes");
+            let DaemonMsg::Request(back) = read_message(&encoded).expect("decodes") else {
+                panic!("a request decodes as a request");
+            };
+            assert_eq!(back.operations, operations, "the operations arrived in another order");
+            assert_eq!(back.stop_on_failure, stop_on_failure, "the policy did not survive");
+        }
     }
 }

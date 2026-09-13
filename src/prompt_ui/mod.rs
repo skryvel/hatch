@@ -580,7 +580,7 @@ pub enum Incoming {
 pub struct PromptState {
     phase: Phase,
     request: Option<Request>,
-    shown: Option<Shown>,
+    shown: Vec<Shown>,
     queue_depth: u32,
     outcome: Option<Outcome>,
     output: VecDeque<(Stream, String)>,
@@ -607,7 +607,7 @@ impl PromptState {
         PromptState {
             phase: Phase::WaitingForRequest,
             request: None,
-            shown: None,
+            shown: Vec::new(),
             queue_depth: 0,
             outcome: None,
             output: VecDeque::new(),
@@ -633,25 +633,70 @@ impl PromptState {
         self.request.as_ref()
     }
 
-    /// The payload as something drawable, checked when it arrived.
+    /// The operation this window draws, as something drawable, checked when
+    /// it arrived.
     ///
     /// There is never a request without one: a payload that could not be
     /// rebuilt through the real builder closed the window instead of
     /// becoming one. See [`PromptState::handle`].
+    ///
+    /// One, because a window draws one operation today and closes on a
+    /// request for any other number of them. [`PromptState::operations`] is
+    /// the list this is the only member of.
     pub fn shown(&self) -> Option<&Shown> {
-        self.shown.as_ref()
+        self.shown.first()
+    }
+
+    /// Every operation the request covers, drawable, in the order they run.
+    ///
+    /// The window's own copy of [`Request::operations`], held as a list for
+    /// the reason that one is: the window that draws several is a change to
+    /// how this is drawn, not to what is kept.
+    pub fn operations(&self) -> &[Shown] {
+        &self.shown
+    }
+
+    /// The sentence that says what happens after an operation fails, when
+    /// there is an after to speak of.
+    ///
+    /// `None` for a request of one operation, and that is not an omission.
+    /// With nothing after it there is nothing to stop and nothing to carry on
+    /// to, and a line saying which of the two would not happen is a line a
+    /// reader learns to skip -- which takes it down with it on the window
+    /// where it matters.
+    ///
+    /// Worded as a fact about the sequence and not as a warning. Neither
+    /// answer is the dangerous one: stopping leaves approved work undone, and
+    /// carrying on runs approved work on whatever an earlier operation left.
+    /// What the reader needs is to know which they are approving.
+    pub fn sequencing(&self) -> Option<&'static str> {
+        let request = self.request.as_ref()?;
+        if request.operations.len() < 2 {
+            return None;
+        }
+        Some(match request.stop_on_failure {
+            true => "stops at the first operation that fails",
+            false => "runs every operation, whichever of them fail",
+        })
     }
 
     /// Whether what this window is showing runs, or ran, as root.
     ///
     /// Read off the payload and not off the phase, because it is not a phase:
     /// it is true from the moment the request arrives until the window goes,
-    /// and every phase in between draws the mark that says so. A `swap_file`
-    /// request answers `false` here whatever its plan says — it states its
-    /// own ownership in its own header, and a second claim about the same
-    /// thing in a second vocabulary is how the two come to disagree.
+    /// and every phase in between draws the mark that says so. A file write
+    /// answers `false` here whatever its plan says — it states its own
+    /// ownership in its own header, and a second claim about the same thing
+    /// in a second vocabulary is how the two come to disagree.
+    ///
+    /// Asked of every operation rather than of the one drawn, so that the
+    /// frame is a fact about the whole approval: one root command anywhere in
+    /// a request is enough to put the window in it.
     pub fn runs_as_root(&self) -> bool {
-        self.shown().and_then(panes::RunContext::of).is_some_and(|context| context.root)
+        self.operations()
+            .iter()
+            .filter_map(panes::RunContext::of)
+            .any(|context| context.root)
     }
 
     /// The last depth the daemon published, whether or not it is drawn.
@@ -813,7 +858,22 @@ impl PromptState {
                 // whose one-line form disagrees with them, is a frame this
                 // window cannot show the truth of, so it closes: the daemon
                 // reads that as a denial, which is the safe direction.
-                let shown = match Shown::of(&req.payload) {
+                //
+                // And it is one operation. A window that drew the first of
+                // three would be asking for an approval that covers two
+                // operations nobody was shown, so a request for any other
+                // number closes the window for the same reason a bad
+                // rendering does. The daemon does not send one today; this is
+                // what makes sending one fail towards a denial rather than
+                // towards a yes.
+                let [operation] = req.operations.as_slice() else {
+                    self.channel_broken(format!(
+                        "hatch sent a request of {} operations, and this window draws exactly one",
+                        req.operations.len()
+                    ));
+                    return;
+                };
+                let shown = match Shown::of(operation) {
                     Ok(shown) => shown,
                     Err(e) => {
                         self.channel_broken(format!(
@@ -824,7 +884,7 @@ impl PromptState {
                 };
                 self.queue_depth = req.queue_depth;
                 self.request = Some(*req);
-                self.shown = Some(shown);
+                self.shown = vec![shown];
                 self.phase = Phase::AwaitingVerdict;
             }
             DaemonMsg::QueueDepth { depth } => self.queue_depth = depth,
@@ -3246,13 +3306,14 @@ mod tests {
             deadline: Utc::now() + chrono::Duration::seconds(seconds_left),
             queue_depth: 0,
             number: Some(47),
-            payload: Payload::command(
+            operations: vec![Payload::command(
                 &render_command("rm -rf target", &BTreeMap::new()),
                 Vec::new(),
                 PathBuf::from("/"),
                 false,
                 false,
-            ),
+            )],
+            stop_on_failure: false,
         }
     }
 
@@ -4513,13 +4574,13 @@ mod tests {
     fn a_root_window_showing(command: &str) -> PromptApp {
         let mut app = a_window_showing(command);
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command(command, &BTreeMap::new()),
             Vec::new(),
             PathBuf::from("/tmp"),
             true,
             false,
-        );
+        )];
         app.state = PromptState::new();
         app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
@@ -4530,13 +4591,13 @@ mod tests {
     fn an_interactive_window_showing(command: &str) -> PromptApp {
         let mut app = a_window_showing(command);
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command(command, &BTreeMap::new()),
             Vec::new(),
             PathBuf::from("/tmp"),
             false,
             true,
-        );
+        )];
         app.state = PromptState::new();
         app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
@@ -4548,13 +4609,13 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command(command, &BTreeMap::from([("HOME".into(), "/home/u".into())])),
             Vec::new(),
             PathBuf::from("/tmp"),
             false,
             false,
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
     }
@@ -4720,13 +4781,13 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command("id", &BTreeMap::new()),
             Vec::new(),
             PathBuf::from("/srv/app"),
             true,
             false,
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
@@ -4765,7 +4826,7 @@ mod tests {
         let long = "a very long story about why this is necessary. ".repeat(90);
         let mut request = a_request(90);
         request.title = long;
-        request.payload = app.state.request().expect("a request").payload.clone();
+        request.operations = app.state.request().expect("a request").operations.clone();
         app.state = PromptState::new();
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
@@ -4784,13 +4845,13 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command("rm -rf /", &BTreeMap::new()),
             vec!["deletes a directory tree".to_string()],
             PathBuf::from("/tmp"),
             false,
             false,
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
@@ -4807,7 +4868,7 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::swap(
+        request.operations = vec![Payload::swap(
             PathBuf::from("/tmp/conf.toml"),
             crate::swap::SwapPlan {
                 kind: crate::swap::PlanKind::Replace,
@@ -4818,7 +4879,7 @@ mod tests {
                 size_delta: 4,
             },
             &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
@@ -4835,13 +4896,13 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::command(
+        request.operations = vec![Payload::command(
             &render_command("vim /etc/hosts", &BTreeMap::new()),
             Vec::new(),
             PathBuf::from("/tmp"),
             false,
             true,
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
@@ -4932,7 +4993,7 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::swap(
+        request.operations = vec![Payload::swap(
             PathBuf::from("/tmp/f"),
             crate::swap::SwapPlan {
                 kind: crate::swap::PlanKind::Create,
@@ -4943,7 +5004,7 @@ mod tests {
                 size_delta: 2,
             },
             &crate::render::diff::side_by_side("", "hi\n"),
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         let drawn = window_text(&mut app, true);
@@ -4961,14 +5022,15 @@ mod tests {
     fn a_request_this_window_cannot_draw_closes_it_rather_than_being_guessed_at() {
         let mut state = PromptState::new();
         let mut request = a_request(90);
-        let Payload::Command { spans, raw, danger, runs, cwd, root, interactive, .. } = request.payload
+        let Payload::Command { spans, raw, danger, runs, cwd, root, interactive, .. } =
+            request.operations.remove(0)
         else {
             panic!("not a command")
         };
         // A one-line form that does not match the spans it claims to
         // summarise: the two halves of the window would describe different
         // commands.
-        request.payload = Payload::Command {
+        request.operations = vec![Payload::Command {
             display_line: "something else entirely".to_string(),
             spans,
             raw,
@@ -4978,7 +5040,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
-        };
+        }];
 
         state.handle(DaemonMsg::Request(Box::new(request)));
 
@@ -4995,6 +5057,70 @@ mod tests {
 
         assert!(state.shown().is_some(), "the window has nothing to draw");
         assert_eq!(state.phase(), Phase::AwaitingVerdict);
+    }
+
+    #[test]
+    fn a_request_for_more_operations_than_this_window_draws_closes_it() {
+        // A window draws one operation. Handed three, the only thing it could
+        // do short of closing is draw the first -- and then the approval it
+        // sends would cover two operations nobody was shown. Closing is read
+        // by the daemon as a denial, which is the direction every other frame
+        // this window cannot believe already fails in. And none at all is not
+        // a request anybody can approve either.
+        for count in [0, 2, 3] {
+            let mut state = PromptState::new();
+            let mut request = a_request(90);
+            let one = request.operations[0].clone();
+            request.operations = vec![one; count];
+
+            state.handle(DaemonMsg::Request(Box::new(request)));
+
+            assert!(state.should_close(), "a window accepted a request of {count} operations");
+            let why = state.broken().expect("and it did not say why");
+            assert!(why.contains(&count.to_string()), "{why}");
+            assert!(state.operations().is_empty(), "it kept something to draw anyway");
+            assert!(
+                state.decide(crate::protocol::approved(false)).is_none(),
+                "a window that refused a request can still approve it"
+            );
+        }
+    }
+
+    #[test]
+    fn what_happens_after_a_failure_is_stated_only_where_there_is_an_after() {
+        // One operation has nothing after it, so the window says nothing
+        // about stopping or carrying on -- in either policy, because a line
+        // that is true of every window is a line nobody reads.
+        for stop_on_failure in [true, false] {
+            let mut request = a_request(90);
+            request.stop_on_failure = stop_on_failure;
+            let mut state = PromptState::new();
+            state.handle(DaemonMsg::Request(Box::new(request)));
+            assert_eq!(state.sequencing(), None, "one operation was given a sequence to state");
+        }
+
+        // Two operations have one, and each policy reads as itself and
+        // neither reads as a caution. The window that draws two does not
+        // exist yet; the sentence it will draw does, so it is pinned here
+        // rather than written on the day the cap lifts.
+        let sentence = |stop_on_failure| {
+            let mut state = PromptState::new();
+            let mut request = a_request(90);
+            let one = request.operations[0].clone();
+            request.operations = vec![one.clone(), one];
+            request.stop_on_failure = stop_on_failure;
+            state.request = Some(request);
+            state.sequencing().expect("two operations have a sequence").to_string()
+        };
+        let (stops, runs_on) = (sentence(true), sentence(false));
+        assert_ne!(stops, runs_on, "the two policies read as one");
+        assert!(stops.contains("stops"), "{stops}");
+        assert!(runs_on.contains("every operation"), "{runs_on}");
+        for text in [&stops, &runs_on] {
+            for alarm in ["warning", "careful", "danger", "!"] {
+                assert!(!text.to_lowercase().contains(alarm), "a fact reads as a warning: {text}");
+            }
+        }
     }
 
     #[test]
@@ -5920,7 +6046,7 @@ mod tests {
         let mut app =
             PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
         let mut request = a_request(90);
-        request.payload = Payload::swap(
+        request.operations = vec![Payload::swap(
             PathBuf::from("/tmp/conf.toml"),
             crate::swap::SwapPlan {
                 kind: crate::swap::PlanKind::Replace,
@@ -5931,7 +6057,7 @@ mod tests {
                 size_delta: 4,
             },
             &crate::render::diff::side_by_side("port = 80\n", "port = 8080\n"),
-        );
+        )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
 
         assert!(!app.state.runs_as_root(), "a swap answered the command's question");
@@ -6692,13 +6818,13 @@ mod tests {
                 PrefsFile::at(&paths),
             );
             let mut request = a_request(90);
-            request.payload = Payload::command(
+            request.operations = vec![Payload::command(
                 &render_command("vim /etc/hosts", &BTreeMap::new()),
                 Vec::new(),
                 PathBuf::from("/tmp"),
                 false,
                 true,
-            );
+            )];
             app.state.handle(DaemonMsg::Request(Box::new(request)));
 
             window_text_sized(&mut app, opening_size());

@@ -276,7 +276,10 @@ impl Sample {
             // counting windows here, so this one has no number to put in its
             // title bar -- see `Request::number`.
             number: None,
-            payload: self.payload.clone(),
+            // One operation, because a sample is one. The list is the
+            // request's shape and not the sample's.
+            operations: vec![self.payload.clone()],
+            stop_on_failure: false,
         }
     }
 }

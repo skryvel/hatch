@@ -1383,7 +1383,8 @@ impl Daemon {
             deadline: Utc::now() + chrono::Duration::seconds(self.config.timeout_secs as i64),
             queue_depth: badge,
             number: *number,
-            payload,
+            operations: vec![payload],
+            stop_on_failure: false,
         };
         let mut session = match self.prompter.prompt(request, depths).await {
             Ok(session) => session,
@@ -4819,7 +4820,7 @@ later"), "");
                 );
                 let request = &recorded[0].request;
                 assert_eq!(
-                    request.payload, sample.payload,
+                    request.operations, vec![sample.payload.clone()],
                     "{scenario:?}: the preview and the daemon built different payloads"
                 );
                 assert_eq!(request.title, sample.title, "{scenario:?}");
@@ -4854,7 +4855,7 @@ later"), "");
             within(harness.daemon.run_command(root_run("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let Payload::Command { raw, root, caveat, .. } = shown.payload else {
+            let Payload::Command { raw, root, caveat, .. } = shown.operations.into_iter().next().expect("an operation") else {
                 panic!("not a command payload");
             };
             // The elevation program is in the line the reader approves, not
@@ -4877,7 +4878,7 @@ later"), "");
             within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let Payload::Command { raw, root, caveat, .. } = shown.payload else {
+            let Payload::Command { raw, root, caveat, .. } = shown.operations.into_iter().next().expect("an operation") else {
                 panic!("not a command payload");
             };
             assert_eq!(raw, "echo hi");
@@ -4900,7 +4901,7 @@ later"), "");
             within(harness.daemon.run_command(root_run("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let spans = shown.payload.rendering().expect("a rendering the window can rebuild");
+            let spans = shown.operations[0].rendering().expect("a rendering the window can rebuild");
             let broken: Vec<_> = spans.iter().filter(|span| span.break_before()).collect();
             assert_eq!(broken.len(), 1, "one break, and the daemon asked for it");
             assert!(
@@ -4910,7 +4911,7 @@ later"), "");
             );
             // Layout, and layout only: the line the reader approves is the
             // same line, byte for byte.
-            let Payload::Command { raw, .. } = &shown.payload else {
+            let Payload::Command { raw, .. } = &shown.operations[0] else {
                 panic!("not a command payload");
             };
             assert_eq!(&crate::render::unrender(&spans), raw);
@@ -4927,7 +4928,7 @@ later"), "");
             within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let spans = shown.payload.rendering().expect("a rendering the window can rebuild");
+            let spans = shown.operations[0].rendering().expect("a rendering the window can rebuild");
             assert!(
                 spans.iter().all(|span| !span.break_before()),
                 "an unelevated line was broken somewhere the command did not ask for"
@@ -5545,7 +5546,7 @@ later"), "");
             let seen = harness.prompter.seen();
             assert_eq!(seen.len(), 2, "both forms must reach a window");
             assert_eq!(
-                seen[0].payload, seen[1].payload,
+                seen[0].operations, seen[1].operations,
                 "a patch and the contents it produces are one request by the time a window opens"
             );
             assert_eq!(
