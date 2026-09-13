@@ -1576,8 +1576,8 @@ impl Daemon {
     /// There is no second path behind this. The conversion happens before a
     /// single field is checked, so everything a `batch` call goes through —
     /// the caps, the refusals, the window, the execution, the log — is what
-    /// this call goes through, because it is one. See
-    /// [`BatchParams::from`](From::from).
+    /// this call goes through, because it is one. See the `From` conversion
+    /// on [`BatchParams`].
     pub async fn run_command(&self, params: RunCommandParams, caller: Caller) -> CallToolResult {
         self.batch(BatchParams::from(params), caller).await
     }
@@ -5703,8 +5703,9 @@ later"), "");
         /// A batch of the operations of several, in order, as one request.
         ///
         /// The tool refuses this past the cap, so it is handed to the daemon
-        /// behind the boundary: see `a_batch_of_several` for why that is a
-        /// fair test of the path the cap guards and not a way around it.
+        /// behind the boundary: see the note over the tests of a batch of
+        /// several for why that is a fair test of the path the cap guards and
+        /// not a way around it.
         fn several(stop_on_failure: bool, batches: Vec<BatchParams>) -> Batch {
             let mut operations = Vec::new();
             for params in batches {
