@@ -2004,9 +2004,10 @@ impl PromptApp {
         };
         let body = egui::TextStyle::Body.resolve(ui.style()).size;
 
+        let runs = self.runs();
         ui.vertical_centered(|ui| {
             if let Some(outcome) = self.state.outcome() {
-                let (text, clean) = panes::outcome_text(outcome);
+                let (text, clean) = panes::outcome_text(outcome, runs);
                 let colour = if clean { weak } else { bad };
                 ui.label(egui::RichText::new(text).color(colour).strong());
             }

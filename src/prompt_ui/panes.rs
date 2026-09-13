@@ -320,24 +320,39 @@ pub fn closing_text(seconds_left: u64) -> String {
 /// `false` covers every ending that is not a clean exit, the signals included:
 /// a command hatch killed at the Kill button ended by signal too, and a reader
 /// who pressed that button is not surprised to see it called out.
-pub fn outcome_text(outcome: &Outcome) -> (String, bool) {
+///
+/// `runs` is whether the operation was a command, which is [`Shown::runs`].
+/// Two of the endings can happen to a command and to a root write alike, and
+/// "nothing ran" is not a sentence about a file.
+pub fn outcome_text(outcome: &Outcome, runs: bool) -> (String, bool) {
     match outcome {
         Outcome::Exit { code: 0 } => ("Finished — exit 0".to_string(), true),
         Outcome::Exit { code } => (format!("Finished — exit {code}"), false),
         Outcome::Signal { signal } => (format!("Ended by signal {signal}"), false),
-        // Defanged here and not upstream: this is the one variant carrying
-        // text from outside, and it is drawn beside a number the reader is
+        // Defanged here and not upstream: these are the variants carrying
+        // text from outside, and they are drawn beside a number the reader is
         // meant to trust.
         Outcome::ElevationFailed { message } => {
-            (format!("Nothing ran — {}", defang(message)), false)
+            let nothing = match runs {
+                true => "Nothing ran",
+                false => "Nothing was written",
+            };
+            (format!("{nothing} — {}", defang(message)), false)
         }
-        // Not "nothing ran" and not an exit code. The window is closing on
-        // this line, and the reader's next move — check the machine, or do
-        // not — depends on it saying which of those two hatch is unable to
-        // choose between.
+        // Not "nothing ran" and not an exit code. The reader's next move —
+        // check the machine, or do not — depends on this line saying which of
+        // those two hatch is unable to choose between.
         Outcome::Unclear { message } => {
-            (format!("hatch cannot tell whether this ran — {}", defang(message)), false)
+            let what = match runs {
+                true => "whether this ran",
+                false => "whether the file was written",
+            };
+            (format!("hatch cannot tell {what} — {}", defang(message)), false)
         }
+        Outcome::Written => ("Written".to_string(), true),
+        // "Failed" and hatch's own account of how, which already says what
+        // it left: nothing written, nothing run, or a file not as approved.
+        Outcome::Failed { message } => (format!("Failed — {}", defang(message)), false),
     }
 }
 
@@ -3944,17 +3959,17 @@ mod tests {
 
     #[test]
     fn how_it_ended_is_said_plainly_and_only_a_clean_exit_is_quiet() {
-        assert_eq!(outcome_text(&Outcome::Exit { code: 0 }), ("Finished — exit 0".into(), true));
-        assert_eq!(outcome_text(&Outcome::Exit { code: 3 }), ("Finished — exit 3".into(), false));
+        assert_eq!(outcome_text(&Outcome::Exit { code: 0 }, true), ("Finished — exit 0".into(), true));
+        assert_eq!(outcome_text(&Outcome::Exit { code: 3 }, true), ("Finished — exit 3".into(), false));
         assert_eq!(
-            outcome_text(&Outcome::Signal { signal: 9 }),
+            outcome_text(&Outcome::Signal { signal: 9 }, true),
             ("Ended by signal 9".into(), false)
         );
         // Every nonzero ending is called out, including the one the reader
         // caused themselves: a window that stayed quiet about a failure would
         // be the exit code reaching the agent and nobody else.
         for code in [1, 2, 127, -1] {
-            assert!(!outcome_text(&Outcome::Exit { code }).1, "exit {code} was drawn as fine");
+            assert!(!outcome_text(&Outcome::Exit { code }, true).1, "exit {code} was drawn as fine");
         }
     }
 
@@ -3963,12 +3978,41 @@ mod tests {
         // The one outcome carrying a message, drawn beside a number the
         // reader is meant to trust. A bidi override in it would reorder the
         // line it sits on.
-        let (text, clean) = outcome_text(&Outcome::ElevationFailed {
-            message: "\u{202E}denied".to_string(),
-        });
-        assert!(!text.contains('\u{202E}'), "an override reached the screen: {text}");
-        assert!(text.contains("[RLO]"), "{text}");
+        for outcome in [
+            Outcome::ElevationFailed { message: "\u{202E}denied".to_string() },
+            Outcome::Unclear { message: "\u{202E}denied".to_string() },
+            Outcome::Failed { message: "\u{202E}denied".to_string() },
+        ] {
+            for runs in [true, false] {
+                let (text, clean) = outcome_text(&outcome, runs);
+                assert!(!text.contains('\u{202E}'), "an override reached the screen: {text}");
+                assert!(text.contains("[RLO]"), "{text}");
+                assert!(!clean, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_ending_is_said_in_the_words_of_the_operation_it_ended() {
+        // A root write can end in a dismissed dialog or an elevation hatch
+        // cannot read, exactly as a root command can, and "nothing ran" under
+        // a diff is a sentence about some other window.
+        let dismissed = Outcome::ElevationFailed { message: "cancelled".to_string() };
+        assert!(outcome_text(&dismissed, true).0.starts_with("Nothing ran"));
+        assert!(outcome_text(&dismissed, false).0.starts_with("Nothing was written"));
+        let unclear = Outcome::Unclear { message: "deadline".to_string() };
+        assert!(outcome_text(&unclear, true).0.contains("whether this ran"));
+        assert!(outcome_text(&unclear, false).0.contains("whether the file was written"));
+
+        // And a write's own two endings carry no exit code at all.
+        assert_eq!(outcome_text(&Outcome::Written, false), ("Written".into(), true));
+        let refused = Outcome::Failed { message: "the file changed".to_string() };
+        let (text, clean) = outcome_text(&refused, false);
+        assert_eq!(text, "Failed — the file changed");
         assert!(!clean);
+        for (text, _) in [outcome_text(&Outcome::Written, false), outcome_text(&refused, false)] {
+            assert!(!text.contains("exit"), "a write was described as a process: {text}");
+        }
     }
 
     #[test]

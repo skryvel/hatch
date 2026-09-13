@@ -2610,10 +2610,15 @@ impl Daemon {
             // decision anybody made, so the agent is told plainly and may
             // retry without wondering what already ran.
             Err(error) => {
-                // No `Finished` frame: the wire can only say "exited" or
-                // "was signalled", and both would be a plausible-looking lie
-                // about a command that never started. The window is closed
-                // instead, and the agent is told the truth.
+                // Not "exited" and not "was signalled": both would be a
+                // plausible-looking lie about a command that never started.
+                // The window is told what the agent is told.
+                let told = session
+                    .outbox()
+                    .finished(protocol::Outcome::Failed {
+                        message: format!("hatch could not start it, so nothing ran: {error}"),
+                    })
+                    .await;
                 return Step {
                     // The elevation program failing to start is an elevation
                     // failure and nothing else: nothing was elevated, so
@@ -2626,11 +2631,12 @@ impl Daemon {
                         "the user approved this, but hatch could not start it, so nothing ran: \
                          {error}"
                     ))]),
-                    // No outcome frame means a window still drawing "it is
-                    // running". Nothing will ever tell it otherwise, so it is
-                    // closed here rather than handed to a reader who would be
-                    // watching a command that never started.
-                    windup: Windup::Close,
+                    // What becomes of any window told how its run ended; see
+                    // the end of this function.
+                    windup: match told && stream {
+                        true => Windup::Detach,
+                        false => Windup::Close,
+                    },
                     // A failure that left nothing behind: nothing started.
                     status: Status::Failed(Failure::Settled),
                 };
@@ -2791,14 +2797,15 @@ impl Daemon {
             record_landing(detail, content, plan);
         }
 
-        // The window closes on this frame. A swap has no process and so no
-        // exit code of its own; zero for "it landed" and one for "it did not"
-        // is the whole of what the wire can carry today, and it is the same
-        // fact the tool result states.
-        let _ = session
-            .outbox()
-            .finished(protocol::Outcome::Exit { code: i32::from(!landed) })
-            .await;
+        // The same fact the tool result states, in the window's words. A write
+        // has no process and so no exit code of its own, and the reason it
+        // did not happen is the one sentence a person who approved it can act
+        // on.
+        let frame = match &applied {
+            Ok(()) => protocol::Outcome::Written,
+            Err(error) => protocol::Outcome::Failed { message: error.to_string() },
+        };
+        let _ = session.outbox().finished(frame).await;
 
         let result = match applied {
             Ok(()) => CallToolResult::success(vec![ContentBlock::text(format!(
@@ -2854,7 +2861,7 @@ impl Daemon {
             Err(error) => {
                 let _ = session
                     .outbox()
-                    .finished(protocol::Outcome::Exit { code: 1 })
+                    .finished(protocol::Outcome::Failed { message: error.to_string() })
                     .await;
                 // The re-check refused before anything was staged or
                 // elevated: the file is untouched, as with any refused write.
@@ -2959,7 +2966,13 @@ impl Daemon {
                     // disk is not the thing on the screen.
                     let _ = session
                         .outbox()
-                        .finished(protocol::Outcome::Exit { code: 1 })
+                        .finished(protocol::Outcome::Failed {
+                            message: format!(
+                                "the write happened, but what is on disk is not what was \
+                                 approved: {} is now {found}, and the window said {described}",
+                                path.display(),
+                            ),
+                        })
                         .await;
                     return Step {
                         verdict: LogVerdict::Approve,
@@ -2979,10 +2992,7 @@ impl Daemon {
                     };
                 }
                 record_landing(detail, content, plan);
-                let _ = session
-                    .outbox()
-                    .finished(protocol::Outcome::Exit { code: 0 })
-                    .await;
+                let _ = session.outbox().finished(protocol::Outcome::Written).await;
                 Step {
                     verdict: LogVerdict::Approve,
                     result: CallToolResult::success(vec![ContentBlock::text(format!(
@@ -2998,9 +3008,26 @@ impl Daemon {
             // An ordinary failed write, reported as one — the user gave a
             // password and it was used, so this is not an elevation outcome.
             RootOutcome::Ran { exit } => {
+                let how = match exit {
+                    Some(code) => format!("exited {code}"),
+                    None => "ended on a signal".to_string(),
+                };
                 let _ = session
                     .outbox()
-                    .finished(protocol::Outcome::Exit { code: exit.unwrap_or(1) })
+                    .finished(protocol::Outcome::Failed {
+                        message: match first_line(&output.stderr) {
+                            "" => format!(
+                                "{} {how}; a root write is not a rename, so the file may be \
+                                 left short",
+                                self.elevation.mechanism(),
+                            ),
+                            line => format!(
+                                "{} {how}: {line}; a root write is not a rename, so the file \
+                                 may be left short",
+                                self.elevation.mechanism(),
+                            ),
+                        },
+                    })
                     .await;
                 Step {
                     verdict: LogVerdict::Approve,
@@ -6223,6 +6250,15 @@ later"), "");
             assert_eq!(record["verdict"], "approve");
             assert_eq!(record["root"], true);
             assert_eq!(record["mode"], "0640");
+            assert_eq!(told_the_window(&harness), Some(protocol::Outcome::Written));
+        }
+
+        /// How the window was told the one operation ended, if it was.
+        fn told_the_window(harness: &Harness) -> Option<protocol::Outcome> {
+            harness.prompter.recorded()[0].sent.iter().find_map(|frame| match frame {
+                crate::protocol::DaemonMsg::Finished(outcome) => Some(outcome.clone()),
+                _ => None,
+            })
         }
 
         /// The argument after `flag`.
@@ -6306,6 +6342,12 @@ later"), "");
             let record = harness.only_record();
             assert_eq!(record["verdict"], "approve");
             assert_eq!(record["mode"], serde_json::Value::Null, "{record}");
+            // And the window is told the same two facts, not an exit code:
+            // this is the ending its reader most needs to read.
+            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness) else {
+                panic!("the window was not told the write landed differently")
+            };
+            assert!(message.contains("0640") && message.contains("0600"), "{message}");
         }
 
         #[tokio::test]
@@ -6408,6 +6450,10 @@ later"), "");
             assert_eq!(harness.verdict(), "approve", "a failed write was filed as an elevation problem");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before\n");
             assert_eq!(staged_files(&harness), 0);
+            let Some(protocol::Outcome::Failed { message }) = told_the_window(&harness) else {
+                panic!("the window was not told the write failed")
+            };
+            assert!(message.contains("not a rename"), "the window was promised an untouched file: {message}");
         }
 
         #[tokio::test]
@@ -6533,7 +6579,7 @@ later"), "");
             );
             assert!(
                 harness.prompter.recorded()[0].sent.contains(
-                    &crate::protocol::DaemonMsg::Finished(protocol::Outcome::Exit { code: 0 })
+                    &crate::protocol::DaemonMsg::Finished(protocol::Outcome::Written)
                 ),
                 "the window must be told it landed: {:?}",
                 harness.prompter.recorded()[0].sent
@@ -8049,13 +8095,19 @@ later"), "");
                 "somebody else got there first\n",
                 "a refused write must not touch the file"
             );
-            assert!(
-                harness.prompter.recorded()[0].sent.contains(
-                    &crate::protocol::DaemonMsg::Finished(protocol::Outcome::Exit { code: 1 })
-                ),
-                "the window must be told it did not land: {:?}",
-                harness.prompter.recorded()[0].sent
-            );
+            // In words, and the words the agent was given: an exit code of 1
+            // is a command's vocabulary, and "failed" alone is not something
+            // the person who approved the write can act on.
+            let sent = &harness.prompter.recorded()[0].sent;
+            let told = sent.iter().find_map(|frame| match frame {
+                crate::protocol::DaemonMsg::Finished(protocol::Outcome::Failed { message }) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            });
+            let told = told.unwrap_or_else(|| panic!("the window was not told it did not land: {sent:?}"));
+            assert!(told.contains("changed after the request was approved"), "{told}");
+            assert!(text.contains(&told), "the window and the agent were told different things");
             // Still one record, and still an approval: the user did approve.
             assert_eq!(harness.verdict(), "approve");
         }
@@ -8161,10 +8213,13 @@ later"), "");
         }
 
         #[tokio::test]
-        async fn a_command_that_could_not_be_started_leaves_no_window_behind() {
-            // No outcome frame is sent on this path, so the window is still
-            // drawing "it is running" and nothing will ever tell it otherwise.
-            // Handing that one to a reader would be handing them an orphan.
+        async fn a_command_that_could_not_be_started_tells_its_window_so_and_leaves_it_with_the_reader() {
+            // There used to be no outcome frame on this path, because the wire
+            // could only say "exited" or "was signalled" and both would have
+            // been a lie about a command that never started. So the window
+            // went on drawing "it is running" until it was killed. It is told
+            // now, in words, and a window that is told how its run ended is
+            // one the reader can be left with.
             let harness = Harness::new(vec![Reply::verdict(approved(true))]);
             let mut params = run_of("echo hello");
             // A working directory that is one, so it passes validation, and
@@ -8181,7 +8236,16 @@ later"), "");
                 .unwrap();
 
             assert_eq!(result.is_error, Some(true), "{result:?}");
-            assert!(!windup_of(&harness).await, "a window that was told nothing was left open");
+            assert!(windup_of(&harness).await, "the window was killed over what it was told");
+            let sent = &harness.prompter.recorded()[0].sent;
+            assert!(
+                sent.iter().any(|frame| matches!(
+                    frame,
+                    crate::protocol::DaemonMsg::Finished(protocol::Outcome::Failed { message })
+                        if message.contains("could not start it, so nothing ran")
+                )),
+                "the window was not told the command never started: {sent:?}"
+            );
         }
 
         #[tokio::test]

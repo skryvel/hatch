@@ -409,6 +409,34 @@ pub enum Outcome {
         /// What to tell the user, as text.
         message: String,
     },
+    /// A file was written, and it is the file the window described.
+    ///
+    /// Its own variant rather than the `Exit { code: 0 }` it used to be sent
+    /// as. A write has no process and so no status, and an exit code standing
+    /// in for "it landed" is a number drawn from the vocabulary of a command
+    /// onto a window about a file: "Finished — exit 0" under a diff. It also
+    /// made two different facts share a spelling, and a window reading the
+    /// frame could not tell a command's answer from a file's landing.
+    ///
+    /// A root write hatch could not re-examine afterwards is sent as this
+    /// too. That is the absence of evidence against the write, not evidence
+    /// for a different one, and the tool result is where it is said.
+    Written,
+    /// The operation did not do what was approved, and hatch can say how in
+    /// words that are neither a status nor an elevation's.
+    ///
+    /// For the endings the four variants above cannot state without
+    /// inventing something: a write refused at the moment of writing because
+    /// the file moved, a root write that landed as something other than the
+    /// window described, an `install` that failed part way, a command that
+    /// could not be started at all. Each of them used to be an exit code of
+    /// 1 or no frame, which is the plausible-looking lie the first paragraph
+    /// of this type is about.
+    Failed {
+        /// What to tell the user, as text: hatch's own sentence, which may
+        /// quote a path or another program's diagnostic.
+        message: String,
+    },
 }
 
 /// The one request a window is about.
@@ -1380,6 +1408,9 @@ mod tests {
             Outcome::Exit { code: 1 },
             Outcome::Signal { signal: 9 },
             Outcome::ElevationFailed { message: "the password dialog was cancelled".to_string() },
+            Outcome::Unclear { message: "the run was ended at its deadline".to_string() },
+            Outcome::Written,
+            Outcome::Failed { message: "the file changed after the request was approved".to_string() },
         ] {
             let message = DaemonMsg::Finished(outcome);
             let encoded = encode(&message).expect("encodes");
@@ -1392,6 +1423,8 @@ mod tests {
         .expect("encodes");
         assert!(encoded.contains("\"type\":\"finished\""), "{encoded}");
         assert!(encoded.contains("\"reason\":\"elevation_failed\""), "{encoded}");
+        let encoded = encode(&DaemonMsg::Finished(Outcome::Written)).expect("encodes");
+        assert!(encoded.contains("\"reason\":\"written\""), "{encoded}");
     }
 
     // ---- renderings across the pipe ----------------------------------------
