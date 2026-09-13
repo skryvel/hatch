@@ -2855,6 +2855,14 @@ fn line_job(line: &[Span], palette: &Palette, font: &egui::FontId) -> egui::text
             // bad idea; that is `render::danger`'s to say, in the colour this
             // one is deliberately not.
             SpanKind::Redirect => egui::TextFormat { color: palette.redirect, ..plain.clone() },
+            // A here-document's body arrives here, and that is the decision
+            // rather than an oversight: it has no kind of its own, so it is
+            // drawn in body text at full contrast like any other argument.
+            // The body is usually the whole point of the command -- the file
+            // `cat <<EOF > /etc/sudoers` writes is in it and nowhere else --
+            // so it is the last text on this pane that should be quieted or
+            // tinted, and the delimiter at each end of it is already marked.
+            // See `render::command`, which argues it at length.
             SpanKind::Variable { .. } | SpanKind::Plain => plain.clone(),
         };
         job.append(&span.display_text(), 0.0, format);

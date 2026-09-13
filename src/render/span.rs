@@ -167,9 +167,11 @@ pub enum SpanKind {
     /// to see.
     ///
     /// Decoration, on the same terms as [`SpanKind::Command`]. Where the
-    /// scanner's model stops — `$'…'`, a heredoc body, a comment — this is
-    /// wrong in the same direction and at the same bounded cost: the text is
-    /// still on screen, drawn as itself.
+    /// scanner's model stops — `$'…'` is the case left — this is wrong in the
+    /// same direction and at the same bounded cost: the text is still on
+    /// screen, drawn as itself. A comment and a here-document body are no
+    /// longer among them: a quote in either opens nothing, because the shell
+    /// reads neither as shell.
     Quoted,
     /// A comment: the `#` that begins it and everything after it up to, but
     /// not including, the newline that ends it.
@@ -209,6 +211,14 @@ pub enum SpanKind {
     /// is, and deciding that is [`super::danger`]'s job; this kind says only
     /// that the shell will treat these bytes as a redirection, which is a
     /// lexical fact and true of `> /dev/null` as well.
+    ///
+    /// A here-document's delimiter is the one target that appears twice, and
+    /// both are drawn in this kind: once as the word after `<<`, and once as
+    /// the line that ends the body, closing what the operator opened. What is
+    /// between them is the body, which has no kind at all -- it is data rather
+    /// than shell, and drawing the payload of a command in anything but body
+    /// text at full contrast would be a claim about it. See
+    /// [`super::command`], which argues that at length.
     ///
     /// Decoration, on the same terms as [`SpanKind::Command`],
     /// [`SpanKind::Quoted`] and [`SpanKind::Comment`]: drawn as its own text,
