@@ -839,8 +839,10 @@ itself. **Segment numbering is a reading aid, not an execution plan.** A fuller
 answer needs a real shell grammar.
 
 **A TOCTOU window remains on file writes.** The target is hashed when the diff
-is drawn and re-hashed immediately before the write; drift re-prompts with the
-fresh diff rather than applying stale content. But between that last check and
+is drawn and re-hashed immediately before the write. If the two differ, the
+write is refused and nothing is written: the agent is told the file changed and
+has to read it again and send a new request, which opens a new window with a
+new diff. hatch does not ask again by itself. But between that last check and
 the `rename`, an attacker who can already write to a *directory* in the path
 can replace it with a symlink. Re-checking narrows the window from human time
 to syscall time; it does not close it. (`rename(2)` never follows its final
