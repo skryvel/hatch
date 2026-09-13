@@ -1,10 +1,27 @@
 //! `AuditRecord`, `LogVerdict`, append-only audit writer.
 //!
-//! One JSON object per line, one line per outcome. A timeout, a client that
+//! One JSON object per line, one line per operation. A timeout, a client that
 //! hung up and a prompt window that died are outcomes too: they are written
 //! with their own verdicts, so a failure nobody was watching still leaves a
 //! record. The file is opened, appended to and flushed per record, so the log
 //! survives a crash of the process that wrote it.
+//!
+//! # One decision, several lines
+//!
+//! A `batch` is one approval covering several operations, and it is written
+//! as one line for each of them rather than as one line holding a list. The
+//! two questions this file exists to answer are *what wrote to this file* and
+//! *what ran as root*, and both are asked with `grep` or `jq` a line at a
+//! time. A line holding three operations matches a search for one path with
+//! two other effects riding along on it, and it matches `"root":true` when
+//! one of the three was root and the other two were not -- so the answer to
+//! "what ran as root" would come back with things that did not. One line per
+//! effect keeps every line a true answer about exactly one thing.
+//!
+//! The decision is what the lines share, and they share it visibly: the same
+//! `ts`, the same `number`, the same title, reason and note, and an
+//! `operation` of `operations` that places each one. A request of one
+//! operation is one line, as it always was.
 //!
 //! The verdict set here is a superset of the one the agent sees. A user
 //! denial, a cancelled call, a dropped transport and a dead prompter all
@@ -22,9 +39,11 @@ use anyhow::Context;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-/// How a request ended.
+/// How one operation of a request ended.
 ///
-/// Every variant is a terminal outcome: exactly one is written per request.
+/// Every variant is a terminal outcome: exactly one is written per operation.
+/// A decision that was never made about an operation -- a denial, a timeout,
+/// a refusal -- is the same verdict on every operation the request carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogVerdict {
@@ -65,6 +84,15 @@ pub enum LogVerdict {
     Disconnected,
     /// The approval window process died before returning a verdict.
     PromptDied,
+    /// The user approved the request this operation was part of, and the run
+    /// ended before it was reached.
+    ///
+    /// Its own verdict and not an [`LogVerdict::Approve`] with nothing filled
+    /// in, because the difference is the whole of what somebody reading the
+    /// file later is asking. An approved write with no `hash_after` could be a
+    /// write that was refused for drift; this is a write that was never tried,
+    /// and the operation before it on the same `number` says why.
+    NotAttempted,
     /// hatch rejected the request before showing it to the user: a symlinked
     /// target, a missing parent directory, a denylist hit, a nonexistent cwd.
     Refused,
@@ -74,7 +102,7 @@ impl LogVerdict {
     /// Every verdict, once. A new variant belongs here as well as in the
     /// exhaustive match below, so that callers and tests which must cover the
     /// whole set have one list to read rather than a copy of their own.
-    pub const ALL: [LogVerdict; 13] = [
+    pub const ALL: [LogVerdict; 14] = [
         LogVerdict::Approve,
         LogVerdict::Deny,
         LogVerdict::Explain,
@@ -87,6 +115,7 @@ impl LogVerdict {
         LogVerdict::Cancelled,
         LogVerdict::Disconnected,
         LogVerdict::PromptDied,
+        LogVerdict::NotAttempted,
         LogVerdict::Refused,
     ];
 
@@ -107,6 +136,7 @@ impl LogVerdict {
             LogVerdict::Cancelled => "cancelled",
             LogVerdict::Disconnected => "disconnected",
             LogVerdict::PromptDied => "prompt_died",
+            LogVerdict::NotAttempted => "not_attempted",
             LogVerdict::Refused => "refused",
         }
     }
@@ -153,6 +183,27 @@ pub struct AuditRecord {
     pub title: String,
     /// The agent's justification, as it was shown to the user.
     pub reason: String,
+    /// Which operation of the request this line is about, counting from one.
+    ///
+    /// Written on every line, including the lines of a request that only ever
+    /// had one, for the reason [`SwapForm`] is: the JSON is what gets parsed,
+    /// and a key that is absent on most lines is a question on most lines. A
+    /// line from a build that predates batches reads back as the first of
+    /// one, which is what every request then was.
+    #[serde(default = "first")]
+    pub operation: usize,
+    /// How many operations the request carried.
+    #[serde(default = "first")]
+    pub operations: usize,
+    /// Whether the request was to stop at its first failed operation, or to
+    /// run every operation whichever of them failed.
+    ///
+    /// The agent's choice, written down because it decides what a
+    /// `not_attempted` line further down the same request means. A line from
+    /// before the choice existed reads back as `false`, the default; it had
+    /// one operation, and with one operation the two policies are the same.
+    #[serde(default)]
+    pub stop_on_failure: bool,
     /// How it ended.
     pub verdict: LogVerdict,
     /// What the user typed into the prompt window, if anything.
@@ -163,21 +214,37 @@ pub struct AuditRecord {
     pub detail: LogDetail,
 }
 
-/// The tool-specific fields, tagged by `tool`.
+/// The fields of one kind of operation, tagged by `tool`.
 ///
 /// The tag is what puts `tool` in the record, and it is what decides which
 /// variant a line is read back as. Leaving the variants untagged would make
 /// that decision by trial and error over whichever fields happen to be
 /// required, and every field a future variant adds could quietly change it.
+///
+/// The key is still called `tool` and it no longer names one. It dates from
+/// when each tool did one kind of thing; a write now arrives inside a
+/// `batch`, and a command may arrive through `batch` or through its shortcut,
+/// so what the tag names is the kind of operation. The key kept its name so
+/// that every line already in somebody's log parses the way it did, and the
+/// old values are read as aliases for the same reason: `swap_file` names a
+/// tool that is gone, and a month's file written before it went still has to
+/// say what was written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "tool", rename_all = "snake_case")]
+#[serde(tag = "tool")]
 pub enum LogDetail {
+    #[serde(rename = "command", alias = "run_command")]
     RunCommand(RunDetail),
+    #[serde(rename = "write", alias = "swap_file")]
     SwapFile(SwapDetail),
 }
 
-/// A `run_command` request. The first three fields are known when the request
-/// arrives; the rest exist only once the command has actually run.
+/// The count a line from before batches reads back with: the first of one.
+fn first() -> usize {
+    1
+}
+
+/// A command. The first three fields are known when the request arrives; the
+/// rest exist only once the command has actually run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDetail {
     /// The command line, exactly as it was rendered for approval.
@@ -246,15 +313,15 @@ pub enum PromptEnd {
     Died,
 }
 
-/// A `swap_file` request. `path` and `root` are known when the request
-/// arrives; the rest describe the file as it ended up.
+/// A file write. `path` and `root` are known when the request arrives; the
+/// rest describe the file as it ended up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapDetail {
     /// The file that was to be replaced.
     pub path: String,
     /// Whether the write was requested as root.
     pub root: bool,
-    /// Which of `swap_file`'s two forms the request arrived in.
+    /// Which of the two forms of a write the request arrived in.
     ///
     /// Not a fact about the change — a patch is applied before anybody is
     /// asked, so the bytes, the plan and the diff on screen are the same
@@ -280,7 +347,7 @@ pub struct SwapDetail {
     pub bytes: Option<u64>,
 }
 
-/// How a `swap_file` request said what the file should contain.
+/// How a write said what the file should contain.
 ///
 /// Written on every record rather than only when it is news, because the JSON
 /// is what a later reader parses and a missing key there is a question rather
@@ -405,7 +472,7 @@ impl AuditRecord {
     /// operation itself.
     fn summary(&self) -> String {
         let mut line = format!(
-            "{}  {:<5}{:<16}  {}  |  {}",
+            "{}  {:<5}{:<16}  {}  |  {}{}",
             self.ts.format("%Y-%m-%d %H:%M:%S"),
             // A column of its own, left empty rather than skipped for a
             // refusal that never got a number: the verdicts below it stay in
@@ -416,12 +483,36 @@ impl AuditRecord {
             },
             self.verdict,
             visible(&self.title),
+            self.position(),
             self.detail.summary()
         );
         if let Some(note) = &self.note {
             line.push_str(&format!("  |  note: {}", visible(note)));
         }
         line
+    }
+
+    /// Where this line's operation sits in its request, when it has company.
+    ///
+    /// Empty for a request of one operation, which is every request today and
+    /// most requests afterwards: the JSON says `1` of `1` because a parser
+    /// wants an answer, and the line a person reads says nothing because a
+    /// note on every line is read by nobody. A line that is one of several
+    /// says which, and says the policy the several ran under, because that is
+    /// what explains a `not_attempted` two lines further down.
+    fn position(&self) -> String {
+        if self.operations <= 1 {
+            return String::new();
+        }
+        format!(
+            "[{} of {}, {}]  ",
+            self.operation,
+            self.operations,
+            match self.stop_on_failure {
+                true => "stopping at a failure",
+                false => "running on past a failure",
+            }
+        )
     }
 }
 
@@ -514,6 +605,9 @@ mod tests {
             number: Some(47),
             title: "Fix DNS resolution".to_string(),
             reason: "resolved is stale after the netctl change".to_string(),
+            operation: 1,
+            operations: 1,
+            stop_on_failure: false,
             verdict,
             note: None,
             detail: LogDetail::RunCommand(RunDetail {
@@ -604,6 +698,9 @@ mod tests {
             number: Some(2),
             title: "Add staging host".to_string(),
             reason: "the deploy target moved".to_string(),
+            operation: 1,
+            operations: 1,
+            stop_on_failure: false,
             verdict: LogVerdict::Deny,
             note: Some("wrong IP, it's .12 not .21".to_string()),
             detail: LogDetail::SwapFile(SwapDetail {
@@ -670,11 +767,80 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_name_is_written_on_every_record() {
+    fn the_kind_of_operation_is_written_on_every_record() {
         let run = serde_json::to_string(&sample_record(LogVerdict::Approve)).unwrap();
-        assert!(run.contains("\"tool\":\"run_command\""), "{run}");
+        assert!(run.contains("\"tool\":\"command\""), "{run}");
         let swap = serde_json::to_string(&swap_record()).unwrap();
-        assert!(swap.contains("\"tool\":\"swap_file\""), "{swap}");
+        assert!(swap.contains("\"tool\":\"write\""), "{swap}");
+    }
+
+    #[test]
+    fn a_line_written_under_the_old_tool_names_still_reads_as_what_it_recorded() {
+        // The user's log already holds months of `run_command` and
+        // `swap_file` lines, and `swap_file` names a tool that no longer
+        // exists. `hatch log` must go on reading them as the command and the
+        // write they were -- not as lines it cannot parse and prints raw, and
+        // not as lines from a request of zero operations.
+        let run = r#"{"ts":"2026-09-06T12:00:00+02:00","title":"t","reason":"r",
+            "verdict":"approve","tool":"run_command","command":"true","root":false,"cwd":"/"}"#;
+        let swap = r#"{"ts":"2026-09-06T12:00:00+02:00","title":"t","reason":"r",
+            "verdict":"approve","tool":"swap_file","path":"/etc/hosts","root":true}"#;
+
+        let run: AuditRecord = serde_json::from_str(run).expect("an old command line parses");
+        let LogDetail::RunCommand(detail) = &run.detail else { panic!("not a command") };
+        assert_eq!(detail.command, "true");
+        let swap: AuditRecord = serde_json::from_str(swap).expect("an old write line parses");
+        let LogDetail::SwapFile(detail) = &swap.detail else { panic!("not a write") };
+        assert_eq!(detail.path, "/etc/hosts");
+
+        for old in [&run, &swap] {
+            assert_eq!((old.operation, old.operations), (1, 1), "an old line is the first of one");
+            assert!(!old.stop_on_failure, "{old:?}");
+            assert!(!old.summary().contains(" of "), "an old line was placed in a batch");
+        }
+    }
+
+    #[test]
+    fn every_line_of_a_batch_says_where_it_sits_and_under_which_policy() {
+        // The JSON says it on every line, a request of one included, because
+        // that is what gets parsed. The line a person reads says it only when
+        // there is company: `1 of 1` on every line is read by nobody.
+        let alone = sample_record(LogVerdict::Approve);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&alone).unwrap()).unwrap();
+        assert_eq!(json["operation"], 1);
+        assert_eq!(json["operations"], 1);
+        assert_eq!(json["stop_on_failure"], false);
+        assert!(!alone.summary().contains("of 1"), "{}", alone.summary());
+
+        for (stop_on_failure, policy) in
+            [(true, "stopping at a failure"), (false, "running on past a failure")]
+        {
+            let mut second = swap_record();
+            second.operation = 2;
+            second.operations = 3;
+            second.stop_on_failure = stop_on_failure;
+            second.verdict = LogVerdict::NotAttempted;
+            let json: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&second).unwrap()).unwrap();
+            assert_eq!(json["operation"], 2);
+            assert_eq!(json["operations"], 3);
+            assert_eq!(json["stop_on_failure"], stop_on_failure);
+            assert_eq!(json["verdict"], "not_attempted");
+
+            let line = second.summary();
+            assert!(line.contains("[2 of 3, "), "{line}");
+            assert!(line.contains(policy), "{line}");
+            // And the effect is still on the line with its own path, which
+            // is what a search for the file finds.
+            assert!(line.contains("/etc/hosts"), "{line}");
+            assert_eq!(
+                serde_json::from_str::<AuditRecord>(&serde_json::to_string(&second).unwrap())
+                    .unwrap(),
+                second,
+                "a line of a batch did not survive the file"
+            );
+        }
     }
 
     #[test]
@@ -863,6 +1029,9 @@ mod tests {
             number: Some(3),
             title: "Add staging host".to_string(),
             reason: "the deploy target moved".to_string(),
+            operation: 1,
+            operations: 1,
+            stop_on_failure: false,
             verdict: LogVerdict::Approve,
             note: None,
             detail: LogDetail::SwapFile(SwapDetail {
