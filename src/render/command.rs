@@ -391,7 +391,7 @@
 //! scanner is wrong about a quote, the highlight is wrong in the same
 //! direction, and `highlighting_where_the_model_stops` pins those cases.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
 use super::{SpanBuilder, SpanKind, Spans, unicode, variable_name};
@@ -825,7 +825,12 @@ struct Scan<'a> {
     /// The here-documents opened on this line whose bodies have not started
     /// yet, in the order their operators appeared. `cat <<A <<B` queues two
     /// and the next newline starts the first of them.
-    pending: Vec<HereDoc>,
+    ///
+    /// A queue rather than a `Vec`, because both ends are used and the command
+    /// is the agent's: `cat <<A` twenty thousand times over is a line an agent
+    /// can write, and taking the front of a vector that long once per body
+    /// would be quadratic in a number it chose.
+    pending: VecDeque<HereDoc>,
     /// Which part of a here-document the character at the cursor is in.
     here: Option<Here>,
     /// The here-document `here` belongs to, kept because every line of a body
@@ -845,7 +850,7 @@ fn scan(command: &str) -> Scan<'_> {
         word_start: true,
         redirecting: Redirecting::No,
         opening: None,
-        pending: Vec::new(),
+        pending: VecDeque::new(),
         here: None,
         active: None,
     }
@@ -1098,7 +1103,7 @@ impl Scan<'_> {
         let Some(opening) = self.opening.take() else { return };
         let Some(start) = opening.word else { return };
         let (delimiter, expands) = delimiter_of(&self.command[start..end]);
-        self.pending.push(HereDoc { delimiter, strip_tabs: opening.strip_tabs, expands });
+        self.pending.push_back(HereDoc { delimiter, strip_tabs: opening.strip_tabs, expands });
     }
 
     /// Start the next queued here-document's data at the cursor, if there is
@@ -1108,11 +1113,9 @@ impl Scan<'_> {
     /// of its callers, so "at the cursor" is the first character of the line
     /// the data begins on.
     fn open_here(&mut self) {
-        if self.pending.is_empty() {
-            return;
+        if let Some(doc) = self.pending.pop_front() {
+            self.enter(doc);
         }
-        let doc = self.pending.remove(0);
-        self.enter(doc);
     }
 
     /// Enter `doc`'s data at the cursor: its terminating line when the line
@@ -5007,6 +5010,30 @@ mod tests {
         }
         let spans = render_command("cat <<EOF\n\u{202E}gnp.exe\nEOF");
         assert_eq!(chips(&spans), vec!['\n', '\u{202E}', '\n'], "a body still chips");
+    }
+
+    #[test]
+    fn a_command_of_many_here_documents_is_read_in_one_walk() {
+        // The input is the agent's, and a line of twenty thousand `<<A`s with
+        // twenty thousand bodies under it is a line an agent can write. Every
+        // walk here moves forward only: the queue is taken from the front, and
+        // each line is compared against its delimiter once, at the newline in
+        // front of it. The counts are asserted so that a walk which gave up
+        // early would not pass for a fast one.
+        let count = 2_000;
+        let command = format!(
+            "cat{}\n{}",
+            " <<A".repeat(count),
+            "body\nA\n".repeat(count)
+        );
+        let spans = render_command(&command);
+        assert_eq!(commands(&spans), vec!["cat"]);
+        assert_eq!(
+            redirects(&spans).len(),
+            count * 3,
+            "an operator, the word it points at, and the line the body ends on, each time"
+        );
+        assert_eq!(unrender(&spans), command);
     }
 
     #[test]
