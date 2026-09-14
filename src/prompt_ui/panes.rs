@@ -3264,6 +3264,8 @@ mod tests {
         assert_eq!(countdown_text(135), "2 min 15 s left to decide");
         assert_eq!(countdown_text(3599), "59 min 59 s left to decide");
         assert_eq!(countdown_text(3600), "over an hour left to decide");
+        assert_eq!(review_countdown_text(135), "2 min 15 s left to review");
+        assert_eq!(review_countdown_text(0), "no time left");
         // Three years, which is what an absurd deadline looks like. A window
         // that answered with a seven-digit minute count would be a window
         // reporting nonsense with a straight face.

@@ -7876,4 +7876,306 @@ mod tests {
         let (_, plain) = read_noticing(&format!("{finished}\n"));
         assert!(plain.iter().any(|n| n.final_frame), "an ordinary ending stopped being noticed");
     }
+
+    // ---- the review box, and the screen it leads to ------------------------
+
+    /// Where a string is drawn on a settled frame of `app`, if it is.
+    fn drawn_at(app: &mut PromptApp, ctx: &egui::Context, text: &str, at: Instant) -> Option<egui::Rect> {
+        let shapes = a_settled_frame(app, ctx, at);
+        text_rects(&shapes).into_iter().find(|(drawn, _)| drawn == text).map(|(_, rect)| rect)
+    }
+
+    /// Press and release the pointer at `place`, one frame for each half.
+    fn click_at(app: &mut PromptApp, ctx: &egui::Context, place: egui::Pos2, at: Instant) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: place,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        a_live_frame(app, ctx, vec![egui::Event::PointerMoved(place)], at);
+        a_live_frame(app, ctx, vec![button(true)], at);
+        a_live_frame(app, ctx, vec![button(false)], at);
+    }
+
+    /// A command window, remembering `prefs`, with its review box clicked on
+    /// a real frame.
+    fn a_window_whose_review_box_was_clicked(
+        prefs: PrefsFile,
+    ) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (mut app, sink) = an_awaiting_window_remembering(prefs);
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let label = drawn_at(&mut app, &ctx, REVIEW_LABEL, now).expect("the review box is not drawn");
+        click_at(&mut app, &ctx, label.center(), now);
+        (app, sink)
+    }
+
+    #[test]
+    fn a_command_window_offers_to_show_the_output_first_and_a_write_window_does_not() {
+        for size in [opening_size(), egui::vec2(520.0, 700.0)] {
+            let (mut command, _sink) = an_awaiting_window();
+            let drawn = window_text_sized(&mut command, size);
+            assert!(drawn.contains(REVIEW_LABEL), "a {size:?} command window has no review box: {drawn}");
+            let drawn = window_text_sized(&mut a_write_window(), size);
+            assert!(!drawn.contains(REVIEW_LABEL), "a {size:?} write window offers to review a file: {drawn}");
+        }
+    }
+
+    #[test]
+    fn the_review_box_fits_beside_the_terminal_box_at_the_size_the_window_opens_at() {
+        // It costs no row of its own where there is room, which is the size
+        // most windows are read at; the panes keep what they had.
+        let (mut app, _sink) = an_awaiting_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let review = drawn_at(&mut app, &ctx, REVIEW_LABEL, now).expect("drawn");
+        let terminal = drawn_at(&mut app, &ctx, TERMINAL_LABEL, now).expect("drawn");
+        assert!((review.center().y - terminal.center().y).abs() < 2.0, "{review:?} {terminal:?}");
+        assert!(review.right() <= opening_size().x, "the box runs off the window: {review:?}");
+    }
+
+    #[test]
+    fn ticking_the_review_box_is_remembered_by_nothing() {
+        // The one box on the window that is not a preference: it is about
+        // this command. Clicked on a real frame, it asks for a review, and
+        // neither the file nor the next window knows it ever did.
+        let (_root, paths) = a_prefs_file();
+        let stored = Prefs { close_on_decide: false, stream: true, terminal: false };
+        PrefsFile::at(&paths).write(&stored);
+        let (app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
+
+        assert!(app.reviews(), "the click did not reach the box");
+        assert!(matches!(app.approval(), Verdict::Approve { review: true, .. }), "{:?}", app.approval());
+        assert_eq!(PrefsFile::at(&paths).read(), stored, "a review was written down as a preference");
+
+        let (next, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        assert!(!next.reviews(), "the next window opened already reviewing");
+    }
+
+    #[test]
+    fn reviewing_beats_a_standing_order_to_close_and_the_greyed_box_says_why() {
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { close_on_decide: true, ..Prefs::default() });
+        let (mut app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
+
+        assert!(!app.closes_on_decide(), "it would have closed over the question it was asked to ask");
+        assert!(app.close_on_decide, "the standing preference was overwritten rather than beaten");
+        assert!(
+            matches!(app.approval(), Verdict::Approve { closing: false, review: true, .. }),
+            "{:?}",
+            app.approval()
+        );
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(CLOSE_REVIEWING), "the window ignored one of the two in silence: {said}");
+
+        // And Alt+C cannot tick it past the review.
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::C, egui::Modifiers::ALT)], past_the_guard());
+        assert!(!app.closes_on_decide());
+        assert!(PrefsFile::at(&paths).read().close_on_decide, "the refused chord rewrote the file");
+
+        app.review = false;
+        assert!(app.closes_on_decide(), "unticking the review did not give the preference back");
+    }
+
+    #[test]
+    fn a_run_under_review_says_its_output_is_held_and_offers_nothing_to_keep() {
+        let (mut app, _sink) = an_awaiting_window();
+        app.review = true;
+        app.stream = true;
+        app.state.decide(app.approval());
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(!drawn.contains("Keep this window"), "{drawn}");
+
+        let (mut quiet, _sink) = an_awaiting_window();
+        quiet.review = true;
+        quiet.state.decide(quiet.approval());
+        let drawn = window_text_sized(&mut quiet, opening_size());
+        assert!(drawn.contains("you will see it before it is sent"), "{drawn}");
+    }
+
+    /// A window on the review screen, with the daemon's review delivered the
+    /// way a real one is: down the channel, through `take_arrivals`.
+    fn a_reviewing_window_of(review: Review) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app =
+            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()), PrefsFile::none());
+        // Opened a minute ago, so its first guard has long been open: the
+        // review arrives at a window somebody already answered, which is
+        // the only kind it ever arrives at.
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).expect("a minute of uptime");
+        app.guard = Guard::new(long_ago);
+        tx.send(Incoming::Frame(DaemonMsg::Request(Box::new(a_request(90))))).unwrap();
+        app.take_arrivals();
+        app.review = true;
+        let frame = app.state.decide(app.approval());
+        answer(&mut app.out, &mut app.state, frame);
+        tx.send(Incoming::Frame(DaemonMsg::Review(review))).unwrap();
+        tx.send(Incoming::Frame(DaemonMsg::Finished(Outcome::Exit { code: 0 }))).unwrap();
+        app.take_arrivals();
+        assert_eq!(app.state.phase(), Phase::Reviewing);
+        sink.lock().unwrap().clear();
+        (app, sink)
+    }
+
+    fn a_reviewing_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        a_reviewing_window_of(a_review())
+    }
+
+    /// What the window wrote back, as the one frame it should be.
+    fn the_release(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Option<Release> {
+        let out = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        let mut lines = out.lines();
+        let first = lines.next()?;
+        assert!(lines.next().is_none(), "more than one frame went out: {out}");
+        match protocol::read_message::<PromptMsg>(first).expect("a frame") {
+            PromptMsg::Release(release) => Some(release),
+            other => panic!("not a release: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_review_screen_draws_each_pipe_apart_and_says_how_much_of_each_will_go() {
+        let (mut app, _sink) = a_reviewing_window();
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(drawn.contains(reviewing::NOTHING_SENT_YET), "{drawn}");
+        assert!(drawn.contains("stdout — 3 of 3 lines will be sent"), "{drawn}");
+        assert!(drawn.contains("stderr — 1 of 1 lines will be sent"), "{drawn}");
+        assert!(drawn.contains("token=hunter2") && drawn.contains("warning: slow"), "{drawn}");
+        assert!(drawn.contains("left to review"), "{drawn}");
+        assert!(drawn.contains(reviewing::EXPIRY), "what the clock ends in is not said: {drawn}");
+        assert!(drawn.contains(reviewing::SEND_LABEL) && drawn.contains(reviewing::WITHHOLD_LABEL));
+        // The question it asked before is over, and its buttons with it.
+        assert!(!drawn.contains("Approve") && !drawn.contains("left to decide"), "{drawn}");
+    }
+
+    #[test]
+    fn a_filter_typed_on_the_screen_changes_what_is_drawn_before_anything_is_sent() {
+        let (mut app, sink) = a_reviewing_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let label = drawn_at(&mut app, &ctx, reviewing::DROP_LABEL, now).expect("the drop filter is not drawn");
+        click_at(&mut app, &ctx, egui::pos2(label.right() + 60.0, label.center().y), now);
+        a_live_frame(&mut app, &ctx, vec![egui::Event::Text("token".to_string())], now);
+
+        let shapes = a_settled_frame(&mut app, &ctx, now);
+        let drawn: String = text_rects(&shapes).into_iter().map(|(text, _)| text + "\n").collect();
+        assert!(!drawn.contains("hunter2"), "the line the filter drops is still on screen: {drawn}");
+        assert!(drawn.contains("stdout — 2 of 3 lines will be sent"), "{drawn}");
+        assert!(sink.lock().unwrap().is_empty(), "typing a filter sent something");
+
+        // And what goes is what was drawn.
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], now);
+        let Some(Release::Send { output, kept }) = the_release(&sink) else {
+            panic!("the chord did not send");
+        };
+        let crate::review::Sections::Streams { stdout, stderr } = output else { panic!() };
+        assert_eq!(stdout, "ok: one\nok: two\n");
+        assert_eq!(stderr, "warning: slow\n", "a filter that matched nothing on stderr took something");
+        assert!(kept.is_empty());
+        assert!(app.state.should_close(), "the window stayed after answering");
+    }
+
+    #[test]
+    fn the_send_button_sends_and_escape_sends_nothing() {
+        let (mut app, sink) = a_reviewing_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let send = drawn_at(&mut app, &ctx, reviewing::SEND_LABEL, now).expect("Send is not drawn");
+        click_at(&mut app, &ctx, send.center(), now);
+        assert!(
+            matches!(the_release(&sink), Some(Release::Send { .. })),
+            "the button did not send"
+        );
+
+        let (mut app, sink) = a_reviewing_window();
+        a_settled_frame(&mut app, &ctx, now);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Escape, egui::Modifiers::NONE)], now);
+        assert_eq!(the_release(&sink), Some(Release::Withhold));
+    }
+
+    #[test]
+    fn the_typing_guard_starts_again_when_the_review_appears() {
+        // The review appears whenever the command finishes, and whoever is
+        // at the keyboard may be typing somewhere else by then. A chord in
+        // flight at that moment must not send the output.
+        let (mut app, sink) = a_reviewing_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let just_now = Instant::now();
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], just_now);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Escape, egui::Modifiers::NONE)], just_now);
+        assert!(sink.lock().unwrap().is_empty(), "a keystroke in flight answered the review");
+        assert_eq!(app.state.phase(), Phase::Reviewing);
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], past_the_guard());
+        assert!(the_release(&sink).is_some(), "the guard never opened again");
+    }
+
+    #[test]
+    fn a_character_that_would_hide_or_reorder_output_is_drawn_by_name() {
+        let mut review = a_review();
+        review.output = crate::review::Sections::Streams {
+            stdout: crate::review::Captured {
+                text: "pass\u{200B}word=1\nname\u{202E}txt\n".to_string(),
+                truncated: true,
+            },
+            stderr: crate::review::Captured { text: String::new(), truncated: false },
+        };
+        let (mut app, _sink) = a_reviewing_window_of(review);
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(drawn.contains("pass[ZWSP]word=1"), "{drawn}");
+        assert!(drawn.contains("name[RLO]txt"), "{drawn}");
+        assert!(!drawn.contains('\u{202E}') && !drawn.contains('\u{200B}'), "{drawn}");
+        assert!(drawn.contains("output cap cut it short"), "a cut capture read as the whole: {drawn}");
+        assert!(drawn.contains("It printed nothing here."), "{drawn}");
+    }
+
+    #[test]
+    fn a_filter_the_matcher_refuses_leaves_nothing_to_send_and_says_so() {
+        let (mut app, sink) = a_reviewing_window();
+        app.draft.field(reviewing::Filter::Drop).push_str(&"é".repeat(crate::review::MAX_PATTERN_BYTES));
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains(reviewing::PATTERN_REFUSED), "{drawn}");
+
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], past_the_guard());
+        assert!(sink.lock().unwrap().is_empty(), "something was sent past a refused filter");
+        assert_eq!(app.state.phase(), Phase::Reviewing);
+    }
+
+    #[test]
+    fn an_edit_made_on_the_screen_is_what_is_sent() {
+        let (mut app, sink) = a_reviewing_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let edit = drawn_at(&mut app, &ctx, reviewing::EDIT_LABEL, now).expect("no way to edit");
+        click_at(&mut app, &ctx, edit.center(), now);
+        assert!(app.draft.editing(), "the button did not start an edit");
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains(reviewing::UNEDIT_LABEL) && drawn.contains("edited by hand"), "{drawn}");
+
+        let text = app.draft.edited(crate::review::Section::Stdout).expect("stdout is editable");
+        *text = text.replace("hunter2", "[gone]");
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], now);
+        let Some(Release::Send { output, .. }) = the_release(&sink) else { panic!("nothing sent") };
+        let crate::review::Sections::Streams { stdout, .. } = output else { panic!() };
+        assert_eq!(stdout, "ok: one\ntoken=[gone]\nok: two\n");
+    }
 }

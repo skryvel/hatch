@@ -688,6 +688,28 @@ mod tests {
     }
 
     #[test]
+    fn a_second_question_shuts_the_guard_again_on_both_clocks() {
+        let clock = Clock::new();
+        let enter = press(Key::Enter, Modifiers::CTRL);
+
+        // Focused: open long ago, shut again for the guard from the moment
+        // the question changed.
+        let mut focused = Guard::new(clock.at(0));
+        assert_eq!(asking(&focused, &enter, Modifiers::CTRL, clock.at(60_000)), Action::Approve);
+        focused.question_changed(clock.at(60_000));
+        assert_eq!(asking(&focused, &enter, Modifiers::CTRL, clock.at(60_749)), Action::Ignored);
+        assert_eq!(asking(&focused, &enter, Modifiers::CTRL, clock.at(60_751)), Action::Approve);
+
+        // Unfocused: the grace counts from the change, not from a creation
+        // whose grace was spent a minute ago.
+        let mut unfocused = Guard::new(clock.at(0));
+        unfocused.focus_lost(clock.at(1));
+        unfocused.question_changed(clock.at(60_000));
+        assert_eq!(asking(&unfocused, &enter, Modifiers::CTRL, clock.at(62_999)), Action::Ignored);
+        assert_eq!(asking(&unfocused, &enter, Modifiers::CTRL, clock.at(63_001)), Action::Approve);
+    }
+
+    #[test]
     fn input_is_accepted_after_the_guard_expires() {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));

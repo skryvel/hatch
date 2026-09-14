@@ -221,7 +221,7 @@ impl Draft {
     }
 
     /// The text being edited, one section of it, while editing.
-    fn edit_of(&mut self, section: Section) -> Option<&mut String> {
+    pub fn edited(&mut self, section: Section) -> Option<&mut String> {
         match (self.edits.as_mut()?, section) {
             (Sections::Streams { stdout, .. }, Section::Stdout) => Some(stdout),
             (Sections::Streams { stderr, .. }, Section::Stderr) => Some(stderr),
@@ -387,7 +387,7 @@ impl PromptApp {
             let scroll = egui::ScrollArea::both()
                 .id_salt(("hatch-review", name))
                 .auto_shrink([false, false]);
-            if let Some(text) = self.draft.edit_of(section) {
+            if let Some(text) = self.draft.edited(section) {
                 let hidden = scan(text).invisible;
                 scroll.show(ui, |ui| {
                     ui.add(
@@ -519,5 +519,98 @@ impl PromptApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output() -> Sections<Captured> {
+        Sections::Streams {
+            stdout: Captured { text: "ok: one\ntoken=hunter2\nerror: two\n".to_string(), truncated: false },
+            stderr: Captured { text: "error: on stderr\n".to_string(), truncated: false },
+        }
+    }
+
+    fn stdout_of(sections: &Sections<String>) -> &str {
+        match sections {
+            Sections::Streams { stdout, .. } => stdout,
+            Sections::Transcript { transcript } => transcript,
+        }
+    }
+
+    #[test]
+    fn an_untouched_draft_sends_the_output_as_it_was_captured() {
+        let draft = Draft::default();
+        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+            panic!("an untouched draft could not be sent");
+        };
+        assert_eq!(sent, output().map(|_, captured| captured.text.clone()));
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn what_is_being_typed_counts_before_it_is_added() {
+        // The result on the screen follows the field, not a button: a filter
+        // the reader can see and that did nothing until confirmed would be a
+        // screen showing a result other than the one Send sends.
+        let mut draft = Draft::default();
+        draft.field(Filter::Drop).push_str("TOKEN");
+        let result = draft.result(&output()).unwrap();
+        assert_eq!(stdout_of(&result), "ok: one\nerror: two\n");
+
+        draft.add(Filter::Drop);
+        assert!(draft.field(Filter::Drop).is_empty());
+        assert_eq!(draft.added(Filter::Drop), ["TOKEN".to_string()]);
+        assert_eq!(draft.result(&output()).unwrap(), result, "adding it changed what goes");
+
+        draft.remove(Filter::Drop, 0);
+        assert!(stdout_of(&draft.result(&output()).unwrap()).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_keep_pattern_goes_with_the_answer_and_a_drop_pattern_never_does() {
+        let mut draft = Draft::default();
+        draft.field(Filter::Keep).push_str("error");
+        draft.add(Filter::Keep);
+        draft.field(Filter::Drop).push_str("on std");
+        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+            panic!("no answer");
+        };
+        assert_eq!(kept, ["error".to_string()]);
+        assert_eq!(stdout_of(&sent), "error: two\n");
+        let Sections::Streams { stderr, .. } = &sent else { panic!() };
+        assert!(stderr.is_empty(), "the drop filter did not reach stderr");
+        let encoded = crate::protocol::encode(&Release::Send { output: sent.clone(), kept }).unwrap();
+        assert!(!encoded.contains("on std"), "the drop pattern rode along: {encoded}");
+    }
+
+    #[test]
+    fn editing_starts_from_the_filtered_result_and_the_filters_stop_until_it_is_undone() {
+        let mut draft = Draft::default();
+        draft.field(Filter::Drop).push_str("ok:");
+        draft.start_editing(&output());
+        assert!(draft.editing());
+        let text = draft.edited(Section::Stdout).expect("stdout is being edited");
+        assert_eq!(text, "token=hunter2\nerror: two\n", "editing did not start from the filtered text");
+        *text = text.replace("hunter2", "…");
+
+        // A filter typed while editing changes nothing that goes.
+        draft.field(Filter::Keep).push_str("nothing matches this");
+        assert_eq!(stdout_of(&draft.result(&output()).unwrap()), "token=…\nerror: two\n");
+
+        draft.stop_editing();
+        assert!(!draft.editing());
+        assert_eq!(draft.result(&output()).unwrap().iter().map(|(_, t)| t.len()).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn a_refused_filter_leaves_nothing_to_send_rather_than_something_else() {
+        let mut draft = Draft::default();
+        draft.field(Filter::Drop).push_str(&"é".repeat(review::MAX_PATTERN_BYTES));
+        assert_eq!(draft.release(&output()), None);
+        draft.start_editing(&output());
+        assert!(!draft.editing(), "an edit started from a result that does not exist");
     }
 }
