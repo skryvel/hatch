@@ -103,6 +103,7 @@
 
 pub mod guard;
 pub mod panes;
+pub mod reviewing;
 pub mod theme;
 pub mod visibility;
 
@@ -313,6 +314,13 @@ const CLOSE_LABEL: &str = "Close when I decide";
 /// which is what the other sentence is about.
 const CLOSE_COST: &str = "The Kill button goes with it.";
 
+/// The label on the control that holds the output back for the reader.
+///
+/// Said as what it does for the person ticking it, in the words they would
+/// use for it, rather than as a mode: the question it answers is "will I see
+/// this before the agent does?".
+const REVIEW_LABEL: &str = "Show me the output before it is sent";
+
 /// Why the control is dead on a run the reader asked to watch.
 ///
 /// Ticking Stream wins, and this is the window saying which of two
@@ -344,6 +352,18 @@ const CLOSE_WATCHING: &str = "You asked to watch this one.";
 /// Shorter than [`CLOSE_WATCHING`] on purpose, so that [`PromptApp::close_width`]
 /// is unchanged and a third sentence cannot move the two buttons that decide.
 const CLOSE_WATCHING_ALWAYS: &str = "You stream every run.";
+
+/// Why the close box is dead on a run whose output the reader asked to see
+/// first.
+///
+/// Reviewing wins, the way streaming does and for a stronger reason: a
+/// window that has gone cannot show the output, and the output then goes
+/// nowhere at all rather than to the reader, so the tick would not merely lose
+/// a view — it would lose the output. Only one sentence, where streaming has
+/// two, because the box it is about is never remembered: whoever ticked it did
+/// so in front of this command. Measured with the others in
+/// [`PromptApp::close_width`], so that ticking it cannot move the buttons.
+const CLOSE_REVIEWING: &str = "You asked to see its output first.";
 
 /// What the running window says once the reader has kept it.
 ///
@@ -1533,6 +1553,34 @@ pub(crate) struct PromptApp {
     /// two that is a standing decision about execution rather than about the
     /// view. [`crate::prefs::Prefs`] is where the difference is set out.
     terminal: bool,
+    /// The Show me the output before it is sent checkbox.
+    ///
+    /// # Why this one is not remembered
+    ///
+    /// Its three neighbours are written to `prefs.toml` the moment they are
+    /// clicked, and this one never is, and it opens unticked in every window.
+    /// Two reasons, and either would be enough.
+    ///
+    /// **It is a choice about the command on the screen.** The other three
+    /// are standing preferences about how a person likes their windows — watch
+    /// the output, get out of the way, give things a terminal — and they are
+    /// right for the next command as often as for this one. Whether this
+    /// command's output might carry something that must not leave the machine
+    /// is a judgement about this command, made reading it: `cat` on a file
+    /// with a key in it, and not `ls` on the directory it is in.
+    ///
+    /// **Reviewing puts a person back in the return path.** Every reviewed
+    /// run waits for a second answer before the agent hears anything, up to
+    /// the approval's own ten minutes. Remembered, one tick on one sensitive
+    /// command would turn every later approval into two decisions and every
+    /// later call into one that blocks for however long the reader takes to
+    /// get back to it; the fast path would stop being fast for a reason
+    /// nobody could see on the screen. So it costs one click, each time, on
+    /// the command it is for.
+    review: bool,
+    /// What the reader has done to the output under review, once there is
+    /// one. See [`reviewing::Draft`].
+    draft: reviewing::Draft,
     /// What the user is telling the agent, for every verdict but Approve.
     note: String,
     /// The one thing between a keystroke meant for another window and an
@@ -1580,6 +1628,8 @@ impl PromptApp {
             close_on_decide: remembered.close_on_decide,
             prefs,
             terminal: remembered.terminal,
+            review: false,
+            draft: reviewing::Draft::default(),
             note: String::new(),
             guard: Guard::new(Instant::now()),
             guard_open: false,
@@ -1614,8 +1664,17 @@ impl PromptApp {
     /// frame would have put it in. The tests that drive this window without
     /// a display want that, and so does the preview's own -- both of which
     /// exist precisely so that the window under test is this one.
+    ///
+    /// It is also where the typing guard is told a second question has
+    /// appeared, because this is where a window learns it has one: the review
+    /// arrives on the channel, not from anything the reader did. See
+    /// [`Guard::question_changed`].
     pub(crate) fn take_arrivals(&mut self) {
+        let was_reviewing = self.state.phase() == Phase::Reviewing;
         drain(&mut self.state, &self.inbox);
+        if !was_reviewing && self.state.phase() == Phase::Reviewing {
+            self.guard.question_changed(Instant::now());
+        }
     }
 
     /// Whether the typing guard was open when this frame's input was judged.
@@ -1679,7 +1738,7 @@ impl PromptApp {
             stream: self.streams(),
             terminal: self.in_a_terminal(),
             closing: self.closes_on_decide(),
-            review: false,
+            review: self.reviews(),
             note: self.note.clone(),
         }
     }
@@ -1715,8 +1774,24 @@ impl PromptApp {
     ///
     /// The stored answer is untouched, so the next command window opens with
     /// the box as the reader left it. See [`PromptApp::runs`].
+    ///
+    /// # Not on a run whose output the reader will review
+    ///
+    /// For [`CLOSE_REVIEWING`]'s reason, which is stronger than streaming's: a
+    /// window that has gone cannot ask, and a review nobody can answer sends
+    /// nothing, so the tick would cost the agent the whole output.
     fn closes_on_decide(&self) -> bool {
-        self.close_on_decide && !self.streams() && self.runs()
+        self.close_on_decide && !self.streams() && !self.reviews() && self.runs()
+    }
+
+    /// Whether approving this window will hold the output back until its
+    /// reader has seen it.
+    ///
+    /// The box, on a payload that has output at all. A write prints nothing,
+    /// and the box is not drawn on a write window any more than the stream box
+    /// is; it is also never ticked there, because nothing remembers it.
+    fn reviews(&self) -> bool {
+        self.review && self.runs()
     }
 
     /// Whether approving this window leaves a run behind it, which is the
@@ -1934,7 +2009,14 @@ impl PromptApp {
         egui::Panel::bottom("hatch-controls").show(ui, |ui| self.controls(ui, guard_open));
 
         let viewing = matches!(self.state.drawn_phase(), Phase::Lingering | Phase::Detached);
+        let reviewing = self.state.drawn_phase() == Phase::Reviewing;
         egui::CentralPanel::default().show(ui, |ui| {
+            // The command is not what the reader is deciding about any more;
+            // its output is, and the output takes the room.
+            if reviewing {
+                self.reviewer(ui, &title);
+                return;
+            }
             if viewing && self.runs() {
                 // The question has been answered and the command has run, so
                 // the two panes arguing about what the command says are of no
@@ -2040,6 +2122,23 @@ impl PromptApp {
     /// while the window awaits a verdict, and it leaves that phase on the way
     /// out.
     pub(crate) fn act(&mut self, ctx: &egui::Context, action: Action) {
+        // A window asking what of the output to send. The approve chord
+        // sends what is on the screen and Escape sends none of it, which are
+        // the two answers the verdict's keys give in the verdict's phase; the
+        // rest mean nothing here. Before everything below, because this phase
+        // is neither a viewer nor the approval.
+        if self.state.phase() == Phase::Reviewing {
+            match action {
+                Action::Approve => self.send_review(),
+                Action::Deny => self.withhold_review(),
+                Action::Toggle(_)
+                | Action::Keep
+                | Action::Copy
+                | Action::Ignored
+                | Action::Passthrough => {}
+            }
+            return;
+        }
         // A window that is only showing a result has nothing to decide, so
         // the keys mean the three things that are left: keep it, take what is
         // on it, or put it away. Enter still means nothing at all, and
@@ -2136,7 +2235,7 @@ impl PromptApp {
                     false => self.refused = Some((toggle, Instant::now())),
                 }
             }
-            guard::Toggle::Close => match self.runs() && !self.streams() {
+            guard::Toggle::Close => match self.runs() && !self.streams() && !self.reviews() {
                 true => self.set_close_on_decide(!self.closes_on_decide()),
                 // Dead, or never drawn. Either way nothing is written down.
                 false => self.refused = Some((toggle, Instant::now())),
@@ -2198,7 +2297,14 @@ impl PromptApp {
             // one that matters now is two numbers the reader has to tell
             // apart.
             Phase::Lingering | Phase::Detached => self.viewer_row(ui),
-            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Reviewing | Phase::Closed => {
+            // Drawn on the way out too, like the other phases, and inert
+            // then: the guard is reported shut, and both answers ask the real
+            // phase before they build anything.
+            Phase::Reviewing => {
+                let asking = self.state.phase() == Phase::Reviewing;
+                self.review_row(ui, guard_open && asking)
+            }
+            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => {
                 self.status_row(ui)
             }
         }
@@ -2440,6 +2546,13 @@ impl PromptApp {
                 });
         } else if self.in_a_terminal() {
             ui.label(egui::RichText::new("It is running in a terminal of its own.").small());
+        } else if self.state.reviewing() {
+            ui.label(
+                egui::RichText::new(
+                    "Its output is held until it finishes, and you will see it before it is sent.",
+                )
+                .small(),
+            );
         } else {
             ui.label(
                 egui::RichText::new("Its output is not being streamed to this window.").small(),
@@ -2457,7 +2570,9 @@ impl PromptApp {
         // wait for it. Only for a run they asked to watch -- see
         // [`PromptState::keep`] -- which is also the only kind that has
         // anything to show at the end.
-        let offer_keep = self.state.streaming();
+        // Not for a run under review, which ends in a question rather than a
+        // viewer: see `PromptState::keep`.
+        let offer_keep = self.state.streaming() && !self.state.reviewing();
         let kept = self.state.keeping();
         let mut keep = false;
         let width = cluster_width(ui);
@@ -2731,22 +2846,41 @@ impl PromptApp {
     /// withdraws, so for a request that already asked for a terminal there is
     /// nothing for it to decide — and the row still says what the terminal
     /// costs, because that is exactly the case where nobody chose it.
+    ///
+    /// # Why the review box is on this row
+    ///
+    /// Both boxes on it are about what reaches the agent, and the sentence
+    /// between them is the one that says what a terminal sends. A reader who
+    /// has just read that everything they type there goes to the agent is
+    /// looking at the one control that lets them see it first. It sits past
+    /// the sentence with the gap the verdict buttons keep, so the row reads as
+    /// two controls and not as one box with a second label.
+    ///
+    /// It takes no row of its own, which matters on a window read at 700
+    /// points high, and it goes under the rest when the row cannot hold it —
+    /// on the same terms as the sentence, and never off the end.
     fn terminal_row(&mut self, ui: &mut egui::Ui, asked_for: bool) {
         let quiet = ui.visuals().weak_text_color();
         let warn = ui.visuals().warn_fg_color;
         let mut ticked = self.in_a_terminal();
+        let checkbox = ui.spacing().icon_width + ui.spacing().icon_spacing;
         let width = text_width(ui, TERMINAL_LABEL, egui::TextStyle::Button)
-            + ui.spacing().icon_width
-            + ui.spacing().icon_spacing
+            + checkbox
             + text_width(ui, TERMINAL_CAPTURE, egui::TextStyle::Small)
             + match asked_for {
                 true => text_width(ui, TERMINAL_ASKED, egui::TextStyle::Small),
                 false => 0.0,
             }
-            + 3.0 * ui.spacing().item_spacing.x;
+            + PRIMARY_GAP
+            + checkbox
+            + text_width(ui, REVIEW_LABEL, egui::TextStyle::Button)
+            + 4.0 * ui.spacing().item_spacing.x;
 
         let mut changed = false;
-        let mut controls = |ui: &mut egui::Ui| {
+        let review = &mut self.review;
+        // `beside` is whether the row is one row: the gap is a distance along
+        // it, and in the stacked fallback it would be a blank line instead.
+        let mut controls = |ui: &mut egui::Ui, beside: bool| {
             changed |= ui
                 .add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL))
                 .changed();
@@ -2754,14 +2888,20 @@ impl PromptApp {
                 ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
             }
             ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn));
+            if beside {
+                ui.add_space(PRIMARY_GAP);
+            }
+            // Not written down when it changes, unlike the box before it: see
+            // `PromptApp::review` for why this one is never remembered.
+            ui.checkbox(review, REVIEW_LABEL);
         };
         if width <= ui.available_width() {
-            centred_row(ui, width, &mut controls);
+            centred_row(ui, width, |ui| controls(ui, true));
         } else {
             // Under the box rather than beside it. The sentence is the part
             // that must not be dropped, so the row that cannot hold it gets
             // taller instead of shorter.
-            ui.vertical_centered(&mut controls);
+            ui.vertical_centered(|ui| controls(ui, false));
         }
         // Only the reader's half is stored. `ticked` is the *effective*
         // answer, which is already true for a request the agent asked for, and
@@ -2866,7 +3006,7 @@ impl PromptApp {
         // asked for. Writing the effective answer back would turn a ticked
         // Stream box into the reader having unticked this one, and it would
         // stay unticked after Stream was cleared again.
-        let live = !self.streams();
+        let live = !self.streams() && !self.reviews();
         let mut ticked = self.closes_on_decide();
         let changed = ui
             .add_enabled(live, egui::Checkbox::new(&mut ticked, CLOSE_LABEL))
@@ -2879,10 +3019,14 @@ impl PromptApp {
         // Three sentences and not two: a greyed box has two different reasons
         // for being grey now, and only one of them is about the command on
         // the screen. See [`CLOSE_WATCHING_ALWAYS`].
-        let said = match (live, self.stream_is_remembered) {
-            (true, _) => CLOSE_COST,
-            (false, false) => CLOSE_WATCHING,
-            (false, true) => CLOSE_WATCHING_ALWAYS,
+        //
+        // Reviewing is asked first. Both are grey for the same reason, and
+        // this is the one chosen in front of this command every time.
+        let said = match (live, self.reviews(), self.stream_is_remembered) {
+            (true, _, _) => CLOSE_COST,
+            (false, true, _) => CLOSE_REVIEWING,
+            (false, false, false) => CLOSE_WATCHING,
+            (false, false, true) => CLOSE_WATCHING_ALWAYS,
         };
         let colour = match self.refusing(guard::Toggle::Close) {
             true => ui.visuals().warn_fg_color,
@@ -2913,7 +3057,8 @@ impl PromptApp {
         let label = box_ + text_width(ui, CLOSE_LABEL, egui::TextStyle::Button);
         let said = text_width(ui, CLOSE_COST, egui::TextStyle::Small)
             .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small))
-            .max(text_width(ui, CLOSE_WATCHING_ALWAYS, egui::TextStyle::Small));
+            .max(text_width(ui, CLOSE_WATCHING_ALWAYS, egui::TextStyle::Small))
+            .max(text_width(ui, CLOSE_REVIEWING, egui::TextStyle::Small));
         label.max(said) + 2.0 * ui.spacing().item_spacing.x
     }
 

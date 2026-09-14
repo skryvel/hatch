@@ -317,6 +317,43 @@ pub fn defang(text: &str) -> String {
     out
 }
 
+/// A command's *output*, made safe to draw as ordinary text: every character
+/// that carries no ink or reorders what is around it is replaced by the label
+/// that names it, and everything else is left as it is.
+///
+/// # Not [`defang`]
+///
+/// [`defang`] labels everything outside ASCII, because what it is used on is
+/// drawn beside a command a reader is about to approve, where a Cyrillic `а`
+/// passing for a Latin `a` is the attack. Output is not that. Nobody approves
+/// what a command printed; a person reviewing it is deciding what of it may
+/// reach the agent, and output from a program in any language but English
+/// labelled letter by letter would be a review screen nobody could read.
+///
+/// What still matters there is narrower and it is this function's whole
+/// remit: the characters that make text on the screen disagree with the text
+/// that will be sent. A bidi override reorders a line so a secret is not
+/// where it seems; a zero-width space inside `password` makes a line that
+/// reads as containing it slip past a drop filter for that word; a carriage
+/// return, obeyed, draws a later run of text over an earlier one that is
+/// still there; an escape sequence is bytes a terminal would have hidden.
+/// Each is shown as its name, so what the reader sees is what goes.
+///
+/// A newline and a tab are left alone. They are the structure of the output
+/// rather than disguises inside it, and the window lays a line break out as a
+/// line break and a tab as whitespace, which is what they are.
+pub fn reveal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c != '\n' && c != '\t' && is_invisible(c) {
+            out.push_str(&loud_label(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Classify `source` into plain runs and one chip per character that must not
 /// be drawn as itself.
 ///
@@ -480,6 +517,15 @@ pub fn scan(source: &str) -> ScanReport {
 mod tests {
     use super::*;
     use crate::render::{Span, unrender};
+
+    #[test]
+    fn output_is_revealed_where_it_would_lie_and_left_alone_where_it_would_not() {
+        let printed = "héllo 日本\tcol\npass\u{200B}word\u{202E}txt\r\u{1b}[31mred\n";
+        assert_eq!(
+            reveal(printed),
+            "héllo 日本\tcol\npass[ZWSP]word[RLO]txt[CR][U+001B][31mred\n"
+        );
+    }
 
     fn chips(spans: &Spans) -> Vec<char> {
         spans.iter().filter_map(Span::chip_codepoint).collect()

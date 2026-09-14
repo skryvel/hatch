@@ -319,6 +319,27 @@ impl Guard {
         self.armed_at = Some(now);
     }
 
+    /// A second question has appeared on a window that already had its first
+    /// one answered. Shut, and counting again.
+    ///
+    /// The review screen is this: it appears when a command finishes, which is
+    /// whenever the command finishes, and the reader may be typing in another
+    /// window at that moment for exactly the reason the first guard exists.
+    /// The keys it answers to are the approve chord and Escape again, and a
+    /// burst of typing that reached it must not be what sends a command's
+    /// output to the agent.
+    ///
+    /// Both clocks start again. A window that holds focus is shut for
+    /// [`GUARD`] from now; one that does not is shut for [`UNFOCUSED_GRACE`]
+    /// from now, not from when it was created minutes ago — an unfocused
+    /// window whose grace was long spent would otherwise open at once.
+    pub fn question_changed(&mut self, now: Instant) {
+        self.created_at = now;
+        if self.armed_at.is_some() {
+            self.armed_at = Some(now);
+        }
+    }
+
     /// The window cannot receive input, and hatch has been told so.
     ///
     /// `now` is taken for symmetry and ignored on purpose: what governs an

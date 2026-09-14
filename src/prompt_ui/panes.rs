@@ -277,19 +277,35 @@ pub fn urgency(seconds_left: i64) -> Urgency {
 /// compared against "can I read this in time", and nobody reads `02:15` as a
 /// quantity of reading.
 pub fn countdown_text(seconds_left: i64) -> String {
+    time_left_to(seconds_left, "decide")
+}
+
+/// The review countdown in words: [`countdown_text`]'s, for the second
+/// question a reviewed run asks.
+///
+/// Its own verb rather than "decide" again, because a reader who has already
+/// decided once and sees "left to decide" under a screen of output would be
+/// told the approval is still open. What runs out here is different, too, and
+/// the window says what happens then beside it.
+pub fn review_countdown_text(seconds_left: i64) -> String {
+    time_left_to(seconds_left, "review")
+}
+
+/// How much time is left to do `what`, in the words both countdowns use.
+fn time_left_to(seconds_left: i64, what: &str) -> String {
     match seconds_left {
         seconds if seconds <= 0 => "no time left".to_string(),
-        seconds if seconds < 60 => format!("{seconds} s left to decide"),
+        seconds if seconds < 60 => format!("{seconds} s left to {what}"),
         // Above an hour the exact figure has stopped being information and
         // started being a number to squint at. A window is normally open for
         // a minute or two; a deadline further out than an hour says only
         // that time is not what the reader should be thinking about.
-        seconds if seconds >= 3600 => "over an hour left to decide".to_string(),
+        seconds if seconds >= 3600 => format!("over an hour left to {what}"),
         seconds => {
             let (minutes, rest) = (seconds / 60, seconds % 60);
             match rest {
-                0 => format!("{minutes} min left to decide"),
-                rest => format!("{minutes} min {rest} s left to decide"),
+                0 => format!("{minutes} min left to {what}"),
+                rest => format!("{minutes} min {rest} s left to {what}"),
             }
         }
     }
@@ -2319,7 +2335,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
 /// has to know how much of a column the furniture takes: a frame measured
 /// through one constructor and drawn through another is how a column comes to
 /// promise room it does not have.
-fn pane_frame(ui: &Ui) -> egui::Frame {
+pub(crate) fn pane_frame(ui: &Ui) -> egui::Frame {
     egui::Frame::group(ui.style()).fill(palette(ui).surface)
 }
 
