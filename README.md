@@ -48,6 +48,7 @@ same thing.*
 - [Install and run](#install-and-run)
 - [Required for root: the polkit drop-in](#required-for-root-the-polkit-drop-in)
 - [The approval window](#the-approval-window)
+  - [Reviewing the output before it goes](#reviewing-the-output-before-it-goes)
   - [Look at it yourself: `hatch preview`](#look-at-it-yourself-hatch-preview)
 - [Terminals](#terminals)
 - [Threat model](#threat-model)
@@ -94,6 +95,13 @@ same thing.*
   version you can actually read, take the job and run it yourself, or stop the
   whole line of work to talk. Each returns your own words to the agent rather
   than a broken-server error — and an approval carries your note too.
+- **You decide what the agent reads back.** Tick *Show me the output before it
+  is sent* and a finished command's output waits on your screen instead of
+  going to the agent. Keep only the lines containing `error`, drop the ones
+  containing `token`, or edit a line by hand; what is drawn is what goes. The
+  agent is told its view was trimmed — which keep filter, if one was used, but
+  never what was dropped or what an edit changed. If you do not answer in time,
+  nothing is sent.
 - **You can watch it, and stop it.** Output streams into the window while the
   command runs, with a Kill button. A command that needs a keyboard gets a real
   terminal, and the window says plainly that everything typed in there goes
@@ -114,7 +122,7 @@ hatch exposes two MCP tools. Both block until a human answers.
 | Tool | Parameters | On approval |
 |------|-----------|-------------|
 | `batch` | `title`, `reason`, `operations`, `stop_on_failure?` | Carries the operations out in order and reports each as done, failed or not attempted |
-| `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply. A run in a terminal returns one `transcript` instead of the two streams — see [Terminals](#terminals) |
+| `run_command` | `title`, `command`, `reason`, `cwd?`, `root?`, `interactive?` | Runs the command and returns `exit_code`, `stdout`, `stderr`, `duration_ms`, and `killed_by_user`, `signal` or `timed_out` where they apply. A run in a terminal returns one `transcript` instead of the two streams — see [Terminals](#terminals). Output the person reviewed first comes back labelled as trimmed, or withheld — see [Reviewing the output](#reviewing-the-output-before-it-goes) |
 
 Each operation of a batch is one of two kinds:
 
@@ -246,12 +254,15 @@ from this side. It prints; it never edits your client's configuration.
 
 ### Set the client's tool timeout
 
-One call can block for the approval wait *plus* the operations' own runtime —
-900 seconds with the defaults, which are 600 s to decide and 300 s to run. The
-approval wait is counted once, because one window covers a whole batch, and the
-execution time once per operation; at one operation per batch that is the same
-900. Set
-your client's MCP tool timeout to at least that. If the client gives up first,
+One call can block for the approval wait *plus* the operations' own runtime
+*plus* the time you may take to review a command's output before it is sent —
+1500 seconds with the defaults, which are 600 s to decide, 300 s to run and
+600 s to review. The approval wait is counted once, because one window covers a
+whole batch, and the execution time and the review once per operation; at one
+operation per batch that is the same 1500. The review term is counted whether
+or not you ever tick the box, because neither the agent nor the client can know
+in advance which call you will choose to read. Set your client's MCP tool
+timeout to at least that. If the client gives up first,
 the agent sees an opaque transport failure instead of a clean verdict — and the
 request you were part way through reading vanishes from under you, because a
 cancellation and a dropped connection both close the window and log a denial.
@@ -665,6 +676,87 @@ contrast ratio against that ground, and a ground that moved in lightness would
 push one of them under. The hue claims nothing about the outcome: a failed run
 is the same violet as a clean one, and what happened is said in words.
 
+### Reviewing the output before it goes
+
+Approving a command used to mean its whole output reached the agent, and
+through the agent whatever model provider it talks to. There was no way to
+approve `cat` on a file with one secret in it. **Show me the output before it
+is sent**, on the row beside the terminal box, is that way.
+
+**It is off by default and never remembered.** Its three neighbours are written
+to `prefs.toml`; this one opens unticked in every window. It is a judgement
+about the command on the screen — `cat` on a file with a key in it, not `ls` on
+its directory — and a reviewed run waits for a second answer before the agent
+hears anything, so a tick that persisted would quietly turn every later
+approval into two decisions. It applies to commands only: a write returns no
+output. Ticked, it greys **Close when I decide** with *You asked to see its
+output first.*, because a window that has gone cannot ask, and a run under
+review offers no Keep, because it does not end in a viewer.
+
+**When the command finishes, the window shows its output as it will go.**
+stdout and stderr are two panes, side by side, each captioned with how many of
+its lines will be sent; a terminal run's transcript is one pane, and is
+reviewed like any other output — it can hold what you typed into the terminal,
+which is the strongest case there is for reading it first. Two filters sit
+above them:
+
+- **Keep only lines containing** — only lines that contain one of these stay.
+- **Drop lines containing** — lines that contain one of these go.
+
+A pattern is **plain text, not a regular expression**: a dot is a dot, because
+somebody in a hurry who types `a.b` means three characters, and a pattern
+language would keep or drop lines they never meant. Case is ignored, because
+`password`, `Password:` and `PASSWORD=` are one secret. Keep applies first,
+then drop. What is in a field counts as you type it; *Add another* moves it
+into a list so a second can be typed, and each added pattern is a button that
+takes it back out. Matching goes through the `regex` crate on the escaped
+pattern, so it is linear in the output and nothing typed can hang the window.
+A character that draws as nothing or reorders its line — a zero-width space
+inside `password`, a right-to-left override, a carriage return, an escape
+sequence — is drawn by name, so the text on the screen is the text that goes.
+
+**Edit the text by hand** turns the filtered result into text you can change,
+for the password in the middle of a line that has to stay. The filters are set
+aside while you edit and come back when you undo; the caption counts any
+invisible characters left in what you are editing, since the editor is the one
+place they do not draw; and Enter never reaches the field, so an edit can take
+text out but cannot type new lines in.
+
+**Send this** (`Ctrl+Enter` or `Shift+Enter`) sends what is on the screen.
+**Send nothing** (`Esc`) sends none of it. Both wait out the typing guard,
+which starts again when the review appears: it appears whenever the command
+finishes, and you may be typing somewhere else by then.
+
+**What the agent is told.** Trimmed output is always labelled as trimmed, and
+the label is worked out by the daemon from what it captured and what you sent,
+never taken from the window's word:
+
+```
+reviewed: the user read this output before it was released to you and trimmed it, so what follows is not everything the command printed
+
+stdout (trimmed by the user: only lines containing "error", ignoring case, are shown; the other lines were removed):
+stdout (trimmed by the user: lines were removed):
+stdout (trimmed by the user: edited by hand, so lines may be missing or changed):
+```
+
+A keep pattern is named, because "lines containing `error`" says nothing about
+what else there was. A drop pattern is not: "lines containing `password` were
+removed" would announce exactly the lines you removed them to hide. An edit is
+called an edit and nothing more. A section you did not change keeps its plain
+heading.
+
+**If you walk away, nothing is sent.** The review has a deadline of its own —
+`timeout_secs` again, ten minutes by default, for the same reason the approval
+has it — and when it passes, or the window is closed, the agent is told the
+command ran, gets its exit status and duration, and none of its output:
+
+```
+output withheld: the command ran, but the user asked to read its output before it reached you and did not do so within 600s, so none of it was released. Its status above is all you are told about it. Do not run it again to see the output; ask the user for what you need.
+```
+
+You asked to see it first; sending it because you stopped answering would
+override that in exactly the case it exists for.
+
 ### Look at it yourself: `hatch preview`
 
 ```sh
@@ -744,7 +836,9 @@ single stream: what the command wrote to standard output, what it wrote to
 standard error and what you typed all arrive interleaved with nothing marking
 which was which. So a terminal run returns one `transcript` — escape sequences
 stripped, capped at `output_cap_bytes` like any other output — and `stdout` and
-`stderr` are absent rather than empty. Splitting it into two streams it never
+`stderr` are absent rather than empty. **Show me the output before it is sent**
+works on a transcript as it does on two streams, and a transcript is the output
+most worth reading first. Splitting it into two streams it never
 had would be hatch inventing a distinction for the agent to rely on.
 
 **There is no execution deadline.** `exec_timeout_secs` is a runaway-process
@@ -886,11 +980,18 @@ verdicts: it says a binary sits in a directory anyone can write to, and it does
 not say whether that should alarm you. There are still no danger markers for
 shapes like `rm -rf` or `curl … | sh`.
 
-**Approved output reaches the agent whole.** There is no way to approve `cat`
-on a file with one secret in it and hold the secret back — approving a command
-today means its entire output goes to the agent, and through it to whatever
-model provider the agent uses. Trimming before the result returns is a privacy
-control hatch does not currently have.
+**Approved output reaches the agent whole unless you ask to review it.**
+Reviewing is per command and off by default, so a secret in the output of a
+command you did not tick it for goes to the agent, and through it to whatever
+model provider the agent uses. And a review hides text from the agent, not
+from the machine: the command ran, and anything it wrote elsewhere is where it
+wrote it.
+
+**The live output view draws what the command printed as it is.** Streamed
+output, and the window a finished streamed run stays as, show escape sequences
+and invisible characters however the font draws them — often as nothing. The
+review screen names every one of them; the live view does not, and it is not a
+place to judge whether a secret is there.
 
 **A root outcome can be unknown.** A cancelled password dialog and a command
 that ran and exited 1 can end with the same status, and the only thing telling
@@ -990,9 +1091,10 @@ five-minute idle timer is reset by those notifications.
 
 The bound that does bind is the one in
 [Set the client's tool timeout](#set-the-clients-tool-timeout):
-`timeout_secs + exec_timeout_secs` has to stay under whatever ceiling your
-client actually enforces. `hatch serve` prints that sum on startup — 900 s with
-the defaults, 1500 s for the config above, which raises the execution half.
+`timeout_secs + exec_timeout_secs`, plus `timeout_secs` again for the time a
+review may take, has to stay under whatever ceiling your client actually
+enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
+2100 s for the config above, which raises the execution term.
 
 ### Every key
 
@@ -1000,7 +1102,7 @@ the defaults, 1500 s for the config above, which raises the execution half.
 |---|---|---|
 | `port` | `8787` | Loopback port the MCP server listens on |
 | `token` | generated | Bearer token the client must present |
-| `timeout_secs` | `600` | How long a window waits for a decision |
+| `timeout_secs` | `600` | How long a window waits for a decision, and how long a review of a command's output waits before nothing is sent |
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
@@ -1051,6 +1153,10 @@ it — goes back to the agent. A tick made today therefore decides how a request
 next week executes. It is still one box, on screen, in the window that is
 asking, and the capture warning is drawn beside it whether or not it is
 ticked; it is worth knowing which of the three it is.
+
+The fourth box, **Show me the output before it is sent**, is deliberately not
+here: it is a choice about the command in front of you, and it opens unticked
+every time. See [Reviewing the output](#reviewing-the-output-before-it-goes).
 
 `stream` beats `close_on_decide` when both are on, because a window that has
 gone shows nothing. The close box is then greyed with *You stream every run.*
@@ -1130,6 +1236,14 @@ facts about requests live. A line rendered for a person says `(from a patch)`
 only when it was one; the JSON says either way, so a reader parsing the file
 gets an answer rather than an absence.
 
+A command whose output was reviewed says how the review ended — `review` is
+`released`, `filtered`, `edited`, `withheld` (you sent nothing) or `unreviewed`
+(nobody answered in time, or the window went) — and `hatch log` prints the same
+at the end of the line. It records none of the output and nothing about what
+was removed: no lines, no drop patterns, no edits. The log has never held a
+command's output, and a copy of what you took out would be the one that
+survives.
+
 `hatch log` escapes what it prints. `title`, `reason`, `note`, `command` and
 `path` all come from the agent, and a newline interpolated raw would split one
 record into two plausible-looking lines while ANSI escapes took over the
@@ -1145,7 +1259,6 @@ Stated so you do not go looking:
   diff would say "nothing changes", which is the one thing it must never say.
 - **Editing a command in the window** before approving it. Today the answers
   are deny, or ask for something simpler and wait.
-- **Trimming output** before it returns to the agent.
 - **Drawing a nested command as a tree.** The roster above the panes reads
   through `bash -c '…'` and `sh -c '…'` to name what is inside, and reads
   through the fourteen other wrappers it knows; `ssh host '…'` and

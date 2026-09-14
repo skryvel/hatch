@@ -47,6 +47,15 @@
 //!   indicator — with a Kill button, for a command — and on
 //!   [`DaemonMsg::Finished`] it closes, unless the ending is news.
 //!
+//! Beside all three, a reader can tick "Show me the output before it is sent"
+//! — see [`REVIEW_LABEL`] — and then the command's ending is a second
+//! question rather than any of these: the window stays, whatever the ending,
+//! and asks what of the output the agent may have. [`Phase::Reviewing`] is
+//! that question and [`reviewing`] is the screen that asks it. It beats "Close
+//! when I decide" for the reason that box's greyed sentence gives, and unlike
+//! the lingering below it is not the window's own: the daemon holds that
+//! deadline, as it holds the approval's.
+//!
 //! A window whose reader ticked "Stream output to this window" does not close
 //! on [`DaemonMsg::Finished`]. The whole life of an ordinary command is
 //! milliseconds, so closing there took the output away at the instant it
