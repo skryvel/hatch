@@ -198,9 +198,9 @@ fn hatch_token_prints_the_line_for_the_config_it_creates() {
     assert_eq!(token.len(), 43, "32 bytes, base64url, unpadded");
     assert!(printed.contains("claude mcp add"), "the line must be pasteable: {printed}");
     assert!(printed.contains(token), "and carry the token that reached disk: {printed}");
-    assert!(printed.contains("900s"), "and the timeout the client has to be set to: {printed}");
+    assert!(printed.contains("1500s"), "and the timeout the client has to be set to: {printed}");
     assert!(
-        printed.contains("approval 600s + execution 300s"),
+        printed.contains("approval 600s + execution 300s + review 600s"),
         "and what that number is made of, so neither term can go stale under the sum: {printed}"
     );
 }
@@ -410,14 +410,17 @@ fn hatch_setup_mcp_prints_both_spellings_of_the_token_the_config_file_holds() {
     assert_eq!(entry["url"], "http://127.0.0.1:8787/mcp");
     assert_eq!(entry["headers"]["Authorization"], format!("Bearer {token}"));
 
-    assert!(printed.contains("at least 900 seconds"), "the client bound: {printed}");
-    assert!(printed.contains("600s to decide plus 300s to run"), "and its terms: {printed}");
+    assert!(printed.contains("at least 1500 seconds"), "the client bound: {printed}");
+    assert!(
+        printed.contains("600s to decide plus 300s to run plus 600s to review"),
+        "and its terms: {printed}"
+    );
 }
 
 #[test]
 fn hatch_setup_mcp_follows_the_config_it_finds_rather_than_the_defaults() {
     // A user who has moved the port or lengthened the wait has to be given
-    // their own numbers. A page that printed 8787 and 900 to everybody would
+    // their own numbers. A page that printed 8787 and 1500 to everybody would
     // be a page that sends them to register a server that is not there.
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(config_file(home.path()).parent().unwrap()).unwrap();
@@ -434,9 +437,9 @@ fn hatch_setup_mcp_follows_the_config_it_finds_rather_than_the_defaults() {
     let printed = String::from_utf8(output.stdout).unwrap();
 
     assert_eq!(json_block(&printed)["mcpServers"]["hatch"]["url"], "http://127.0.0.1:9191/mcp");
-    assert!(printed.contains("at least 1800 seconds"), "{printed}");
+    assert!(printed.contains("at least 3000 seconds"), "{printed}");
     assert!(!printed.contains("8787"), "no default port may appear: {printed}");
-    assert!(!printed.contains("900"), "no default bound may appear: {printed}");
+    assert!(!printed.contains("1500"), "no default bound may appear: {printed}");
 }
 
 #[test]

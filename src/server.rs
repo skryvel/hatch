@@ -89,6 +89,22 @@
 //!   claims; this is the absence of one, and the only honest answer when the
 //!   evidence that separates them is missing.
 //!
+//! ## A second question after the run
+//!
+//! A reader who ticks "Show me the output before it is sent" is asked again
+//! once a command has run, and the output waits in the daemon until they
+//! answer. Unlike the password dialog this wait is not inside the execution
+//! timeout — the command is over — so it has a deadline of its own, the
+//! approval's number again, and the tool descriptions count it in the bound
+//! they state. See [`Config::review_timeout_secs`].
+//!
+//! Every ending of that wait that is not an answer withholds the output: the
+//! deadline, a window that goes, an abandoned call. The reader's instruction
+//! was *show me first*, and sending the output because they stopped answering
+//! would overrule it in the one case it exists for. What the agent is then
+//! told, and what it is told about output that was trimmed, is set out in
+//! [`crate::review`].
+//!
 //! ## Why every operation gets exactly one audit line
 //!
 //! Not because every exit path remembers to write one. `Outcome` is the
@@ -155,7 +171,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{
-    AuditLog, AuditRecord, LogDetail, LogVerdict, PromptEnd, RunDetail, SwapDetail, SwapForm,
+    AuditLog, AuditRecord, LogDetail, LogVerdict, PromptEnd, ReviewEnd, RunDetail, SwapDetail,
+    SwapForm,
 };
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
@@ -164,12 +181,13 @@ use crate::exec::env::build_child_env;
 use crate::exec::{Chunk, Env, Output, RunOpts};
 use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
-use crate::protocol::{Payload, Request as PromptRequest, ReviseKind, Verdict};
+use crate::protocol::{Payload, Release, Request as PromptRequest, ReviseKind, Verdict};
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_breaking_at;
 use crate::render::roster::roster;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
+use crate::review::{Captured, Matcher, Section, Sections, Trimmed};
 use crate::swap::{ApplyError, PlanKind, RootWrite, SwapPlan};
 use crate::{exec, protocol, swap};
 
@@ -973,6 +991,7 @@ impl ToolDescriptions {
 pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
     let approval = config.timeout_secs;
     let exec = config.exec_timeout_secs;
+    let review = config.review_timeout_secs();
     let one = config.blocking_bound_secs(1);
     let total = config.client_timeout_secs();
     let cap = match MAX_OPERATIONS {
@@ -993,14 +1012,21 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          \n\
          Every call opens a window on a person's screen and waits for them to read the command \
          and decide. One call can block for up to {one} seconds: up to {approval}s waiting for \
-         that decision, then up to {exec}s while the command runs. Plan for that. Batch related \
-         commands into a single command — chain them with `&&`, or write a short script — \
-         instead of making a run of separate calls, because each extra call is another \
-         interruption.\n\
+         that decision, then up to {exec}s while the command runs, then — only if the person \
+         chose to read the output before you get it — up to {review}s while they do. Plan for \
+         that. Batch related commands into a single command — chain them with `&&`, or write a \
+         short script — instead of making a run of separate calls, because each extra call is \
+         another interruption.\n\
          \n\
          The person may refuse the command, ask you to explain it, ask for a form of it that \
          is easier to read, or decide to run it themselves. You get back what actually \
          happened, which is not always what you asked for.\n\
+         \n\
+         The person may also read the output before you receive it, and send you only part of \
+         it. A section they trimmed says so in its heading — lines are missing, or the text was \
+         edited — so do not treat it as everything the command printed. If they send none of \
+         it, or do not answer in time, you are told the command ran and its output was \
+         withheld: do not run it again just to see the output; ask them for what you need.\n\
          \n\
          **To change a file, use `batch` instead.** Reading one here is exactly what this tool \
          is for — `cat` it, `grep` it, list a directory. Writing one is not. The difference is \
@@ -1064,7 +1090,9 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          \n\
          Every call opens a window on a person's screen and waits for them to read it and \
          decide. One call can block for up to {total} seconds: up to {approval}s waiting for \
-         that decision, then up to {exec}s for each operation while it runs. Plan for that, and \
+         that decision, then up to {exec}s for each operation while it runs, and up to {review}s \
+         more for each command whose output the person chooses to read before it reaches you. \
+         Plan for that, and \
          gather related work into as few calls as you can, because each call is another \
          interruption. The person may refuse, ask you to explain, ask for a form that is easier \
          to read, or decide to do it themselves; you get back what actually happened.\n\
@@ -1082,7 +1110,8 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          context does not match is refused, naming the line and what was found there, and \
          nothing is written and nobody is interrupted.\n\
          - A command has `command`, and optionally `cwd` and `interactive`, which mean what they \
-         mean in `run_command`.\n\
+         mean in `run_command` — including that the person may trim its output before you \
+         receive it, which its headings then say, or withhold it.\n\
          - Either kind takes `root`: true carries that operation out as root, and costs the \
          person a password dialog of its own after they approve; dismissing it means that \
          operation does not happen. A root write keeps the file's existing owner and mode, or \
@@ -1359,6 +1388,7 @@ enum Phase {
     AwaitingApproval = 1,
     Executing = 2,
     Elevating = 3,
+    Reviewing = 4,
 }
 
 impl Phase {
@@ -1372,6 +1402,10 @@ impl Phase {
             // is no moment at which it could honestly switch to "running".
             // This sentence is true from the spawn to the end either way.
             Phase::Elevating => "approved; waiting for the system password dialog, then running",
+            // Said, because this wait can be as long as the approval was and
+            // a client that hears "running" for ten minutes has been told
+            // something that stopped being true when the command ended.
+            Phase::Reviewing => "ran; waiting for the user to review its output",
         }
     }
 
@@ -1380,7 +1414,8 @@ impl Phase {
             0 => Phase::Queued,
             1 => Phase::AwaitingApproval,
             2 => Phase::Executing,
-            _ => Phase::Elevating,
+            3 => Phase::Elevating,
+            _ => Phase::Reviewing,
         }
     }
 }
@@ -1569,6 +1604,24 @@ struct RunPlan {
     /// request that asked for it, and the window is built not to try. Holding
     /// it here means the daemon does not have to trust that it did not.
     asked_for_a_terminal: bool,
+}
+
+/// What an approval said about carrying a command out, and about what
+/// becomes of its window and its output afterwards.
+///
+/// One struct for the reason [`RunPlan`] is one: four booleans in a row are a
+/// call site that can put two of them in the wrong order, and two of these
+/// four decide what reaches the agent.
+#[derive(Debug, Clone, Copy)]
+struct Asked {
+    /// The reader ticked Stream.
+    stream: bool,
+    /// The reader, or the agent, asked for a terminal.
+    terminal: bool,
+    /// The window is closing itself on its verdict.
+    closing: bool,
+    /// The reader asked to see the output before the agent does.
+    review: bool,
 }
 
 impl Daemon {
@@ -1801,9 +1854,9 @@ impl Daemon {
         // not hold every other agent behind it.
         drop(permit);
 
-        let (stream, terminal, closing, note) = match verdict {
-            Verdict::Approve { stream, terminal, closing, review: _, note } => {
-                (stream, terminal, closing, note)
+        let (stream, terminal, closing, review, note) = match verdict {
+            Verdict::Approve { stream, terminal, closing, review, note } => {
+                (stream, terminal, closing, review, note)
             }
             other => {
                 session.close().await;
@@ -1844,7 +1897,8 @@ impl Daemon {
             });
             let step = match work {
                 Work::Run(run) => {
-                    self.run_it(&run, stream, terminal, closing, &session, &mut detail).await
+                    let asked = Asked { stream, terminal, closing, review };
+                    self.run_it(&run, asked, &mut session, &caller, &progress, &mut detail).await
                 }
                 Work::Swap { path, content, plan, root } => {
                     self.swap_it(&path, &content, &plan, root, &session, &mut detail).await
@@ -2282,6 +2336,7 @@ impl Daemon {
                 killed_by_user: None,
                 timed_out: None,
                 prompt: None,
+                review: None,
             })
         };
         let refuse = |message: String| Rendered::Refused(Refusal { detail: detail(&cwd), message });
@@ -2526,12 +2581,13 @@ impl Daemon {
     async fn run_it(
         &self,
         run: &RunPlan,
-        stream: bool,
-        terminal: bool,
-        closing: bool,
-        session: &PromptSession,
+        asked: Asked,
+        session: &mut PromptSession,
+        caller: &Caller,
+        progress: &Progress,
         detail: &mut LogDetail,
     ) -> Step {
+        let Asked { stream, terminal, closing, review } = asked;
         let RunPlan { argv, env, cwd, elevated, asked_for_a_terminal } = run;
         let elevated = *elevated;
         // Either half is enough. The window is built so that a request which
@@ -2673,17 +2729,66 @@ impl Daemon {
             run.timed_out = Some(output.timed_out);
             run.interactive = Some(terminal);
         }
-        let (verdict, result, frame, status) = match root {
+        // Where the window was while it ran, settled now and not after a
+        // review: a window that closes itself on answering one has done what
+        // it was asked, and read afterwards it would be filed as a death.
+        note_prompt_death(session, closing, detail);
+
+        // Which of the endings carries the command's output to the agent.
+        // Only those can be reviewed, and every one of them is: a review
+        // that covered the ordinary ending and not the unclear elevation
+        // would send a root command's output past the person who asked to
+        // read it on exactly the run they would most want to.
+        let carries_output = match &root {
+            None | Some(RootOutcome::Ran { .. } | RootOutcome::Unclear { .. }) => true,
+            Some(RootOutcome::Denied | RootOutcome::Failed { .. }) => false,
+        };
+        let (verdict, frame, status) = match &root {
             // Unelevated, or elevated and the command demonstrably ran: the
             // status is the command's and is reported as it always was.
-            None | Some(RootOutcome::Ran { .. }) => (
-                LogVerdict::Approve,
-                CallToolResult::success(vec![ContentBlock::text(describe_run(&output, elapsed))]),
-                finished_frame(&output),
-                run_status(&output, exit),
-            ),
+            None | Some(RootOutcome::Ran { .. }) => {
+                (LogVerdict::Approve, finished_frame(&output), run_status(&output, exit))
+            }
             Some(outcome) => {
-                let (verdict, message, frame) = elevation_ending(&outcome);
+                let (verdict, _, frame) = elevation_ending(outcome);
+                (verdict, Some(frame), elevation_status(outcome))
+            }
+        };
+
+        // Held back, when the reader asked. The window is told the ending
+        // here as well, after the output it is about, because the frame it
+        // decides on has to find the question already there.
+        let (reviewed, windup) = match review && carries_output {
+            true => {
+                progress.enter(Phase::Reviewing);
+                let reviewed = self.held_for_review(session, caller, &output, frame).await;
+                if let LogDetail::RunCommand(run) = detail {
+                    run.review = Some(reviewed.log_end());
+                }
+                // Always ended, never handed over. The window either
+                // answered, in which case it closed itself on the frame it
+                // sent, or it did not, in which case the question it is
+                // showing is over and nobody may answer it any more.
+                (Some(reviewed), Windup::Close)
+            }
+            false => {
+                // See `tell_the_window` for which windows stay. A run with no
+                // frame to send is one the window was never told had ended,
+                // and it is closed.
+                let windup = match frame {
+                    Some(frame) => tell_the_window(session, frame, stream).await,
+                    None => Windup::Close,
+                };
+                (None, windup)
+            }
+        };
+
+        let result = match root {
+            None | Some(RootOutcome::Ran { .. }) => CallToolResult::success(vec![
+                ContentBlock::text(describe_run(&output, elapsed, reviewed.as_ref())),
+            ]),
+            Some(outcome) => {
+                let (_, message, _) = elevation_ending(&outcome);
                 // What goes with the message depends on what the outcome
                 // claims, and the difference is the whole point of the three
                 // being separate.
@@ -2699,31 +2804,83 @@ impl Daemon {
                 // `Unclear` says hatch does not know, and there the captured
                 // output is the evidence: it is what anybody deciding whether
                 // the command ran would look at, and withholding it would
-                // leave the question unanswerable as well as unanswered.
+                // leave the question unanswerable as well as unanswered —
+                // unless the reader asked to review it, when it is what they
+                // released and no more.
                 let text = match &outcome {
-                    RootOutcome::Unclear { .. } => {
-                        format!("{message}\n\n{}", describe_run(&output, elapsed))
-                    }
+                    RootOutcome::Unclear { .. } => format!(
+                        "{message}\n\n{}",
+                        describe_run(&output, elapsed, reviewed.as_ref())
+                    ),
                     _ => match first_line(diagnostics(&output)) {
                         "" => message,
                         line => format!("{message}\n\n{line}"),
                     },
                 };
-                (
-                    verdict,
-                    CallToolResult::error(vec![ContentBlock::text(text)]),
-                    Some(frame),
-                    elevation_status(&outcome),
-                )
+                CallToolResult::error(vec![ContentBlock::text(text)])
             }
         };
-        // See `tell_the_window` for which windows stay. A run with no frame to
-        // send is one the window was never told had ended, and it is closed.
-        let windup = match frame {
-            Some(frame) => tell_the_window(session, frame, stream).await,
-            None => Windup::Close,
-        };
         Step { verdict, result, windup, status }
+    }
+
+    /// Put a finished run's output in front of the reader who asked to see
+    /// it, and wait for what they let the agent have.
+    ///
+    /// # Everything that is not an answer withholds
+    ///
+    /// The deadline, a window that goes, a call that is abandoned, a window
+    /// that could not be told: in each of them nobody decided what may reach
+    /// the agent, and the reader's standing instruction is the tick they gave
+    /// before any of it — *show me first*. Sending the output anyway when they
+    /// stop answering would override that choice in exactly the case it
+    /// exists for: the person who ticked it because of what might be in there
+    /// and then got called away. So the agent is told the command ran, and
+    /// none of its output.
+    ///
+    /// The deadline is the daemon's, like the approval's, and the window only
+    /// draws it. See [`Config::review_timeout_secs`] for how long it is.
+    async fn held_for_review(
+        &self,
+        session: &mut PromptSession,
+        caller: &Caller,
+        output: &Output,
+        frame: Option<protocol::Outcome>,
+    ) -> Reviewed {
+        // A run the window cannot be told the end of is a run it cannot ask
+        // about either; see `finished_frame` for why that arm is not reached.
+        let Some(frame) = frame else {
+            return Reviewed::Withheld(Withheld::Unasked);
+        };
+        let wait = Duration::from_secs(self.config.review_timeout_secs());
+        let expires_at = tokio::time::Instant::now() + wait;
+        let captured = captured_output(output);
+        let review = protocol::Review {
+            deadline: Utc::now() + chrono::Duration::seconds(wait.as_secs() as i64),
+            output: captured.clone(),
+        };
+        let outbox = session.outbox();
+        if !(outbox.review(review).await && outbox.finished(frame).await) {
+            return Reviewed::Withheld(Withheld::Unasked);
+        }
+
+        let answer = tokio::select! {
+            // Biased, and the answer first, for the reason the verdict is: an
+            // answer in the same instant as the deadline is an answer.
+            biased;
+            answer = session.release() => answer,
+            () = caller.cancelled.cancelled() => return Reviewed::Withheld(Withheld::CallGone),
+            () = caller.hung_up() => return Reviewed::Withheld(Withheld::CallGone),
+            () = tokio::time::sleep_until(expires_at) => {
+                return Reviewed::Withheld(Withheld::NotInTime { secs: wait.as_secs() });
+            }
+        };
+        match answer {
+            Err(_gone) => Reviewed::Withheld(Withheld::WindowGone),
+            Ok(Release::Withhold) => Reviewed::Withheld(Withheld::ByUser),
+            Ok(Release::Send { output: released, kept }) => {
+                Reviewed::of(&captured, released, &kept)
+            }
+        }
     }
 
     /// What an elevated run that has finished actually means.
@@ -3271,7 +3428,9 @@ async fn tell_the_window(
     frame: protocol::Outcome,
     watched: bool,
 ) -> Windup {
-    let stays = watched || frame.is_news();
+    // Never under review: a reviewed run's window is told its ending by
+    // `Daemon::held_for_review`, which keeps hold of it for the answer.
+    let stays = frame.stays(watched, false);
     let told = session.outbox().finished(frame).await;
     match told && stays {
         true => Windup::Detach,
@@ -3326,7 +3485,22 @@ fn elevation_status(outcome: &RootOutcome) -> Status {
 /// exist, which is the same class of untruth as a rendering that does not
 /// match the command — so the heading says what it is, and the two stream
 /// headings are absent rather than empty.
-fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
+///
+/// # A reviewed run
+///
+/// `reviewed` is what its reader let through, when they were asked. Withheld
+/// output leaves the status and the timings — which say what happened to the
+/// command and nothing of what it said — and a sentence in place of every
+/// section. Released output keeps the sections, each under the heading
+/// [`crate::review::heading`] gives it, below a line saying a person read it
+/// first and whether what follows is all of it. That line and those headings
+/// are the whole of what the agent learns about the review; see
+/// [`crate::review`] for what they may and may not say.
+fn describe_run(
+    output: &Output,
+    elapsed: std::time::Duration,
+    reviewed: Option<&Reviewed>,
+) -> String {
     let mut text = String::new();
     match output.exit_code {
         Some(code) => text.push_str(&format!("exit code: {code}\n")),
@@ -3342,28 +3516,209 @@ fn describe_run(output: &Output, elapsed: std::time::Duration) -> String {
     if output.killed_by_user {
         text.push_str("killed: the user pressed Kill while it ran\n");
     }
-    let sections = match &output.transcript {
-        Some(transcript) => vec![("transcript", transcript, output.transcript_truncated)],
-        None => vec![
-            ("stdout", &output.stdout, output.stdout_truncated),
-            ("stderr", &output.stderr, output.stderr_truncated),
-        ],
+    let released = match reviewed {
+        Some(Reviewed::Withheld(why)) => {
+            text.push_str(&format!("\n{}\n", why.sentence()));
+            return text;
+        }
+        Some(Reviewed::Sent { sections, kept }) => {
+            text.push_str(match sections.iter().any(|(_, _, trimmed)| trimmed.is_trimmed()) {
+                true => {
+                    "reviewed: the user read this output before it was released to you and \
+                     trimmed it, so what follows is not everything the command printed\n"
+                }
+                false => {
+                    "reviewed: the user read this output before it was released to you and \
+                     released all of it\n"
+                }
+            });
+            Some((sections, kept))
+        }
+        None => None,
     };
-    for (name, body, truncated) in sections {
-        text.push_str(&format!("\n{name}:\n"));
+    for (section, captured) in captured_output(output).iter() {
+        let name = section.name();
+        let (heading, body, trimmed) = match released
+            .and_then(|(sections, kept)| {
+                sections.iter().find(|(s, _, _)| *s == section).map(|found| (found, kept))
+            }) {
+            Some(((_, body, trimmed), kept)) => {
+                (crate::review::heading(section, *trimmed, kept), body.as_str(), *trimmed)
+            }
+            None => (format!("{name}:"), captured.text.as_str(), Trimmed::Whole),
+        };
+        text.push_str(&format!("\n{heading}\n"));
         if body.is_empty() {
-            text.push_str("(empty)\n");
+            text.push_str(match trimmed.is_trimmed() {
+                // Not "(empty)": the command may well have printed plenty,
+                // and a trimmed section with nothing in it reading as a
+                // silent command is the confident misreading the label is
+                // there to prevent.
+                true => "(nothing was released)\n",
+                false => "(empty)\n",
+            });
         } else {
             text.push_str(body);
             if !body.ends_with('\n') {
                 text.push('\n');
             }
         }
-        if truncated {
+        if captured.truncated {
             text.push_str(&format!("({name} was truncated at hatch's output cap)\n"));
         }
     }
     text
+}
+
+/// A run's output as it would reach the agent, section by section.
+///
+/// The one place the two shapes of a run are told apart for the purposes of
+/// what is sent: the tool result is built from it, and so is what a reviewing
+/// window is shown, so the reader reviews exactly the text the agent would
+/// otherwise have had.
+fn captured_output(output: &Output) -> Sections<Captured> {
+    match &output.transcript {
+        Some(transcript) => Sections::Transcript {
+            transcript: Captured {
+                text: transcript.clone(),
+                truncated: output.transcript_truncated,
+            },
+        },
+        None => Sections::Streams {
+            stdout: Captured { text: output.stdout.clone(), truncated: output.stdout_truncated },
+            stderr: Captured { text: output.stderr.clone(), truncated: output.stderr_truncated },
+        },
+    }
+}
+
+/// What became of the output of a run its reader asked to review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reviewed {
+    /// The reader sent this: every section as they left it, with what was
+    /// done to it read off the text, and the keep patterns that may be named.
+    Sent {
+        sections: Vec<(Section, String, Trimmed)>,
+        /// Empty unless every one of them could be believed; see
+        /// [`Reviewed::of`].
+        kept: Vec<String>,
+    },
+    /// None of it reached the agent, and why.
+    Withheld(Withheld),
+}
+
+/// Why reviewed output reached the agent as nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withheld {
+    /// The reader chose to send none of it.
+    ByUser,
+    /// Nobody answered before the review deadline, which was this long.
+    NotInTime { secs: u64 },
+    /// The window went without answering.
+    WindowGone,
+    /// The call was cancelled, or its connection lost, while the review was
+    /// open. The agent is rarely there to read this, and the log is.
+    CallGone,
+    /// The review could not be put in front of the reader at all.
+    Unasked,
+    /// The reader's answer did not fit the output it was about.
+    Unreadable,
+}
+
+impl Withheld {
+    /// What the agent is told instead of the output.
+    ///
+    /// Every one of them says the command ran, because it did and the status
+    /// above says so, and every one says none of the output was released, so
+    /// that nothing about the absence of sections reads as a command that
+    /// printed nothing. Only the reader's own choice is called a choice; the
+    /// rest say what happened instead, for the reason a timeout is not a
+    /// denial.
+    fn sentence(self) -> String {
+        let reason = match self {
+            Withheld::ByUser => {
+                return "output withheld: the user read this command's output and chose to \
+                        release none of it to you. The command ran; its status above is all you \
+                        are told about it. Do not run it again to see the output; ask the user \
+                        for what you need."
+                    .to_string();
+            }
+            Withheld::NotInTime { secs } => {
+                format!("did not do so within {secs}s")
+            }
+            Withheld::WindowGone => "the window closed before they released any of it".to_string(),
+            Withheld::CallGone => {
+                "this call was cancelled before they released any of it".to_string()
+            }
+            Withheld::Unasked => "hatch could not put it in front of them".to_string(),
+            Withheld::Unreadable => {
+                "hatch could not read what they chose to release".to_string()
+            }
+        };
+        format!(
+            "output withheld: the command ran, but the user asked to read its output before it \
+             reached you and {reason}, so none of it was released. Its status above is all you \
+             are told about it. Do not run it again to see the output; ask the user for what you \
+             need."
+        )
+    }
+}
+
+impl Reviewed {
+    /// Read a release against the output it is about.
+    ///
+    /// What was done to each section is worked out here from the two texts —
+    /// see [`Trimmed::of`] — and the window's own account of it is not asked
+    /// for. The keep patterns are the one thing taken from the release, and
+    /// only to be repeated where the text bears them out; a set that cannot
+    /// be built is set aside whole rather than in part, and the sections are
+    /// described by what can be seen instead.
+    ///
+    /// A release shaped differently from the capture — two streams answered
+    /// with a transcript — is not a release of this output, and nothing is
+    /// sent on it.
+    fn of(captured: &Sections<Captured>, released: Sections<String>, kept: &[String]) -> Reviewed {
+        let Some(pairs) = captured.zip(&released) else {
+            return Reviewed::Withheld(Withheld::Unreadable);
+        };
+        let (matcher, kept) = match Matcher::new(kept) {
+            Ok(matcher) => (matcher, crate::review::meaningful(kept)),
+            Err(_) => (Matcher::none(), Vec::new()),
+        };
+        let sections = pairs
+            .into_iter()
+            .map(|(section, captured, released)| {
+                (section, released.clone(), Trimmed::of(&captured.text, released, &matcher))
+            })
+            .collect::<Vec<_>>();
+        // Named only if some section is actually limited to them. A keep
+        // pattern the text does not bear out anywhere is not repeated, and one
+        // that is borne out somewhere is what those sections' headings name.
+        let kept = match sections.iter().any(|(_, _, t)| matches!(t, Trimmed::Kept { .. })) {
+            true => kept,
+            false => Vec::new(),
+        };
+        Reviewed::Sent { sections, kept }
+    }
+
+    /// Which line the audit log gets.
+    fn log_end(&self) -> ReviewEnd {
+        match self {
+            Reviewed::Withheld(Withheld::ByUser) => ReviewEnd::Withheld,
+            Reviewed::Withheld(_) => ReviewEnd::Unreviewed,
+            // The most that was done to any section: one edited section makes
+            // the output edited, whatever was only filtered beside it.
+            Reviewed::Sent { sections, .. } => {
+                let trims = || sections.iter().map(|(_, _, trimmed)| *trimmed);
+                if trims().any(|trimmed| trimmed == Trimmed::Edited) {
+                    ReviewEnd::Edited
+                } else if trims().any(Trimmed::is_trimmed) {
+                    ReviewEnd::Filtered
+                } else {
+                    ReviewEnd::Released
+                }
+            }
+        }
+    }
 }
 
 /// Whatever the run left that a diagnostic could be read out of.
@@ -3542,13 +3897,20 @@ fn declined(verdict: Verdict, details: Vec<LogDetail>) -> Outcome {
 /// ever runs. So the window says on its way out that it is leaving, and the
 /// two are filed apart: what is asked here is not whether the window is there
 /// but whether its absence is news.
+///
+/// Settled once. A command's run records it the moment the run is over, before
+/// any review of its output — a window that closes itself on answering one has
+/// done what it was asked — and the call the batch loop makes afterwards finds
+/// it settled and leaves it alone.
 fn note_prompt_death(session: &PromptSession, closing: bool, detail: &mut LogDetail) {
     let end = match (closing, session.window_gone().is_cancelled()) {
         (true, _) => PromptEnd::Dismissed,
         (false, true) => PromptEnd::Died,
         (false, false) => PromptEnd::Held,
     };
-    if let LogDetail::RunCommand(run) = detail {
+    if let LogDetail::RunCommand(run) = detail
+        && run.prompt.is_none()
+    {
         run.prompt = Some(end);
     }
 }
@@ -4001,10 +4363,10 @@ mod tests {
         let config = Config::default();
         for name in ["run_command", "batch"] {
             let text = tool_descriptions(&config).for_tool(name).unwrap().to_string();
-            assert!(text.contains("900"), "the blocking bound must be the full one: {text}");
+            assert!(text.contains("1500"), "the blocking bound must be the full one: {text}");
             assert!(text.contains("only when"), "the description must narrow when to reach for it");
         }
-        assert_eq!(config.client_timeout_secs(), 900, "the bound the description quotes");
+        assert_eq!(config.client_timeout_secs(), 1500, "the bound the description quotes");
     }
 
     // --- the auth layer -------------------------------------------------
@@ -4696,13 +5058,14 @@ mod tests {
         // Guards against interpolating the approval timeout alone, which
         // understates the bound by more than three times -- and, for the
         // batch, against counting one execution for a call that may carry
-        // several.
+        // several. The review is the approval's number again, so it is the
+        // 11 counted a second time.
         let config = Config { timeout_secs: 11, exec_timeout_secs: 700, ..Config::default() };
         let descriptions = tool_descriptions(&config);
         let run = descriptions.for_tool("run_command").unwrap();
         let batch = descriptions.for_tool("batch").unwrap();
-        assert!(run.contains("711"), "run_command must state the full bound: {run}");
-        let batch_bound = 11 + 700 * MAX_OPERATIONS as u64;
+        assert!(run.contains("722"), "run_command must state the full bound: {run}");
+        let batch_bound = 11 + (700 + 11) * MAX_OPERATIONS as u64;
         assert!(
             batch.contains(&format!("up to {batch_bound} seconds")),
             "batch must state the bound for its largest call: {batch}"
@@ -4818,7 +5181,7 @@ mod tests {
             for tool in &tools {
                 let description = tool["description"].as_str().unwrap();
                 assert!(
-                    description.contains("900"),
+                    description.contains("1500"),
                     "{} shipped a description without the blocking bound: {description}",
                     tool["name"]
                 );
@@ -5040,7 +5403,7 @@ later"), "");
         use super::*;
         use crate::audit::LogVerdict;
         use crate::exec::elevate::Rehearsed;
-        use crate::prompter::{ProcessPrompter, Reply, StubPrompter};
+        use crate::prompter::{ProcessPrompter, Reply, Reviewer, StubPrompter};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use crate::protocol::{Verdict, approved};
 
@@ -6592,19 +6955,20 @@ later"), "");
             // The password wait sits inside the execution timeout, because
             // the dialog lives inside the elevated process and that process
             // is what the execution deadline kills. So the number the tool
-            // description quotes — the approval wait plus the execution
-            // wait — still bounds the whole call, with nothing added for the
-            // dialog and nothing unbounded anywhere in it.
+            // description quotes — the approval wait, the execution wait and
+            // the review wait — still bounds the whole call, with nothing
+            // added for the dialog and nothing unbounded anywhere in it.
             let harness = rooted(
                 vec![approve()],
                 Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
             );
             // The bound for a call of one command, which is the number
             // `run_command`'s description quotes whatever a batch may carry.
-            let ceiling = harness.daemon.config().blocking_bound_secs(1);
+            let config = harness.daemon.config();
+            let ceiling = config.blocking_bound_secs(1);
             assert_eq!(
                 ceiling,
-                harness.daemon.config().timeout_secs + harness.daemon.config().exec_timeout_secs
+                config.timeout_secs + config.exec_timeout_secs + config.review_timeout_secs()
             );
 
             let started = tokio::time::Instant::now();
@@ -7744,7 +8108,13 @@ later"), "");
 
         #[test]
         fn every_phase_has_its_own_message() {
-            let messages: Vec<&str> = [Phase::Queued, Phase::AwaitingApproval, Phase::Executing]
+            let messages: Vec<&str> = [
+                Phase::Queued,
+                Phase::AwaitingApproval,
+                Phase::Executing,
+                Phase::Elevating,
+                Phase::Reviewing,
+            ]
                 .into_iter()
                 .map(Phase::message)
                 .collect();
@@ -8420,6 +8790,310 @@ later"), "");
             assert!(!windup_of(&harness).await, "a window that said it was going was handed over");
         }
 
+        // --- a run whose reader asked to review its output -------------------
+
+        /// An approval that asks to see the output first, and nothing else.
+        fn reviewed() -> Reply {
+            Reply::verdict(Verdict::Approve {
+                stream: false,
+                terminal: false,
+                closing: false,
+                review: true,
+                note: String::new(),
+            })
+        }
+
+        /// A reader who sends whatever this makes of each section.
+        fn shaped(review: &protocol::Review, shape: impl Fn(&str) -> String) -> Sections<String> {
+            review.output.map(|_, captured| shape(&captured.text))
+        }
+
+        fn sends_everything(review: &protocol::Review) -> Release {
+            Release::Send { output: shaped(review, str::to_string), kept: Vec::new() }
+        }
+
+        fn keeps_errors(review: &protocol::Review) -> Release {
+            let keep = Matcher::new(&["error"]).unwrap();
+            Release::Send {
+                output: shaped(review, |text| crate::review::filter(text, &keep, &Matcher::none())),
+                kept: vec!["error".to_string()],
+            }
+        }
+
+        fn drops_tokens(review: &protocol::Review) -> Release {
+            let drop = Matcher::new(&["token"]).unwrap();
+            Release::Send {
+                output: shaped(review, |text| crate::review::filter(text, &Matcher::none(), &drop)),
+                kept: Vec::new(),
+            }
+        }
+
+        fn redacts_by_hand(review: &protocol::Review) -> Release {
+            Release::Send {
+                output: shaped(review, |text| text.replace("hunter2", "[gone]")),
+                kept: Vec::new(),
+            }
+        }
+
+        fn withholds(_: &protocol::Review) -> Release {
+            Release::Withhold
+        }
+
+        fn answers_some_other_review(_: &protocol::Review) -> Release {
+            Release::Send {
+                output: Sections::Transcript { transcript: "invented\n".to_string() },
+                kept: Vec::new(),
+            }
+        }
+
+        /// A file with a secret in it, and the command that prints it beside
+        /// two ordinary lines and a diagnostic. The secret is in the file and
+        /// not in the command, because the command is what the audit log
+        /// records and a test about the log keeping the secret out of it has
+        /// to start from a log that never had it for another reason.
+        fn a_secret_to_print(harness: &Harness) -> String {
+            let file = harness.dir.path().join("notes");
+            std::fs::write(&file, "ok: one\ntoken=hunter2\nerror: two\n").unwrap();
+            format!("cat {}; echo 'error: on stderr' >&2", file.display())
+        }
+
+        /// The one audit line, as it was written to the file.
+        fn logged_line(harness: &Harness) -> String {
+            let path = AuditLog::new(&harness.paths.log_dir()).current_path();
+            std::fs::read_to_string(path).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_reviewed_run_is_held_until_its_reader_answers_and_then_says_it_was_read() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(sends_everything))]);
+            let command = a_secret_to_print(&harness);
+            let result = within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await;
+            let text = result_text(&result);
+
+            assert_eq!(result.is_error, Some(false), "{text}");
+            assert!(text.contains("reviewed: the user read this output"), "{text}");
+            assert!(text.contains("released all of it"), "{text}");
+            assert!(text.contains("\nstdout:\nok: one\ntoken=hunter2\nerror: two\n"), "{text}");
+            assert!(text.contains("\nstderr:\nerror: on stderr\n"), "{text}");
+            assert!(!text.contains("trimmed"), "{text}");
+
+            // The output went to the window before the ending, whole, and the
+            // window was ended rather than handed over once it had answered.
+            let sent = &harness.prompter.recorded()[0].sent;
+            let review = sent.iter().position(|m| matches!(m, protocol::DaemonMsg::Review(_)));
+            let finished = sent.iter().position(|m| matches!(m, protocol::DaemonMsg::Finished(_)));
+            assert!(review.is_some() && review < finished, "{sent:?}");
+            assert!(!windup_of(&harness).await, "a reviewed window was handed over");
+
+            let record = harness.only_record();
+            assert_eq!(record["review"], "released");
+            assert_eq!(record["prompt"], "held", "a window that answered was filed as a death");
+        }
+
+        #[tokio::test]
+        async fn a_keep_filter_is_named_to_the_agent_and_the_two_pipes_stay_apart() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(keeps_errors))]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("trimmed it, so what follows is not everything"), "{text}");
+            assert!(
+                text.contains(
+                    "\nstdout (trimmed by the user: only lines containing \"error\", ignoring \
+                     case, are shown; the other lines were removed):\nerror: two\n"
+                ),
+                "{text}"
+            );
+            // Every stderr line contained the pattern, so nothing was taken
+            // from it, and it says nothing about having been trimmed.
+            assert!(text.contains("\nstderr:\nerror: on stderr\n"), "{text}");
+            assert!(!text.contains("hunter2") && !text.contains("ok: one"), "{text}");
+            assert_eq!(harness.only_record()["review"], "filtered");
+        }
+
+        #[tokio::test]
+        async fn a_drop_filter_says_lines_were_removed_and_never_what_they_said() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(drops_tokens))]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("\nstdout (trimmed by the user: lines were removed):\n"), "{text}");
+            assert!(text.contains("ok: one\nerror: two\n"), "{text}");
+            // Neither the line nor the word that found it. Saying which lines
+            // went would announce the very thing the reader removed.
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(!text.contains("token"), "the drop pattern reached the agent: {text}");
+
+            let line = logged_line(&harness);
+            assert!(line.contains("\"review\":\"filtered\""), "{line}");
+            assert!(!line.contains("hunter2") && !line.contains("token"), "{line}");
+        }
+
+        #[tokio::test]
+        async fn a_hand_edit_says_the_output_was_edited_and_not_what_changed() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(redacts_by_hand))]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(
+                text.contains("\nstdout (trimmed by the user: edited by hand, so lines may be missing or changed):\n"),
+                "{text}"
+            );
+            assert!(text.contains("token=[gone]"), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+            assert_eq!(harness.only_record()["review"], "edited");
+        }
+
+        #[tokio::test]
+        async fn a_review_nobody_answers_withholds_the_output_at_its_deadline() {
+            // The reader asked to see it first and then did not. Sending it
+            // anyway would override that choice in exactly the case it is for.
+            let harness = Harness::new(vec![reviewed()]);
+            let command = a_secret_to_print(&harness);
+            let started = tokio::time::Instant::now();
+            let result = within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await;
+            let text = result_text(&result);
+
+            assert!(started.elapsed() >= Duration::from_secs(1), "it did not wait for the reader");
+            assert!(text.contains("exit code: 0"), "the agent was not told the command ran: {text}");
+            assert!(text.contains("output withheld: the command ran"), "{text}");
+            assert!(text.contains("did not do so within 1s"), "{text}");
+            for leaked in ["hunter2", "ok: one", "error: two", "stdout", "stderr"] {
+                assert!(!text.contains(leaked), "{leaked} reached the agent unreviewed: {text}");
+            }
+            assert!(!windup_of(&harness).await, "an expired review was left on screen");
+            assert_eq!(harness.verdict(), "approve", "the command was approved and ran");
+            assert_eq!(harness.only_record()["review"], "unreviewed");
+        }
+
+        #[tokio::test]
+        async fn a_window_that_goes_during_a_review_withholds_the_output_too() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Dies)]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("the window closed before they released any of it"), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+            assert_eq!(harness.only_record()["review"], "unreviewed");
+        }
+
+        #[tokio::test]
+        async fn a_reader_who_sends_nothing_is_reported_as_having_chosen_to() {
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(withholds))]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("chose to release none of it"), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+            assert_eq!(harness.only_record()["review"], "withheld");
+        }
+
+        #[tokio::test]
+        async fn an_answer_shaped_for_some_other_output_releases_nothing() {
+            let harness =
+                Harness::new(vec![reviewed().reviewing(Reviewer::Answers(answers_some_other_review))]);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("hatch could not read what they chose to release"), "{text}");
+            assert!(!text.contains("invented") && !text.contains("hello"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn a_terminal_transcript_is_reviewed_like_any_other_output() {
+            // A transcript can hold what the person typed into the terminal,
+            // which is the strongest case there is for reading it first.
+            let harness = Harness::new(vec![reviewed().reviewing(Reviewer::Answers(drops_tokens))]);
+            let params = RunCommandParams {
+                interactive: true,
+                ..run_of("echo kept; echo token=hunter2")
+            };
+            let text = result_text(&within(harness.daemon.run_command(params, Caller::quiet())).await);
+
+            assert!(text.contains("transcript (trimmed by the user: lines were removed):"), "{text}");
+            assert!(text.contains("kept"), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+            let sent = &harness.prompter.recorded()[0].sent;
+            assert!(
+                sent.iter().any(|m| matches!(
+                    m,
+                    protocol::DaemonMsg::Review(protocol::Review { output: Sections::Transcript { .. }, .. })
+                )),
+                "the window was not shown the transcript: {sent:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_root_run_hatch_cannot_account_for_is_still_reviewed_before_its_output_goes() {
+            // The one elevation ending whose result carries the output, as
+            // evidence. It is also the one where a reader who asked to see a
+            // root command's output first would most mind it going without
+            // them.
+            let harness = rooted(
+                vec![reviewed().reviewing(Reviewer::Answers(drops_tokens))],
+                Arc::new(Rehearsed::running(RootOutcome::Unclear {
+                    exit: Some(1),
+                    message: "hatch cannot read this mechanism's diagnostics".to_string(),
+                })),
+            );
+            let text = result_text(
+                &within(
+                    harness.daemon.run_command(root_run("echo out; echo token=hunter2; exit 1"), Caller::quiet()),
+                )
+                .await,
+            );
+
+            assert!(text.contains("cannot say whether it ran"), "{text}");
+            assert!(text.contains("lines were removed"), "{text}");
+            assert!(text.contains("out") && !text.contains("hunter2"), "{text}");
+            assert_eq!(harness.only_record()["review"], "filtered");
+        }
+
+        #[tokio::test]
+        async fn a_run_nobody_asked_to_review_is_never_held_and_says_nothing_about_it() {
+            let harness = Harness::new(vec![approve()]);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of("echo hello"), Caller::quiet())).await,
+            );
+
+            assert!(!text.contains("reviewed") && !text.contains("withheld"), "{text}");
+            assert!(
+                !harness.prompter.recorded()[0]
+                    .sent
+                    .iter()
+                    .any(|m| matches!(m, protocol::DaemonMsg::Review(_))),
+                "output went to a window that did not ask to review it"
+            );
+            assert!(harness.only_record().get("review").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_command_that_could_not_start_has_no_output_to_hold() {
+            // Nothing ran and nothing was printed, so there is nothing to
+            // review and no deadline to wait out: the agent hears at once that
+            // nothing happened, as it would have without the box.
+            let harness = Harness::configured(vec![reviewed()], |config| {
+                config.terminal = vec!["no-such-terminal-anywhere".to_string()];
+            });
+            let params = RunCommandParams { interactive: true, ..run_of("echo never") };
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(result_text(&result).contains("nothing ran"));
+            assert!(harness.only_record().get("review").is_none());
+        }
+
         #[tokio::test]
         async fn a_character_left_unfinished_is_flushed_to_the_stream_it_came_from() {
             // Two bytes of a three-byte character on stdout and nothing after
@@ -8569,6 +9243,7 @@ later"), "");
             killed_by_user: None,
             timed_out: None,
             prompt: None,
+            review: None,
         })
     }
 
@@ -8719,7 +9394,7 @@ later"), "");
             transcript: None,
             transcript_truncated: false,
         };
-        let text = describe_run(&full, Duration::from_millis(12));
+        let text = describe_run(&full, Duration::from_millis(12), None);
         assert!(text.contains("exit code: 0"), "{text}");
         assert!(text.contains("12ms"), "{text}");
         assert!(
@@ -8742,7 +9417,7 @@ later"), "");
             transcript: None,
             transcript_truncated: false,
         };
-        let text = describe_run(&cut, Duration::from_secs(1));
+        let text = describe_run(&cut, Duration::from_secs(1), None);
         assert!(text.contains("signal 9"), "{text}");
         assert!(text.contains("timed out"), "{text}");
         assert!(text.contains("killed"), "{text}");

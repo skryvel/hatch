@@ -52,6 +52,20 @@
 //! one awaiting `run`. Sending output from inside that same task deadlocks as
 //! soon as the channel fills.
 //!
+//! **Approve, run, review.** When the approval carried `review`, the output
+//! goes to the window whole once the run is over, before the outcome, and the
+//! daemon waits for what the reader lets through before it writes the result:
+//!
+//! ```text
+//! outbox.review(Review { deadline, output }).await;
+//! outbox.finished(outcome_of(&out)).await;
+//! match session.release().await {                // raced against the deadline
+//!     Ok(Release::Send { output, kept }) => { .. } // labelled against what was captured
+//!     Ok(Release::Withhold) | Err(PromptGone) => { .. } // nothing is released
+//! }
+//! session.close().await;                         // never handed over
+//! ```
+//!
 //! **Deny and stop.**
 //!
 //! ```text

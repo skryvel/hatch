@@ -34,9 +34,11 @@ const TOKEN_BYTES: usize = 32;
 /// they were still reading. A timeout resolves as a denial, so the cost of
 /// the low number was landing on the agent as a refusal nobody made.
 ///
-/// The bound that still matters is the sum of this and
-/// [`Config::exec_timeout_secs`], which the tool descriptions state and
-/// `hatch serve` prints. Raising this raises that, and the README says so.
+/// The bound that still matters is the sum of this,
+/// [`Config::exec_timeout_secs`] and [`Config::review_timeout_secs`], which the
+/// tool descriptions state and `hatch serve` prints. Raising this raises that
+/// twice over, because the review deadline is this number too, and the README
+/// says so.
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 /// How long an approved command may run unless the config says otherwise.
@@ -226,22 +228,53 @@ impl Config {
         self.font_size.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()) as f32
     }
 
+    /// How long a reader who asked to see a command's output before the agent
+    /// does has to decide what of it to send.
+    ///
+    /// # The approval deadline, again
+    ///
+    /// Not a key of its own, and not a shorter number. A review is the same
+    /// person making the same kind of decision about the same command — read
+    /// something, then say what may go — and what [`DEFAULT_TIMEOUT_SECS`]
+    /// says about the approval is true here word for word: the time is
+    /// counted from when the screen appears and not from when it is noticed,
+    /// and a deadline that ran out while somebody was still reading five
+    /// hundred lines would be the review deciding instead of the reader. So
+    /// it is that number, and a person who has raised one has raised both.
+    ///
+    /// What happens at it is not what happens at the approval deadline, and
+    /// that is deliberate too: an unanswered review sends nothing. See
+    /// `crate::server`, where the output is withheld.
+    pub fn review_timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
     /// The longest a client call can block: the approval wait followed by a
-    /// full-length execution of every operation the largest batch may carry.
+    /// full-length execution, and a full-length review, of every operation
+    /// the largest batch may carry.
     pub fn client_timeout_secs(&self) -> u64 {
         self.blocking_bound_secs(crate::server::MAX_OPERATIONS)
     }
 
     /// The longest a call carrying `operations` operations can block.
     ///
-    /// The approval deadline is counted once and the execution timeout once
-    /// per operation, because that is how each is enforced: one window covers
-    /// the whole batch, and every operation that runs a process runs it under
-    /// a deadline of its own. A description that multiplied the approval wait
-    /// would overstate the bound, and one that counted a single execution for
-    /// a batch would understate it by every operation after the first.
+    /// The approval deadline is counted once, and the execution timeout and
+    /// the review deadline once per operation, because that is how each is
+    /// enforced: one window covers the whole batch, every operation that runs
+    /// a process runs it under a deadline of its own, and every command whose
+    /// reader asked to review it is reviewed on its own. A description that
+    /// multiplied the approval wait would overstate the bound, and one that
+    /// counted a single execution for a batch would understate it by every
+    /// operation after the first.
+    ///
+    /// The review term is counted whether or not anybody ticks the box. The
+    /// bound is what an agent plans around and what a client's timeout is set
+    /// from, and neither can know in advance which call a person will choose
+    /// to read; a number that left the review out would be one the first
+    /// reviewed call overran.
     pub fn blocking_bound_secs(&self, operations: usize) -> u64 {
-        self.timeout_secs + operations as u64 * self.exec_timeout_secs
+        self.timeout_secs
+            + operations as u64 * (self.exec_timeout_secs + self.review_timeout_secs())
     }
 }
 
@@ -502,12 +535,13 @@ pub fn client_json(config: &Config) -> String {
 /// The execution term is per operation, so where a batch may carry more than
 /// one the arithmetic says so; at one operation it reads as it always did.
 pub fn client_timeout_note(config: &Config) -> String {
-    let execution = match crate::server::MAX_OPERATIONS {
-        1 => format!("execution {}s", config.exec_timeout_secs),
-        n => format!("execution {}s for each of up to {n} operations", config.exec_timeout_secs),
+    let (exec, review) = (config.exec_timeout_secs, config.review_timeout_secs());
+    let per_operation = match crate::server::MAX_OPERATIONS {
+        1 => format!("execution {exec}s + review {review}s"),
+        n => format!("execution {exec}s and review {review}s for each of up to {n} operations"),
     };
     format!(
-        "Set your client's MCP tool timeout to at least {}s\n(approval {}s + {execution}).",
+        "Set your client's MCP tool timeout to at least {}s\n(approval {}s + {per_operation}).",
         config.client_timeout_secs(),
         config.timeout_secs,
     )
@@ -669,21 +703,27 @@ mod tests {
     }
 
     #[test]
-    fn client_blocking_bound_is_approval_plus_execution() {
+    fn client_blocking_bound_is_approval_plus_execution_plus_review() {
         let c = Config::default();
-        // One approval wait, one execution per operation the largest batch
-        // may carry -- which, while a batch carries one, is the sum it has
-        // always been.
+        // One approval wait, and one execution and one review per operation
+        // the largest batch may carry.
+        let per = c.exec_timeout_secs + c.review_timeout_secs();
         assert_eq!(
             c.client_timeout_secs(),
-            c.timeout_secs + crate::server::MAX_OPERATIONS as u64 * c.exec_timeout_secs
+            c.timeout_secs + crate::server::MAX_OPERATIONS as u64 * per
         );
-        assert_eq!(c.blocking_bound_secs(1), c.timeout_secs + c.exec_timeout_secs);
+        assert_eq!(c.blocking_bound_secs(1), c.timeout_secs + per);
         assert_eq!(
             c.blocking_bound_secs(3),
-            c.timeout_secs + 3 * c.exec_timeout_secs,
+            c.timeout_secs + 3 * per,
             "the approval wait is paid once however many operations there are"
         );
+    }
+
+    #[test]
+    fn a_review_gets_the_time_an_approval_gets() {
+        let c = Config { timeout_secs: 1234, ..Config::default() };
+        assert_eq!(c.review_timeout_secs(), 1234, "raising one did not raise the other");
     }
 
     // ---- the registration, in both of its spellings ----------------------
@@ -758,16 +798,16 @@ mod tests {
     }
 
     #[test]
-    fn the_timeout_note_states_the_sum_and_the_two_terms_it_is_made_of() {
-        // Both terms, so that a reader who has raised one of them in their own
-        // config can see their own arithmetic rather than wondering whether
-        // the total is the default.
+    fn the_timeout_note_states_the_sum_and_the_terms_it_is_made_of() {
+        // Every term, so that a reader who has raised one of them in their
+        // own config can see their own arithmetic rather than wondering
+        // whether the total is the default.
         let config = Config { timeout_secs: 1200, exec_timeout_secs: 600, ..registered() };
         let note = client_timeout_note(&config);
 
-        assert!(note.contains("at least 1800s"), "{note}");
-        assert!(note.contains("approval 1200s + execution 600s"), "{note}");
-        assert!(!note.contains("900"), "the default must not survive a raised config: {note}");
+        assert!(note.contains("at least 3000s"), "{note}");
+        assert!(note.contains("approval 1200s + execution 600s + review 1200s"), "{note}");
+        assert!(!note.contains("1500"), "the default must not survive a raised config: {note}");
     }
 
     #[test]
@@ -783,7 +823,7 @@ mod tests {
         assert_eq!(c.timeout_secs, 600);
         assert_eq!(c.exec_timeout_secs, DEFAULT_EXEC_TIMEOUT_SECS);
         assert_eq!(c.exec_timeout_secs, 300);
-        assert_eq!(c.client_timeout_secs(), 900, "what the tool descriptions state");
+        assert_eq!(c.client_timeout_secs(), 1500, "what the tool descriptions state");
     }
 
     #[test]

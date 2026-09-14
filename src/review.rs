@@ -241,6 +241,11 @@ impl Matcher {
         Ok(Matcher { patterns: built })
     }
 
+    /// A matcher with no patterns, which matches nothing.
+    pub fn none() -> Matcher {
+        Matcher { patterns: Vec::new() }
+    }
+
     /// Whether this matcher has any patterns at all.
     pub fn is_empty(&self) -> bool {
         self.patterns.is_empty()
@@ -322,7 +327,7 @@ impl Trimmed {
             return Trimmed::Whole;
         }
         if !keep.is_empty() {
-            let kept = filter(captured, keep, &Matcher { patterns: Vec::new() });
+            let kept = filter(captured, keep, &Matcher::none());
             if released == kept {
                 return Trimmed::Kept { further: false };
             }

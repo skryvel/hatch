@@ -284,6 +284,49 @@ pub struct RunDetail {
     /// reason `exit_code` is: there was no run for a window to be absent from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptEnd>,
+    /// What became of the output of a run its reader asked to review.
+    ///
+    /// `None` for every run nobody asked to review, and for a reviewed run
+    /// that left no output to review — a command that could not start, an
+    /// elevation that ran nothing.
+    ///
+    /// # What it does not record
+    ///
+    /// The output, or any part of it, and nothing about what was removed:
+    /// not the lines, not the drop patterns, not an edit. This file has never
+    /// held a command's output — it holds the command, which the person read
+    /// and approved — and a review exists to keep text away from somewhere it
+    /// would otherwise go. A log that kept what the person removed would be
+    /// the one copy of it that survives, in a file whose whole purpose is to
+    /// be read back later. What is here is only which of the endings it was,
+    /// which is what somebody working out what reached the agent needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewEnd>,
+}
+
+/// What became of reviewed output.
+///
+/// The five endings a review has, told apart by what the agent received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewEnd {
+    /// The reader sent it without taking anything out or changing anything.
+    Released,
+    /// The reader sent some of its lines, unchanged: a filter, or lines
+    /// deleted by hand, which the agent cannot tell apart and neither can
+    /// this.
+    Filtered,
+    /// The reader changed the text before sending it.
+    Edited,
+    /// The reader chose to send none of it.
+    Withheld,
+    /// Nobody answered the review — its deadline passed, the window went,
+    /// or the call was abandoned — and none of it was sent.
+    ///
+    /// Apart from [`ReviewEnd::Withheld`] because that one is a decision and
+    /// this is the absence of one, which is the difference between a timeout
+    /// and a denial one step later.
+    Unreviewed,
 }
 
 /// Where the approval window was while the operation it authorised ran.
@@ -544,6 +587,21 @@ impl LogDetail {
                 if run.prompt == Some(PromptEnd::Died) {
                     s.push_str("  (prompt died while it ran)");
                 }
+                // Every one of them, unlike the prompt's three. A review is
+                // asked for one command at a time and never by default, so
+                // this is not a note on every line; and the question a reader
+                // of this file brings to one — what reached the agent — has a
+                // different answer for each.
+                match run.review {
+                    None => {}
+                    Some(ReviewEnd::Released) => s.push_str("  (output reviewed, sent in full)"),
+                    Some(ReviewEnd::Filtered) => s.push_str("  (output reviewed, lines removed)"),
+                    Some(ReviewEnd::Edited) => s.push_str("  (output reviewed, edited)"),
+                    Some(ReviewEnd::Withheld) => s.push_str("  (output reviewed, withheld)"),
+                    Some(ReviewEnd::Unreviewed) => {
+                        s.push_str("  (output withheld, not reviewed in time)")
+                    }
+                }
                 s
             }
             LogDetail::SwapFile(swap) => {
@@ -621,6 +679,7 @@ mod tests {
                 killed_by_user: Some(false),
                 timed_out: Some(false),
                 prompt: None,
+                review: None,
             }),
         }
     }
@@ -963,6 +1022,37 @@ mod tests {
                 .map(|end| serde_json::to_string(end).expect("a tag"))
                 .collect();
         assert_eq!(tags.len(), 3, "two of them are written down as the same word");
+    }
+
+    #[test]
+    fn a_review_is_named_on_its_line_and_survives_the_file_without_any_of_the_output() {
+        let ends = [
+            ReviewEnd::Released,
+            ReviewEnd::Filtered,
+            ReviewEnd::Edited,
+            ReviewEnd::Withheld,
+            ReviewEnd::Unreviewed,
+        ];
+        let mut said = std::collections::HashSet::new();
+        for end in ends {
+            let mut record = sample_record(LogVerdict::Approve);
+            if let LogDetail::RunCommand(run) = &mut record.detail {
+                run.review = Some(end);
+            }
+            let line = serde_json::to_string(&record).expect("a record encodes");
+            assert_eq!(serde_json::from_str::<AuditRecord>(&line).expect("decodes"), record);
+            let summary = record.summary();
+            assert!(summary.contains("(output"), "{end:?} left no trace on its line: {summary}");
+            said.insert(summary);
+        }
+        assert_eq!(said.len(), ends.len(), "two endings read as the same line");
+
+        // A line from before reviews reads back as a run nobody reviewed, and
+        // a run nobody reviewed says nothing about it.
+        let plain = sample_record(LogVerdict::Approve);
+        let line = serde_json::to_string(&plain).unwrap();
+        assert!(!line.contains("review"), "{line}");
+        assert!(!plain.summary().contains("(output"));
     }
 
     #[test]

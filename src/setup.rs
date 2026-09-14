@@ -398,10 +398,11 @@ pub fn mcp_page(
         out,
         "3. Raise the client's MCP tool timeout to at least {seconds} seconds\n\
          \n   \
-         One call blocks for the approval wait and then for the command's own run:\n   \
-         {}s to decide plus {}s to run, so {seconds}s in all. Claude Code takes this\n   \
-         from MCP_TOOL_TIMEOUT, in milliseconds — {}. Its default for an HTTP\n   \
-         server is well under what hatch needs.\n\
+         One call blocks for the approval wait, then for the command's own run, and\n   \
+         then, if you chose to read its output before the agent gets it, for that:\n   \
+         {}s to decide plus {}s to run plus {}s to review, so {seconds}s in all.\n   \
+         Claude Code takes this from MCP_TOOL_TIMEOUT, in milliseconds — {}. Its\n   \
+         default for an HTTP server is well under what hatch needs.\n\
          \n   \
          Set it too low and the client gives up first. Three things happen at once:\n   \
          the agent gets an opaque transport failure instead of a clean allowed or\n   \
@@ -413,6 +414,7 @@ pub fn mcp_page(
          \n",
         config.timeout_secs,
         config.exec_timeout_secs,
+        config.review_timeout_secs(),
         seconds * 1000,
     );
 
@@ -642,25 +644,28 @@ mod tests {
 
     #[test]
     fn the_timeout_is_the_sum_of_the_configured_waits_and_not_a_number_in_the_text() {
-        // Raise both halves away from their defaults. A page still carrying
-        // 900 after this is a page with the default written into its prose.
+        // Raise every term away from its default. A page still carrying 1500
+        // after this is a page with the default written into its prose.
         let config = Config { timeout_secs: 1200, exec_timeout_secs: 600, ..config() };
         let page = page_for(&config);
 
-        assert!(flat(&page).contains("at least 1800 seconds"), "{page}");
-        assert!(flat(&page).contains("1200s to decide plus 600s to run"), "{page}");
-        assert!(flat(&page).contains("so 1800s in all"), "{page}");
-        assert!(!flat(&page).contains("900"), "the default must not survive a raised config: {page}");
+        assert!(flat(&page).contains("at least 3000 seconds"), "{page}");
+        assert!(
+            flat(&page).contains("1200s to decide plus 600s to run plus 1200s to review"),
+            "{page}"
+        );
+        assert!(flat(&page).contains("so 3000s in all"), "{page}");
+        assert!(!flat(&page).contains("1500"), "the default must not survive a raised config: {page}");
     }
 
     #[test]
-    fn the_default_config_asks_for_fifteen_minutes_in_seconds_and_in_milliseconds() {
+    fn the_default_config_asks_for_twenty_five_minutes_in_seconds_and_in_milliseconds() {
         // The number a reader pastes into their client, in the unit the client
         // wants it in. A wrong conversion here is a client that gives up after
-        // nine hundred milliseconds.
+        // fifteen hundred milliseconds.
         let page = page_for(&config());
-        assert!(flat(&page).contains("at least 900 seconds"), "{page}");
-        assert!(flat(&page).contains("MCP_TOOL_TIMEOUT, in milliseconds — 900000"), "{page}");
+        assert!(flat(&page).contains("at least 1500 seconds"), "{page}");
+        assert!(flat(&page).contains("MCP_TOOL_TIMEOUT, in milliseconds — 1500000"), "{page}");
     }
 
     #[test]
