@@ -20,6 +20,7 @@ pub mod prompter;
 pub mod protocol;
 pub mod queue;
 pub mod render;
+pub mod review;
 pub mod server;
 pub mod setup;
 pub mod swap;

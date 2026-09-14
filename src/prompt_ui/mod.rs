@@ -120,7 +120,9 @@ use crate::exec::Stream;
 use crate::prefs::PrefsFile;
 use crate::prompt_ui::guard::{Action, Guard, Keyboard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
-use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, ReviseKind, Verdict};
+use crate::protocol::{
+    self, DaemonMsg, Outcome, PromptMsg, Release, Request, Review, ReviseKind, Verdict,
+};
 
 /// The window's application id.
 ///
@@ -570,6 +572,15 @@ pub enum Phase {
     /// reader ticked the stream box on or an ending that is news; see
     /// [`Outcome::is_news`].
     Lingering,
+    /// The command has finished and its reader asked to see the output before
+    /// the agent does: the window is asking what of it to send.
+    ///
+    /// Reachable only through [`Phase::Running`], and only on a
+    /// [`DaemonMsg::Finished`] that followed a [`DaemonMsg::Review`]. It is a
+    /// question, like [`Phase::AwaitingVerdict`], and the daemon holds a
+    /// deadline over it the same way: nothing about it is the window's own
+    /// clock. See [`PromptState::release`].
+    Reviewing,
     /// The reader kept the window. It is a viewer now: the output, a way to
     /// copy it and a way to close it, and no decision of any kind.
     ///
@@ -602,6 +613,8 @@ pub struct PromptState {
     output_bytes: usize,
     output_dropped: bool,
     streaming: bool,
+    reviewing: bool,
+    review: Option<Review>,
     elevating: bool,
     was_elevated: bool,
     keeping: bool,
@@ -631,6 +644,8 @@ impl PromptState {
             output_bytes: 0,
             output_dropped: false,
             streaming: false,
+            reviewing: false,
+            review: None,
             elevating: false,
             was_elevated: false,
             keeping: false,
@@ -772,6 +787,31 @@ impl PromptState {
     /// frame as Approve must not change what happens afterwards.
     pub fn streaming(&self) -> bool {
         self.streaming
+    }
+
+    /// Whether the reader asked to see the output before the agent does.
+    ///
+    /// Recorded from the verdict, for the reason [`PromptState::streaming`]
+    /// is.
+    pub fn reviewing(&self) -> bool {
+        self.reviewing
+    }
+
+    /// The output held up for review, once the daemon has sent it.
+    pub fn review(&self) -> Option<&Review> {
+        self.review.as_ref()
+    }
+
+    /// Seconds left before the review expires and nothing is sent, at `now`.
+    ///
+    /// Only while the window is asking about it, and read off the daemon's
+    /// deadline for the reason [`PromptState::seconds_remaining`] is.
+    pub fn review_seconds_remaining(&self, now: DateTime<Utc>) -> Option<i64> {
+        if self.phase != Phase::Reviewing {
+            return None;
+        }
+        let deadline = self.review.as_ref()?.deadline;
+        Some((deadline - now).num_seconds().max(0))
     }
 
     /// Whether the reader has already said they want this window kept.
@@ -962,6 +1002,31 @@ impl PromptState {
                 self.elevating = false;
                 self.push_output(stream, text);
             }
+            DaemonMsg::Review(review) => {
+                // Only for a window that asked, only while its command is
+                // what it is showing, and only once. Anything else is a
+                // daemon describing some other window, and a question about
+                // output this window's reader never asked to see is not one
+                // to put in front of them.
+                if !(self.phase == Phase::Running && self.reviewing && self.review.is_none()) {
+                    self.channel_broken(
+                        "hatch sent output to review to a window that did not ask to review it",
+                    );
+                    return;
+                }
+                self.elevating = false;
+                self.review = Some(review);
+            }
+            DaemonMsg::Finished(outcome) if self.review.is_some() => {
+                // A question, not a result: nothing reaches the agent until
+                // the reader answers it, so the window stays whatever the
+                // ending and whatever was pressed while it ran. See
+                // `Outcome::stays`.
+                debug_assert!(outcome.stays(self.streaming, true));
+                self.outcome = Some(outcome);
+                self.elevating = false;
+                self.phase = Phase::Reviewing;
+            }
             DaemonMsg::Finished(outcome) => {
                 // Two reasons to stay, and without either the window goes on
                 // this frame, at once.
@@ -979,7 +1044,7 @@ impl PromptState {
                 // a non-zero exit is not on it. The daemon reads the same rule
                 // off the same frame and lets go of a window that is staying,
                 // so a window never stays only to be killed half way through.
-                let stays = self.streaming || outcome.is_news();
+                let stays = outcome.stays(self.streaming, false);
                 self.outcome = Some(outcome);
                 self.elevating = false;
                 // Three endings, and which one this is was settled before
@@ -1098,7 +1163,11 @@ impl PromptState {
                 self.keeping = true;
                 true
             }
-            Phase::Running if self.streaming && !self.keeping => {
+            // Not for a run under review. Its window does not end in a
+            // viewer: it ends in a question, and once that is answered it
+            // goes, so a keep pressed now would be a promise about an ending
+            // this window is not going to have.
+            Phase::Running if self.streaming && !self.reviewing && !self.keeping => {
                 self.keeping = true;
                 true
             }
@@ -1128,8 +1197,9 @@ impl PromptState {
         // Approve is the only verdict that leaves anything to watch. The rest
         // return a note to the agent and there is nothing further to show, so
         // the window is over the moment the frame is written.
-        if let Verdict::Approve { stream, .. } = verdict {
+        if let Verdict::Approve { stream, review, .. } = verdict {
             self.streaming = stream;
+            self.reviewing = review;
         }
         match verdict {
             // The reader ticked "Close when I decide", so an approval joins
@@ -1146,6 +1216,23 @@ impl PromptState {
             | Verdict::StopAndSync { .. } => self.close(),
         }
         Some(PromptMsg::Verdict(verdict))
+    }
+
+    /// Record the reader's answer to the review, and hand back the one frame
+    /// to send.
+    ///
+    /// The review's counterpart to [`PromptState::decide`], with the same
+    /// guarantee: an answer is produced only while the window is asking for
+    /// one, and producing it is what stops the asking. The window goes on the
+    /// frame that carries it — the reader has just seen everything there was
+    /// to see, and a window that lingered afterwards would only be showing it
+    /// again.
+    pub fn release(&mut self, release: Release) -> Option<PromptMsg> {
+        if self.phase != Phase::Reviewing {
+            return None;
+        }
+        self.close();
+        Some(PromptMsg::Release(release))
     }
 
     /// The Kill frame, if there is something running to kill.
@@ -1230,6 +1317,7 @@ pub struct Noticed {
 /// that learns the daemon has finished without needing the loop to be running
 /// — see [`arm_linger_backstop`].
 pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn(Noticed)) {
+    let mut reviewing = false;
     for line in reader.lines() {
         let item = match line {
             Ok(line) => match protocol::read_message::<DaemonMsg>(&line) {
@@ -1246,8 +1334,13 @@ pub fn read_frames<R: BufRead>(reader: R, tx: &Sender<Incoming>, wake: impl Fn(N
         };
         // Read before the item is given away, reported after: the loop must
         // not be woken for something it cannot yet see.
+        // The outcome after a review is not the daemon's last word: the
+        // window is about to ask a question, the daemon is waiting for the
+        // answer and holds the deadline over it, so nothing about the window's
+        // own clock starts here.
+        reviewing |= matches!(item, Incoming::Frame(DaemonMsg::Review(_)));
         let noticed = Noticed {
-            final_frame: matches!(item, Incoming::Frame(DaemonMsg::Finished(_))),
+            final_frame: matches!(item, Incoming::Frame(DaemonMsg::Finished(_))) && !reviewing,
             last: matches!(item, Incoming::Broken(_)),
         };
         if tx.send(item).is_err() {
@@ -1586,6 +1679,7 @@ impl PromptApp {
             stream: self.streams(),
             terminal: self.in_a_terminal(),
             closing: self.closes_on_decide(),
+            review: false,
             note: self.note.clone(),
         }
     }
@@ -1653,7 +1747,10 @@ impl PromptApp {
             // afterwards: keep this window. One key, one meaning, two phases,
             // which is the opposite of a collision.
             Phase::Running | Phase::Lingering | Phase::Detached => Keyboard::Watching,
-            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => {
+            // A review has text fields on it — the filters, and the output
+            // itself once the reader edits it — so it is asking, and its keys
+            // are chords.
+            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Reviewing | Phase::Closed => {
                 Keyboard::Asking
             }
         }
@@ -2101,7 +2198,7 @@ impl PromptApp {
             // one that matters now is two numbers the reader has to tell
             // apart.
             Phase::Lingering | Phase::Detached => self.viewer_row(ui),
-            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => {
+            Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Reviewing | Phase::Closed => {
                 self.status_row(ui)
             }
         }
@@ -3184,7 +3281,9 @@ fn mood(phase: Phase) -> theme::Mood {
     match phase {
         Phase::Running => theme::Mood::Running,
         Phase::Lingering | Phase::Detached => theme::Mood::Finished,
-        Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Closed => theme::Mood::Asking,
+        Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Reviewing | Phase::Closed => {
+            theme::Mood::Asking
+        }
     }
 }
 
@@ -3651,6 +3750,7 @@ mod tests {
             stream: true,
             terminal: false,
             closing: false,
+            review: false,
             note: "go on".to_string(),
         });
         answer(&mut wire, &mut state, frame);
@@ -3658,7 +3758,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(wire).unwrap(),
             "{\"type\":\"verdict\",\"verdict\":\"approve\",\"stream\":true,\"terminal\":false,\
-             \"closing\":false,\"note\":\"go on\"}\n"
+             \"closing\":false,\"review\":false,\"note\":\"go on\"}\n"
         );
         assert_eq!(state.broken(), None, "a written verdict is not a failure");
     }
@@ -4596,6 +4696,7 @@ mod tests {
                 stream: false,
                 terminal: false,
                 closing: true,
+                review: false,
                 note: String::new()
             }
         );
@@ -4611,6 +4712,7 @@ mod tests {
             stream: false,
             terminal: false,
             closing: true,
+            review: false,
             note: String::new(),
         });
         assert!(frame.is_some(), "a closing window still has to send its approval");
@@ -4629,6 +4731,7 @@ mod tests {
             stream: false,
             terminal: false,
             closing: true,
+            review: false,
             note: String::new(),
         });
         assert_eq!(state.request_kill(), None, "a window that has gone offered a Kill button");
@@ -6481,6 +6584,7 @@ mod tests {
             note: String::new(),
             terminal: false,
             closing: false,
+            review: false,
         });
         let running = window_text_sized(&mut app, opening_size());
         assert!(
@@ -7494,5 +7598,137 @@ mod tests {
         assert!(drawn.contains("closing now"), "{drawn}");
         assert!(!drawn.contains("Kept"), "a window going on its countdown said it was kept: {drawn}");
         assert!(drawn.contains("a line it printed"), "the output vanished before the window: {drawn}");
+    }
+
+    // ---- a run whose reader asked to review its output ---------------------
+
+    /// What a daemon hands a reviewing window: a line on each pipe.
+    fn a_review() -> Review {
+        Review {
+            deadline: Utc::now() + chrono::Duration::seconds(600),
+            output: crate::review::Sections::Streams {
+                stdout: crate::review::Captured {
+                    text: "ok: one\ntoken=hunter2\nok: two\n".to_string(),
+                    truncated: false,
+                },
+                stderr: crate::review::Captured {
+                    text: "warning: slow\n".to_string(),
+                    truncated: false,
+                },
+            },
+        }
+    }
+
+    /// An approval that asks to review, and nothing else.
+    fn approved_for_review() -> Verdict {
+        Verdict::Approve {
+            stream: false,
+            terminal: false,
+            closing: false,
+            review: true,
+            note: String::new(),
+        }
+    }
+
+    /// A command window whose reader asked to review, with the run over and
+    /// the question on screen.
+    fn a_reviewing_state() -> PromptState {
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.decide(approved_for_review());
+        state.handle(DaemonMsg::Review(a_review()));
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        state
+    }
+
+    #[test]
+    fn a_reviewed_run_stays_to_ask_even_when_its_ending_is_no_news_at_all() {
+        // Exit 0, nobody watching: the ending that closes every other window
+        // at once. This one has a question on it.
+        let state = a_reviewing_state();
+        assert_eq!(state.phase(), Phase::Reviewing);
+        assert!(!state.is_viewer(), "a window with a question on it is not only showing a result");
+        assert!(state.review_seconds_remaining(Utc::now()).is_some_and(|left| left > 0));
+    }
+
+    #[test]
+    fn output_to_review_is_believed_only_by_a_window_that_asked_for_it() {
+        let mut unasked = PromptState::new();
+        unasked.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        unasked.decide(approved(false));
+        unasked.handle(DaemonMsg::Review(a_review()));
+        assert!(unasked.should_close() && unasked.broken().is_some(), "{:?}", unasked.phase());
+
+        let mut twice = PromptState::new();
+        twice.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        twice.decide(approved_for_review());
+        twice.handle(DaemonMsg::Review(a_review()));
+        twice.handle(DaemonMsg::Review(a_review()));
+        assert!(twice.should_close() && twice.broken().is_some(), "a second review was believed");
+
+        let mut early = PromptState::new();
+        early.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        early.handle(DaemonMsg::Review(a_review()));
+        assert!(early.should_close(), "a review arrived before anything was approved");
+    }
+
+    #[test]
+    fn a_review_that_never_comes_leaves_the_ending_to_the_ordinary_rule() {
+        // A command that could not start printed nothing, so there is no
+        // output to review; the window is told why it failed like any other.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.decide(approved_for_review());
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(state.phase(), Phase::Closed);
+    }
+
+    #[test]
+    fn the_answer_to_a_review_leaves_once_and_takes_the_window_with_it() {
+        let mut state = a_reviewing_state();
+        let first = state.release(Release::Withhold);
+        assert_eq!(first, Some(PromptMsg::Release(Release::Withhold)));
+        assert!(state.should_close());
+        assert_eq!(state.broken(), None, "an answered review is not a failure");
+        assert_eq!(state.release(Release::Withhold), None, "it answered twice");
+        assert_eq!(state.decide(approved(false)), None, "a review became a second verdict");
+    }
+
+    #[test]
+    fn nothing_but_a_review_can_be_answered_as_one() {
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        assert_eq!(state.release(Release::Withhold), None, "a release came out of an approval window");
+        state.decide(approved_for_review());
+        assert_eq!(state.release(Release::Withhold), None, "a release came out of a running window");
+    }
+
+    #[test]
+    fn a_reviewed_run_cannot_be_kept_because_it_does_not_end_in_a_viewer() {
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.decide(Verdict::Approve {
+            stream: true,
+            terminal: false,
+            closing: false,
+            review: true,
+            note: String::new(),
+        });
+        assert!(!state.keep(), "a keep was promised for a window that ends in a question");
+    }
+
+    #[test]
+    fn the_outcome_after_a_review_is_not_the_daemons_last_word() {
+        // The reader thread arms the countdown that ends a lingering window
+        // off the final frame. A reviewing window has no countdown of its
+        // own -- the daemon holds the deadline -- and one armed anyway would
+        // take the question away twelve seconds into reading it.
+        let review = protocol::encode(&DaemonMsg::Review(a_review())).unwrap();
+        let finished = protocol::encode(&DaemonMsg::Finished(Outcome::Exit { code: 0 })).unwrap();
+        let (_, noticed) = read_noticing(&format!("{review}\n{finished}\n"));
+        assert!(noticed.iter().all(|n| !n.final_frame), "{noticed:?}");
+
+        let (_, plain) = read_noticing(&format!("{finished}\n"));
+        assert!(plain.iter().any(|n| n.final_frame), "an ordinary ending stopped being noticed");
     }
 }

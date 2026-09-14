@@ -20,6 +20,7 @@
 //! | [`PromptSession::outbox`] | Output and the final outcome, sent *after* an approval. |
 //! | [`PromptSession::kill_requested`] | Fires when the user presses Kill. Plugs straight into [`crate::exec::RunOpts::cancel`]. |
 //! | [`PromptSession::window_gone`] | Fires when the window is no longer there. |
+//! | [`PromptSession::release`] | What of a reviewed command's output the user lets the agent have. |
 //!
 //! and two ways for the request to be done with it: [`PromptSession::close`],
 //! which ends the window, and [`PromptSession::detach`], which gives it up.
@@ -141,7 +142,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::exec::Stream;
-use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Request, Verdict};
+use crate::protocol::{self, DaemonMsg, Outcome, PromptMsg, Release, Request, Review, Verdict};
 
 /// The subcommand that draws one window. The daemon spawns *itself* with it,
 /// so this string and `main`'s dispatch are the same fact written twice.
@@ -223,6 +224,7 @@ impl std::error::Error for PromptGone {}
 /// Dropping it ends the window. See the module docs.
 pub struct PromptSession {
     verdict: oneshot::Receiver<Verdict>,
+    release: oneshot::Receiver<Release>,
     outbox: Outbox,
     kill: CancellationToken,
     gone: CancellationToken,
@@ -245,6 +247,26 @@ impl PromptSession {
     /// there is exactly one verdict per window and it is delivered once.
     pub async fn verdict(&mut self) -> Result<Verdict, PromptGone> {
         (&mut self.verdict).await.map_err(|_| PromptGone)
+    }
+
+    /// Await the reader's answer to a review.
+    ///
+    /// Only meaningful once [`Outbox::review`] has been sent, and only once:
+    /// the answer is delivered the way the verdict is, through a channel that
+    /// keeps the value after the window is gone, so a window that sends it
+    /// and closes in the same instant is read as having answered.
+    ///
+    /// Cancel-safe for the reason [`PromptSession::verdict`] is: the review
+    /// deadline races it, and an answer that arrives in the same instant as
+    /// the deadline must not be lost by losing the race.
+    ///
+    /// # Errors
+    ///
+    /// [`PromptGone`]: the window ended without answering. Nothing is released
+    /// on it, which is the direction the reader chose when they asked to
+    /// review.
+    pub async fn release(&mut self) -> Result<Release, PromptGone> {
+        (&mut self.release).await.map_err(|_| PromptGone)
     }
 
     /// A handle for sending output and the final outcome to the window.
@@ -373,6 +395,19 @@ impl Outbox {
         self.send(DaemonMsg::Elevating).await
     }
 
+    /// Hand the window the whole output of a run its reader asked to review.
+    ///
+    /// Before [`Outbox::finished`], never after: the window decides what to
+    /// do with the ending by whether it has something to ask about. See
+    /// [`crate::protocol::DaemonMsg::Review`].
+    ///
+    /// Returns whether it was delivered, on the same terms as
+    /// [`Outbox::output`]. `false` is a window that cannot be asked, and the
+    /// output is withheld.
+    pub async fn review(&self, review: Review) -> bool {
+        self.send(DaemonMsg::Review(review)).await
+    }
+
     /// Tell the window how the command ended. It closes on this frame.
     ///
     /// Returns whether it was delivered, on the same terms as
@@ -396,6 +431,9 @@ pub struct WindowSide {
     /// Deliver the one verdict. Dropping it without sending is how a window
     /// says it ended without deciding.
     pub verdict: oneshot::Sender<Verdict>,
+    /// Deliver the answer to a review. Dropping it without sending, like the
+    /// verdict, is how a window says it ended without answering.
+    pub release: oneshot::Sender<Release>,
     /// Output and the final outcome, in the order the daemon sent them.
     pub messages: mpsc::Receiver<DaemonMsg>,
     /// Cancel it when the user presses Kill.
@@ -421,6 +459,7 @@ pub struct WindowSide {
 /// there are two in this crate and both are built from here.
 pub fn session_pair() -> (PromptSession, WindowSide) {
     let (verdict_tx, verdict_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
     let (msg_tx, msg_rx) = mpsc::channel(OUTBOX_CAPACITY);
     let kill = CancellationToken::new();
     let gone = CancellationToken::new();
@@ -430,6 +469,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
 
     let session = PromptSession {
         verdict: verdict_rx,
+        release: release_rx,
         outbox: Outbox(msg_tx),
         kill: kill.clone(),
         gone: gone.clone(),
@@ -439,6 +479,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
     };
     let side = WindowSide {
         verdict: verdict_tx,
+        release: release_tx,
         messages: msg_rx,
         kill,
         shutdown,
@@ -550,10 +591,18 @@ impl Prompter for ProcessPrompter {
 
         let (session, side) = session_pair();
         let gone = session.window_gone();
-        let WindowSide { verdict, messages, kill, shutdown, gone: gone_guard, reaped, detached } =
-            side;
+        let WindowSide {
+            verdict,
+            release,
+            messages,
+            kill,
+            shutdown,
+            gone: gone_guard,
+            reaped,
+            detached,
+        } = side;
 
-        tokio::spawn(read_from_window(stdout, verdict, kill, gone_guard));
+        tokio::spawn(read_from_window(stdout, verdict, release, kill, gone_guard));
         tokio::spawn(write_to_window(WriteToWindow {
             child,
             stdin,
@@ -579,11 +628,13 @@ impl Prompter for ProcessPrompter {
 async fn read_from_window(
     stdout: tokio::process::ChildStdout,
     verdict: oneshot::Sender<Verdict>,
+    release: oneshot::Sender<Release>,
     kill: CancellationToken,
     gone: DropGuard,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut verdict = Some(verdict);
+    let mut release = Some(release);
     while let Ok(Some(line)) = lines.next_line().await {
         match protocol::read_message::<PromptMsg>(&line) {
             // The first verdict is the verdict. A second one has nowhere to go
@@ -597,6 +648,18 @@ async fn read_from_window(
                 }
             }
             Ok(PromptMsg::Kill) => kill.cancel(),
+            // The first answer to a review is the answer, for the reason the
+            // first verdict is the verdict. It is not checked against whether
+            // a review was sent, and cannot be from here: the writing half
+            // owns that, on another task. The daemon reads it only after it
+            // has sent one, and what makes an early one harmless is on the
+            // daemon's side -- it labels the text against the output it
+            // captured, whatever the window says the text is.
+            Ok(PromptMsg::Release(r)) => {
+                if let Some(tx) = release.take() {
+                    let _ = tx.send(r);
+                }
+            }
             // A frame we cannot read means the two ends no longer agree about
             // the protocol, which cannot happen without a bug -- both ends are
             // the same build. Ending the channel resolves to deny before a
@@ -756,7 +819,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(out: &mut W, msg: &DaemonMsg) -> io:
 // ---- the scriptable one ----------------------------------------------------
 
 #[cfg(feature = "test-stub-prompter")]
-pub use stub::{Recorded, Reply, StubPrompter};
+pub use stub::{Recorded, Reply, Reviewer, StubPrompter};
 
 #[cfg(feature = "test-stub-prompter")]
 mod stub {
@@ -766,7 +829,10 @@ mod stub {
 
     use tokio::sync::{broadcast, watch};
 
-    use super::{DaemonMsg, PromptSession, Prompter, Request, Verdict, WindowSide, session_pair};
+    use super::{
+        DaemonMsg, PromptSession, Prompter, Release, Request, Review, Verdict, WindowSide,
+        session_pair,
+    };
 
     /// A window that does what a test told it to do.
     ///
@@ -808,6 +874,28 @@ mod stub {
         delay: Duration,
         then: Then,
         failure: Option<String>,
+        reviewer: Reviewer,
+    }
+
+    /// What a scripted window does when the daemon hands it output to review.
+    ///
+    /// Three of the things a real reader can do, as seen from the daemon: say
+    /// what to send (or to send nothing, which is an answer too), let the
+    /// deadline come, or close the window.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Reviewer {
+        /// Never answer, so the review deadline decides. What a window that
+        /// was scripted with no review at all does, which is the right
+        /// default: a test that did not expect a review and gets one waits
+        /// out a deadline rather than being handed an answer it never wrote.
+        Silent,
+        /// Answer with whatever this makes of the review it was shown.
+        ///
+        /// A function rather than a value, because what a reader sends is
+        /// made from the output, and the output is the command's to decide.
+        Answers(fn(&Review) -> Release),
+        /// End the window without answering.
+        Dies,
     }
 
     /// What a window does once it has answered, or decided not to.
@@ -825,19 +913,37 @@ mod stub {
     impl Reply {
         /// Answer with this verdict, at once, and stay open.
         pub fn verdict(verdict: Verdict) -> Reply {
-            Reply { verdict: Some(verdict), delay: Duration::ZERO, then: Then::Stay, failure: None }
+            Reply {
+                verdict: Some(verdict),
+                delay: Duration::ZERO,
+                then: Then::Stay,
+                failure: None,
+                reviewer: Reviewer::Silent,
+            }
         }
 
         /// Never answer. The window stays open until the daemon's deadline
         /// closes it — the approval timeout, which is not the same outcome as a
         /// denial.
         pub fn silent() -> Reply {
-            Reply { verdict: None, delay: Duration::ZERO, then: Then::Stay, failure: None }
+            Reply {
+                verdict: None,
+                delay: Duration::ZERO,
+                then: Then::Stay,
+                failure: None,
+                reviewer: Reviewer::Silent,
+            }
         }
 
         /// End without deciding: a crashed or closed window.
         pub fn dies() -> Reply {
-            Reply { verdict: None, delay: Duration::ZERO, then: Then::Die, failure: None }
+            Reply {
+                verdict: None,
+                delay: Duration::ZERO,
+                then: Then::Die,
+                failure: None,
+                reviewer: Reviewer::Silent,
+            }
         }
 
         /// Fail to open at all, with this message. Nothing is ever shown.
@@ -847,6 +953,7 @@ mod stub {
                 delay: Duration::ZERO,
                 then: Then::Die,
                 failure: Some(message.into()),
+                reviewer: Reviewer::Silent,
             }
         }
 
@@ -867,6 +974,12 @@ mod stub {
         /// Press Kill this long after answering.
         pub fn then_kills_after(mut self, delay: Duration) -> Reply {
             self.then = Then::Kill(delay);
+            self
+        }
+
+        /// Do this when handed output to review.
+        pub fn reviewing(mut self, reviewer: Reviewer) -> Reply {
+            self.reviewer = reviewer;
             self
         }
     }
@@ -979,7 +1092,9 @@ mod stub {
         // same way. Which of the two it was is still worth recording: it is the
         // difference between a window the daemon ended and one it left for a
         // reader, and the server's tests have no other way to see it.
-        let WindowSide { verdict, mut messages, kill, shutdown, gone, reaped, detached } = side;
+        let WindowSide { verdict, release, mut messages, kill, shutdown, gone, reaped, detached } =
+            side;
+        let mut release = Some(release);
 
         if !reply.delay.is_zero() {
             tokio::select! {
@@ -1023,6 +1138,18 @@ mod stub {
                     kill.cancel();
                 }
                 msg = messages.recv() => match msg {
+                    Some(DaemonMsg::Review(review)) => {
+                        log.lock().unwrap()[index].sent.push(DaemonMsg::Review(review.clone()));
+                        match reply.reviewer {
+                            Reviewer::Silent => {}
+                            Reviewer::Answers(answer) => {
+                                if let Some(tx) = release.take() {
+                                    let _ = tx.send(answer(&review));
+                                }
+                            }
+                            Reviewer::Dies => break,
+                        }
+                    }
                     Some(msg) => log.lock().unwrap()[index].sent.push(msg),
                     None => break,
                 },

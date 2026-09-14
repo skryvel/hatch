@@ -10,12 +10,14 @@
 //! | [`DaemonMsg::Request`] | The one and only request. Always first. |
 //! | [`DaemonMsg::QueueDepth`] | The "N more waiting" badge changed. |
 //! | [`DaemonMsg::Output`] | A chunk of an approved command's output. |
+//! | [`DaemonMsg::Review`] | The whole output, for a reader who asked to see it before it is sent. |
 //! | [`DaemonMsg::Finished`] | How it ended. The last frame either way. |
 //!
 //! | Prompt → daemon | |
 //! |---|---|
 //! | [`PromptMsg::Verdict`] | Exactly one. |
 //! | [`PromptMsg::Kill`] | The user pressed Kill on a running command. |
+//! | [`PromptMsg::Release`] | What of the reviewed output the user will let the agent have. |
 //!
 //! # What the prompt is not allowed to do
 //!
@@ -37,12 +39,20 @@
 //!   would be adding the ability to answer for someone else's window.
 //! * **It cannot approve more than the operation it was shown.** The verdict
 //!   set is closed, and what an [`Verdict::Approve`] carries besides itself is
-//!   four things that cannot widen it: `stream` and `closing`, two display
+//!   five things that cannot widen it: `stream` and `closing`, two display
 //!   preferences about what this window does with itself; `terminal`, which
 //!   says how the operation runs and can only ever *grant* a terminal to the
-//!   command already on screen; and `note`, the words the person typed, which
+//!   command already on screen; `review`, which can only put a person between
+//!   the output and the agent; and `note`, the words the person typed, which
 //!   the daemon relays and never interprets. There is no field in which a
 //!   command, an argument, a path or a mode could ride back.
+//! * **It cannot pass off shaped output as whole.** [`PromptMsg::Release`]
+//!   carries text back, which is new in this direction, and the text is what
+//!   the person chose to send. What the daemon does *not* take from it is a
+//!   description of that text: whether lines were removed or edited is read
+//!   off the release against the output the daemon captured, so a window that
+//!   is wrong about what it did still cannot make trimmed output reach the
+//!   agent labelled as complete. See [`crate::review::Trimmed::of`].
 //! * **[`PromptMsg::Kill`] is safe by direction.** A prompt that sends it
 //!   early, twice, or for no reason can only stop a command. Everything a
 //!   prompt can say unprompted fails towards deny, which is invariant 2.
@@ -335,6 +345,21 @@ pub enum DaemonMsg {
     /// has been told "it is running" has no reason to connect the two, or to
     /// know that dismissing the dialog stops something they already approved.
     Elevating,
+    /// Everything the command left for the agent, held back until the reader
+    /// who asked to see it has decided what of it to send.
+    ///
+    /// Sent only to a window whose approval carried `review`, once the run is
+    /// over and immediately before its [`DaemonMsg::Finished`], so that the
+    /// window reads the ending knowing it has a question to ask: see
+    /// [`Outcome::stays`].
+    ///
+    /// The whole capture in one frame, and not the [`DaemonMsg::Output`]
+    /// chunks already sent to a streaming window. Those are uncapped and the
+    /// window keeps the last megabyte of them; what the agent would receive
+    /// is the capture, cut at the output cap from the other end. A review of
+    /// the live view would be a review of different text from the text being
+    /// released.
+    Review(Review),
     /// How the command ended. The last frame the daemon sends.
     ///
     /// Strictly, how one *operation* ended: the daemon sends one for each
@@ -509,6 +534,16 @@ impl Outcome {
     /// whenever it was not last. What it would show then is every operation's
     /// ending, the quiet ones included, so the news is read in its place.
     ///
+    /// # A run under review
+    ///
+    /// Not a question this function is asked. A window whose reader asked to
+    /// see the output before it is sent stays whatever the ending, news or
+    /// not, because it is no longer showing a result: it is asking what of
+    /// the result the agent may have, and nothing reaches the agent until it
+    /// is answered. That is not news in the sense above and does not pretend
+    /// to be. [`Outcome::stays`] is where the two reasons and the third meet,
+    /// and both ends of the pipe ask it rather than this.
+    ///
     /// # What it does not touch
     ///
     /// The agent's result. The window is the person's and the tool result is
@@ -522,6 +557,40 @@ impl Outcome {
             | Outcome::Failed { .. } => true,
         }
     }
+
+    /// Whether a window stays after this ending, rather than going at once.
+    ///
+    /// The whole rule, in the one place both ends of the pipe read it: the
+    /// window by staying, the daemon by not ending a window that is going to.
+    /// Three reasons, and any one is enough:
+    ///
+    /// * `reviewed` — the window was sent a [`DaemonMsg::Review`] and has a
+    ///   question on it. It stays regardless of the ending, and it is the one
+    ///   staying window the daemon keeps hold of rather than letting go,
+    ///   because the answer is still to come back up the pipe.
+    /// * `watched` — the reader ticked the stream box.
+    /// * [`Outcome::is_news`] — the ending is something the reader could not
+    ///   have known from what they approved.
+    pub fn stays(&self, watched: bool, reviewed: bool) -> bool {
+        reviewed || watched || self.is_news()
+    }
+}
+
+/// The output of an approved command, held up for the reader to decide about.
+///
+/// See [`DaemonMsg::Review`] for when it is sent, and [`crate::review`] for
+/// what the reader may do with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    /// When the review expires, on the daemon's clock.
+    ///
+    /// Absolute for the reason [`Request::deadline`] is. At this instant the
+    /// daemon releases nothing and ends the window; the window only draws the
+    /// countdown to it.
+    pub deadline: DateTime<Utc>,
+    /// The output as the agent would otherwise have received it, section by
+    /// section.
+    pub output: crate::review::Sections<crate::review::Captured>,
 }
 
 /// The one request a window is about.
@@ -817,6 +886,47 @@ pub enum PromptMsg {
     /// [`Verdict::Approve`], and harmless before one: it can stop a command
     /// and can never start one.
     Kill,
+    /// The reader's answer to a [`DaemonMsg::Review`]: what of the output the
+    /// agent may have.
+    ///
+    /// Read by the daemon only after it has sent the review, and only once. A
+    /// window that sends one unasked has said something nobody is waiting
+    /// for, and one that sends two has its second dropped, like a second
+    /// verdict.
+    Release(Release),
+}
+
+/// What a reader who reviewed a command's output lets the agent have.
+///
+/// # Why the text itself comes back
+///
+/// The alternative was to send back the filters and let the daemon apply
+/// them, and it would have been the one place in hatch where what a person
+/// approved was an instruction rather than a result. The reader was looking
+/// at the lines that would go; those lines are what goes. A hand edit has no
+/// other form anyway.
+///
+/// What the daemon does not take on the window's word is what the text *is*:
+/// see [`crate::review::Trimmed::of`]. The only claim carried here that
+/// reaches the agent is `kept`, and it is repeated only where the text bears
+/// it out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "release", rename_all = "snake_case")]
+pub enum Release {
+    /// Send this.
+    Send {
+        /// The output as the reader left it, in the shape it was captured in.
+        output: crate::review::Sections<String>,
+        /// The keep patterns in force, which the agent may be told.
+        ///
+        /// Drop patterns are deliberately not a field. They would name what
+        /// the reader removed, and a field is a thing that ends up in a
+        /// sentence or a log line some day; a string that never crosses the
+        /// pipe cannot.
+        kept: Vec<String>,
+    },
+    /// Send none of it.
+    Withhold,
 }
 
 /// The agent-facing verdict set.
@@ -884,6 +994,21 @@ pub enum Verdict {
         /// to be watched, and the window clears one when the other is asked
         /// for.
         closing: bool,
+        /// Whether the reader asked to see the output before the agent does.
+        ///
+        /// Unlike `stream` and `closing` it changes what the agent receives —
+        /// possibly nothing — and like `terminal` it changes nothing about
+        /// what runs. It can only put a person between the output and the
+        /// agent, never take one away, so like every other field here it
+        /// cannot widen the approval.
+        ///
+        /// It cannot arrive `true` alongside `closing` from a working window,
+        /// which clears the one when the other is asked for: a window that has
+        /// gone cannot show anything. The daemon does not depend on that. A
+        /// review asked for of a window that is not there is a review nobody
+        /// answers, and the output is withheld, which is the direction the
+        /// reader chose.
+        review: bool,
         /// What the user typed, returned to the agent.
         ///
         /// The window has always had the field and an approval used to drop
@@ -960,7 +1085,7 @@ pub enum ReviseKind {
 /// the verdict out.
 #[cfg(test)]
 pub(crate) fn approved(stream: bool) -> Verdict {
-    Verdict::Approve { stream, terminal: false, closing: false, note: String::new() }
+    Verdict::Approve { stream, terminal: false, closing: false, review: false, note: String::new() }
 }
 
 /// One of every verdict, for the tests across this crate that must cover the
@@ -980,19 +1105,29 @@ pub(crate) fn every_verdict() -> Vec<Verdict> {
             stream: true,
             terminal: false,
             closing: false,
+            review: false,
             note: "thanks — watch the tail of it".to_string(),
         },
         Verdict::Approve {
             stream: false,
             terminal: true,
             closing: false,
+            review: false,
             note: "this one is going to ask you things".to_string(),
         },
         Verdict::Approve {
             stream: false,
             terminal: false,
             closing: true,
+            review: false,
             note: "get on with it, I am going back to what I was doing".to_string(),
+        },
+        Verdict::Approve {
+            stream: true,
+            terminal: false,
+            closing: false,
+            review: true,
+            note: "show me before it goes".to_string(),
         },
         approved(false),
         Verdict::Deny { note: "not now".to_string() },
@@ -1193,6 +1328,7 @@ mod tests {
     use crate::render::diff::side_by_side;
     use crate::render::{render_command, unrender};
     use crate::swap::{PlanKind, Principal};
+    use crate::review::{Captured, Sections};
 
     fn rendering(command: &str) -> Spans {
         render_command(command, &BTreeMap::from([("HOME".to_string(), "/home/user".to_string())]))
@@ -1236,6 +1372,19 @@ mod tests {
                 stream: Stream::Stderr,
                 text: "a line\nand another\n".to_string(),
             },
+            DaemonMsg::Review(Review {
+                deadline: Utc.with_ymd_and_hms(2026, 9, 6, 12, 10, 0).unwrap(),
+                output: Sections::Streams {
+                    stdout: Captured { text: "token=abc\nok\n".to_string(), truncated: false },
+                    stderr: Captured { text: String::new(), truncated: true },
+                },
+            }),
+            DaemonMsg::Review(Review {
+                deadline: Utc.with_ymd_and_hms(2026, 9, 6, 12, 10, 0).unwrap(),
+                output: Sections::Transcript {
+                    transcript: Captured { text: "Password: \r\n".to_string(), truncated: false },
+                },
+            }),
             DaemonMsg::Finished(Outcome::Exit { code: 0 }),
         ];
         for message in messages {
@@ -1280,7 +1429,21 @@ mod tests {
         let messages: Vec<PromptMsg> = every_verdict()
             .into_iter()
             .map(PromptMsg::Verdict)
-            .chain([PromptMsg::Kill])
+            .chain([
+                PromptMsg::Kill,
+                PromptMsg::Release(Release::Withhold),
+                PromptMsg::Release(Release::Send {
+                    output: Sections::Streams {
+                        stdout: "error: one\n".to_string(),
+                        stderr: String::new(),
+                    },
+                    kept: vec!["error".to_string()],
+                }),
+                PromptMsg::Release(Release::Send {
+                    output: Sections::Transcript { transcript: "edited\n".to_string() },
+                    kept: Vec::new(),
+                }),
+            ])
             .collect();
         for message in messages {
             let encoded = encode(&message).expect("a prompt message encodes");
@@ -1467,8 +1630,9 @@ mod tests {
         //
         // The permitted set is what the window is entitled to decide: which
         // answer (`verdict`, `kind`), what to say about it (`note`), what this
-        // window then does with itself (`stream`, `closing`), and how an
-        // approved operation should be carried out (`terminal`). What is not
+        // window then does with itself (`stream`, `closing`), how an approved
+        // operation should be carried out (`terminal`), and whether a person
+        // stands between its output and the agent (`review`). What is not
         // in it is the whole point — no request id, no command, no path, no
         // argv. A window cannot name the thing it is answering about, so it
         // cannot name a different one.
@@ -1479,7 +1643,7 @@ mod tests {
                 serde_json::from_str(&encode(&message).expect("encodes")).expect("valid JSON");
             for key in json.as_object().expect("an object").keys() {
                 assert!(
-                    ["type", "verdict", "note", "stream", "terminal", "closing", "kind"]
+                    ["type", "verdict", "note", "stream", "terminal", "closing", "review", "kind"]
                         .contains(&key.as_str()),
                     "a prompt message may not carry {key}: which request this is, and what it \
                      asked for, are the daemon's and not the window's"
@@ -1533,6 +1697,41 @@ mod tests {
         ] {
             assert!(news.is_news(), "{news:?} would close a window over what it has to say");
         }
+    }
+
+    #[test]
+    fn a_window_under_review_stays_whatever_the_ending_and_nothing_else_changes() {
+        // The one rule both ends read. A review is a question still open, so
+        // the quietest ending there is keeps its window; without one, staying
+        // is what it always was.
+        let endings = [
+            Outcome::Exit { code: 0 },
+            Outcome::Exit { code: 1 },
+            Outcome::Signal { signal: 9 },
+            Outcome::Failed { message: "why".to_string() },
+        ];
+        for ending in endings {
+            for watched in [false, true] {
+                assert!(ending.stays(watched, true), "{ending:?} closed a window with a question on it");
+                assert_eq!(ending.stays(watched, false), watched || ending.is_news(), "{ending:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_drop_patterns_have_nowhere_to_ride_back_on() {
+        // A release names what it keeps and nothing about what it removed.
+        // Written out as the JSON a window sends, because a field added later
+        // for "completeness" is exactly how a removed secret would leave.
+        let encoded = encode(&PromptMsg::Release(Release::Send {
+            output: Sections::Streams { stdout: "ok\n".to_string(), stderr: String::new() },
+            kept: Vec::new(),
+        }))
+        .expect("encodes");
+        let json: serde_json::Value = serde_json::from_str(&encoded).expect("JSON");
+        let mut keys: Vec<&str> = json.as_object().expect("an object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["kept", "output", "release", "type"], "{encoded}");
     }
 
     // ---- renderings across the pipe ----------------------------------------

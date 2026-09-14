@@ -1802,7 +1802,7 @@ impl Daemon {
         drop(permit);
 
         let (stream, terminal, closing, note) = match verdict {
-            Verdict::Approve { stream, terminal, closing, note } => {
+            Verdict::Approve { stream, terminal, closing, review: _, note } => {
                 (stream, terminal, closing, note)
             }
             other => {
@@ -5205,6 +5205,7 @@ later"), "");
                     stream: false,
                     terminal: false,
                     closing: false,
+                    review: false,
                     note: typed.to_string(),
                 });
             let tail = format!("{USER_NOTE_PREFIX}{typed}");
@@ -5341,6 +5342,7 @@ later"), "");
                 stream: false,
                 terminal: true,
                 closing: false,
+                review: false,
                 note: String::new(),
             })]);
             let result =
@@ -5475,6 +5477,7 @@ later"), "");
                     stream: false,
                     terminal: false,
                     closing: true,
+                    review: false,
                     note: String::new(),
                 })
                 .then_dies(),
@@ -8409,6 +8412,7 @@ later"), "");
                 stream: false,
                 terminal: false,
                 closing: true,
+                review: false,
                 note: String::new(),
             })]);
             within(harness.daemon.run_command(run_of("kill -9 $$"), Caller::quiet())).await;
