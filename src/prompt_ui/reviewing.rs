@@ -328,9 +328,13 @@ impl PromptApp {
         let mut removed = None;
         let mut add = false;
         ui.horizontal_wrapped(|ui| {
-            ui.add_sized(
+            // Right-aligned in a column as wide as the longer label, so the
+            // two fields start at one edge and each label is read against
+            // the field it names.
+            ui.allocate_ui_with_layout(
                 egui::vec2(label_width, ui.spacing().interact_size.y),
-                egui::Label::new(label),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| ui.label(label),
             );
             ui.add(
                 egui::TextEdit::singleline(self.draft.field(filter))
@@ -380,15 +384,32 @@ impl PromptApp {
             caption.push_str("; hatch's output cap cut it short");
         }
         ui.label(egui::RichText::new(caption).small().strong());
+        // Above the pane and not under the editor, where a pane that takes
+        // the height it is given would push it off the window: this is the
+        // one thing the editor draws differently from what is sent, and it
+        // has to be on the screen for that to be a disclosure.
+        let hidden = self.draft.edited(section).map_or(0, |text| scan(text).invisible);
+        if hidden > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{hidden} character(s) in the text below draw as nothing, and are sent as \
+                     they are."
+                ))
+                .small()
+                .color(ui.visuals().warn_fg_color),
+            );
+        }
 
         let row = ui.text_style_height(&egui::TextStyle::Monospace);
         panes::pane_frame(ui).show(ui, |ui| {
             ui.set_min_height(ui.available_height());
             let scroll = egui::ScrollArea::both()
                 .id_salt(("hatch-review", name))
-                .auto_shrink([false, false]);
+                .auto_shrink([false, false])
+                // A bar across an output that fits is a control for nothing,
+                // drawn under the text of every short review.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
             if let Some(text) = self.draft.edited(section) {
-                let hidden = scan(text).invisible;
                 scroll.show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -396,16 +417,6 @@ impl PromptApp {
                             .desired_width(f32::INFINITY),
                     );
                 });
-                if hidden > 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{hidden} character(s) in this text draw as nothing here, and are \
-                             sent as they are."
-                        ))
-                        .small()
-                        .color(ui.visuals().warn_fg_color),
-                    );
-                }
                 return;
             }
             let Some(sent) = sent else { return };
