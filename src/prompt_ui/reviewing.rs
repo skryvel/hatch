@@ -16,16 +16,24 @@
 //! lines are going, so a filter that removed everything, or nothing, is
 //! visible without scrolling.
 //!
-//! # Hand editing, and what makes it fit
+//! # Redacting, and hand editing
 //!
-//! A filter cannot take a password out of the middle of a line that has to
-//! stay. So the reader can turn the result into text they edit, and it is
-//! allowed on three conditions that keep it safe and legible:
+//! A filter cannot take a token out of the middle of a line that has to stay,
+//! and for a long time the only answer was to lose the line or edit it by
+//! hand. The redaction field does it instead — see [`crate::review::Redactor`]
+//! — and a reader who can describe the thing they are hiding needs nothing
+//! more. It is the third field and the last one applied, so what it works on
+//! is the lines the other two left.
 //!
-//! * **It starts from the filtered result, and the filters stop.** Two ways
+//! Hand editing stays, for what no pattern describes: the one value that is
+//! only wrong in context. The reader turns the result into text they edit,
+//! and it is allowed on three conditions that keep it safe and legible:
+//!
+//! * **It starts from the shaped result, and the fields stop.** Two ways
 //!   of shaping the same text at once would leave the reader unable to say
-//!   which of them made what is on the screen. While editing the filters are
-//!   drawn but disabled, and undoing the edits gives them back as they were.
+//!   which of them made what is on the screen. While editing the three fields
+//!   are drawn but disabled, and undoing the edits gives them back as they
+//!   were.
 //! * **The editor is the text that is sent**, with nothing between the two.
 //!   The one thing an editor draws differently from the text is a character
 //!   that draws as nothing, so the caption counts those when there are any
@@ -33,8 +41,11 @@
 //!   draw every one of them by name — see [`crate::render::unicode::reveal`].
 //! * **It cannot add lines.** Enter is the typing guard's and never reaches a
 //!   field — see [`super::guard`] — so an edit can change or remove text and
-//!   join lines, and cannot compose new ones by typing. A redaction does not
-//!   need to, and the agent is told only that the output was edited.
+//!   join lines, and cannot compose new ones by typing. Taking a value out
+//!   does not
+//!   need to, and the agent is told only that the output was edited — which
+//!   is also all it is told about a redaction, for the reason
+//!   [`crate::review::heading`] gives.
 //!
 //! # Keys
 //!
@@ -55,7 +66,7 @@ use super::{
 };
 use crate::protocol::{self, Release};
 use crate::render::unicode::{reveal, scan};
-use crate::review::{self, Captured, Matcher, PatternError, Section, Sections};
+use crate::review::{self, Captured, Matcher, PatternError, Redactor, Section, Sections};
 
 /// What the reader is told before anything else on the screen.
 ///
@@ -74,21 +85,49 @@ pub const WITHHOLD_LABEL: &str = "Send nothing";
 /// What happens when the review clock runs out, said beside it.
 pub const EXPIRY: &str = "When it runs out, nothing is sent.";
 
-/// The two filters' labels.
+/// The three fields' labels.
 pub const KEEP_LABEL: &str = "Keep only lines containing";
 pub const DROP_LABEL: &str = "Drop lines containing";
+pub const REDACT_LABEL: &str = "Redact text matching";
 
 /// How a pattern is read, said once under the two fields.
 ///
 /// The whole of what a reader needs to predict a match: not a pattern
 /// language, and not case. The sentence exists because the other reading is
 /// the one a person who knows `grep` brings with them.
-pub const FILTER_HINT: &str =
-    "Plain text, not a pattern: a dot is a dot. Case is ignored. Keep applies first, then drop.";
+pub const FILTER_HINT: &str = "Plain text, not a pattern: a dot is a dot. Case is ignored. \
+     Keep applies first, then drop, then the redaction below.";
+
+/// How a redaction is read, said under its own field.
+///
+/// The opposite of [`FILTER_HINT`] in the one way that matters, and the two
+/// sentences sit under the fields each of them describes so that neither can
+/// be read as the rule for the other. A reader who knows `grep` was told the
+/// filters are not that; they have to be told this one is.
+pub const REDACT_HINT: &str = "A regular expression, not plain text: a dot matches any \
+     character. Case is ignored. Each match is replaced by [redacted] and the rest of its line \
+     is sent.";
 
 /// What a filter the matcher refuses does to Send.
 pub const PATTERN_REFUSED: &str =
     "A filter is too long, or there are too many: nothing can be sent until it is shorter.";
+
+/// What a redaction the `regex` crate would not build does to Send, said with
+/// the crate's own reason after it.
+pub const REDACTION_REFUSED: &str = "That redaction cannot be used, so nothing can be sent:";
+
+/// What the reader is told about a field that stopped Send.
+///
+/// A redaction says why, where a filter says only that it is too big. The
+/// difference is that a redaction is a language a person can be wrong in, and
+/// "unclosed group" is the whole of what they need to fix it; a pattern over
+/// the bound is already described by the bound.
+pub fn refusal_said(error: &PatternError) -> String {
+    match error {
+        PatternError::Refused(why) => format!("{REDACTION_REFUSED} {why}."),
+        _ => PATTERN_REFUSED.to_string(),
+    }
+}
 
 /// The button that turns the result into text to edit, and the one that
 /// turns it back.
@@ -99,13 +138,19 @@ pub const UNEDIT_LABEL: &str = "Undo my edits";
 pub const EDITING_NOTE: &str = "Editing the text itself: the agent is told it was edited, not \
      what changed. The filters are set aside until you undo your edits.";
 
-/// Which of the two filters.
+/// Which of the three fields the reader shapes the output with.
+///
+/// One enum for all three because everything a field does — hold what is
+/// being typed, add it to a list, take one back — is the same work, and the
+/// only place the three differ is what their patterns are then used for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
     /// Only lines containing a pattern stay.
     Keep,
     /// Lines containing a pattern go.
     Drop,
+    /// What a pattern matches is replaced, and the rest of its line stays.
+    Redact,
 }
 
 /// What the reader has done to the output so far.
@@ -117,11 +162,13 @@ pub enum Filter {
 pub struct Draft {
     keep: Vec<String>,
     drop: Vec<String>,
+    redact: Vec<String>,
     /// What is in each field, which counts as a pattern as it is typed: the
     /// result on the screen is the result of what the reader can see in the
     /// fields, not of what they have confirmed.
     keep_field: String,
     drop_field: String,
+    redact_field: String,
     /// The text as the reader has edited it, once they have started to.
     edits: Option<Sections<String>>,
 }
@@ -132,6 +179,7 @@ impl Draft {
         let (added, field) = match filter {
             Filter::Keep => (&self.keep, &self.keep_field),
             Filter::Drop => (&self.drop, &self.drop_field),
+            Filter::Redact => (&self.redact, &self.redact_field),
         };
         review::meaningful(&added.iter().chain([field]).collect::<Vec<_>>())
     }
@@ -141,6 +189,7 @@ impl Draft {
         match filter {
             Filter::Keep => &mut self.keep_field,
             Filter::Drop => &mut self.drop_field,
+            Filter::Redact => &mut self.redact_field,
         }
     }
 
@@ -149,6 +198,7 @@ impl Draft {
         match filter {
             Filter::Keep => &self.keep,
             Filter::Drop => &self.drop,
+            Filter::Redact => &self.redact,
         }
     }
 
@@ -163,6 +213,7 @@ impl Draft {
         match filter {
             Filter::Keep => self.keep.push(text),
             Filter::Drop => self.drop.push(text),
+            Filter::Redact => self.redact.push(text),
         }
     }
 
@@ -171,6 +222,7 @@ impl Draft {
         let list = match filter {
             Filter::Keep => &mut self.keep,
             Filter::Drop => &mut self.drop,
+            Filter::Redact => &mut self.redact,
         };
         if index < list.len() {
             list.remove(index);
@@ -182,16 +234,56 @@ impl Draft {
         self.edits.is_some()
     }
 
-    /// The output as the filters leave it.
+    /// The output as all three fields leave it, with how much each section's
+    /// redactions did.
+    ///
+    /// Keep and drop choose the lines, and the redaction is applied to what
+    /// they left — the order [`FILTER_HINT`] states, and the only one in
+    /// which each field means what it says: lines are chosen by what they
+    /// hold, so a redaction that ran first would hide a line from the filter
+    /// aimed at it.
     ///
     /// # Errors
     ///
-    /// A filter the matcher refuses; see [`Matcher::new`]. Nothing is sent
-    /// while one stands, rather than something other than what the fields say.
-    pub fn filtered(&self, output: &Sections<Captured>) -> Result<Sections<String>, PatternError> {
+    /// A pattern any of the three refuses; see [`Matcher::new`] and
+    /// [`Redactor::new`]. Nothing is sent while one stands, rather than
+    /// something other than what the fields say.
+    fn shaped(
+        &self,
+        output: &Sections<Captured>,
+    ) -> Result<Sections<review::Redacted>, PatternError> {
         let keep = Matcher::new(&self.patterns(Filter::Keep))?;
         let drop = Matcher::new(&self.patterns(Filter::Drop))?;
-        Ok(output.map(|_, captured| review::filter(&captured.text, &keep, &drop)))
+        let redactor = Redactor::new(&self.patterns(Filter::Redact))?;
+        Ok(output.map(|_, captured| {
+            review::redact(&review::filter(&captured.text, &keep, &drop), &redactor)
+        }))
+    }
+
+    /// The output as the fields leave it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Draft::shaped`].
+    pub fn filtered(&self, output: &Sections<Captured>) -> Result<Sections<String>, PatternError> {
+        Ok(self.shaped(output)?.map(|_, redacted| redacted.text.clone()))
+    }
+
+    /// How many lines of each section a redaction changed, or `None` when
+    /// there is nothing to say about one: no redaction typed, or an edit
+    /// under way with the fields set aside.
+    ///
+    /// On the screen, never in the answer. See [`review::Redacted::lines`]
+    /// for why a reader needs it: a pattern that matched nothing leaves a
+    /// result identical to one with no redaction on it. Worked out a second
+    /// time rather than carried out of [`Draft::result`], which keeps the
+    /// result one thing; the pass is over at most hatch's output cap and only
+    /// happens while a redaction is typed.
+    pub fn redacted(&self, output: &Sections<Captured>) -> Option<Sections<usize>> {
+        if self.editing() || self.patterns(Filter::Redact).is_empty() {
+            return None;
+        }
+        Some(self.shaped(output).ok()?.map(|_, redacted| redacted.lines))
     }
 
     /// What Send would send now.
@@ -207,8 +299,9 @@ impl Draft {
         }
     }
 
-    /// Start editing, from what the filters leave. Does nothing while a
-    /// filter is refused, since there is then no result to start from.
+    /// Start editing, from what the three fields leave — redactions included,
+    /// so an edit never reveals what one of them took. Does nothing while a
+    /// pattern is refused, since there is then no result to start from.
     pub fn start_editing(&mut self, output: &Sections<Captured>) {
         if let Ok(filtered) = self.filtered(output) {
             self.edits = Some(filtered);
@@ -284,19 +377,27 @@ impl PromptApp {
 
         let editing = self.draft.editing();
         ui.add_enabled_ui(!editing, |ui| {
-            let label_width = [KEEP_LABEL, DROP_LABEL]
+            let label_width = [KEEP_LABEL, DROP_LABEL, REDACT_LABEL]
                 .iter()
                 .map(|label| super::text_width(ui, label, egui::TextStyle::Body))
                 .fold(0.0, f32::max);
+            // The two that choose lines, under the sentence that says how
+            // their patterns are read; then the one that rewrites them, under
+            // the sentence that says how its own are. Each rule sits under the
+            // fields it governs, because the two rules are opposites.
             for filter in [Filter::Keep, Filter::Drop] {
                 self.filter_row(ui, filter, label_width);
             }
             ui.label(egui::RichText::new(FILTER_HINT).small().color(quiet));
+            self.filter_row(ui, Filter::Redact, label_width);
+            ui.label(egui::RichText::new(REDACT_HINT).small().color(quiet));
         });
         let result = self.draft.result(&review.output);
-        if result.is_err() {
+        if let Err(error) = &result {
             ui.label(
-                egui::RichText::new(PATTERN_REFUSED).strong().color(ui.visuals().error_fg_color),
+                egui::RichText::new(refusal_said(error))
+                    .strong()
+                    .color(ui.visuals().error_fg_color),
             );
         }
         if editing {
@@ -306,6 +407,10 @@ impl PromptApp {
 
         let released: Option<Vec<String>> =
             result.ok().map(|sections| sections.iter().map(|(_, text)| text.clone()).collect());
+        let redacted: Option<Vec<usize>> = self
+            .draft
+            .redacted(&review.output)
+            .map(|counts| counts.iter().map(|(_, lines)| *lines).collect());
         let captured: Vec<(Section, Captured)> =
             review.output.iter().map(|(section, captured)| (section, captured.clone())).collect();
         let count = captured.len();
@@ -314,7 +419,8 @@ impl PromptApp {
                 columns.iter_mut().zip(&captured).enumerate()
             {
                 let sent = released.as_ref().map(|texts| texts[index].as_str());
-                self.section_pane(column, *section, captured, sent);
+                let changed = redacted.as_ref().map(|counts| counts[index]);
+                self.section_pane(column, *section, captured, sent, changed);
             }
         });
     }
@@ -324,6 +430,7 @@ impl PromptApp {
         let label = match filter {
             Filter::Keep => KEEP_LABEL,
             Filter::Drop => DROP_LABEL,
+            Filter::Redact => REDACT_LABEL,
         };
         let mut removed = None;
         let mut add = false;
@@ -363,20 +470,32 @@ impl PromptApp {
     /// One section of the output: how much of it is going, and the text that
     /// is — or the text being edited, while the reader edits.
     ///
-    /// `sent` is `None` while a filter is refused, when nothing is going.
+    /// `sent` is `None` while a pattern is refused, when nothing is going.
+    /// `redacted` is how many of its lines a redaction changed, and `None`
+    /// when there is no redaction to report on — see [`Draft::redacted`].
     fn section_pane(
         &mut self,
         ui: &mut egui::Ui,
         section: Section,
         captured: &Captured,
         sent: Option<&str>,
+        redacted: Option<usize>,
     ) {
         let name = section.name();
         let total = review::lines(&captured.text).count();
         let mut caption = match (self.draft.editing(), sent) {
             (true, _) => format!("{name} — edited by hand"),
             (false, Some(sent)) => {
-                format!("{name} — {} of {total} lines will be sent", review::lines(sent).count())
+                let going = review::lines(sent).count();
+                let mut said = format!("{name} — {going} of {total} lines will be sent");
+                // Said even when it is none, which is the number the reader
+                // most needs: a redaction that matched nothing leaves a screen
+                // identical to one with no redaction typed, and "0 redacted"
+                // is the only thing that tells them it missed.
+                if let Some(lines) = redacted {
+                    said.push_str(&format!(", {lines} of them redacted"));
+                }
+                said
             }
             (false, None) => format!("{name} — nothing can be sent yet"),
         };
@@ -614,6 +733,86 @@ mod tests {
         draft.stop_editing();
         assert!(!draft.editing());
         assert_eq!(draft.result(&output()).unwrap().iter().map(|(_, t)| t.len()).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn a_redaction_leaves_the_rest_of_the_line_and_never_rides_along() {
+        // The line the filters could only have lost whole goes, with the one
+        // thing on it that could not go taken out.
+        let mut draft = Draft::default();
+        draft.field(Filter::Redact).push_str("hunter\\d");
+        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+            panic!("no answer");
+        };
+        assert_eq!(stdout_of(&sent), "ok: one\ntoken=[redacted]\nerror: two\n");
+        assert!(kept.is_empty(), "a redaction was claimed as a keep pattern");
+        let encoded =
+            crate::protocol::encode(&Release::Send { output: sent.clone(), kept }).unwrap();
+        assert!(!encoded.contains("hunter"), "the redaction or its subject rode along: {encoded}");
+    }
+
+    #[test]
+    fn a_redaction_applies_to_what_the_filters_left() {
+        // Lines are chosen first and rewritten second. A redaction that ran
+        // first would have hidden `token` from the keep filter aimed at it.
+        let mut draft = Draft::default();
+        draft.field(Filter::Keep).push_str("token");
+        draft.add(Filter::Keep);
+        draft.field(Filter::Redact).push_str("=.*");
+        assert_eq!(stdout_of(&draft.result(&output()).unwrap()), "token[redacted]\n");
+    }
+
+    #[test]
+    fn the_caption_is_told_how_many_lines_a_redaction_changed() {
+        let mut draft = Draft::default();
+        assert!(draft.redacted(&output()).is_none(), "counted with no redaction typed");
+
+        draft.field(Filter::Redact).push_str("hunter\\d");
+        let Some(Sections::Streams { stdout, stderr }) = draft.redacted(&output()) else {
+            panic!("no counts");
+        };
+        assert_eq!((stdout, stderr), (1, 0));
+
+        // The case the count exists for: a pattern that matched nothing
+        // leaves a screen identical to one with no redaction on it.
+        draft.field(Filter::Redact).clear();
+        draft.field(Filter::Redact).push_str("nothing-like-this");
+        let Some(Sections::Streams { stdout, .. }) = draft.redacted(&output()) else {
+            panic!("no counts");
+        };
+        assert_eq!(stdout, 0);
+        assert_eq!(draft.result(&output()).unwrap(), output().map(|_, c| c.text.clone()));
+
+        // While editing there is nothing to count: the fields are set aside.
+        draft.start_editing(&output());
+        assert!(draft.redacted(&output()).is_none());
+    }
+
+    #[test]
+    fn editing_starts_from_the_redacted_text() {
+        // An edit that started from the unredacted text would put the token
+        // back on the screen and into what Send sends.
+        let mut draft = Draft::default();
+        draft.field(Filter::Redact).push_str("hunter\\d");
+        draft.start_editing(&output());
+        let text = draft.edited(Section::Stdout).expect("stdout is being edited");
+        assert_eq!(text, "ok: one\ntoken=[redacted]\nerror: two\n");
+    }
+
+    #[test]
+    fn a_redaction_that_will_not_build_leaves_nothing_to_send_and_says_why() {
+        let mut draft = Draft::default();
+        draft.field(Filter::Redact).push_str("(unclosed");
+        assert_eq!(draft.release(&output()), None);
+        let Err(error) = draft.result(&output()) else {
+            panic!("an unclosed group was accepted");
+        };
+        let said = refusal_said(&error);
+        assert!(said.starts_with(REDACTION_REFUSED), "{said}");
+        assert!(said.len() > REDACTION_REFUSED.len(), "no reason was given: {said}");
+        assert_eq!(refusal_said(&PatternError::TooLong), PATTERN_REFUSED);
+        draft.start_editing(&output());
+        assert!(!draft.editing(), "an edit started from a result that does not exist");
     }
 
     #[test]

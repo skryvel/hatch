@@ -8168,6 +8168,29 @@ mod tests {
     }
 
     #[test]
+    fn a_redaction_is_drawn_and_sent_with_the_rest_of_its_line() {
+        // The case the filters could not serve: the line is worth sending and
+        // one thing on it is not.
+        let (mut app, sink) = a_reviewing_window();
+        app.draft.field(reviewing::Filter::Redact).push_str("hunter\\d");
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains("token=[redacted]"), "{drawn}");
+        assert!(!drawn.contains("hunter2"), "what was redacted is still on the screen: {drawn}");
+        assert!(drawn.contains(reviewing::REDACT_LABEL), "{drawn}");
+        // The count that answers "did that do anything", on the screen
+        // without scrolling to look for a marker.
+        assert!(drawn.contains("1 of them redacted"), "{drawn}");
+
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], past_the_guard());
+        let Some(Release::Send { output, kept }) = the_release(&sink) else { panic!("nothing sent") };
+        let crate::review::Sections::Streams { stdout, .. } = output else { panic!() };
+        assert_eq!(stdout, "ok: one\ntoken=[redacted]\nok: two\n");
+        assert!(kept.is_empty(), "a redaction was claimed to the agent as a keep pattern");
+    }
+
+    #[test]
     fn an_edit_made_on_the_screen_is_what_is_sent() {
         let (mut app, sink) = a_reviewing_window();
         let ctx = egui::Context::default();

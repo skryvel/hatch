@@ -8942,7 +8942,7 @@ later"), "");
             );
 
             assert!(
-                text.contains("\nstdout (trimmed by the user: edited by hand, so lines may be missing or changed):\n"),
+                text.contains("\nstdout (trimmed by the user: the text was edited, so lines may be missing or changed):\n"),
                 "{text}"
             );
             assert!(text.contains("token=[gone]"), "{text}");
