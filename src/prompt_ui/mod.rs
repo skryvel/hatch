@@ -93,6 +93,32 @@
 //!   [`CHANNEL_END_GRACE`]), and a window that never opened or stopped drawing
 //!   (`eframe` returning, which returns from [`run_prompt`]).
 //!
+//! # Above the other windows, and then not
+//!
+//! The window opens on top of everything around it, because an agent is
+//! stopped on the answer and a question three windows down is a question
+//! nobody sees. That standing belongs to the asking and not to the window:
+//! once the command is approved and running there is nothing left to answer,
+//! and a window that still floated over every other one would be a progress
+//! indicator that cannot be put away. A reader who approved a long run and
+//! went back to work should be able to alt-tab past it like anything else.
+//!
+//! So the level follows the phase — [`standing`] is the rule, and
+//! [`PromptState::take_standing`] is how the window is told — and a run, a
+//! linger and a detached viewer are ordinary windows: raise them, lower them,
+//! leave them behind. [`Phase::Reviewing`] takes the standing back, because it
+//! is a second question with a deadline on it rather than part of the
+//! watching, and output nobody answers for is output the agent never gets.
+//!
+//! That split is not a third opinion about the phases: it is the one
+//! [`mood`] draws and [`PromptApp::keyboard`] types on, a window is either
+//! asking something or watching something, and
+//! `the_ground_the_keys_and_the_standing_read_the_same_split` holds the two
+//! that are reachable without a display to it.
+//!
+//! On Wayland none of this does anything, there as here: a client may not
+//! place itself, and the answer is a compositor rule matching [`APP_ID`].
+//!
 //! # Input
 //!
 //! Nothing here reads a key. Every event of every frame goes to
@@ -621,6 +647,20 @@ pub enum Phase {
     Closed,
 }
 
+/// Where a window sits among the windows around it.
+///
+/// Egui-free, like everything else [`PromptState`] answers with: the state
+/// machine says what the window should be, and the eframe app is the only
+/// thing that knows the command to say it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// Above the windows around it, and not to be lost behind one. There is a
+    /// question on it that something is stopped on.
+    Insistent,
+    /// An ordinary window. Raise it, lower it, leave it behind.
+    Ordinary,
+}
+
 /// One thing that came up the channel, or the reason nothing else will.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
@@ -652,6 +692,7 @@ pub struct PromptState {
     closed_from: Phase,
     close_taken: bool,
     title_taken: bool,
+    standing_sent: Standing,
 }
 
 impl Default for PromptState {
@@ -683,6 +724,10 @@ impl PromptState {
             closed_from: Phase::WaitingForRequest,
             close_taken: false,
             title_taken: false,
+            // What `open_window` built the viewport as. Starting anywhere
+            // else would have the first frame of every window restack it to
+            // where it already is.
+            standing_sent: Standing::Insistent,
         }
     }
 
@@ -946,6 +991,32 @@ impl PromptState {
         let number = self.request.as_ref()?.number?;
         self.title_taken = true;
         Some(numbered_title(number))
+    }
+
+    /// The standing this window should have, at each moment that changes.
+    ///
+    /// `None` while the window already is what it should be, which on the
+    /// ordinary path is its whole life up to the verdict: the viewport is
+    /// built [`Standing::Insistent`] — see [`open_window`] — so the first
+    /// thing this ever returns is the window letting go of the screen.
+    ///
+    /// Unlike [`PromptState::take_title`] this is not once and for all, and
+    /// so what is latched is the last standing handed out rather than the
+    /// fact of having handed one out: a reviewed run asks a second question,
+    /// and asking takes the screen back. What the latch is against is sixty
+    /// restack requests a second saying the same thing, not a second change.
+    ///
+    /// Read from [`PromptState::drawn_phase`], so a window on its way out
+    /// keeps the standing it had. The last frames of a window belong to what
+    /// it was, and restacking one that is already leaving is a flicker at the
+    /// end for nobody's benefit.
+    pub fn take_standing(&mut self) -> Option<Standing> {
+        let wanted = standing(self.drawn_phase());
+        if wanted == self.standing_sent {
+            return None;
+        }
+        self.standing_sent = wanted;
+        Some(wanted)
     }
 
     /// Seconds left before the approval expires, at `now`.
@@ -1428,6 +1499,11 @@ pub(crate) fn open_window(
             // A no-op on Wayland, where only the compositor may raise a
             // window, and correct everywhere else. The Wayland answer is a
             // compositor rule matching the app id above.
+            //
+            // Where every window starts and not where it stays: this is the
+            // standing of a window that is asking, and `standing` is what
+            // hands it back once the window is only watching a command it
+            // was given permission to run.
             .with_always_on_top(),
         ..Default::default()
     };
@@ -1930,6 +2006,15 @@ impl eframe::App for PromptApp {
         // exists, and the state machine's latch is what keeps it to once.
         if let Some(title) = self.state.take_title() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        // And whenever the window stops asking or starts again. Nothing is
+        // sent while it is what it already is, so an ordinary window says
+        // this once, on the frame that carries its verdict. See `standing`.
+        if let Some(standing) = self.state.take_standing() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(match standing {
+                Standing::Insistent => egui::WindowLevel::AlwaysOnTop,
+                Standing::Ordinary => egui::WindowLevel::Normal,
+            }));
         }
         // Before anything is drawn, and before any widget sees the frame.
         // Whatever the guard did not hand back is gone from this frame.
@@ -3441,6 +3526,26 @@ fn mood(phase: Phase) -> theme::Mood {
     }
 }
 
+/// Where a phase's window belongs among the windows around it.
+///
+/// The same split [`mood`] draws and [`PromptApp::keyboard`] types on: a
+/// window is either asking something or watching something happen. Asking is
+/// what earns a window the screen, because something is stopped until it is
+/// answered; watching earns nothing, however interesting the output is.
+///
+/// `Closed` is grouped with the asking for [`mood`]'s reason and reaches here
+/// only the same way — a window that closed before it ever had a request,
+/// which was asking. Everything closing otherwise is read through
+/// [`PromptState::drawn_phase`] and keeps what it had.
+fn standing(phase: Phase) -> Standing {
+    match phase {
+        Phase::Running | Phase::Lingering | Phase::Detached => Standing::Ordinary,
+        Phase::WaitingForRequest | Phase::AwaitingVerdict | Phase::Reviewing | Phase::Closed => {
+            Standing::Insistent
+        }
+    }
+}
+
 /// A primary button's label.
 fn strong(label: &str) -> egui::RichText {
     egui::RichText::new(label).strong().size(16.0)
@@ -3863,6 +3968,101 @@ mod tests {
     fn a_numbered_title_is_the_plain_one_with_the_number_on_the_end() {
         assert_eq!(numbered_title(1), format!("{WINDOW_TITLE} #1"));
         assert_eq!(numbered_title(47), "hatch — approval #47");
+    }
+
+    // ---- the standing ------------------------------------------------------
+
+    #[test]
+    fn an_approved_command_lets_go_of_the_screen() {
+        // The bug. A window that is asking belongs over everything, because
+        // an agent is stopped on the answer. A window watching a command it
+        // already authorised is a progress indicator, and one that still
+        // floated over every other window could not be put away: the reader
+        // who approved a long run and went back to work could not alt-tab
+        // past it.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        assert_eq!(
+            state.take_standing(),
+            None,
+            "a window that is asking would be restacked to where it already is"
+        );
+
+        state.decide(approved(true));
+        assert_eq!(state.phase(), Phase::Running);
+        assert_eq!(
+            state.take_standing(),
+            Some(Standing::Ordinary),
+            "the window is still holding the screen over a command nobody has to answer"
+        );
+        assert_eq!(state.take_standing(), None, "it would say so on every frame");
+    }
+
+    #[test]
+    fn the_question_a_review_asks_takes_the_screen_back() {
+        // A review is not the watching: it is a second question, with a
+        // deadline the daemon holds, and output nobody answers for is output
+        // the agent never gets. A window that stayed where the run left it
+        // could be behind three others when it starts asking.
+        let mut state = PromptState::new();
+        state.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        state.decide(approved_for_review());
+        assert_eq!(state.take_standing(), Some(Standing::Ordinary), "the run is not the question");
+
+        state.handle(DaemonMsg::Review(a_review()));
+        state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(state.phase(), Phase::Reviewing);
+        assert_eq!(
+            state.take_standing(),
+            Some(Standing::Insistent),
+            "a question with a deadline on it is asking from behind other windows"
+        );
+    }
+
+    #[test]
+    fn a_window_on_its_way_out_is_not_restacked() {
+        // `drawn_phase`'s argument, for the stack rather than the picture: a
+        // closing window goes on being what it was for the frames it has
+        // left, and asking the compositor to raise one that is already
+        // leaving is a flicker at the end for nobody.
+        let mut running = PromptState::new();
+        running.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        running.decide(approved(true));
+        assert_eq!(running.take_standing(), Some(Standing::Ordinary));
+        running.dismiss();
+        assert_eq!(running.phase(), Phase::Closed);
+        assert_eq!(running.take_standing(), None, "it was raised on the way out");
+
+        // And the other way: a window closing on a question it never got to
+        // answer was on top, and stays there for the frames it has left.
+        let mut asking = PromptState::new();
+        asking.handle(DaemonMsg::Request(Box::new(a_request(90))));
+        asking.dismiss();
+        assert_eq!(asking.take_standing(), None, "it was let down on the way out");
+    }
+
+    #[test]
+    fn the_ground_a_phase_is_drawn_on_and_the_standing_it_takes_agree() {
+        // Not a third opinion about the phases. A window is either asking
+        // something or watching something happen, `mood` is that split as a
+        // colour and `standing` is that split as a place in the stack, and a
+        // phase that changed its mind in one of them without the other would
+        // be a window drawn as a question that anything can cover.
+        for phase in [
+            Phase::WaitingForRequest,
+            Phase::AwaitingVerdict,
+            Phase::Running,
+            Phase::Lingering,
+            Phase::Reviewing,
+            Phase::Detached,
+            Phase::Closed,
+        ] {
+            assert_eq!(
+                standing(phase) == Standing::Insistent,
+                mood(phase) == theme::Mood::Asking,
+                "{phase:?} is drawn as one thing and stacked as another"
+            );
+        }
     }
 
     // ---- the wiring --------------------------------------------------------
