@@ -47,7 +47,7 @@ use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError};
-use crate::render::diff::{Row, Side};
+use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::prompt_ui::theme::{self, Palette};
@@ -1613,6 +1613,19 @@ fn diff_rows_id() -> egui::Id {
     egui::Id::new("hatch-diff-showing")
 }
 
+/// Where the diff pane keeps whether the reader has asked for every line.
+///
+/// egui's per-frame store, beside [`diff_rows_id`], and deliberately not
+/// `prefs.toml`. Which rows a reader wants to see is a fact about the diff in
+/// front of them and not about how they like to work: a remembered
+/// "collapsed" would be a standing choice hiding lines on some later request
+/// the person never made the choice for, which is the argument
+/// [`crate::prefs`] already makes for not remembering `terminal`. A window is
+/// one request, so this starts collapsed on every one of them.
+fn diff_expanded_id() -> egui::Id {
+    egui::Id::new("hatch-diff-expanded")
+}
+
 /// How many rows a pane laid out, and how many of them it had room to show.
 ///
 /// Measured off a pane that has been drawn, for the reason [`PaneAt`] gives:
@@ -2222,6 +2235,34 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
         RichText::new(diff_caption(view, rows, longest, column)).small().color(palette.quiet),
     );
 
+    // Derived here, per request, rather than read from a preference: see
+    // `diff_expanded_id`. Collapsed is the default because the status quo
+    // already hides changes -- behind the scrolling -- and a reader who gives
+    // up in a four-thousand-line unchanged middle has been shown less than
+    // one who is handed the hunks. A file with no run long enough to be worth
+    // a marker comes back from `changed_hunks` entirely `Shown`, so a short
+    // diff is drawn exactly as it was before any of this existed.
+    let expanded = ui.data(|data| data.get_temp::<bool>(diff_expanded_id()).unwrap_or(false));
+    let collapsed = changed_hunks(rows, CONTEXT_ROWS);
+    let hidden = hidden_rows(&collapsed);
+    let segments: Vec<Segment> =
+        if expanded { (0..rows.len()).map(Segment::Shown).collect() } else { collapsed };
+
+    // Drawn only when there is a choice to offer. A diff that collapses
+    // nothing gets no control, because a button that does nothing is a
+    // question the reader has to answer before they can get on with the one
+    // the window is actually asking.
+    if hidden > 0 {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(toggle_label(expanded, hidden)).clicked() {
+                ui.data_mut(|data| data.insert_temp(diff_expanded_id(), !expanded));
+            }
+            ui.label(
+                RichText::new(collapse_note(expanded, hidden)).small().color(palette.quiet),
+            );
+        });
+    }
+
     // The same notice the command panes carry, for the same reason: a diff is
     // a list of lines somebody is about to let be written, and a pane showing
     // forty of two hundred of them said so through its scroll bar alone. Side
@@ -2277,25 +2318,34 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
                     // the side to scroll to, and a horizontal bar that moved
                     // one column out from under the other would break the
                     // alignment the view is for.
+                    let items = column_items(rows, &segments);
                     egui::ScrollArea::vertical()
                         .id_salt("hatch-diff-columns")
                         .max_height(ui.available_height())
                         .auto_shrink([false, false])
-                        .show_rows(ui, row_height, rows.len(), |ui, range| {
-                            for row in &rows[range] {
-                                draw_row(ui, row, &palette, size);
+                        .show_rows(ui, row_height, items.len(), |ui, range| {
+                            for item in &items[range] {
+                                match item {
+                                    Item::Drawn(row) => draw_row(ui, row, &palette, size),
+                                    Item::Marker(len) => draw_marker(ui, *len, &palette),
+                                }
                             }
                         })
                 }
                 DiffView::Unified => {
-                    let lines = diff_lines(rows);
+                    let items = unified_items(rows, &segments);
                     egui::ScrollArea::both()
                         .id_salt("hatch-diff")
                         .max_height(ui.available_height())
                         .auto_shrink([false, false])
-                        .show_rows(ui, row_height, lines.len(), |ui, range| {
-                            for line in &lines[range] {
-                                draw_diff_line(ui, line, palette.danger, palette.warn);
+                        .show_rows(ui, row_height, items.len(), |ui, range| {
+                            for item in &items[range] {
+                                match item {
+                                    Item::Drawn(line) => {
+                                        draw_diff_line(ui, line, palette.danger, palette.warn)
+                                    }
+                                    Item::Marker(len) => draw_marker(ui, *len, &palette),
+                                }
                             }
                         })
                 }
@@ -2608,6 +2658,110 @@ fn diff_lines(rows: &[Row]) -> Vec<DiffLine<'_>> {
         }
     }
     out
+}
+
+/// One thing the diff pane draws: a piece of the file, or the marker that
+/// stands for a run of unchanged rows that is not on screen.
+///
+/// Generic over what "a piece of the file" is because the two views disagree
+/// about it and about nothing else: side by side draws a [`Row`], the unified
+/// view draws a [`DiffLine`], and a marker is the same one row in both. Both
+/// lists stay uniform in height, which is what `show_rows` needs and what
+/// lets a quarter-million-row diff be drawn at all.
+enum Item<T> {
+    /// Draw this.
+    Drawn(T),
+    /// Say that this many unchanged rows are behind it.
+    Marker(usize),
+}
+
+/// The segments as the side-by-side view draws them.
+fn column_items<'a>(rows: &'a [Row], segments: &[Segment]) -> Vec<Item<&'a Row>> {
+    segments
+        .iter()
+        .map(|segment| match *segment {
+            Segment::Shown(index) => Item::Drawn(&rows[index]),
+            Segment::Collapsed { len, .. } => Item::Marker(len),
+        })
+        .collect()
+}
+
+/// The segments as the unified view draws them.
+///
+/// A marker replaces exactly `len` drawn lines here, the same as it does in
+/// the other view, and that is not a coincidence worth relying on quietly: a
+/// collapsed run is unchanged rows only, and [`diff_lines`] draws an
+/// unchanged row as one line. A changed row is the case that can become two
+/// lines, and a changed row is never inside a marker.
+fn unified_items<'a>(rows: &'a [Row], segments: &[Segment]) -> Vec<Item<DiffLine<'a>>> {
+    let mut out = Vec::new();
+    for segment in segments {
+        match *segment {
+            Segment::Shown(index) => {
+                out.extend(diff_lines(&rows[index..index + 1]).into_iter().map(Item::Drawn));
+            }
+            Segment::Collapsed { len, .. } => out.push(Item::Marker(len)),
+        }
+    }
+    out
+}
+
+/// What a marker says: how many rows it stands for, and that they are rows
+/// the two files agree about.
+///
+/// The count is the whole point. A marker reading "unchanged lines hidden"
+/// would tell the reader that something is missing without telling them how
+/// much, which is the scroll bar's failure again in fewer rows.
+fn marker_text(len: usize) -> String {
+    match len {
+        1 => "1 unchanged line".to_string(),
+        len => format!("{len} unchanged lines"),
+    }
+}
+
+/// One drawn marker: hatch's own note, in the register the captions use.
+///
+/// Quiet and italic, because the one thing it must not read as is a line of
+/// the file. Every other row in this pane is content; this row is the window
+/// talking.
+fn draw_marker(ui: &mut Ui, len: usize, palette: &Palette) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(
+            RichText::new(format!("  {}", marker_text(len)))
+                .monospace()
+                .italics()
+                .color(palette.quiet),
+        );
+    });
+}
+
+/// What the control above the pane offers to do next.
+fn toggle_label(expanded: bool, hidden: usize) -> String {
+    if expanded {
+        "Collapse the unchanged runs again".to_string()
+    } else {
+        format!("Show all {hidden} unchanged lines")
+    }
+}
+
+/// The sentence under the caption that says what the markers mean.
+///
+/// It says what is behind them, how much, and that nothing which changes ever
+/// is — the same promise [`crate::render::diff::changed_hunks`] is written to
+/// keep and `a_marker_never_hides_a_change` is what holds it. A view that
+/// showed less without saying so would be the thing this window exists not to
+/// be.
+fn collapse_note(expanded: bool, hidden: usize) -> String {
+    if expanded {
+        format!("Every line is drawn; {hidden} of them are unchanged.")
+    } else {
+        format!(
+            "Unchanged runs are collapsed: {hidden} lines the two files agree about are behind \
+             the markers, with {CONTEXT_ROWS} rows either side of every change still drawn. \
+             Nothing that changes is ever behind a marker."
+        )
+    }
 }
 
 /// Whether this row's two sides end differently.
@@ -3921,6 +4075,101 @@ mod tests {
         assert!(!unified.contains("not built"), "the caption still promises a missing view");
     }
 
+    // ---- the collapsed view ------------------------------------------------
+
+    /// Forty lines with one change in the middle: the shape the collapsed
+    /// view exists for, small enough to count by hand.
+    fn long_diff() -> Vec<Row> {
+        let before: String = (0..40).map(|n| format!("line {n}\n")).collect();
+        let after = before.replace("line 20\n", "changed 20\n");
+        crate::render::diff::side_by_side(&before, &after)
+    }
+
+    /// How many items a list draws, and how many rows its markers stand for.
+    fn tally<T>(items: &[Item<T>]) -> (usize, usize) {
+        items.iter().fold((0, 0), |(drawn, counted), item| match item {
+            Item::Drawn(_) => (drawn + 1, counted),
+            Item::Marker(len) => (drawn, counted + len),
+        })
+    }
+
+    #[test]
+    fn one_change_in_a_long_file_becomes_a_pane_a_reader_can_finish() {
+        let rows = long_diff();
+        let items = column_items(&rows, &changed_hunks(&rows, CONTEXT_ROWS));
+        // The change, its context, and a marker at each end.
+        assert!(
+            items.len() < rows.len() / 2,
+            "a forty-row file with one change still draws {} rows",
+            items.len()
+        );
+        let markers = items.iter().filter(|item| matches!(item, Item::Marker(_))).count();
+        assert_eq!(markers, 2, "the runs above and below the change are not one marker each");
+    }
+
+    #[test]
+    fn the_pane_draws_or_counts_every_row_of_the_file() {
+        let rows = long_diff();
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+
+        // Side by side draws one item per row, so the two numbers are the
+        // file. A marker that over- or under-counted itself fails here.
+        let (drawn, counted) = tally(&column_items(&rows, &segments));
+        assert_eq!(drawn + counted, rows.len(), "the side-by-side view lost a row");
+        assert_eq!(counted, hidden_rows(&segments), "a marker changed its count on the way in");
+
+        // The unified view draws lines, not rows, so the equality is against
+        // the lines the whole file would have drawn. It holds exactly because
+        // a hidden row is an unchanged row and an unchanged row is one line:
+        // the claim `unified_items` makes in prose, checked.
+        let (lines, hidden) = tally(&unified_items(&rows, &segments));
+        assert_eq!(hidden, counted, "the two views disagree about what is behind the markers");
+        assert_eq!(
+            lines + hidden,
+            diff_lines(&rows).len(),
+            "collapsing changed how many lines the unified view accounts for"
+        );
+    }
+
+    #[test]
+    fn asking_for_every_line_brings_the_whole_file_back() {
+        let rows = long_diff();
+        let every: Vec<Segment> = (0..rows.len()).map(Segment::Shown).collect();
+
+        assert_eq!(hidden_rows(&every), 0, "an expanded view still hides something");
+        assert_eq!(column_items(&rows, &every).len(), rows.len());
+        assert_eq!(
+            unified_items(&rows, &every).len(),
+            diff_lines(&rows).len(),
+            "the expanded pane is not the pane this view had before it could collapse"
+        );
+    }
+
+    #[test]
+    fn a_marker_says_how_many_rows_it_stands_for() {
+        assert_eq!(marker_text(1), "1 unchanged line");
+        assert_eq!(marker_text(2), "2 unchanged lines");
+        assert_eq!(marker_text(1204), "1204 unchanged lines");
+    }
+
+    #[test]
+    fn the_control_and_the_note_say_what_is_behind_the_markers() {
+        let note = collapse_note(false, 33);
+        assert!(note.contains("33"), "the reader is not told how much is hidden: {note}");
+        assert!(note.contains("3 rows either side"), "the context is unexplained: {note}");
+        assert!(
+            note.contains("Nothing that changes is ever behind a marker"),
+            "the one promise a collapsed diff has to make is missing: {note}"
+        );
+
+        assert_eq!(toggle_label(false, 33), "Show all 33 unchanged lines");
+        assert!(
+            toggle_label(true, 33).starts_with("Collapse"),
+            "the control does not offer the way back"
+        );
+        assert!(collapse_note(true, 33).contains("Every line is drawn"));
+    }
+
     #[test]
     fn a_side_with_no_line_is_a_gap_and_an_empty_line_is_a_line() {
         // The distinction the two-column view turns on. A gap is a row this
@@ -5009,8 +5258,13 @@ mod tests {
         // of text: a list of lines somebody is about to let be written. A
         // pane showing forty of two hundred of them said so through its
         // scroll bar alone.
+        //
+        // Two hundred rows that all change, because that is the diff the
+        // collapsed view cannot shorten -- there is no unchanged run to put
+        // behind a marker -- and so it is the diff this notice is still the
+        // only thing standing between the reader and a silent scroll bar.
         let before = (0..200).map(|n| format!("key{n} = {n}\n")).collect::<String>();
-        let after = before.replace("key7 =", "key7 = ");
+        let after = (0..200).map(|n| format!("key{n} = {}\n", n + 1)).collect::<String>();
         let text = settled_text(&swap_payload(&before, &after), a_window());
         let note = out_of_sight_line(&text)
             .unwrap_or_else(|| panic!("a 200-row diff said nothing: {text:?}"));
@@ -5024,6 +5278,38 @@ mod tests {
             None,
             "a one-line diff was reported as running off the pane: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_collapsed_diff_that_fits_says_what_is_behind_its_markers_instead() {
+        // The other half of the promise above, and the case the collapsed
+        // view changed. Two hundred rows with one change in them now draw
+        // about sixteen, so they *fit*, and the out-of-sight notice correctly
+        // falls silent: there is nothing to scroll for. What the reader is
+        // owed -- that 193 lines of this file are not on screen -- is owed by
+        // the markers and the control instead, and this is the test that they
+        // pay it. A frame where both said nothing would be the failure the
+        // notice was written to prevent, arriving by the other door.
+        let before = (0..200).map(|n| format!("key{n} = {n}\n")).collect::<String>();
+        let after = before.replace("key7 =", "key7 = ");
+        let text = settled_text(&swap_payload(&before, &after), a_window());
+
+        assert_eq!(
+            out_of_sight_line(&text),
+            None,
+            "a diff that now fits its pane still claimed rows were out of sight: {text:?}"
+        );
+
+        let said = |want: &str| text.iter().any(|(line, _)| line.contains(want));
+        assert!(said("Show all 193 unchanged lines"), "no way back to the whole file: {text:?}");
+        assert!(said("unchanged lines"), "no marker stands for the hidden runs: {text:?}");
+        assert!(
+            said("Nothing that changes is ever behind a marker"),
+            "the markers are unexplained: {text:?}"
+        );
+        // The caption still counts the file and not the pane: the reader is
+        // told this is one change out of two hundred lines either way.
+        assert!(said("1 of 200 lines change."), "the caption stopped counting the file: {text:?}");
     }
 
 

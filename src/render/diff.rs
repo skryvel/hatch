@@ -327,6 +327,156 @@ pub fn rejoin_right(rows: &[Row]) -> String {
     rows.iter().filter_map(Row::right).map(|s| unrender(s.spans())).collect()
 }
 
+// ---- showing only what changed ---------------------------------------------
+
+/// How many unchanged lines stay on screen either side of a change.
+///
+/// Three is the diff convention — `diff -U3`, and what every review tool a
+/// reader has used shows them — and the convention is the argument. A number
+/// chosen here would be a number this project would have to defend; the one
+/// every reader already has their eye calibrated to needs no defending, and
+/// the cases where three is too few are the cases where the reader wants the
+/// whole file anyway, which is one click away.
+pub const CONTEXT_ROWS: usize = 3;
+
+/// The fewest rows a collapsed run may stand for.
+///
+/// A marker is itself a row, so collapsing a single row trades one row of the
+/// file for one row of furniture: the reader loses a line they could have
+/// read and the pane is no shorter. Two is where the trade starts paying, and
+/// below it [`changed_hunks`] draws the run rather than hiding it.
+pub const COLLAPSE_MINIMUM: usize = 2;
+
+/// One piece of the changed-hunks view: a row to draw, or a run of unchanged
+/// rows that is not being drawn.
+///
+/// The segments are a *projection* over the rows and never a filtered copy of
+/// them. That is the distinction the whole of this section turns on: the rows
+/// stay whole and stay the thing [`rejoin_left`] and [`rejoin_right`] read,
+/// so no arrangement of segments can cost the file a line. The view decides
+/// what is on screen; it does not get to decide what the approval covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    /// Draw `rows[index]`.
+    Shown(usize),
+    /// `rows[first..first + len]` are unchanged and are not on screen.
+    ///
+    /// `len` is not a hint and not a rounding: it is the number the marker
+    /// has to say out loud, and [`rows_covered`] is what holds it to the rows
+    /// it names.
+    Collapsed { first: usize, len: usize },
+}
+
+impl Segment {
+    /// The rows this segment stands for.
+    fn range(self) -> std::ops::Range<usize> {
+        match self {
+            Segment::Shown(index) => index..index + 1,
+            Segment::Collapsed { first, len } => first..first + len,
+        }
+    }
+}
+
+/// Cut `rows` into the changed-hunks view: every changed row, `context`
+/// unchanged rows either side of it, and each remaining run of unchanged rows
+/// collapsed into one [`Segment::Collapsed`] that says how many it stands
+/// for.
+///
+/// # Why a big file needs this
+///
+/// A write replaces a file's whole contents, so the diff is as long as the
+/// file — and a one-line change in a four-thousand-line file is four thousand
+/// rows of which the reader needs to find three. The scroll bar does not say
+/// where they are. What actually happens is that the reader scrolls, loses
+/// patience somewhere in the unchanged middle, and approves: the view that
+/// hides nothing has hidden the change behind the scrolling, which is the
+/// failure this view exists to fix. Showing less is what gets more read.
+///
+/// # What it is not allowed to become
+///
+/// "Show only the changes" is one bad step from "hide what was not changed",
+/// and the step is not taken here for two reasons that are both testable
+/// rather than editorial:
+///
+/// * Every row is accounted for. [`rows_covered`] expands the segments back
+///   to row indices and the result is `0..rows.len()`, in order, with nothing
+///   dropped and nothing counted twice. A row is either drawn or inside a
+///   marker's count; there is no third place for one to go.
+/// * A collapsed run is **unchanged** rows only. An `Equal` row's two lines
+///   are byte-identical by construction — see [`Row::changed`], which
+///   over-reports on purpose — so what a marker hides is a run the two sides
+///   agree about. The rows that carry the decision are never candidates.
+///
+/// # The edges of the file
+///
+/// A run at the very start of the file has no change above it, and a run at
+/// the very end has none below, so those runs keep context on one side only.
+/// Otherwise a file whose first change is on line 900 would open on three
+/// arbitrary lines of its own first page, which says nothing and costs the
+/// reader the one row that would have told them how much is up there.
+///
+/// `context` is a parameter rather than [`CONTEXT_ROWS`] read directly, for
+/// the reason [`diff_files`] takes a cap: a caller passes it, and a test can
+/// pass a different one and watch the shape change.
+pub fn changed_hunks(rows: &[Row], context: usize) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        if rows[at].changed() {
+            segments.push(Segment::Shown(at));
+            at += 1;
+            continue;
+        }
+        let end = at + rows[at..].iter().take_while(|row| !row.changed()).count();
+        let above = if at == 0 { 0 } else { context };
+        let below = if end == rows.len() { 0 } else { context };
+        // `checked_sub` and not a comparison: a run shorter than the context
+        // it would keep is a run that is drawn whole, and that is the same
+        // answer as a run whose middle is too small to be worth a marker.
+        match (end - at).checked_sub(above + below).filter(|hidden| *hidden >= COLLAPSE_MINIMUM) {
+            Some(hidden) => {
+                segments.extend((at..at + above).map(Segment::Shown));
+                segments.push(Segment::Collapsed { first: at + above, len: hidden });
+                segments.extend((end - below..end).map(Segment::Shown));
+            }
+            None => segments.extend((at..end).map(Segment::Shown)),
+        }
+        at = end;
+    }
+    segments
+}
+
+/// The segments expanded back to the row indices they stand for.
+///
+/// This section's [`rejoin_left`]: the statement that the view loses nothing,
+/// made executable. `rows_covered(&changed_hunks(&rows, n))` is
+/// `(0..rows.len())` for every input, and a collapse that dropped a row, ran
+/// past the end of a run, overlapped its neighbour or miscounted its own `len`
+/// fails that equality rather than merely looking wrong on screen.
+///
+/// It reads the segments' own arithmetic — `first` and `len`, the two numbers
+/// the marker draws — rather than any separately tracked total, for the
+/// reason [`rejoin_left`] goes through the spans: a check against a figure
+/// computed beside the thing it describes is a check that cannot fail.
+pub fn rows_covered(segments: &[Segment]) -> Vec<usize> {
+    segments.iter().flat_map(|segment| segment.range()).collect()
+}
+
+/// How many rows the markers stand for in total: what the view is not
+/// showing.
+///
+/// Zero when the view is drawing everything, which is what the caller says
+/// nothing about.
+pub fn hidden_rows(segments: &[Segment]) -> usize {
+    segments
+        .iter()
+        .filter_map(|segment| match *segment {
+            Segment::Shown(_) => None,
+            Segment::Collapsed { len, .. } => Some(len),
+        })
+        .sum()
+}
+
 /// Why a side could not be shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryReason {
@@ -993,6 +1143,149 @@ mod tests {
         ));
     }
 
+    // ---- showing only what changed ----
+
+    /// A file of `count` numbered lines.
+    fn numbered(count: usize) -> String {
+        (0..count).map(|i| format!("line {i}\n")).collect()
+    }
+
+    /// The same file with the lines at `at` shouted, so each is a changed row
+    /// paired one-to-one with the line it replaces.
+    fn shouting(count: usize, at: &[usize]) -> String {
+        (0..count)
+            .map(|i| if at.contains(&i) { format!("LINE {i}\n") } else { format!("line {i}\n") })
+            .collect()
+    }
+
+    /// What a marker stands for, as `(first, len)`, in order.
+    fn collapsed(segments: &[Segment]) -> Vec<(usize, usize)> {
+        segments
+            .iter()
+            .filter_map(|s| match *s {
+                Segment::Collapsed { first, len } => Some((first, len)),
+                Segment::Shown(_) => None,
+            })
+            .collect()
+    }
+
+    /// The row indices actually on screen, in order.
+    fn shown(segments: &[Segment]) -> Vec<usize> {
+        segments
+            .iter()
+            .filter_map(|s| match *s {
+                Segment::Shown(index) => Some(index),
+                Segment::Collapsed { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_change_in_a_long_file_becomes_one_hunk() {
+        let rows = side_by_side(&numbered(100), &shouting(100, &[50]));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+
+        // Three lines of context either side of row 50, and the rest of the
+        // file in the two markers that bracket them.
+        assert_eq!(shown(&segments), vec![47, 48, 49, 50, 51, 52, 53]);
+        assert_eq!(collapsed(&segments), vec![(0, 47), (54, 46)]);
+        // The claim the markers make, against the file they are made about.
+        assert_eq!(hidden_rows(&segments), 100 - 7);
+    }
+
+    #[test]
+    fn a_marker_stands_for_exactly_the_rows_it_names() {
+        let rows = side_by_side(&numbered(100), &shouting(100, &[50]));
+        for (first, len) in collapsed(&changed_hunks(&rows, CONTEXT_ROWS)) {
+            // What the reader is told is hidden, and what is really in there:
+            // `len` rows, all of them unchanged, all inside the file.
+            assert!(first + len <= rows.len(), "a marker names rows past the end of the diff");
+            assert!(
+                rows[first..first + len].iter().all(|row| !row.changed()),
+                "a marker hides a row that changed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_s_own_ends_keep_context_on_one_side_only() {
+        // Changes on the first and last lines: neither has a change beyond
+        // it, so neither spends context there.
+        let rows = side_by_side(&numbered(40), &shouting(40, &[0, 39]));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+        assert_eq!(shown(&segments), vec![0, 1, 2, 3, 36, 37, 38, 39]);
+        assert_eq!(collapsed(&segments), vec![(4, 32)]);
+    }
+
+    #[test]
+    fn two_changes_close_together_share_one_stretch_of_context() {
+        // Five apart: the context around each meets in the middle, so the
+        // run between them is drawn rather than cut in two by a marker that
+        // would hide nothing worth hiding.
+        let rows = side_by_side(&numbered(40), &shouting(40, &[20, 25]));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+        assert_eq!(shown(&segments), (17..=28).collect::<Vec<_>>());
+        assert_eq!(collapsed(&segments), vec![(0, 17), (29, 11)]);
+    }
+
+    #[test]
+    fn a_run_too_short_to_be_worth_a_marker_is_drawn() {
+        // Seven unchanged rows between two changes: three of context each
+        // side leaves one in the middle, and one row behind a marker that is
+        // itself a row saves nothing. `COLLAPSE_MINIMUM` is that rule.
+        let rows = side_by_side(&numbered(40), &shouting(40, &[10, 18]));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+        assert!(
+            collapsed(&segments).iter().all(|&(first, _)| first != 14),
+            "a single row was hidden behind a marker of its own: {segments:?}"
+        );
+        assert_eq!(shown(&segments), (7..=21).collect::<Vec<_>>());
+
+        // One more row between them and there are two to hide, which pays.
+        let rows = side_by_side(&numbered(40), &shouting(40, &[10, 19]));
+        assert_eq!(collapsed(&changed_hunks(&rows, CONTEXT_ROWS)), vec![(0, 7), (14, 2), (23, 17)]);
+    }
+
+    #[test]
+    fn a_file_that_changes_nowhere_is_one_marker() {
+        let rows = side_by_side(&numbered(40), &numbered(40));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+        assert_eq!(collapsed(&segments), vec![(0, 40)]);
+        assert!(shown(&segments).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_changes_everywhere_hides_nothing() {
+        let rows = side_by_side(&numbered(40), &shouting(40, &(0..40).collect::<Vec<_>>()));
+        let segments = changed_hunks(&rows, CONTEXT_ROWS);
+        assert!(rows.iter().all(Row::changed), "the sample is not the one this test is about");
+        assert_eq!(hidden_rows(&segments), 0);
+        assert_eq!(shown(&segments), (0..rows.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_short_file_is_left_alone() {
+        // The case the default has to be harmless in: nothing to save, so
+        // nothing is hidden and the view is the view it always was.
+        let rows = side_by_side(&numbered(6), &shouting(6, &[3]));
+        assert_eq!(hidden_rows(&changed_hunks(&rows, CONTEXT_ROWS)), 0);
+    }
+
+    #[test]
+    fn an_empty_diff_has_no_segments() {
+        assert!(changed_hunks(&[], CONTEXT_ROWS).is_empty());
+    }
+
+    #[test]
+    fn more_context_shows_more_and_hides_less() {
+        let rows = side_by_side(&numbered(100), &shouting(100, &[50]));
+        let wide = changed_hunks(&rows, 10);
+        assert_eq!(shown(&wide), (40..=60).collect::<Vec<_>>());
+        assert!(hidden_rows(&wide) < hidden_rows(&changed_hunks(&rows, CONTEXT_ROWS)));
+        // No context at all is the changed rows and nothing else.
+        assert_eq!(shown(&changed_hunks(&rows, 0)), vec![50]);
+    }
+
     // ---- the round trip as a property ----
 
     /// Lines built from the pieces that break diffs: the two terminators, a
@@ -1058,6 +1351,51 @@ mod tests {
                             }
                             _ => prop_assert_eq!(span.display_text(), span.text()),
                         }
+                    }
+                }
+            }
+        }
+
+        /// The statement this view is allowed to exist on: every row of the
+        /// diff is either on screen or inside a marker's count, once, in
+        /// order. A collapse that dropped a row, overlapped its neighbour or
+        /// misreported its own length fails here.
+        #[test]
+        fn every_row_is_drawn_or_counted(
+            before in file(),
+            after in file(),
+            context in 0usize..6,
+        ) {
+            let rows = side_by_side(&before, &after);
+            let segments = changed_hunks(&rows, context);
+            prop_assert_eq!(rows_covered(&segments), (0..rows.len()).collect::<Vec<_>>());
+            // Counted a second way, off the two things the view actually
+            // draws: the rows on screen and the totals the markers say. A
+            // sentence built from `hidden_rows` cannot drift from the pane.
+            let on_screen = segments.iter().filter(|s| matches!(s, Segment::Shown(_))).count();
+            prop_assert_eq!(on_screen + hidden_rows(&segments), rows.len());
+        }
+
+        /// A marker only ever hides rows the two sides agree about. The rows
+        /// that carry the decision are never candidates, whatever the context.
+        #[test]
+        fn a_marker_never_hides_a_change(
+            before in file(),
+            after in file(),
+            context in 0usize..6,
+        ) {
+            let rows = side_by_side(&before, &after);
+            for segment in changed_hunks(&rows, context) {
+                if let Segment::Collapsed { first, len } = segment {
+                    prop_assert!(len >= COLLAPSE_MINIMUM);
+                    for row in &rows[first..first + len] {
+                        prop_assert!(!row.changed());
+                        // Unchanged means byte-identical, which is what makes
+                        // hiding the run honest rather than merely tidy.
+                        prop_assert_eq!(
+                            row.left().map(Side::text),
+                            row.right().map(Side::text)
+                        );
                     }
                 }
             }
