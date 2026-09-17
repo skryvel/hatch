@@ -294,6 +294,10 @@ impl Sample {
             // request's shape and not the sample's.
             operations: vec![self.payload.clone()],
             stop_on_failure: false,
+            // A preview stands alone: there is no daemon behind it that has
+            // watched other windows end, so there is nothing it could
+            // honestly report having missed.
+            unanswered: Vec::new(),
         }
     }
 }

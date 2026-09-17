@@ -667,6 +667,54 @@ pub struct Request {
     /// the window says nothing about it: see
     /// [`crate::prompt_ui::PromptState::sequencing`].
     pub stop_on_failure: bool,
+    /// Windows that ended since the last one somebody answered, and how each
+    /// of them ended.
+    ///
+    /// The agent is told when a request ends without a decision -- it
+    /// expired, the call went away, the window's process died -- and until
+    /// this field existed the person was told nothing at all. Their window
+    /// vanished and the next thing they saw was an agent that had moved on,
+    /// which is indistinguishable from having denied something by accident.
+    ///
+    /// Carried on the request rather than pushed as its own message because
+    /// there is nothing to show it on until a window exists: a notice about a
+    /// window that is gone needs a window to be drawn in, and the next one is
+    /// the first place it can appear.
+    ///
+    /// Empty on almost every request, and an empty list draws nothing. It is
+    /// required on the wire like every other field.
+    pub unanswered: Vec<Unanswered>,
+}
+
+/// One window that ended without the reader deciding anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unanswered {
+    /// Which window it was, by the number it wore in its title bar, so a
+    /// person can find it in the log. `None` when nobody was counting.
+    pub number: Option<u64>,
+    /// When it ended, on the daemon's clock.
+    pub at: DateTime<Utc>,
+    /// How it ended.
+    pub how: Unheard,
+}
+
+/// The ways a window can end with nobody having decided.
+///
+/// Three, and the distinction between them is the whole value of the notice:
+/// "you ran out of time" and "the agent stopped waiting" are different facts
+/// about different parties, and a reader who is told only that something
+/// vanished cannot tell which of them to do anything about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unheard {
+    /// Nobody answered before the approval timeout.
+    Expired,
+    /// The agent's call went away -- it disconnected, or it cancelled --
+    /// while the window was still asking.
+    AgentLeft,
+    /// The window's own process ended before a verdict: it was closed from
+    /// its title bar, or it died.
+    WindowDied,
 }
 
 /// One operation, already rendered.
@@ -1341,6 +1389,7 @@ mod tests {
             deadline: Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap(),
             queue_depth: 0,
             number: Some(47),
+            unanswered: Vec::new(),
             operations: vec![Payload::command(
                 &rendering("rm -rf /tmp/build"),
                 vec!["rm -rf".to_string()],
@@ -1574,7 +1623,8 @@ mod tests {
                 "reason",
                 "stop_on_failure",
                 "title",
-                "type"
+                "type",
+                "unanswered"
             ]
         );
 

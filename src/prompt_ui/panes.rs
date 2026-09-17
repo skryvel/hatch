@@ -44,10 +44,12 @@
 use std::ops::Range;
 use std::path::Path;
 
+use chrono::Local;
+
 use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
-use crate::protocol::{Outcome, Payload, ProtocolError};
+use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
 use crate::render::blocks::{Block, blocks};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
@@ -457,6 +459,80 @@ fn bytes(count: i64) -> String {
         1 => "1 byte".to_string(),
         count => format!("{count} bytes"),
     }
+}
+
+/// What to say about windows that ended with nobody deciding, or `None` when
+/// none did.
+///
+/// # Why this is a line and not a dialog
+///
+/// The fact being reported is that something already happened and cannot be
+/// undone: a window is gone and whatever it was asking about did not run.
+/// There is nothing for the reader to decide, so anything that asks them to
+/// dismiss it would be charging them for news they did not ask for. A line
+/// that appears only when it is true, above a window they were going to read
+/// anyway, is the whole of it.
+///
+/// # Why it says what ended it
+///
+/// "A window went away" is not actionable; which of three things took it away
+/// is. A window that expired says the reader was not at the screen in time; a
+/// window the agent abandoned says the other end stopped waiting, which is
+/// not about them at all; a window that died says something broke. Told only
+/// that a window vanished, a reader with no way to tell those apart is left
+/// to assume the worst about their own attention -- which is exactly the
+/// report this is written for, of denials nobody remembers making.
+///
+/// # Why "nothing ran"
+///
+/// It is the one thing the reader actually needs, and it is true for all
+/// three: an unanswered window authorises nothing. Without it the sentence
+/// describes a loss and leaves open whether something happened on the machine
+/// because of it.
+pub fn unanswered_note(items: &[Unanswered]) -> Option<String> {
+    let last = items.last()?;
+    let at = last.at.with_timezone(&Local).format("%H:%M");
+    if let [only] = items {
+        let who = match only.number {
+            Some(number) => format!("Window {number}"),
+            None => "An earlier window".to_string(),
+        };
+        return Some(format!("{who} ended without you at {at}: it {}. Nothing ran.", phrase(only.how)));
+    }
+    // Counted by kind and in a fixed order, so the same set of endings is
+    // always described with the same sentence.
+    let mut parts = Vec::new();
+    for how in [Unheard::Expired, Unheard::AgentLeft, Unheard::WindowDied] {
+        let count = items.iter().filter(|item| item.how == how).count();
+        if count > 0 {
+            parts.push(format!("{count} {}", phrase(how)));
+        }
+    }
+    Some(format!(
+        "{} earlier windows ended without you, the last at {at}: {}. Nothing ran.",
+        items.len(),
+        parts.join(", ")
+    ))
+}
+
+/// How one ending reads, as a verb phrase after "it" or after a count.
+///
+/// Neither half blames the reader. "Expired unanswered" is what happened and
+/// not what they failed to do, and the difference matters on a line that will
+/// mostly be read by somebody who has just discovered they missed something.
+fn phrase(how: Unheard) -> &'static str {
+    match how {
+        Unheard::Expired => "expired unanswered",
+        Unheard::AgentLeft => "ended when the agent stopped waiting",
+        Unheard::WindowDied => "closed before anyone decided",
+    }
+}
+
+/// Draw that line, if there is one.
+pub fn draw_unanswered(ui: &mut Ui, items: &[Unanswered]) {
+    let Some(note) = unanswered_note(items) else { return };
+    let palette = palette(ui);
+    ui.label(RichText::new(note).small().color(palette.warn));
 }
 
 /// How many of the rows are marked as changed.
@@ -3371,6 +3447,91 @@ mod tests {
             .iter()
             .map(|line| line.iter().map(|span| span.text()).collect::<String>())
             .collect()
+    }
+
+    /// One ending, at a fixed instant so the sentence is the same every run.
+    fn ended(number: Option<u64>, how: Unheard) -> Unanswered {
+        use chrono::TimeZone as _;
+        Unanswered { number, at: chrono::Utc.timestamp_opt(1_770_000_000, 0).unwrap(), how }
+    }
+
+    #[test]
+    fn nothing_unanswered_says_nothing() {
+        // The ordinary case by far, and the line has to cost a row only when
+        // it is true or it stops being read on the day it matters.
+        assert_eq!(unanswered_note(&[]), None);
+    }
+
+    #[test]
+    fn one_unanswered_window_is_named_by_its_number() {
+        // The number is the handle: it is what the title bar wore and what
+        // the audit record carries, so a reader who wants to know what they
+        // missed has something to look it up by.
+        let note = unanswered_note(&[ended(Some(12), Unheard::Expired)]).expect("a note");
+        assert!(note.starts_with("Window 12 ended without you at "), "{note}");
+        assert!(note.contains("it expired unanswered"), "{note}");
+        assert!(note.ends_with("Nothing ran."), "{note}");
+    }
+
+    #[test]
+    fn an_unnumbered_window_is_still_reported() {
+        let note = unanswered_note(&[ended(None, Unheard::WindowDied)]).expect("a note");
+        assert!(note.starts_with("An earlier window ended without you at "), "{note}");
+        assert!(note.contains("closed before anyone decided"), "{note}");
+    }
+
+    #[test]
+    fn the_three_endings_do_not_read_alike() {
+        // The whole value of the notice is which of the three it was: one is
+        // about the reader's attention, one is about the agent, and one is a
+        // fault. A reader who cannot tell them apart is left assuming the
+        // first, which is the report this was written for.
+        let said: Vec<&str> =
+            [Unheard::Expired, Unheard::AgentLeft, Unheard::WindowDied].map(phrase).to_vec();
+        let mut unique = said.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "two endings read the same: {said:?}");
+        // And none of them tells the reader they did something wrong.
+        for phrase in said {
+            assert!(!phrase.contains("you"), "{phrase} blames the reader");
+            assert!(!phrase.contains("fail"), "{phrase} reads as a failure");
+        }
+    }
+
+    #[test]
+    fn several_are_counted_by_how_each_one_ended() {
+        let note = unanswered_note(&[
+            ended(Some(1), Unheard::Expired),
+            ended(Some(2), Unheard::AgentLeft),
+            ended(Some(3), Unheard::Expired),
+        ])
+        .expect("a note");
+        assert!(note.starts_with("3 earlier windows ended without you, the last at "), "{note}");
+        assert!(note.contains("2 expired unanswered"), "{note}");
+        assert!(note.contains("1 ended when the agent stopped waiting"), "{note}");
+        assert!(note.ends_with("Nothing ran."), "{note}");
+        // No number is named when there are several: there is one line, and
+        // three numbers in it would be a list rather than a sentence.
+        assert!(!note.contains("Window 1"), "{note}");
+    }
+
+    #[test]
+    fn the_time_shown_is_the_last_one_to_end() {
+        use chrono::TimeZone as _;
+        let early = Unanswered {
+            number: None,
+            at: chrono::Utc.timestamp_opt(1_770_000_000, 0).unwrap(),
+            how: Unheard::Expired,
+        };
+        let late = Unanswered {
+            number: None,
+            at: chrono::Utc.timestamp_opt(1_770_003_600, 0).unwrap(),
+            how: Unheard::Expired,
+        };
+        let note = unanswered_note(&[early, late.clone()]).expect("a note");
+        let shown = late.at.with_timezone(&Local).format("%H:%M").to_string();
+        assert!(note.contains(&shown), "the newest ending is the one to orient by: {note}");
     }
 
     #[test]

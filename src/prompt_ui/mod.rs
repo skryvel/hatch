@@ -157,7 +157,7 @@ use crate::prefs::PrefsFile;
 use crate::prompt_ui::guard::{Action, Guard, Keyboard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{
-    self, DaemonMsg, Outcome, PromptMsg, Release, Request, Review, ReviseKind, Verdict,
+    self, DaemonMsg, Outcome, PromptMsg, Release, Request, Review, ReviseKind, Unanswered, Verdict,
 };
 
 /// The window's application id.
@@ -805,6 +805,15 @@ impl PromptState {
             .iter()
             .filter_map(panes::RunContext::of)
             .any(|context| context.root)
+    }
+
+    /// Windows that ended since the last one somebody answered.
+    ///
+    /// Read off the request rather than kept beside it: the request is
+    /// already the one thing this window was opened with, and a second copy
+    /// would be a second thing to keep in step with it.
+    pub fn unanswered(&self) -> &[Unanswered] {
+        self.request.as_ref().map_or(&[], |request| request.unanswered.as_slice())
     }
 
     /// The last depth the daemon published, whether or not it is drawn.
@@ -2130,6 +2139,10 @@ impl PromptApp {
             // could not be rebuilt closed the window instead of becoming one.
             let aside = self.state.shown().and_then(panes::RunContext::of);
             panes::draw_headline(ui, &title, &reason, aside.as_ref());
+            // Above the separator, with the headline rather than with the
+            // request: it is news about a window that is gone, not a fact
+            // about the one being asked about now.
+            panes::draw_unanswered(ui, self.state.unanswered());
             ui.separator();
             if let Some(shown) = self.state.shown() {
                 panes::draw_payload(ui, shown);
@@ -3896,6 +3909,7 @@ mod tests {
             deadline: Utc::now() + chrono::Duration::seconds(seconds_left),
             queue_depth: 0,
             number: Some(47),
+            unanswered: Vec::new(),
             operations: vec![Payload::command(
                 &render_command("rm -rf target", &BTreeMap::new()),
                 Vec::new(),
@@ -5307,6 +5321,40 @@ mod tests {
         )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
+    }
+
+    #[test]
+    fn a_window_says_what_ended_without_the_reader_and_an_ordinary_one_says_nothing() {
+        use chrono::TimeZone as _;
+
+        // The ordinary window first, because the cost of this feature is a
+        // row on every window that has nothing to report, and it must not
+        // have one.
+        let mut quiet = a_window_showing("rm -rf target");
+        let drawn = window_text_sized(&mut quiet, opening_size());
+        assert!(!drawn.contains("ended without you"), "an ordinary window reported a loss: {drawn}");
+
+        // And one that has something to say. This is the report it exists
+        // for: a window that vanished while the reader was elsewhere, which
+        // from their side is indistinguishable from a denial they do not
+        // remember making.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app =
+            PromptApp::new(rx, Box::new(Vec::new()), Arc::new(OnceLock::new()), PrefsFile::none());
+        let mut request = a_request(90);
+        request.unanswered = vec![protocol::Unanswered {
+            number: Some(46),
+            at: chrono::Utc.timestamp_opt(1_770_000_000, 0).unwrap(),
+            how: protocol::Unheard::AgentLeft,
+        }];
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains("Window 46 ended without you"), "{drawn}");
+        assert!(drawn.contains("the agent stopped waiting"), "{drawn}");
+        assert!(drawn.contains("Nothing ran."), "{drawn}");
+        // It is news about a window that is gone, so it does not claim to be
+        // about the one being asked about now.
+        assert!(drawn.contains("rm -rf") || drawn.contains("delete"), "{drawn}");
     }
 
     /// The same window once its streamed command has finished, with `printed`

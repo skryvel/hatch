@@ -181,7 +181,9 @@ use crate::exec::env::build_child_env;
 use crate::exec::{Chunk, Env, Output, RunOpts};
 use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
-use crate::protocol::{Payload, Release, Request as PromptRequest, ReviseKind, Verdict};
+use crate::protocol::{
+    Payload, Release, Request as PromptRequest, ReviseKind, Unanswered, Unheard, Verdict,
+};
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_breaking_at;
 use crate::render::roster::roster;
@@ -239,6 +241,14 @@ pub const MAX_PATCH_BYTES: usize = MAX_CONTENT_BYTES;
 /// bound is computed from — see [`Config::client_timeout_secs`] — so raising
 /// it moves both, and neither can be left behind saying the old number.
 pub const MAX_OPERATIONS: usize = 1;
+
+/// How many unanswered windows are remembered for the next one to mention.
+///
+/// Eight, which is more than a person will have missed in a sitting and few
+/// enough that the sentence stays a sentence. It is a bound on memory as much
+/// as on wording: an agent that cannot reach a screen could otherwise retry
+/// all night and leave a list as long as the night was.
+const MAX_UNANSWERED: usize = 8;
 
 /// Parameters of `run_command`.
 ///
@@ -1268,6 +1278,14 @@ pub struct Daemon {
     elevation: Arc<dyn Elevation>,
     /// Where approved bytes wait between the approval and a root write.
     stage_dir: PathBuf,
+    /// Windows that ended with nobody deciding, waiting for a window to say
+    /// so in.
+    ///
+    /// A `Mutex` and not a channel: it is read once, by the next request to
+    /// build a window, and a channel would make "what has happened since"
+    /// into a thing that can be consumed by the wrong reader. Draining it is
+    /// what stops a notice being shown twice.
+    unanswered: Mutex<Vec<Unanswered>>,
 }
 
 impl Daemon {
@@ -1294,6 +1312,7 @@ impl Daemon {
             denylist,
             elevation: Arc::from(crate::exec::elevate::platform()),
             stage_dir,
+            unanswered: Mutex::new(Vec::new()),
         }
     }
 
@@ -1309,6 +1328,29 @@ impl Daemon {
     pub fn with_elevation(mut self, elevation: Arc<dyn Elevation>) -> Daemon {
         self.elevation = elevation;
         self
+    }
+
+    /// Remember that a window ended with nobody having decided, so the next
+    /// one can say so.
+    ///
+    /// Called on every ending that is not a verdict, and on no ending that
+    /// is. A poisoned lock is stepped over rather than panicked on: failing
+    /// to keep a notice must not take down the daemon that was going to draw
+    /// it, and the cost of losing one is a line that is not shown.
+    fn remember_unanswered(&self, number: Option<u64>, how: Unheard) {
+        if let Ok(mut held) = self.unanswered.lock() {
+            held.push(Unanswered { number, at: Utc::now(), how });
+            // A reader cannot use a list of forty, and the window has one
+            // line to say it in. What is dropped is the oldest, because the
+            // recent ones are the ones they might still act on.
+            let over = held.len().saturating_sub(MAX_UNANSWERED);
+            held.drain(..over);
+        }
+    }
+
+    /// Take everything remembered, leaving nothing.
+    fn take_unanswered(&self) -> Vec<Unanswered> {
+        self.unanswered.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default()
     }
 
     /// The running config, for the tool descriptions.
@@ -1783,6 +1825,12 @@ impl Daemon {
             number: *number,
             operations: payloads,
             stop_on_failure,
+            // Drained, so a notice is shown once. This window is the first
+            // place these could have been drawn, and it is also the last: a
+            // second window repeating them would be telling a reader about
+            // something they have already been told about, which is how a
+            // line that only appears when it is true stops being read.
+            unanswered: self.take_unanswered(),
         };
         let mut session = match self.prompter.prompt(request, depths).await {
             Ok(session) => session,
@@ -1813,6 +1861,7 @@ impl Daemon {
         let verdict = match ending {
             Ending::Decided(Ok(verdict)) => verdict,
             Ending::Decided(Err(gone)) => {
+                self.remember_unanswered(*number, Unheard::WindowDied);
                 session.close().await;
                 return Outcome::refusing(
                     LogVerdict::PromptDied,
@@ -1826,6 +1875,7 @@ impl Daemon {
                 );
             }
             Ending::Expired => {
+                self.remember_unanswered(*number, Unheard::Expired);
                 session.close().await;
                 return Outcome::refusing(
                     LogVerdict::Timeout,
@@ -1840,10 +1890,12 @@ impl Daemon {
                 );
             }
             Ending::Cancelled => {
+                self.remember_unanswered(*number, Unheard::AgentLeft);
                 session.close().await;
                 return abandoned(LogVerdict::Cancelled, details);
             }
             Ending::HungUp => {
+                self.remember_unanswered(*number, Unheard::AgentLeft);
                 session.close().await;
                 return abandoned(caller.abandonment(), details);
             }
@@ -5632,6 +5684,69 @@ later"), "");
             assert!(!text.contains("denied"), "a timeout must not read as a denial: {text}");
             assert_eq!(harness.verdict(), "timeout");
             assert!(harness.prompter.seen().len() == 1, "the window was shown, just unanswered");
+        }
+
+        #[tokio::test]
+        async fn the_next_window_says_the_last_one_ended_without_anybody() {
+            // The complaint this exists for: a window appears, goes away on
+            // its own, and the person is never told. The agent learns three
+            // different things from the three endings and the reader used to
+            // learn none of them, which leaves a denial nobody remembers
+            // making as the only available explanation.
+            let harness = Harness::new(vec![
+                Reply::silent(),
+                Reply::verdict(Verdict::Deny { note: String::new() }),
+            ]);
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), 2, "two windows were opened");
+            assert!(seen[0].unanswered.is_empty(), "the first had nothing to report");
+            assert_eq!(seen[1].unanswered.len(), 1, "the second said nothing about the first");
+            assert_eq!(seen[1].unanswered[0].how, Unheard::Expired);
+            assert_eq!(
+                seen[1].unanswered[0].number, seen[0].number,
+                "the notice names a window other than the one that ended"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_notice_is_shown_once_and_not_to_every_window_after() {
+            // Drained when it is handed over. A line that appears only when
+            // it is true stops being read the moment it starts repeating,
+            // and this one has to be read on the day it matters.
+            let harness = Harness::new(vec![
+                Reply::silent(),
+                Reply::verdict(Verdict::Deny { note: String::new() }),
+                Reply::verdict(Verdict::Deny { note: String::new() }),
+            ]);
+            for _ in 0..3 {
+                let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            }
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), 3);
+            assert_eq!(seen[1].unanswered.len(), 1, "the second window carried the notice");
+            assert!(seen[2].unanswered.is_empty(), "the third repeated a notice already shown");
+        }
+
+        #[tokio::test]
+        async fn a_window_somebody_answered_is_not_reported_as_unanswered() {
+            // Only the endings that are not decisions are remembered. A
+            // denial is a decision the reader made and telling them about it
+            // afterwards would be noise -- and worse, it would make the
+            // notice mean nothing, because it would then appear after
+            // windows they remember perfectly well.
+            let harness = Harness::new(vec![
+                Reply::verdict(Verdict::Deny { note: "no".to_string() }),
+                Reply::verdict(Verdict::Deny { note: String::new() }),
+            ]);
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let seen = harness.prompter.seen();
+            assert!(seen[1].unanswered.is_empty(), "a decided window was reported as missed");
         }
 
         #[tokio::test]

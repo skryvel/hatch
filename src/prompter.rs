@@ -1255,6 +1255,7 @@ mod tests {
             deadline: Utc::now() + chrono::Duration::seconds(90),
             queue_depth: 0,
             number: Some(1),
+            unanswered: Vec::new(),
             operations: vec![Payload::command(
                 &render_command("true", &BTreeMap::new()),
                 Vec::new(),
