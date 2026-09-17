@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+pub mod blocks;
 pub mod command;
 pub mod danger;
 pub mod diff;
