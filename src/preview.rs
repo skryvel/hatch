@@ -204,13 +204,25 @@ pub enum Scenario {
     /// resolves above one that does not -- so the two readings are on screen
     /// at once and the difference between them is what the sample is for.
     Heredoc,
+    /// A command whose lines belong together in four nested ways: the gutter
+    /// brackets, and how far in they step.
+    ///
+    /// Its own sample because the thing to look at is depth. One bracket says
+    /// little that indentation would not; four, stepping in from the same
+    /// left edge while the text stays where it is, is the claim the treatment
+    /// is actually making, and the only way to tell whether it reads is to
+    /// look at it. The pipeline at the bottom is there so a block that is not
+    /// a loop is on screen beside ones that are, and the `if` is there
+    /// because it deliberately draws nothing -- see
+    /// [`crate::render::blocks`].
+    Blocks,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 8] {
+    pub(crate) fn all() -> [Scenario; 9] {
         [
             Scenario::Command,
             Scenario::Chips,
@@ -220,6 +232,7 @@ impl Scenario {
             Scenario::Comment,
             Scenario::Redirect,
             Scenario::Heredoc,
+            Scenario::Blocks,
         ]
     }
 }
@@ -502,6 +515,23 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Blocks => {
+            let asked = Asked::Command {
+                command: BLOCKS_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Check every dump against its checksum and prune the old ones".to_string(),
+                reason: "The restore drill needs a checksum for every dump, and the backup \
+                         volume is at 91%."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
         Scenario::Chips => {
             let asked = Asked::Command {
                 // The second line is the whole argument for the rendering.
@@ -666,6 +696,32 @@ server {
 }
 NGINXCONF
 nginx -t && systemctl --user reload nginx";
+
+/// The command behind [`Scenario::Blocks`].
+///
+/// Four constructs inside one another -- a loop, a subshell, a second loop
+/// and a case -- so the gutter is four columns wide at its deepest, and a
+/// pipeline broken across three lines at the bottom, which is a block of a
+/// different kind at the outermost column. The `if` in the middle is drawn
+/// with no bracket at all, on purpose.
+const BLOCKS_SAMPLE: &str = "\
+cd $HOME/backups
+for db in app analytics audit; do
+  (
+    while read -r dump; do
+      case $dump in
+        *.tmp) continue;;
+        *) sha256sum \"$dump\" >> SHA256SUMS;;
+      esac
+    done
+  )
+done
+if [ ! -s SHA256SUMS ]; then
+  echo 'no checksums written' >&2
+fi
+find . -name '*.sql.gz' -mtime +30 -print0 |
+  xargs -0 --no-run-if-empty rm -v |
+  tee -a prune.log";
 
 /// The command behind [`Scenario::Long`].
 ///

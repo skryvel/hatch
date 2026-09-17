@@ -41,12 +41,14 @@
 //! they arrive defanged and are drawn as they arrive, per
 //! [`crate::protocol::Request`].
 
+use std::ops::Range;
 use std::path::Path;
 
 use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError};
+use crate::render::blocks::{Block, blocks};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
@@ -87,8 +89,11 @@ const RAW_STRIP_ROWS: f32 = 6.0;
 /// Characters of gutter in front of each diff column: the `-`/`+` mark and
 /// the space after it.
 ///
-/// Diff furniture only. The two command panes have no gutter, which is why
-/// [`column_chars`] takes the figure rather than knowing it.
+/// Diff furniture only, and the reason [`column_chars`] takes the figure
+/// rather than knowing it. The annotated pane has a gutter of its own for
+/// block brackets, measured in [`BRACKET_STEP_CHARS`] and wide only when
+/// there is something to draw in it; the raw pane has none and never will,
+/// because it never groups.
 const GUTTER_CHARS: usize = 2;
 
 /// Characters of empty space between two columns, in either view.
@@ -121,6 +126,14 @@ pub enum Shown {
         /// two panes are drawn side by side, and it depends only on the two
         /// renderings, so measuring it once is not a cache that can go stale.
         longest: usize,
+        /// Which lines of it belong together, for the gutter beside the
+        /// annotated pane.
+        ///
+        /// Measured here for the reason `longest` is: it depends only on the
+        /// source, so measuring it once is not a cache that can go stale, and
+        /// it runs a parser — asking sixty times a second what the answer
+        /// cannot change would be the expensive way to get the same list.
+        blocks: Vec<Block>,
         /// How odd that source is, for the header line.
         scan: ScanReport,
         /// The danger labels the daemon found, defanged for drawing.
@@ -181,6 +194,7 @@ impl Shown {
                 let source = annotated.source();
                 let raw = classify(source);
                 Ok(Shown::Command {
+                    blocks: blocks(source),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
                     runs: runs.clone(),
@@ -1277,9 +1291,9 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, runs, longest, caveat, .. } => {
+        Shown::Command { annotated, raw, scan, danger, runs, longest, caveat, blocks, .. } => {
             draw_command_header(ui, scan, danger, runs, caveat.as_deref());
-            draw_command(ui, annotated, raw, *longest);
+            draw_command(ui, annotated, raw, *longest, blocks);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
     }
@@ -1437,6 +1451,147 @@ struct PaneReach {
     raw: Option<f32>,
     /// How far the annotated pane reached.
     annotated: Option<f32>,
+}
+
+/// How few drawn lines a block may cover and still be worth a bracket.
+///
+/// Two, because a bracket over one line is a mark that opens and closes on
+/// the same row: it costs a column of gutter and tells the reader something
+/// they could already see. The same argument [`crate::render::blocks`] makes
+/// for a pipeline of one command, arriving at the drawn layout instead of the
+/// parse — a construct written on one line is not a block a reader has to
+/// hold in their head.
+const BLOCK_MINIMUM_LINES: usize = 2;
+
+/// Characters of gutter per step of nesting.
+///
+/// One. The gutter is furniture beside text a reader is approving, and every
+/// character of it is a character the command does not get; a step wide
+/// enough to be obvious would be a step wide enough to matter at depth four.
+const BRACKET_STEP_CHARS: usize = 1;
+
+/// How thick a bracket is drawn, in points.
+///
+/// A hairline. It is furniture and it is next to the thing it is describing,
+/// so it needs to be visible rather than emphatic; anything heavier competes
+/// with the text for the reader's eye, which is what sank the outline
+/// treatment when the two were put side by side.
+const BRACKET_STROKE: f32 = 1.0;
+
+/// How far a bracket's end tick reaches towards the text, as a fraction of
+/// one step.
+///
+/// Just over half, so the tick is plainly a tick and still stops short of the
+/// text. At a full step it would touch the first character of the line it
+/// points at, which reads as an underline on that character rather than as a
+/// mark in the gutter.
+const BRACKET_TICK: f32 = 0.6;
+
+/// How far a bracket stops short of the very top and bottom of its rows, in
+/// points.
+///
+/// Two, so that a bracket closing on one line and another opening on the next
+/// do not meet and read as one unbroken rule through both.
+const BRACKET_INSET: f32 = 2.0;
+
+/// One bracket: the lines it spans, and how far into the gutter it sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bracket {
+    /// The first drawn line it covers.
+    first: usize,
+    /// The last, which is never the first — see [`BLOCK_MINIMUM_LINES`].
+    last: usize,
+    /// Which column of the gutter it is drawn in: zero at the outside, one
+    /// step further in for each bracket that encloses it.
+    step: usize,
+}
+
+/// The whole gutter for one rendering.
+///
+/// `steps` is how many columns of nesting are in use, which is what the
+/// gutter is *wide*. It is zero for a command with no structure worth
+/// drawing — the ordinary case, and the one where all of this costs the pane
+/// nothing at all, not even a column of its width.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Gutter {
+    steps: usize,
+    brackets: Vec<Bracket>,
+}
+
+impl Gutter {
+    /// Whether anything is drawn at all.
+    fn is_empty(&self) -> bool {
+        self.steps == 0
+    }
+}
+
+/// The bytes each drawn line covers, in source order.
+///
+/// A line's range runs from the start of its first span to the end of its
+/// last. Spans tile the source, so consecutive lines meet exactly and these
+/// ranges partition the source as completely as the spans do — which is what
+/// lets a block, measured in bytes by a module that has never heard of a
+/// line, be placed on lines.
+fn line_ranges(lines: &[&[Span]]) -> Vec<Range<usize>> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let first = line.first()?;
+            let last = line.last()?;
+            Some(first.range().start..last.range().end)
+        })
+        .collect()
+}
+
+/// Which lines a block covers: the first that holds any of it, and the last.
+///
+/// `None` when it touches no line at all. That cannot happen for a block
+/// built from the source these lines were drawn from, and is checked rather
+/// than assumed, because the alternative to checking is an index.
+fn block_lines(ranges: &[Range<usize>], block: &Range<usize>) -> Option<(usize, usize)> {
+    let touched = |line: &Range<usize>| line.start < block.end && block.start < line.end;
+    let first = ranges.iter().position(touched)?;
+    let last = ranges.iter().rposition(touched)?;
+    Some((first, last))
+}
+
+/// The gutter for one rendering: which lines each bracket spans.
+///
+/// Blocks too short to be worth a bracket are dropped *before* anything is
+/// given a column, and the step is then counted among the brackets that
+/// survived rather than read from [`crate::render::blocks::Block::depth`].
+///
+/// Today the two always agree, and it is worth being exact about why rather
+/// than claiming a difference that cannot happen: a block contains at least
+/// as many drawn lines as anything inside it, so a bracket long enough to
+/// draw can never sit inside one that was dropped for being too short. The
+/// only filter here is length, and length cannot break containment.
+///
+/// It is still the right quantity to count. The step means *how many
+/// brackets a reader can see around this one*, and the day something is
+/// dropped for a reason other than its length — a kind not worth bracketing,
+/// a depth past what the gutter has room for — depth would start naming a
+/// column that is not on screen. `a_step_names_a_column_a_reader_can_count`
+/// is what would fail.
+fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
+    let ranges = line_ranges(lines);
+    let mut brackets: Vec<Bracket> = Vec::new();
+    for block in blocks {
+        let Some((first, last)) = block_lines(&ranges, &block.range()) else { continue };
+        if last + 1 - first < BLOCK_MINIMUM_LINES {
+            continue;
+        }
+        // How many brackets already placed enclose this one. The blocks
+        // arrive in source order with the outermost first, so everything that
+        // could enclose it has been seen.
+        let step = brackets
+            .iter()
+            .filter(|drawn| drawn.first <= first && last <= drawn.last)
+            .count();
+        brackets.push(Bracket { first, last, step });
+    }
+    let steps = brackets.iter().map(|bracket| bracket.step + 1).max().unwrap_or(0);
+    Gutter { steps, brackets }
 }
 
 /// Where one drawn line of a pane begins: in the source, and on screen.
@@ -1967,10 +2122,13 @@ fn draw_out_of_sight(ui: &mut Ui, note: &str) {
 /// did not choose. So the panes are linked, by *position in the command*
 /// rather than by pixels or by line number: see [`pane_lines`] for why those
 /// two would drift and a source offset cannot.
-fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
+fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize, blocks: &[Block]) {
     let palette = palette(ui);
     let column = column_chars(pane_chars(ui, 2), 0);
     let view = command_view(longest, column);
+    // Once per frame rather than once per pane: the annotated pane is drawn
+    // in both views and the raw pane is drawn in neither.
+    let gutter = gutter(&lines(annotated), blocks);
     // One line for both panes: which is which, and what each promises. See
     // `command_caption` for why the promise is not furniture.
     ui.label(RichText::new(command_caption(view, longest, column)).small().color(palette.quiet));
@@ -1989,9 +2147,9 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
             let height = ui.available_height();
             ui.columns(2, |columns| {
                 let raw =
-                    draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None));
+                    draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None), &Gutter::default());
                 let annotated =
-                    draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None));
+                    draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None), &gutter);
                 CommandRows { raw: raw.rows, annotated: annotated.rows }
             })
         }
@@ -2000,7 +2158,8 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
             // The raw pane does not reflow, so one line is one row there; the
             // annotated pane wraps at the width of one full-width box.
             let raw_rows = pane_lines(raw, None);
-            let annotated_rows = pane_lines(annotated, Some(pane_chars(ui, 1)));
+            let annotated_rows =
+                pane_lines(annotated, Some(pane_chars(ui, 1).saturating_sub(gutter.steps * BRACKET_STEP_CHARS)));
             let (link, reach) = ui.data(|data| {
                 (
                     data.get_temp::<ScrollLink>(scroll_link_id()).unwrap_or_default(),
@@ -2023,7 +2182,8 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
             let ceiling = raw_ceiling(ui.available_height(), row, sideways);
             let raw_reach = reach.raw.unwrap_or_else(|| max_offset(raw_rows.rows, row, ceiling));
             let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, raw_reach);
-            let drawn_raw = draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)));
+            let drawn_raw =
+                draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)), &Gutter::default());
             let at_raw = drawn_raw.at;
 
             ui.add_space(4.0);
@@ -2039,7 +2199,7 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
                 annotated_reach,
             );
             let drawn_annotated =
-                draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)));
+                draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)), &gutter);
             let at_annotated = drawn_annotated.at;
 
             let link = drove(link, at_raw, want_raw, at_annotated, want_annotated);
@@ -2081,7 +2241,7 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize) {
 /// both of those from a pane that simply ran out of command. See [`PaneAt`].
 /// The same two numbers, in rows rather than in pixels, are what the caption
 /// says out loud on the next frame: see [`Rows`].
-fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneShown {
+fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox, gutter: &Gutter) -> PaneShown {
     // A pane that cannot wrap needs somewhere to scroll a long line to; one
     // that wraps has nothing to the side and a horizontal bar would only be
     // furniture.
@@ -2098,7 +2258,7 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox) -> PaneShown {
     let row = row_height(ui);
     pane_frame(ui)
         .show(ui, |ui| {
-            let drawn = scroll.show(ui, |ui| draw_spans(ui, spans, pane.weight));
+            let drawn = scroll.show(ui, |ui| draw_spans_bracketed(ui, spans, pane.weight, gutter));
             PaneShown {
                 at: PaneAt {
                     offset: drawn.state.offset.y,
@@ -2589,7 +2749,9 @@ fn draw_cell(ui: &mut Ui, cell: Cell<'_>, palette: &Palette, size: Cells) {
                 );
             });
             let spans = if terminator { side.spans() } else { side.content_spans() };
-            slot(ui, size.cell, size.height, |ui| draw_line(ui, spans, Weight::Mono));
+            slot(ui, size.cell, size.height, |ui| {
+                draw_line(ui, spans, Weight::Mono);
+            });
         }
         Cell::Gap => {
             // No mark and no text: the gutter is left empty on purpose, so
@@ -2847,6 +3009,81 @@ fn draw_spans(ui: &mut Ui, spans: &Spans, weight: Weight) {
     }
 }
 
+/// The same, with a gutter of brackets down its left.
+///
+/// The brackets are painted after every line has been drawn rather than
+/// beside each one as it goes. A bracket is then one unbroken stroke from the
+/// top of its first row to the bottom of its last, taken from where those
+/// rows actually landed — which is the only way to get it right, because a
+/// wrapped line is several rows tall and the gap between two lines belongs to
+/// neither of them. Drawn per line it would be a ladder of segments with a
+/// rung missing at every gap.
+///
+/// An empty gutter draws exactly what [`draw_spans`] draws, through the same
+/// call, so a command with no structure is not laid out differently from the
+/// way it was before any of this existed.
+fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gutter) {
+    if gutter.is_empty() {
+        draw_spans(ui, spans, weight);
+        return;
+    }
+    let ink = palette(ui).quiet;
+    let step = advance(ui) * BRACKET_STEP_CHARS as f32;
+    let width = step * gutter.steps as f32;
+    let mut rows: Vec<egui::Rect> = Vec::new();
+    for line in lines(spans) {
+        let drawn = ui
+            .horizontal_top(|ui| {
+                // Otherwise the gap egui puts between two widgets in a row
+                // would appear between the gutter and the text, and the text
+                // would not start where the gutter says it does.
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(width);
+                draw_line(ui, line, weight).rect
+            })
+            .inner;
+        rows.push(drawn);
+    }
+    paint_brackets(ui, &rows, gutter, step, width, ink);
+}
+
+/// Paint one stroke per bracket, from the rows the lines landed on.
+///
+/// A bracket is a rule down the gutter with a tick into the text at each end:
+/// the tick says which line opens the block and which closes it, and the rule
+/// says everything between them is inside. Nothing is drawn for a line that
+/// was never laid out, which is how a bracket over a line the pane did not
+/// reach draws nothing rather than a stroke to a rectangle that is not there.
+fn paint_brackets(
+    ui: &Ui,
+    rows: &[egui::Rect],
+    gutter: &Gutter,
+    step: f32,
+    width: f32,
+    ink: Color32,
+) {
+    let painter = ui.painter();
+    let stroke = egui::Stroke::new(BRACKET_STROKE, ink);
+    let tick = step * BRACKET_TICK;
+    for bracket in &gutter.brackets {
+        let (Some(first), Some(last)) = (rows.get(bracket.first), rows.get(bracket.last)) else {
+            continue;
+        };
+        // Measured from the text's own left edge, so the gutter follows the
+        // text when the pane is scrolled sideways instead of sitting at a
+        // fixed place on the screen with the command sliding past it.
+        let x = first.left() - width + bracket.step as f32 * step;
+        let top = first.top() + BRACKET_INSET;
+        let bottom = last.bottom() - BRACKET_INSET;
+        if bottom <= top {
+            continue;
+        }
+        painter.line_segment([egui::pos2(x, top), egui::pos2(x, bottom)], stroke);
+        painter.line_segment([egui::pos2(x, top), egui::pos2(x + tick, top)], stroke);
+        painter.line_segment([egui::pos2(x, bottom), egui::pos2(x + tick, bottom)], stroke);
+    }
+}
+
 /// The same, with [`ATTRIBUTION`] in front of the first line.
 ///
 /// In front of it and not above it: the lead-in is appended into the same
@@ -2950,11 +3187,11 @@ fn lines(spans: &[Span]) -> Vec<&[Span]> {
 /// spans to zero, because they are two ranges of one string. And that string
 /// is [`line_text`] — testable, unlike a sequence of widgets — so what the
 /// reader is shown can be asserted against what the spans say.
-fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) {
+fn draw_line(ui: &mut Ui, line: &[Span], weight: Weight) -> egui::Response {
     let palette = palette(ui);
     let font = font(weight, ui.style());
     let job = line_job(line, &palette, &font);
-    ui.add(egui::Label::new(job).wrap_mode(wrap_mode(weight)));
+    ui.add(egui::Label::new(job).wrap_mode(wrap_mode(weight)))
 }
 
 /// One line of spans as an [`egui::text::LayoutJob`]: the text every span
@@ -3110,6 +3347,120 @@ mod tests {
     use crate::render::render_command;
     use crate::render::unicode::classify;
     use crate::swap::Principal;
+
+    /// The gutter a command gets, as `(first line, last line, step)` per
+    /// bracket, with the number of columns it takes.
+    fn bracketed(source: &str) -> (usize, Vec<(usize, usize, usize)>) {
+        let spans = render_command(source, &BTreeMap::new());
+        let drawn = gutter(&lines(&spans), &blocks(source));
+        (
+            drawn.steps,
+            drawn
+                .brackets
+                .iter()
+                .map(|bracket| (bracket.first, bracket.last, bracket.step))
+                .collect(),
+        )
+    }
+
+    /// The text of each drawn line, so a test can say which lines a bracket
+    /// is claimed to span without counting them by hand.
+    fn drawn_lines(source: &str) -> Vec<String> {
+        let spans = render_command(source, &BTreeMap::new());
+        lines(&spans)
+            .iter()
+            .map(|line| line.iter().map(|span| span.text()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn a_command_with_no_structure_has_no_gutter() {
+        // The ordinary case, and the one that has to cost nothing: a pane
+        // with no brackets is laid out exactly as it was before there were
+        // any.
+        let (steps, brackets) = bracketed("ls -l /tmp");
+        assert_eq!(steps, 0);
+        assert_eq!(brackets, vec![]);
+    }
+
+    #[test]
+    fn a_loop_is_bracketed_from_its_first_drawn_line_to_its_last() {
+        let source = "for x in a b; do\n  echo $x\ndone";
+        let shown = drawn_lines(source);
+        let (steps, brackets) = bracketed(source);
+        assert_eq!(steps, 1);
+        assert_eq!(brackets.len(), 1, "{brackets:?}");
+        let (first, last, step) = brackets[0];
+        assert_eq!(step, 0);
+        assert!(shown[first].starts_with("for x"), "opens on {:?}", shown[first]);
+        assert!(shown[last].contains("done"), "closes on {:?}", shown[last]);
+        assert_eq!(last, shown.len() - 1, "the loop does not reach its last line");
+    }
+
+    #[test]
+    fn a_loop_inside_a_loop_is_drawn_one_step_in() {
+        let source = "for a in 1; do\n  for b in 2; do\n    echo $b\n  done\ndone";
+        let (steps, brackets) = bracketed(source);
+        assert_eq!(steps, 2, "{brackets:?}");
+        assert_eq!(brackets.len(), 2, "{brackets:?}");
+        assert_eq!(brackets[0].2, 0);
+        assert_eq!(brackets[1].2, 1);
+        // And the inner one really is inside the outer one, which is what the
+        // step is claiming.
+        assert!(brackets[0].0 <= brackets[1].0 && brackets[1].1 <= brackets[0].1);
+    }
+
+    #[test]
+    fn a_block_on_one_drawn_line_gets_no_bracket() {
+        // `{ a; b; }` is segmented at its separators, so it is several drawn
+        // lines and does get one. A block that stays on one line after
+        // segmentation has nothing to bracket: the mark would open and close
+        // on the same row and say what the row already says.
+        let (_, several) = bracketed("{ a; b; }");
+        assert_eq!(several.len(), 1, "{several:?}");
+        let (steps, none) = bracketed("(true)");
+        assert_eq!(none, vec![], "a subshell on one line drew a bracket");
+        assert_eq!(steps, 0);
+    }
+
+    #[test]
+    fn two_constructs_over_the_same_lines_are_two_brackets_side_by_side() {
+        // A subshell wrapping nothing but a loop covers exactly the lines the
+        // loop does. Both are real and both are drawn, so the gutter has to
+        // say there are two of them — which is what a column each is for.
+        let source = "(for x in a b; do\n  echo $x\ndone)";
+        let (steps, brackets) = bracketed(source);
+        assert_eq!(steps, 2, "{brackets:?}");
+        assert_eq!(brackets.len(), 2, "{brackets:?}");
+        assert_eq!(brackets[0].2, 0);
+        assert_eq!(brackets[1].2, 1);
+        assert_eq!(
+            (brackets[0].0, brackets[0].1),
+            (brackets[1].0, brackets[1].1),
+            "the two cover the same lines, so neither may be shortened to fit"
+        );
+    }
+
+    #[test]
+    fn a_step_names_a_column_a_reader_can_count() {
+        // Every step from zero up to the widest one in use is occupied by
+        // some bracket. A gutter three columns wide with nothing in the
+        // middle column would be counting blocks the reader cannot see.
+        for source in [
+            "for x in a b; do\n  echo $x\ndone",
+            "for a in 1; do\n  for b in 2; do\n    echo $b\n  done\ndone",
+            "(for x in a b; do\n  echo $x\ndone)",
+            "while read -r l; do\n  case $l in\n    a) echo 1;;\n  esac\ndone",
+        ] {
+            let (steps, brackets) = bracketed(source);
+            for step in 0..steps {
+                assert!(
+                    brackets.iter().any(|(_, _, at)| *at == step),
+                    "step {step} of {steps} is empty in {source:?}: {brackets:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_quotation_is_marked_beside_its_text_and_costs_no_row() {
@@ -4804,6 +5155,7 @@ mod tests {
         raw: Spans,
         annotated: Spans,
         longest: usize,
+        blocks: Vec<Block>,
         size: egui::Vec2,
         time: f64,
     }
@@ -4819,7 +5171,10 @@ mod tests {
             let annotated = render_command(source, &home);
             let raw = classify(source);
             let longest = widest_line(&annotated).max(widest_line(&raw));
-            StackedWindow { ctx, raw, annotated, longest, size, time: 0.0 }
+            // From the same source the panes are drawn from, so a real frame
+            // exercises the gutter rather than a window that never has one.
+            let blocks = blocks(source);
+            StackedWindow { ctx, raw, annotated, longest, blocks, size, time: 0.0 }
         }
 
         /// One frame's worth of input: the window, the clock and the reader.
@@ -4855,7 +5210,9 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> Drawn {
             let input = self.input(events);
             let (raw, annotated, longest) = (&self.raw, &self.annotated, self.longest);
-            let mut out = self.ctx.run_ui(input, |ui| draw_command(ui, annotated, raw, longest));
+            let blocks = &self.blocks;
+            let mut out =
+                self.ctx.run_ui(input, |ui| draw_command(ui, annotated, raw, longest, blocks));
             let text = drawn_text(&out);
             // epaint refuses to be dropped holding texture deltas nobody
             // applied.
