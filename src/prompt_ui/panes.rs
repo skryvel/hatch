@@ -51,6 +51,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
 use crate::render::blocks::{Block, BlockKind, blocks};
+use crate::render::language::{Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
@@ -136,6 +137,11 @@ pub enum Shown {
         /// it runs a parser — asking sixty times a second what the answer
         /// cannot change would be the expensive way to get the same list.
         blocks: Vec<Block>,
+        /// Any program carried inside it, and what it reads as.
+        ///
+        /// Measured here for the reason `blocks` is: it depends only on the
+        /// source, so measuring it once is not a cache that can go stale.
+        snippets: Vec<Snippet>,
         /// How odd that source is, for the header line.
         scan: ScanReport,
         /// The danger labels the daemon found, defanged for drawing.
@@ -197,6 +203,7 @@ impl Shown {
                 let raw = classify(source);
                 Ok(Shown::Command {
                     blocks: blocks(source),
+                    snippets: snippets(source),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
                     runs: runs.clone(),
@@ -533,6 +540,36 @@ pub fn draw_unanswered(ui: &mut Ui, items: &[Unanswered]) {
     let Some(note) = unanswered_note(items) else { return };
     let palette = palette(ui);
     ui.label(RichText::new(note).small().color(palette.warn));
+}
+
+/// What to say about the programs a command carries, or `None` when it
+/// carries none.
+///
+/// # Why the evidence is in the sentence
+///
+/// A reading is a reading of a *wrapper's* convention and not a claim about
+/// the bytes: `python3 - <<'PY'` says somebody meant that body as Python, and
+/// would say it just as loudly about a body that is not Python at all. Saying
+/// where the reading came from turns a label a reader has to take on trust
+/// into one they can check against the line above it in a second.
+///
+/// Only when there is one. Two bodies have two reasons, and a sentence
+/// carrying both is longer than the row it has -- so several are named and
+/// the reasons are left to the text, which is on screen anyway.
+pub fn snippet_note(found: &[Snippet]) -> Option<String> {
+    let [only] = found else {
+        let mut named: Vec<&str> = found.iter().map(|s| s.language().name()).collect();
+        named.dedup();
+        return match named.len() {
+            0 => None,
+            _ => Some(format!("Its here-documents read as {}.", listed(named.into_iter().map(str::to_string)))),
+        };
+    };
+    Some(format!(
+        "Its here-document reads as {}, {}.",
+        only.language().name(),
+        only.evidence().because()
+    ))
 }
 
 /// How many of the rows are marked as changed.
@@ -1367,8 +1404,10 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 /// Everything below the headline and above the buttons.
 pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
     match shown {
-        Shown::Command { annotated, raw, scan, danger, runs, longest, caveat, blocks, .. } => {
-            draw_command_header(ui, scan, danger, runs, caveat.as_deref());
+        Shown::Command {
+            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, ..
+        } => {
+            draw_command_header(ui, scan, snippets, danger, runs, caveat.as_deref());
             draw_command(ui, annotated, raw, *longest, blocks);
         }
         Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
@@ -1384,6 +1423,7 @@ pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
 fn draw_command_header(
     ui: &mut Ui,
     report: &ScanReport,
+    snippets: &[Snippet],
     danger: &[String],
     runs: &[Entry],
     caveat: Option<&str>,
@@ -1397,6 +1437,12 @@ fn draw_command_header(
         ui.label(
             RichText::new(format!("Unusual characters: {summary}")).color(palette.warn).strong(),
         );
+    }
+    if let Some(note) = snippet_note(snippets) {
+        // Quiet, and below the unusual-characters line: this is a note about
+        // what the command carries rather than a warning about it, and the
+        // one thing it must not do is compete with a line that is one.
+        ui.label(RichText::new(note).small().color(palette.quiet));
     }
     if !danger.is_empty() {
         ui.horizontal_wrapped(|ui| {

@@ -1998,6 +1998,28 @@ struct Assignment {
     value: Option<String>,
 }
 
+/// Where each here-document body is, in source order.
+///
+/// Exposed so [`super::language`] can read a body without deciding for itself
+/// where one is: the scanner is the authority on that, and a second opinion
+/// about it is how two passes come to disagree about the same bytes. The
+/// terminator line is not part of the range -- it is the delimiter, not the
+/// data.
+pub(crate) fn here_bodies(command: &str) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for scanned in scan(command) {
+        if !matches!(scanned.here, Some(Here::Body { .. })) {
+            continue;
+        }
+        let end = scanned.offset + scanned.ch.len_utf8();
+        match out.last_mut() {
+            Some(last) if last.end == scanned.offset => last.end = end,
+            _ => out.push(scanned.offset..end),
+        }
+    }
+    out
+}
+
 /// The names this command sets for itself, in the order it sets them.
 ///
 /// # Why this exists

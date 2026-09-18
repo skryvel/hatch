@@ -7340,6 +7340,21 @@ mod tests {
     }
 
     #[test]
+    fn a_window_says_what_language_a_here_document_carries() {
+        let mut app = a_window_showing("python3 - <<'PY'\nprint(1)\nPY");
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains("reads as Python"), "{drawn}");
+        assert!(drawn.contains("from the program it is given to"), "{drawn}");
+
+        // And a body nothing names says nothing: an unlabelled body is the
+        // rendering bodies had before any of this, and a window that guessed
+        // would be making the one claim this feature refuses to make.
+        let mut quiet = a_window_showing("cat <<'EOF' > /etc/hosts\n127.0.0.1 local\nEOF");
+        let drawn = window_text_sized(&mut quiet, opening_size());
+        assert!(!drawn.contains("reads as"), "a window guessed at a config file: {drawn}");
+    }
+
+    #[test]
     fn the_review_chord_ticks_the_box_and_writes_nothing_down() {
         // The one box of the four that is never remembered, so the chord for
         // it must not start remembering it: a standing "hold every command's

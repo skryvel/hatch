@@ -12,6 +12,7 @@ pub mod blocks;
 pub mod command;
 pub mod danger;
 pub mod diff;
+pub mod language;
 pub mod roster;
 mod span;
 pub mod unicode;
