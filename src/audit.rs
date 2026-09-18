@@ -207,6 +207,29 @@ pub struct AuditRecord {
     pub stop_on_failure: bool,
     /// How it ended.
     pub verdict: LogVerdict,
+    /// How long the approval window was on screen before this ended it, in
+    /// milliseconds.
+    ///
+    /// Absent when there was never a window: a request refused before the
+    /// queue was never on anybody's screen, and a zero there would claim it
+    /// was and was answered instantly.
+    ///
+    /// # What it is for
+    ///
+    /// The file already says *what* ended a request. It could not say whether
+    /// a person was there. A denial after four seconds is somebody reading
+    /// and deciding; a denial after eighty milliseconds is not a decision at
+    /// all, whatever the verdict column says, and the two were written down
+    /// identically.
+    ///
+    /// That gap is why a report of windows closing on their own could not be
+    /// checked against anything. It is recorded on every line, including the
+    /// approvals, because a number that only appears on the lines somebody
+    /// already suspects is a number they cannot calibrate: knowing that an
+    /// ordinary approval takes seconds is what makes eighty milliseconds mean
+    /// something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u64>,
     /// What the user typed into the prompt window, if anything.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -511,6 +534,19 @@ fn visible(text: &str) -> String {
     out
 }
 
+/// How long a window was on screen, at the precision a reader needs.
+///
+/// Milliseconds below a second and tenths of a second above it. The whole
+/// question this answers is *was somebody there*, and the answer turns on the
+/// difference between eighty milliseconds and four seconds rather than on the
+/// difference between 4.2 and 4.3.
+fn on_screen(ms: u64) -> String {
+    match ms {
+        ms if ms < 1_000 => format!("{ms}ms"),
+        ms => format!("{:.1}s", ms as f64 / 1_000.0),
+    }
+}
+
 impl AuditRecord {
     /// One human-readable line: when, how it ended, what it was, and the
     /// operation itself.
@@ -530,6 +566,13 @@ impl AuditRecord {
             self.position(),
             self.detail.summary()
         );
+        // Before the note, so a note stays the last thing on the line, and on
+        // every line rather than only the suspicious ones: an abnormal
+        // lifetime can only be recognised by somebody who has seen the
+        // ordinary ones in the same column.
+        if let Some(ms) = self.window_ms {
+            line.push_str(&format!("  |  window {}", on_screen(ms)));
+        }
         if let Some(note) = &self.note {
             line.push_str(&format!("  |  note: {}", visible(note)));
         }
@@ -666,6 +709,7 @@ mod tests {
             reason: "resolved is stale after the netctl change".to_string(),
             operation: 1,
             operations: 1,
+            window_ms: Some(4_200),
             stop_on_failure: false,
             verdict,
             note: None,
@@ -688,6 +732,33 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-30T18:42:11+02:00")
             .unwrap()
             .with_timezone(&Local)
+    }
+
+    #[test]
+    fn how_long_a_window_was_on_screen_is_on_the_readable_line() {
+        // The number is useless in the file if reading it needs a JSON tool:
+        // the person who wants it is scanning for a denial that happened too
+        // fast to have been one.
+        let mut record = sample_record(LogVerdict::Deny);
+        record.window_ms = Some(4_210);
+        assert!(record.summary().contains("window 4.2s"), "{}", record.summary());
+
+        record.window_ms = Some(80);
+        assert!(record.summary().contains("window 80ms"), "{}", record.summary());
+
+        // A request nobody was shown says nothing, rather than `0ms`, which
+        // would read as answered-instantly.
+        record.window_ms = None;
+        assert!(!record.summary().contains("window"), "{}", record.summary());
+    }
+
+    #[test]
+    fn a_window_lifetime_is_written_at_the_precision_that_answers_the_question() {
+        assert_eq!(on_screen(0), "0ms");
+        assert_eq!(on_screen(999), "999ms");
+        assert_eq!(on_screen(1_000), "1.0s");
+        assert_eq!(on_screen(4_210), "4.2s");
+        assert_eq!(on_screen(600_000), "600.0s");
     }
 
     #[test]
@@ -760,6 +831,7 @@ mod tests {
             reason: "the deploy target moved".to_string(),
             operation: 1,
             operations: 1,
+            window_ms: Some(4_200),
             stop_on_failure: false,
             verdict: LogVerdict::Deny,
             note: Some("wrong IP, it's .12 not .21".to_string()),
@@ -1122,6 +1194,7 @@ mod tests {
             reason: "the deploy target moved".to_string(),
             operation: 1,
             operations: 1,
+            window_ms: Some(4_200),
             stop_on_failure: false,
             verdict: LogVerdict::Approve,
             note: None,

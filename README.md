@@ -1219,6 +1219,18 @@ because a user denial, a client that gave up and a window that crashed all
 answer the agent with "denied", and conflating them here would hide exactly the
 quiet failures the log exists to catch.
 
+Every line says how long the approval window was on screen before the outcome
+that ended it, as `window_ms` in the JSON and `window 4.2s` on the readable
+line. It is the one thing the file could not say before: what ended a request
+was recorded exactly, and whether a person was there to do it was not. A
+denial after four seconds is somebody reading and deciding; a denial after
+eighty milliseconds is not a decision at all, and the two used to be written
+down identically. It is on every line, including the approvals, because an
+abnormal lifetime can only be recognised next to ordinary ones. A request
+refused before anybody was asked never reached a screen, so the key is absent
+rather than zero — a zero would say the window was there and was answered at
+once, which is the exact reading this is here to make possible.
+
 A batch of several operations is several lines, not one line holding a list,
 because the questions this file is for — what wrote to this file, what ran as
 root — are asked a line at a time, and a line carrying three operations would

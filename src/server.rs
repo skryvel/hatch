@@ -1713,7 +1713,13 @@ impl Daemon {
         // A request refused before the queue never opens a window, never
         // draws a number, and leaves this `None`.
         let mut number = None;
-        let outcome = self.decide(batch, caller, &title, &reason, &mut number).await;
+        // Beside the number, and an out-parameter for the same reason: it is
+        // known half way through `decide`, at the one moment the window stops
+        // being on screen, and every exit path after that would otherwise
+        // have to carry it out.
+        let mut window_ms = None;
+        let outcome =
+            self.decide(batch, caller, &title, &reason, &mut number, &mut window_ms).await;
 
         // The only `append` in the crate's request path. See `Outcome`.
         //
@@ -1732,6 +1738,7 @@ impl Daemon {
                 operations,
                 stop_on_failure,
                 verdict,
+                window_ms,
                 note: outcome.note.clone(),
                 detail,
             };
@@ -1763,6 +1770,7 @@ impl Daemon {
         title: &str,
         reason: &str,
         number: &mut Option<u64>,
+        window_ms: &mut Option<u64>,
     ) -> Outcome {
         let Batch { operations, stop_on_failure, .. } = batch;
 
@@ -1847,6 +1855,11 @@ impl Daemon {
             }
         };
 
+        // From here the window is on somebody's screen. What this measures is
+        // how long it was there before it stopped asking -- not how long the
+        // command then took, which is `duration_ms` and a different question.
+        let opened_at = tokio::time::Instant::now();
+
         // Step 4. The verdict, or one of the four ways there is never going to
         // be one. Every one of those four denies.
         let ending = tokio::select! {
@@ -1858,6 +1871,10 @@ impl Daemon {
             () = caller.hung_up() => Ending::HungUp,
             () = tokio::time::sleep_until(expires_at) => Ending::Expired,
         };
+        // One place, after every one of the five endings and before any of
+        // them is acted on, so no path can forget it.
+        *window_ms = Some(opened_at.elapsed().as_millis() as u64);
+
         let verdict = match ending {
             Ending::Decided(Ok(verdict)) => verdict,
             Ending::Decided(Err(gone)) => {
@@ -5684,6 +5701,57 @@ later"), "");
             assert!(!text.contains("denied"), "a timeout must not read as a denial: {text}");
             assert_eq!(harness.verdict(), "timeout");
             assert!(harness.prompter.seen().len() == 1, "the window was shown, just unanswered");
+        }
+
+        #[tokio::test]
+        async fn every_line_says_how_long_the_window_was_on_screen() {
+            // The file said what ended a request and could not say whether a
+            // person was there. A denial after four seconds is somebody
+            // reading; a denial after eighty milliseconds is not a decision
+            // at all, and the two were written down identically.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Deny {
+                note: "no".to_string(),
+            })]);
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let record = harness.only_record();
+            assert!(
+                record.get("window_ms").is_some_and(serde_json::Value::is_u64),
+                "no window lifetime on the line: {record}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_request_nobody_was_shown_has_no_window_lifetime() {
+            // Absent rather than zero. A zero would say the window was on
+            // screen and answered instantly, which is the exact reading this
+            // field exists to make possible -- so it must not be manufactured
+            // for a request that never reached a screen at all.
+            let harness = Harness::new(Vec::new());
+            let protected = harness.paths.config_file();
+            let _ = within(harness.daemon.batch(
+                BatchParams {
+                    title: "take hatch over".to_string(),
+                    reason: "because a test asked".to_string(),
+                    operations: vec![OperationParams {
+                        path: Some(protected.display().to_string()),
+                        content: Some("x".to_string()),
+                        root: false,
+                        ..a_write()
+                    }],
+                    stop_on_failure: false,
+                },
+                Caller::quiet(),
+            ))
+            .await;
+
+            assert!(harness.prompter.seen().is_empty(), "the test stopped refusing early");
+            let record = harness.only_record();
+            assert_eq!(record["verdict"], "refused");
+            assert!(
+                record.get("window_ms").is_none(),
+                "a request nobody saw claimed a window lifetime: {record}"
+            );
         }
 
         #[tokio::test]
