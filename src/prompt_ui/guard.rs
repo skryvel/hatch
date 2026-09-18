@@ -188,6 +188,11 @@ pub const STREAM_CHORD: &str = "Alt+S";
 /// What toggles "close when I decide". Alt, for [`STREAM_CHORD`]'s reasons.
 pub const CLOSE_CHORD: &str = "Alt+C";
 
+/// What toggles "show me the output before it is sent". Alt, for
+/// [`STREAM_CHORD`]'s reasons, and `R` for *review* -- `S` and `O` are both
+/// taken, by the stream box here and by Keep in the watching phase.
+pub const REVIEW_CHORD: &str = "Alt+R";
+
 /// What keeps the window, printed on the button that does the same thing.
 ///
 /// Three keys for one action, which is more than anything else here gets, and
@@ -279,6 +284,8 @@ pub enum Toggle {
     Stream,
     /// "Close when I decide".
     Close,
+    /// "Show me the output before it is sent".
+    Review,
 }
 
 /// The window's guard against input it did not mean.
@@ -558,6 +565,7 @@ fn toggle_chord(key: Key, m: Modifiers) -> Option<Toggle> {
     match key {
         Key::S => Some(Toggle::Stream),
         Key::C => Some(Toggle::Close),
+        Key::R => Some(Toggle::Review),
         _ => None,
     }
 }
@@ -1020,6 +1028,7 @@ mod tests {
                         "Esc" => Key::Escape,
                         "S" => Key::S,
                         "C" => Key::C,
+                        "R" => Key::R,
                         other => panic!("{label:?} names a key this test cannot read: {other:?}"),
                     };
                     assert_eq!(*key.get_or_insert(named), named, "{label:?} names two keys");
@@ -1061,6 +1070,7 @@ mod tests {
             (DENY_CHORD, Action::Deny),
             (STREAM_CHORD, Action::Toggle(Toggle::Stream)),
             (CLOSE_CHORD, Action::Toggle(Toggle::Close)),
+            (REVIEW_CHORD, Action::Toggle(Toggle::Review)),
         ] {
             let (key, alternatives) = named(label);
             for m in every_modifier_combination() {

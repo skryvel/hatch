@@ -2347,6 +2347,15 @@ impl PromptApp {
                 // Dead, or never drawn. Either way nothing is written down.
                 false => self.refused = Some((toggle, Instant::now())),
             },
+            // Nothing is written down either way: this box is the one of the
+            // four that is never remembered, so there is no preference to
+            // set and none to leave alone. See `PromptApp::review`.
+            guard::Toggle::Review => match self.runs() {
+                true => self.review = !self.review,
+                // A write prints nothing, so there is no output to hold back
+                // and no box on screen to have pressed.
+                false => self.refused = Some((toggle, Instant::now())),
+            },
         }
     }
 
@@ -3000,7 +3009,7 @@ impl PromptApp {
             }
             // Not written down when it changes, unlike the box before it: see
             // `PromptApp::review` for why this one is never remembered.
-            ui.checkbox(review, REVIEW_LABEL);
+            ui.checkbox(review, REVIEW_LABEL).on_hover_text(guard::REVIEW_CHORD);
         };
         if width <= ui.available_width() {
             centred_row(ui, width, |ui| controls(ui, true));
@@ -7331,6 +7340,46 @@ mod tests {
     }
 
     #[test]
+    fn the_review_chord_ticks_the_box_and_writes_nothing_down() {
+        // The one box of the four that is never remembered, so the chord for
+        // it must not start remembering it: a standing "hold every command's
+        // output" is a decision nobody made per command.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+
+        assert!(!app.reviews(), "the box opens unticked");
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::R, egui::Modifiers::ALT)], now);
+        assert!(app.reviews(), "Alt+R did not reach the box");
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs::default(),
+            "the review chord wrote a preference that outlives this window"
+        );
+
+        // And back, because a chord that could only ever tick would be half a
+        // control.
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::R, egui::Modifiers::ALT)], now);
+        assert!(!app.reviews(), "the untick did not reach the box");
+    }
+
+    #[test]
+    fn the_review_chord_says_the_same_thing_the_box_does() {
+        // The chord is on the window's own hint, so a reader who finds the
+        // box finds the key -- and the two cannot drift, because the label is
+        // the constant.
+        let mut app = a_window_showing("echo hi");
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        let now = past_the_guard();
+        let box_at = drawn_at(&mut app, &ctx, REVIEW_LABEL, now).expect("the review box is drawn");
+        assert!(box_at.width() > 0.0);
+        assert_eq!(guard::REVIEW_CHORD, "Alt+R");
+    }
+
+    #[test]
     fn a_chord_during_the_guard_flips_nothing_and_leaves_nothing_behind() {
         // The whole of why these wait as long as Approve does. What they
         // write outlives this window, so the burst that cannot approve must
@@ -7341,10 +7390,13 @@ mod tests {
         apply_faces(&ctx);
         let inside = Instant::now();
 
-        for key in [egui::Key::S, egui::Key::C] {
+        for key in [egui::Key::S, egui::Key::C, egui::Key::R] {
             a_live_frame(&mut app, &ctx, vec![chord(key, egui::Modifiers::ALT)], inside);
         }
-        assert!(!app.streams() && !app.closes_on_decide(), "a burst answered the window");
+        assert!(
+            !app.streams() && !app.closes_on_decide() && !app.reviews(),
+            "a burst answered the window"
+        );
         assert_eq!(
             PrefsFile::at(&paths).read(),
             Prefs::default(),

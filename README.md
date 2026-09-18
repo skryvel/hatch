@@ -85,7 +85,8 @@ same thing.*
   widget sees them, so nothing arrives late. Escape denies only when pressed
   bare. The interval is deliberately not a config key.
 - **One keystroke, and the window gets out of the way.** `Ctrl+Enter` or
-  `Shift+Enter` approves, `Esc` denies, `Alt+S` and `Alt+C` work the two boxes.
+  `Shift+Enter` approves, `Esc` denies, and `Alt+S`, `Alt+C` and `Alt+R` work
+  the three boxes.
   Tick *Close when I decide* once and it is remembered, along with whether you
   stream and whether you want a terminal. Once the command is running the note
   field is gone and bare letters are free, so `e`, `o` or Space keeps the
@@ -564,15 +565,18 @@ something that appeared under their hands. The 750 ms is hardcoded and
 deliberately not a config key — it is a safety property, and a setting inviting
 it to be lowered to zero is a liability.
 
-**Alt+S and Alt+C** tick **Stream output to this window** and **Close when I
-decide**. Chords rather than bare letters, because the note field has the
-keyboard and a window where `s` means something other than the letter `s` eats
-what you type into it. They wait out the same guard as Approve does, which is
-not because a checkbox is dangerous but because these two are remembered: what
-they write outlives the window, and the undo for a file is a box in a request
-nobody has made yet. Aimed at a box that is dead — Alt+S on a command that is
-getting a terminal of its own — they tick nothing and flash the sentence
-saying why instead.
+**Alt+S, Alt+C and Alt+R** tick **Stream output to this window**, **Close when
+I decide** and **Show me the output before it is sent**. Chords rather than
+bare letters, because the note field has the keyboard and a window where `s`
+means something other than the letter `s` eats what you type into it. They
+wait out the same guard as Approve does, which is not because a checkbox is
+dangerous but because the first two are remembered: what they write outlives
+the window, and the undo for a file is a box in a request nobody has made yet.
+Alt+R waits the same guard and writes nothing down, because that box is never
+remembered — see [Reviewing the output](#reviewing-the-output-before-it-goes).
+Aimed at a box that is dead — Alt+S on a command that is getting a terminal of
+its own, Alt+R on a write, which prints nothing — they tick nothing and flash
+the sentence saying why instead.
 
 **After Approve the window stays.** It becomes a running indicator with elapsed
 time and a Kill button, and the output pane if streaming was ticked. Kill
