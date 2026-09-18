@@ -50,7 +50,7 @@ use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
-use crate::render::blocks::{Block, blocks};
+use crate::render::blocks::{Block, BlockKind, blocks};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
@@ -1590,6 +1590,18 @@ struct Bracket {
     first: usize,
     /// The last, which is never the first — see [`BLOCK_MINIMUM_LINES`].
     last: usize,
+    /// Whether that last line is the word that *closes* the construct rather
+    /// than another of its members.
+    ///
+    /// `done`, `esac`, `)` and `}` close one: they belong to the construct at
+    /// the level the construct itself sits at, and indenting them would put
+    /// the word that ends a block one column right of the word that began it.
+    ///
+    /// A pipeline closes with nothing. Its last stage is a member exactly
+    /// like the ones above it — `sort -u` at the end of four pipes is not a
+    /// terminator, and drawing it at the margin says the pipeline ended one
+    /// line earlier than it did.
+    closed_by_a_word: bool,
 }
 
 /// The whole gutter for one rendering: one bracket per construct worth
@@ -1631,14 +1643,22 @@ impl Gutter {
     /// How many brackets enclose line `index` without starting or ending on
     /// it, which is how far that line is indented.
     ///
-    /// A block's own first and last lines are *not* indented by it: `for` and
-    /// `done` belong to the construct rather than to its body, and indenting
-    /// them would put the word that opens a block one column right of the
-    /// line above it for no reason a reader could name.
+    /// A block's own first line is never indented by it, and its last line is
+    /// indented only when nothing closes the block: `for` and `done` belong
+    /// to the construct rather than to its body, but the last stage of a
+    /// pipeline is a member of it. See [`Bracket::closed_by_a_word`].
     fn indent(&self, index: usize) -> usize {
         self.brackets
             .iter()
-            .filter(|bracket| bracket.first < index && index < bracket.last)
+            .filter(|bracket| {
+                // The last line is inside the block when nothing closes it,
+                // and is the closing word itself when something does.
+                let past = match bracket.closed_by_a_word {
+                    true => bracket.last,
+                    false => bracket.last + 1,
+                };
+                bracket.first < index && index < past
+            })
             .count()
     }
 }
@@ -1708,7 +1728,11 @@ fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
         if brackets.iter().any(|drawn| drawn.first == first && drawn.last == last) {
             continue;
         }
-        brackets.push(Bracket { first, last });
+        brackets.push(Bracket {
+            first,
+            last,
+            closed_by_a_word: block.kind() != BlockKind::Pipeline,
+        });
     }
     Gutter { brackets }
 }
@@ -3677,6 +3701,23 @@ mod tests {
             shown.iter().all(|line| !line.starts_with(' ')),
             "a line still opens on the separator's blank: {shown:?}"
         );
+    }
+
+    #[test]
+    fn a_pipeline_indents_its_last_stage_and_a_loop_does_not_indent_its_done() {
+        // The two halves of one rule. A pipeline closes with nothing, so its
+        // last stage is a member like the ones above it; drawing `sort -u` at
+        // the margin said the pipeline ended a line earlier than it did.
+        let piped = "grep -o x | sed -e a | sed -e b | sort -u";
+        let (brackets, indents) = bracketed(piped);
+        assert_eq!(brackets.len(), 1, "{brackets:?}");
+        assert_eq!(indents, vec![0, 1, 1, 1], "the last stage fell out of its own pipeline");
+
+        // A loop does close with a word, and that word belongs to the loop
+        // rather than to its body.
+        let looped = "for x in a b; do\n  echo $x\ndone";
+        let (_, indents) = bracketed(looped);
+        assert_eq!(indents.last(), Some(&0), "`done` was indented into the body: {indents:?}");
     }
 
     #[test]
