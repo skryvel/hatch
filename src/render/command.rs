@@ -1767,6 +1767,11 @@ pub fn segment_breaking_at(command: &str, at: Option<usize>) -> Spans {
                 if newline_already_ends_the_line(command, token.end, found.get(index + 1)) {
                     continue;
                 }
+                // A fallback stays on the line of the thing it is a fallback
+                // for. See `ends_a_line`.
+                if !ends_a_line(&command[token.start..token.end]) {
+                    continue;
+                }
                 // The blanks the author left after the separator belong to
                 // the line the separator ends, not to the one that follows.
                 // See `blanks_after`.
@@ -1823,6 +1828,29 @@ fn take_break(builder: &mut SpanBuilder<'_>, asked: &mut Option<usize>, before: 
         }
         _ => {}
     }
+}
+
+/// Whether a separator ends the drawn line it closes.
+///
+/// Four of the five do. `||` does not, and the difference is not a matter of
+/// taste about short lines: a break reads as *then*, and for `;`, `&&` and a
+/// pipe that is what happened -- the next thing runs after this one, or takes
+/// its output. `||` means *otherwise*. What follows it runs **instead of**
+/// what precedes it, and only when that failed, so drawing it as the next
+/// line draws a fallback as a next step.
+///
+/// One line says the true thing: one of these two runs. It also keeps the
+/// idiom an agent writes most -- `… || true`, `… || exit 1` -- from spending
+/// a whole row on the word `true`, but that is a consequence and not the
+/// reason; a rule about how short the right-hand side is would be a
+/// per-command decision wearing a statistic.
+///
+/// This is layout only. `||` is still a boundary everywhere it matters: it is
+/// drawn as itself at the end of its segment, [`segments`] still ends one
+/// there, so the word after it is still named as a command in the roster and
+/// still highlighted as one.
+fn ends_a_line(separator: &str) -> bool {
+    separator != "||"
 }
 
 /// Where the run of blanks immediately after `at` ends.
@@ -3691,13 +3719,50 @@ mod tests {
     }
 
     #[test]
-    fn every_separator_gets_a_break_after_it() {
+    fn every_separator_that_ends_a_line_gets_a_break_after_it() {
         // Nothing is trimmed on either side of a boundary, and the break
         // lands where the next command starts rather than on the blanks in
         // front of it. Those blanks are still drawn -- at the end of the line
         // their separator ends, where they are not read as an indent. See
         // `blanks_after`.
-        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec!["b", "c", "d", "e"]);
+        //
+        // Four of the five separators end a line. `||` does not, so `d` --
+        // the fallback for `c` -- keeps `c`'s line. See `ends_a_line`.
+        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec!["b", "c", "e"]);
+        assert_eq!(
+            separators(&render_command("a; b && c || d | e")),
+            vec![";", "&&", "||", "|"],
+            "every separator is still drawn as itself, wherever the lines fall"
+        );
+    }
+
+    #[test]
+    fn a_fallback_stays_on_the_line_of_what_it_falls_back_from() {
+        // The reported shape. `true` on a line of its own reads as the next
+        // thing that happens; it is what happens *instead*, and only if the
+        // pipe before it failed.
+        assert_eq!(
+            drawn_lines(&render_command("a | b || true")),
+            vec!["a | ", "b || true"],
+            "the fallback was drawn as a next step"
+        );
+        // The pipe still ends its line: output flowing into the next command
+        // really is the next thing that happens.
+        assert_eq!(
+            drawn_lines(&render_command("make && ./run || echo failed")),
+            vec!["make && ", "./run || echo failed"]
+        );
+    }
+
+    #[test]
+    fn a_fallback_is_still_a_command_of_its_own() {
+        // Layout only: `||` still ends a segment everywhere that decides what
+        // a word *is*. The roster resolves what runs out of the same segments,
+        // so a `true` that stopped being a segment's first word would stop
+        // being named at all.
+        let spans = render_command("a | b || true");
+        assert_eq!(commands(&spans), vec!["a", "b", "true"]);
+        assert_eq!(segments("a | b || true").len(), 3);
     }
 
     #[test]
