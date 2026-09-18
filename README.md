@@ -335,7 +335,7 @@ being made deliberately.
 ## The approval window
 
 Top to bottom: what the agent said it wants and why, then the request itself in
-two panes side by side, then the controls.
+the command in one pane, then the controls.
 
 **The header is the agent talking, and says so.** The title is the first thing
 read, the most persuasive thing on screen, and written by the party whose
@@ -376,13 +376,22 @@ options.](media/approval-root.png)
 
 <sub>`hatch preview root --shot media/approval-root.png`</sub>
 
-**Two panes, same bytes.** The left pane is raw: monospace, no reflow, no
-segmentation, drawn from the same string that becomes the shell's argument. The
-right pane is annotated: numbered segments, highlighting, and `$VAR` references
-with the value the command will actually receive shown beside the reference,
-never in place of it. A reader can use whichever they trust in the moment, and
-a disagreement between them is visible at a glance because the two sit at the
-same height.
+**Two renderings, same bytes, one at a time.** The annotated rendering is what
+a window opens on: segmentation, highlighting, indentation that follows the
+structure the parse found, and `$VAR` references with the value the command
+will actually receive shown beside the reference, never in place of it. **Show
+the original text** swaps it for the raw one — monospace, no reflow, no
+grouping, no colour, drawn from the same string that becomes the shell's
+argument. The box is remembered, so a reader who wants the bytes unannotated
+gets them on every window.
+
+Both draw every byte of the command, so the original is not showing anything
+its neighbour hid; it is showing the same bytes without hatch's reading of
+them, for a reader who wants to check the reading rather than use it. That is
+worth a click and it was not worth half the width of every window, on every
+request, for everybody. The switch keeps your place: a line number means
+different things in the two renderings, but a byte offset means the same thing
+in both, so swapping lands on the line holding the place you were at.
 
 **A comment is not a command, and is not drawn as one.** A `#` at the start of
 a word begins a comment, and everything from it to the end of the line is drawn

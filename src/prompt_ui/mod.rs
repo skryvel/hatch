@@ -1613,6 +1613,9 @@ pub(crate) struct PromptApp {
     /// outlive the command that caused it. [`PromptApp::streams`] is the only
     /// thing that should be asked what this window will actually do.
     stream: bool,
+    /// Whether the command area shows the exact text instead of the
+    /// annotated rendering. Remembered; see [`crate::prefs::Prefs`].
+    show_original: bool,
     /// Whether the tick above came out of the file rather than out of this
     /// window.
     ///
@@ -1718,6 +1721,7 @@ impl PromptApp {
             inbox,
             out,
             stream: remembered.stream,
+            show_original: remembered.show_original,
             stream_is_remembered: remembered.stream,
             close_on_decide: remembered.close_on_decide,
             prefs,
@@ -2113,6 +2117,8 @@ impl PromptApp {
 
         let viewing = matches!(self.state.drawn_phase(), Phase::Lingering | Phase::Detached);
         let reviewing = self.state.drawn_phase() == Phase::Reviewing;
+        // Set inside the panel, applied outside it: see the call.
+        let mut swapped = None;
         egui::CentralPanel::default().show(ui, |ui| {
             // The command is not what the reader is deciding about any more;
             // its output is, and the output takes the room.
@@ -2145,9 +2151,15 @@ impl PromptApp {
             panes::draw_unanswered(ui, self.state.unanswered());
             ui.separator();
             if let Some(shown) = self.state.shown() {
-                panes::draw_payload(ui, shown);
+                // Applied after the panel closes: `shown` borrows the state
+                // for as long as it is drawn, and writing the preference
+                // takes the window.
+                swapped = panes::draw_payload(ui, shown, self.show_original);
             }
         });
+        if let Some(original) = swapped {
+            self.set_show_original(original);
+        }
 
         // Last, so it is over the panels rather than under them, and outside
         // the `if` above so that it reaches the finished window too: a root
@@ -3070,6 +3082,16 @@ impl PromptApp {
     /// One place, because there are two ways to give it — the box and the
     /// chord — and a preference that persisted from one and not the other
     /// would be a window whose keyboard and mouse remembered different things.
+    /// Show the exact text, or the annotated rendering.
+    ///
+    /// Written down on the click for the reason [`PromptApp::set_stream`]'s
+    /// is: this window's ordinary ending is the daemon killing the process,
+    /// so there is no way out to write it on.
+    fn set_show_original(&mut self, ticked: bool) {
+        self.show_original = ticked;
+        self.prefs.update(|prefs| prefs.show_original = ticked);
+    }
+
     fn set_stream(&mut self, ticked: bool) {
         self.stream = ticked;
         // They have now said something about this command, so the sentence
@@ -5466,14 +5488,19 @@ mod tests {
     }
 
     #[test]
-    fn a_disguised_character_is_chipped_in_both_panes() {
-        // Cyrillic a and a right-to-left override. Each chips once per pane,
-        // so each label appears twice: the raw pane is not the pane that gets
-        // to be honest second.
-        let drawn = window_text(&mut a_window_showing("echo us\u{0430}r\u{202e}"), true);
+    fn a_disguised_character_is_chipped_in_whichever_rendering_is_showing() {
+        // Cyrillic a and a right-to-left override. One rendering is on screen
+        // at a time now, and each of them chips: the original is not the one
+        // that gets to be honest second.
+        let mut app = a_window_showing("echo us\u{0430}r\u{202e}");
+        let drawn = window_text(&mut app, true);
+        assert_eq!(drawn.matches("[U+0430]").count(), 1, "not chipped annotated: {drawn}");
+        assert_eq!(drawn.matches("[RLO]").count(), 1, "not chipped annotated: {drawn}");
 
-        assert_eq!(drawn.matches("[U+0430]").count(), 2, "chipped in one pane only: {drawn}");
-        assert_eq!(drawn.matches("[RLO]").count(), 2, "chipped in one pane only: {drawn}");
+        app.set_show_original(true);
+        let drawn = window_text(&mut app, true);
+        assert_eq!(drawn.matches("[U+0430]").count(), 1, "not chipped in the original: {drawn}");
+        assert_eq!(drawn.matches("[RLO]").count(), 1, "not chipped in the original: {drawn}");
     }
 
     #[test]
@@ -5985,27 +6012,27 @@ mod tests {
     }
 
     #[test]
-    fn a_long_command_gives_the_pane_a_reader_reads_more_than_the_one_they_check() {
-        // The bug: stacking is chosen *because* the command is long, and an
-        // even split handed the least room to the case that needed the most.
-        // The raw pane is a strip; the annotated pane gets the rest.
+    fn a_long_command_gets_the_whole_area_to_be_read_in() {
+        // What replaced the split. Stacking existed because a long command
+        // needed room and an even division handed the least of it to the case
+        // that needed the most; one pane is the same argument taken to its
+        // end. There is one pane and it has the area, so the worst case for
+        // reading is also the best case the window can offer.
         let long = (0..12)
             .map(|i| format!("docker build --pull --no-cache -t registry.internal/thing:{i} ."))
             .collect::<Vec<_>>()
             .join("\n");
         let mut app = a_window_showing(&long);
         let shapes = window_shapes(&mut app, opening_size());
-        let mut boxes = pane_boxes(&shapes);
-        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        let boxes = pane_boxes(&shapes);
 
-        assert_eq!(boxes.len(), 2, "a stacked command did not draw two panes");
-        let (strip, reading) = (boxes[0].height(), boxes[1].height());
+        assert_eq!(boxes.len(), 1, "the command area drew more than one pane: {boxes:?}");
         assert!(
-            reading > 1.5 * strip,
-            "the strip is {strip} and the pane a reader reads is {reading}: still a split"
+            boxes[0].height() > 0.4 * WINDOW_SIZE[1],
+            "the one pane got {} of a {} window",
+            boxes[0].height(),
+            WINDOW_SIZE[1]
         );
-        // And the raw text is on screen without anyone asking for it.
-        assert!(strip > 0.0, "the raw pane is not drawn at all when stacked");
     }
 
     // ---- the keys a finished window answers to ----------------------------
@@ -6499,15 +6526,21 @@ mod tests {
     }
 
     #[test]
-    fn one_caption_still_carries_what_each_pane_promises() {
-        // The per-pane labels are gone; the claim they made is not.
-        let drawn = window_text(&mut a_window_showing("ls -l"), true);
-
-        assert!(drawn.contains("no colour"), "the raw pane's promise is gone: {drawn}");
+    fn each_rendering_says_what_it_promises() {
+        // Two panes meant one caption naming both. One pane means the caption
+        // is about the thing in front of the reader -- and the promise each
+        // rendering makes has to survive the change, because the promise is
+        // the reason either of them is trustworthy.
+        let mut app = a_window_showing("ls -l");
+        let drawn = window_text(&mut app, true);
         assert!(
             drawn.contains("hatch's notes, not the command"),
-            "the annotated pane's warning is gone: {drawn}"
+            "the annotated rendering's warning is gone: {drawn}"
         );
+
+        app.set_show_original(true);
+        let drawn = window_text(&mut app, true);
+        assert!(drawn.contains("no colour"), "the original's promise is gone: {drawn}");
     }
 
     /// Every galley egui laid out this frame, with where it put it.
@@ -6581,9 +6614,15 @@ mod tests {
         for clipped in &shapes {
             walk(&clipped.shape, &mut rects);
         }
-        // Wide, and actually painted: egui allocates transparent rectangles
-        // for regions that only clip.
-        rects.retain(|(rect, fill)| rect.width() > 0.9 * WINDOW_SIZE[0] && fill.a() > 0);
+        // The window's own grounds: the full width, not merely most of it.
+        // A pane is full-area now rather than half of a pair, so it clears
+        // nine tenths of the window easily -- and a pane is not a panel. What
+        // separates them is the panel margin the pane is drawn inside, which
+        // is why this asks for the whole width rather than nearly all of it.
+        //
+        // And actually painted: egui allocates transparent rectangles for
+        // regions that only clip.
+        rects.retain(|(rect, fill)| rect.width() > 0.99 * WINDOW_SIZE[0] && fill.a() > 0);
         let grounds: Vec<egui::Color32> = rects.iter().map(|(_, fill)| *fill).collect();
         let first = *grounds.first().expect("the window painted no panel at all");
         assert!(
@@ -7560,6 +7599,7 @@ mod tests {
             stream: true,
             close_on_decide: true,
             terminal: false,
+            show_original: false,
         });
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
@@ -7660,7 +7700,7 @@ mod tests {
         app.set_close_on_decide(true);
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: false, terminal: true },
+            Prefs { close_on_decide: true, stream: false, terminal: true, show_original: false },
             "this window trampled what the one beside it saved"
         );
     }
@@ -7727,7 +7767,7 @@ mod tests {
         // window that closed on a tick nobody could see would be deciding
         // something no control on it admits to.
         let (_root, paths) = a_prefs_file();
-        let stored = Prefs { close_on_decide: true, stream: true, terminal: false };
+        let stored = Prefs { close_on_decide: true, stream: true, terminal: false, show_original: false };
         PrefsFile::at(&paths).write(&stored);
         let (mut app, sink) = a_write_window_remembering(PrefsFile::at(&paths));
         let ctx = egui::Context::default();
@@ -8269,7 +8309,7 @@ mod tests {
         // this command. Clicked on a real frame, it asks for a review, and
         // neither the file nor the next window knows it ever did.
         let (_root, paths) = a_prefs_file();
-        let stored = Prefs { close_on_decide: false, stream: true, terminal: false };
+        let stored = Prefs { close_on_decide: false, stream: true, terminal: false, show_original: false };
         PrefsFile::at(&paths).write(&stored);
         let (app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
 

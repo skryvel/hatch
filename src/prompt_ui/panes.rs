@@ -73,22 +73,6 @@ const SOON: i64 = 30;
 /// the panes' share of the window.
 const HEADLINE_SHARE: f32 = 0.30;
 
-/// The most of the space below the header the raw pane may take, whatever
-/// [`RAW_STRIP_ROWS`] works out to.
-///
-/// A backstop for a short window rather than the ordinary rule: at a window
-/// height where six rows would be most of the space, the annotated pane still
-/// gets the larger half.
-const RAW_SHARE: f32 = 0.40;
-
-/// How many lines of the raw command the stacked strip shows at once.
-///
-/// Enough to see the line you are checking with its neighbours around it,
-/// which is what makes a discrepancy between the two panes visible at all,
-/// and few enough that the pane a reader actually reads keeps the window.
-/// See [`raw_ceiling`] for why this is a strip and not a share.
-const RAW_STRIP_ROWS: f32 = 6.0;
-
 /// Characters of gutter in front of each diff column: the `-`/`+` mark and
 /// the space after it.
 ///
@@ -703,48 +687,6 @@ pub fn fits_two_columns(longest: usize, column: usize) -> bool {
 /// Which view a diff gets.
 pub fn diff_view(longest: usize, column: usize) -> DiffView {
     if fits_two_columns(longest, column) { DiffView::SideBySide } else { DiffView::Unified }
-}
-
-/// Which arrangement the two command panes get.
-pub fn command_view(longest: usize, column: usize) -> CommandView {
-    if fits_two_columns(longest, column) { CommandView::SideBySide } else { CommandView::Stacked }
-}
-
-/// The one line above the command panes: which pane is which, what each of
-/// them promises, and — in the fallback — why the reader is not getting the
-/// other arrangement.
-///
-/// # Why one caption and not one per pane
-///
-/// Each pane used to carry a label of its own. Two labels are two rows when
-/// the panes are stacked, and the window has no rows to spare: the thing
-/// being read is a command somebody is about to let run, and every row of
-/// furniture is a row of it they cannot see.
-///
-/// What the labels said, though, is not furniture. "No colour" and "the
-/// colour is hatch's notes, not the command" is the *claim that makes the raw
-/// pane worth having* — without it the reader has no reason to believe the
-/// two panes differ in anything but prettiness — so it survives whole, in one
-/// sentence per pane, said once.
-///
-/// The arrangement is named because the caption now has to say which pane it
-/// is talking about. That is a change from before, when side by side said
-/// nothing at all: naming a view a reader can see is worth a word when the
-/// same word is what points at the promise.
-pub fn command_caption(view: CommandView, longest: usize, column: usize) -> String {
-    match view {
-        CommandView::SideBySide => "Left: exactly the text being approved — no reflow, no \
-             grouping, no colour. Right: the same command, annotated — the colour, the underline \
-             and the italics are hatch's notes, not the command."
-            .to_string(),
-        CommandView::Stacked => format!(
-            "Above, a strip that scrolls with the pane below: exactly the text being approved — \
-             no reflow, no grouping, no colour. Below: the same command, annotated — the colour, \
-             the underline and the italics are hatch's notes, not the command. Side by side \
-             would need a column of {longest} characters and this window holds {column}; widen \
-             it for that view."
-        ),
-    }
 }
 
 /// The line above the diff: how much changes, which view this is, and — when
@@ -1402,15 +1344,22 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 }
 
 /// Everything below the headline and above the buttons.
-pub fn draw_payload(ui: &mut Ui, shown: &Shown) {
+///
+/// Returns the reader's new answer to "show the original text", on the frame
+/// they change it and on no other. The window writes it down; this function
+/// draws the box and has nowhere to keep anything.
+pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool) -> Option<bool> {
     match shown {
         Shown::Command {
             annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, ..
         } => {
             draw_command_header(ui, scan, snippets, danger, runs, caveat.as_deref());
-            draw_command(ui, annotated, raw, *longest, blocks);
+            draw_command(ui, annotated, raw, *longest, blocks, original)
         }
-        Shown::Swap { path, plan, rows, longest } => draw_swap(ui, path, plan, rows, *longest),
+        Shown::Swap { path, plan, rows, longest } => {
+            draw_swap(ui, path, plan, rows, *longest);
+            None
+        }
     }
 }
 
@@ -1485,51 +1434,6 @@ fn draw_command_header(
 
 // ---- keeping the two stacked panes together --------------------------------
 
-/// How far two offsets may differ and still count as the same one.
-///
-/// Half a logical pixel: smaller than anything a reader can produce and
-/// larger than the rounding a scroll area does to itself, so a pane that was
-/// given an offset and handed it straight back is never mistaken for a pane
-/// the reader scrolled.
-const SCROLL_EPSILON: f32 = 0.5;
-
-/// Where the two stacked panes' shared scroll position is kept.
-fn scroll_link_id() -> egui::Id {
-    egui::Id::new("hatch-command-scroll")
-}
-
-/// Where the two stacked panes' own account of how far they reach is kept.
-fn pane_reach_id() -> egui::Id {
-    egui::Id::new("hatch-command-reach")
-}
-
-/// Which of the two command panes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pane {
-    Raw,
-    Annotated,
-}
-
-/// Which pane the reader last scrolled, and where they left it.
-///
-/// Kept in egui's own per-frame-persistent store rather than threaded through
-/// the state machine: it is a scroll position, which is not part of what the
-/// window is deciding, and [`crate::prompt_ui::PromptState`] deliberately
-/// knows nothing about how anything is drawn.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ScrollLink {
-    /// The pane the reader is driving. It is given back exactly the offset it
-    /// last reported, so it can never be pulled away from where they put it.
-    driver: Pane,
-    offset: f32,
-}
-
-impl Default for ScrollLink {
-    fn default() -> ScrollLink {
-        ScrollLink { driver: Pane::Raw, offset: 0.0 }
-    }
-}
-
 /// Where a pane ended up, and the furthest down it had anything to show.
 ///
 /// The maximum is measured and not predicted, and it has to be: it depends on
@@ -1548,31 +1452,6 @@ struct PaneAt {
 }
 
 impl PaneAt {
-    /// Whether the only thing between this pane and the offset it was asked
-    /// for is that it has nothing that far down.
-    ///
-    /// Both halves are the point. A pane asked for more than it has *and*
-    /// sitting at its maximum was clamped and did not move. A pane sitting at
-    /// its maximum that was asked for no more than that was put there by the
-    /// reader, and that is the case this must never swallow: scrolling a pane
-    /// to its end is how a reader takes it over.
-    fn clamped(self, want: f32) -> bool {
-        want > self.max + SCROLL_EPSILON && self.offset >= self.max - SCROLL_EPSILON
-    }
-}
-
-/// How far each pane reached when it was last drawn.
-///
-/// Kept from one frame to the next because the question it answers — how far
-/// may this pane be asked to scroll — is asked before the pane that knows
-/// exists. `None` is a pane that has not been drawn yet, which is the first
-/// frame of a window and no other.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-struct PaneReach {
-    /// How far the raw strip reached.
-    raw: Option<f32>,
-    /// How far the annotated pane reached.
-    annotated: Option<f32>,
 }
 
 /// How few drawn lines a block may cover and still be worth a bracket.
@@ -1852,99 +1731,6 @@ fn linked_line(from: &[PaneLine], to: &[PaneLine], line: usize) -> usize {
     to.partition_point(|line| line.at <= from.at).saturating_sub(1)
 }
 
-/// A first guess at how far a pane of `rows` rows reaches inside `viewport`,
-/// for the one frame before the pane has reported its own.
-///
-/// It used to be the whole answer, and was deliberately an under-estimate: a
-/// request past a pane's range comes back clamped, a clamped offset was
-/// indistinguishable from a reader scrolling, and staying short of the range
-/// was what kept the two apart. It could not carry that. The row count behind
-/// it is measured in characters, by [`pane_lines`], against a pane whose real
-/// width nothing knows until the pane is drawn — and egui's scroll bars float
-/// over the content rather than taking a column of it, so the real pane is
-/// wider than the measurement thinks and fits a line in fewer rows than it
-/// counted. One row of over-count is all it takes for the guard to invert
-/// into the bug it was there to prevent: the follower clamps, [`drove`] reads
-/// the clamp as a reader, the driver changes hands, and the pane the reader
-/// is holding is dragged back up. See [`PaneAt`] for what settles it now.
-fn max_offset(rows: usize, row: f32, viewport: f32) -> f32 {
-    (rows as f32 * row - viewport).max(0.0)
-}
-
-/// What to ask one pane for this frame.
-///
-/// The driver gets exactly what it last reported, so the reader's own pane
-/// never moves under them. The follower gets the place the driver is looking
-/// at, translated through the source offset the two renderings share, and
-/// capped at `reach` — the furthest down that pane has anything to show.
-///
-/// The cap is not what keeps [`drove`] honest any more; that is
-/// [`PaneAt::clamped`]'s job. It is there because a scroll area asked for an
-/// offset past its content lays the content out there and draws the gap: a
-/// pane asked for more than it has shows blank space in the frame it is
-/// asked, and corrects itself only in the next one. The end of a long command
-/// is exactly where that would happen, and exactly where a reader is looking.
-fn requested_offset(
-    link: ScrollLink,
-    pane: Pane,
-    of: &PaneRows,
-    driver: &PaneRows,
-    row: f32,
-    reach: f32,
-) -> f32 {
-    if link.driver == pane {
-        return link.offset;
-    }
-    let line = linked_line(&driver.lines, &of.lines, line_at(link.offset, row, &driver.lines));
-    let at = of.lines.get(line).map_or(0, |line| line.row) as f32 * row;
-    at.min(reach)
-}
-
-/// Who drove, after a frame in which both panes were asked for an offset.
-///
-/// A pane that hands back what it was given did not move; a pane that hands
-/// back something else was scrolled, and becomes the one the other follows.
-/// The follower is asked first, because it is the pane whose answer is news:
-/// the driver is being handed its own offset and agreeing with it says
-/// nothing.
-///
-/// That order is why a clamp had to be told apart from a reader. A pane that
-/// was asked for more than it has hands back its maximum instead, which is a
-/// disagreement, and it arrives in the arm that takes the driver's role away
-/// from a pane that is agreeing with what it was handed — so a follower with
-/// nothing further to show could unseat the pane the reader had hold of. It
-/// did it every other frame, for as long as they held it: the follower
-/// clamped and took the role, the next frame handed the reader's own pane a
-/// position translated from the clamp and the reader's hand dragged it back,
-/// and the two took turns.
-fn drove(
-    link: ScrollLink,
-    raw: PaneAt,
-    want_raw: f32,
-    annotated: PaneAt,
-    want_annotated: f32,
-) -> ScrollLink {
-    if moved(link, Pane::Annotated, annotated, want_annotated) {
-        ScrollLink { driver: Pane::Annotated, offset: annotated.offset }
-    } else if moved(link, Pane::Raw, raw, want_raw) {
-        ScrollLink { driver: Pane::Raw, offset: raw.offset }
-    } else {
-        link
-    }
-}
-
-/// Whether a pane that is not where it was asked to be was put there by the
-/// reader.
-///
-/// The driver's disagreement always counts, clamp or not. It is already the
-/// pane the other follows, so agreeing that it moved takes nothing from
-/// anyone, and a link that ignored the clamp would keep handing out an offset
-/// its own pane no longer has — which, after a window was made taller, is a
-/// follower reading from a place in the command nobody is looking at.
-fn moved(link: ScrollLink, pane: Pane, at: PaneAt, want: f32) -> bool {
-    (at.offset - want).abs() > SCROLL_EPSILON && (link.driver == pane || !at.clamped(want))
-}
-
 // ---- saying how much of a pane is out of sight -----------------------------
 
 /// Where each command pane's account of how much of itself it showed is kept.
@@ -2170,71 +1956,6 @@ fn out_of_sight(rows: Option<String>, width: Option<String>) -> String {
     [rows, width].into_iter().flatten().collect::<Vec<_>>().join(" ")
 }
 
-/// How much of itself each command pane showed, the last time they were
-/// drawn.
-///
-/// Kept in egui's own per-frame store beside [`ScrollLink`] and [`PaneReach`],
-/// for the same reason and with the same shape: it is a fact about a layout
-/// rather than about what the window is deciding, and the default is a pair
-/// of panes that have never been drawn, which say nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct CommandRows {
-    raw: Rows,
-    annotated: Rows,
-}
-
-impl CommandRows {
-    /// The worse of the two, for an arrangement that draws them level.
-    ///
-    /// The larger row count against the smaller viewport: side by side the
-    /// two panes are the same height and hold two renderings of one command,
-    /// and which of them has the most rows is not something a reader should
-    /// have to be told. Taking the worst of each figure makes the one
-    /// sentence true of both panes.
-    fn worst(self) -> Rows {
-        Rows {
-            of: self.raw.of.max(self.annotated.of),
-            shown: self.raw.shown.min(self.annotated.shown),
-        }
-    }
-}
-
-/// The out-of-sight line for the command panes, in whichever arrangement.
-///
-/// # Which pane each axis is reported off
-///
-/// Side by side, the two panes are level and the same height, so one sentence
-/// covers both — see [`CommandRows::worst`] — and neither can run off to the
-/// side, because the arrangement is only offered when every line fits its
-/// column whole. That is what [`fits_two_columns`] is for, and it is why
-/// there is no sideways sentence here.
-///
-/// Stacked, the rows are reported off the annotated pane alone. The raw pane
-/// is a strip of [`RAW_STRIP_ROWS`] rows by deliberate choice — see
-/// [`raw_ceiling`] — so "only six of sixty-three rows fit the strip" would be
-/// hatch reporting its own layout decision back to the reader as news, every
-/// time, which is the fastest way to teach somebody to stop reading a line.
-/// The strip is also dragged to wherever the annotated pane is looking, so a
-/// reader who scrolls that pane to the end has been past all of the raw text
-/// six rows at a time.
-///
-/// Sideways is the strip's alone, and it is the one that surprises: the raw
-/// pane does not reflow, so a long line runs off the right edge of a
-/// full-width strip and stops there. `longest` is the command's longest line
-/// as either rendering would draw it, which is the figure the caption above
-/// already quotes, and `across` is what one full-width box holds.
-fn command_note(view: CommandView, seen: CommandRows, longest: usize, across: usize) -> String {
-    match view {
-        CommandView::SideBySide => {
-            out_of_sight(rows_out_of_sight(seen.worst(), "the command", "the panes"), None)
-        }
-        CommandView::Stacked => out_of_sight(
-            rows_out_of_sight(seen.annotated, "the command", "the pane below"),
-            width_out_of_sight(longest, across, "the strip"),
-        ),
-    }
-}
-
 /// Draw the out-of-sight line, if there is one.
 ///
 /// In [`Palette::warn`] and not in the caption's quiet grey, and that is the
@@ -2311,108 +2032,139 @@ fn draw_out_of_sight(ui: &mut Ui, note: &str) {
 /// did not choose. So the panes are linked, by *position in the command*
 /// rather than by pixels or by line number: see [`pane_lines`] for why those
 /// two would drift and a source offset cannot.
-fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize, blocks: &[Block]) {
-    let palette = palette(ui);
-    let column = column_chars(pane_chars(ui, 2), 0);
-    let view = command_view(longest, column);
-    // Once per frame rather than once per pane: the annotated pane is drawn
-    // in both views and the raw pane is drawn in neither.
-    let gutter = gutter(&lines(annotated), blocks);
-    // One line for both panes: which is which, and what each promises. See
-    // `command_caption` for why the promise is not furniture.
-    ui.label(RichText::new(command_caption(view, longest, column)).small().color(palette.quiet));
+/// Which rendering the command area is showing, and where it is scrolled.
+///
+/// Kept from one frame to the next so the frame a reader changes their mind
+/// on can tell it happened: the checkbox says *what* to show and this says
+/// what was showing, and the difference between them is the one thing a
+/// switch needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Showing {
+    original: bool,
+    offset: f32,
+}
 
-    // And, under it, how much of the command the panes are not showing. The
-    // row counts are last frame's, because a pane is the only thing that
-    // knows how many rows it laid out and it does not know until it has —
-    // see `rows_out_of_sight`. A window that has drawn no frame yet has a
-    // pair of panes that showed nothing of nothing, which says nothing.
-    let seen = ui.data(|data| data.get_temp::<CommandRows>(pane_rows_id()).unwrap_or_default());
-    let across = pane_chars(ui, 1);
-    draw_out_of_sight(ui, &command_note(view, seen, longest, across));
+/// The id the showing is kept under.
+fn showing_id() -> egui::Id {
+    egui::Id::new("hatch-command-showing")
+}
 
-    let shown = match view {
-        CommandView::SideBySide => {
-            let height = ui.available_height();
-            ui.columns(2, |columns| {
-                let raw =
-                    draw_command_pane(&mut columns[0], raw, PaneBox::raw(height, false, None), &Gutter::default());
-                let annotated =
-                    draw_command_pane(&mut columns[1], annotated, PaneBox::annotated(height, None), &gutter);
-                CommandRows { raw: raw.rows, annotated: annotated.rows }
-            })
+/// What the caption says about the rendering on screen.
+///
+/// Both sentences existed before, side by side over two panes. The pane is
+/// one now, so the sentence is about the one thing in front of the reader
+/// rather than a key to two things.
+fn command_caption(original: bool) -> &'static str {
+    match original {
+        true => "Exactly the text being approved — no reflow, no grouping, no colour.",
+        false => {
+            "This command, annotated — the colour, the underline and the italics are hatch's \
+             notes, not the command."
         }
-        CommandView::Stacked => {
-            let row = row_height(ui);
-            // The raw pane does not reflow, so one line is one row there; the
-            // annotated pane wraps at the width of one full-width box.
-            let raw_rows = pane_lines(raw, None);
-            // The gutter column and the deepest indent both come out of the
-            // width the text has left to wrap in.
-            let furniture = BRACKET_STEP_CHARS + gutter.deepest() * INDENT_CHARS;
-            let annotated_rows =
-                pane_lines(annotated, Some(pane_chars(ui, 1).saturating_sub(furniture)));
-            let (link, reach) = ui.data(|data| {
-                (
-                    data.get_temp::<ScrollLink>(scroll_link_id()).unwrap_or_default(),
-                    data.get_temp::<PaneReach>(pane_reach_id()).unwrap_or_default(),
-                )
-            });
-            let driver = match link.driver {
-                Pane::Raw => &raw_rows,
-                Pane::Annotated => &annotated_rows,
-            };
-
-            // The strip grows a horizontal bar exactly when a line runs past
-            // its right edge, which is the same question the sideways
-            // sentence above asked, so it is asked once and answered here
-            // too.
-            let sideways = match longest > across {
-                true => ui.spacing().scroll.allocated_width(),
-                false => 0.0,
-            };
-            let ceiling = raw_ceiling(ui.available_height(), row, sideways);
-            let raw_reach = reach.raw.unwrap_or_else(|| max_offset(raw_rows.rows, row, ceiling));
-            let want_raw = requested_offset(link, Pane::Raw, &raw_rows, driver, row, raw_reach);
-            let drawn_raw =
-                draw_command_pane(ui, raw, PaneBox::raw(ceiling, true, Some(want_raw)), &Gutter::default());
-            let at_raw = drawn_raw.at;
-
-            ui.add_space(4.0);
-            let rest = ui.available_height();
-            let annotated_reach =
-                reach.annotated.unwrap_or_else(|| max_offset(annotated_rows.rows, row, rest));
-            let want_annotated = requested_offset(
-                link,
-                Pane::Annotated,
-                &annotated_rows,
-                driver,
-                row,
-                annotated_reach,
-            );
-            let drawn_annotated =
-                draw_command_pane(ui, annotated, PaneBox::annotated(rest, Some(want_annotated)), &gutter);
-            let at_annotated = drawn_annotated.at;
-
-            let link = drove(link, at_raw, want_raw, at_annotated, want_annotated);
-            let reach = PaneReach { raw: Some(at_raw.max), annotated: Some(at_annotated.max) };
-            ui.data_mut(|data| {
-                data.insert_temp(scroll_link_id(), link);
-                data.insert_temp(pane_reach_id(), reach);
-            });
-            CommandRows { raw: drawn_raw.rows, annotated: drawn_annotated.rows }
-        }
-    };
-
-    // The line above the panes was built from the frame before this one, and
-    // this is the first frame that knows better. Asking for another is what
-    // makes "one frame old" the whole of the staleness: without it the notice
-    // would wait for whatever else wakes the window next, which on a window
-    // that is only counting down a deadline is as much as a second.
-    if shown != seen {
-        ui.ctx().request_repaint();
     }
-    ui.data_mut(|data| data.insert_temp(pane_rows_id(), shown));
+}
+
+/// The label on the box that swaps them.
+const ORIGINAL_LABEL: &str = "Show the original text";
+
+/// The command, in one pane, in whichever of the two renderings is asked for.
+///
+/// # Why one pane and not two
+///
+/// Both renderings draw every byte of the command — that is invariant 1, and
+/// the annotated pane is held to it as strictly as the raw one. So the raw
+/// pane was never showing bytes its neighbour hid; it was showing the same
+/// bytes without hatch's reading of them, for a reader who wanted to check
+/// the reading rather than use it. That is worth having and it is not worth
+/// half the width of every window, on every request, for everybody.
+///
+/// It is a box away, and the box is remembered, so a reader who wants the
+/// bytes unannotated gets them on every window and one who does not never
+/// spends a column on them.
+///
+/// **What this gives up, said plainly:** several arguments in this crate lean
+/// on the raw text being on screen *beside* the annotation — the block
+/// outlines most of all, whose whole safety case is that a mis-parse can
+/// mislead about grouping while the ground truth sits next to it. That
+/// becomes "one click away" rather than "next to it". It is a real weakening
+/// and it is the reason the switch keeps its place in the text: a check that
+/// costs a reader their place in a long command is a check they stop making.
+///
+/// # Why the switch keeps its place
+///
+/// The two renderings break lines differently — the annotated one opens a
+/// line at every separator — so a line number means different things in
+/// them and pixels mean nothing at all. A byte offset means the same thing
+/// in both, because both tile the same source, and [`linked_line`] already
+/// answers the only question a switch has: which line over there holds the
+/// place this line starts at. It is the same machinery the two panes used to
+/// scroll together with, doing the same job one frame at a time instead of
+/// every frame.
+fn draw_command(
+    ui: &mut Ui,
+    annotated: &Spans,
+    raw: &Spans,
+    longest: usize,
+    blocks: &[Block],
+    original: bool,
+) -> Option<bool> {
+    let palette = palette(ui);
+    let gutter = gutter(&lines(annotated), blocks);
+    let across = pane_chars(ui, 1);
+    let row = row_height(ui);
+
+    // The caption, and the box that changes what it is about. One row for
+    // both: the box is the caption's own subject, and a row of its own would
+    // be a row taken from the command on a window read at 700 points high.
+    let mut wanted = original;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut wanted, ORIGINAL_LABEL);
+        ui.label(RichText::new(command_caption(original)).small().color(palette.quiet));
+    });
+
+    // How much of the command the pane is not showing. Last frame's count,
+    // because a pane is the only thing that knows how many rows it laid out
+    // and it does not know until it has.
+    let seen = ui.data(|data| data.get_temp::<Rows>(pane_rows_id()).unwrap_or_default());
+    draw_out_of_sight(
+        ui,
+        &out_of_sight(
+            rows_out_of_sight(seen, "the command", "the pane"),
+            match original {
+                true => width_out_of_sight(longest, across, "the pane"),
+                // The annotated pane wraps, so nothing of it is off to the
+                // side to be told about.
+                false => None,
+            },
+        ),
+    );
+
+    // Where the pane should open. Only on the frame the rendering changed:
+    // any other frame is the reader's own scrolling and is left alone.
+    let was = ui.data(|data| data.get_temp::<Showing>(showing_id()).unwrap_or_default());
+    let want = (was.original != original).then(|| {
+        let furniture = BRACKET_STEP_CHARS + gutter.deepest() * INDENT_CHARS;
+        let annotated_lines = pane_lines(annotated, Some(across.saturating_sub(furniture)));
+        let raw_lines = pane_lines(raw, None);
+        let (from, to) = match original {
+            true => (&annotated_lines, &raw_lines),
+            false => (&raw_lines, &annotated_lines),
+        };
+        let line = line_at(was.offset, row, &from.lines);
+        let landed = linked_line(&from.lines, &to.lines, line);
+        to.lines.get(landed).map_or(0.0, |line| line.row as f32 * row)
+    });
+
+    let height = ui.available_height();
+    let shown = match original {
+        true => draw_command_pane(ui, raw, PaneBox::raw(height, false, want), &Gutter::default()),
+        false => draw_command_pane(ui, annotated, PaneBox::annotated(height, want), &gutter),
+    };
+    ui.data_mut(|data| {
+        data.insert_temp(pane_rows_id(), shown.rows);
+        data.insert_temp(showing_id(), Showing { original, offset: shown.at.offset });
+    });
+    (wanted != original).then_some(wanted)
 }
 
 /// One command pane: the rendering in a framed, scrolling box.
@@ -2789,45 +2541,6 @@ fn row_height(ui: &Ui) -> f32 {
     let text = ui.text_style_height(&egui::TextStyle::Monospace);
     let points = ui.ctx().pixels_per_point();
     (text * points).round() / points + ui.spacing().item_spacing.y
-}
-
-/// How tall the raw pane is when the panes are stacked.
-///
-/// # Why a strip
-///
-/// Stacking happens *because the command is long* — that is the whole of the
-/// rule that chose it — and long is exactly when a reader needs vertical
-/// room. Splitting the space between two renderings of the same text was
-/// therefore backwards: it took the most room away in the case where reading
-/// was hardest, and spent it drawing the command a second time.
-///
-/// The two panes do not have the same job. The annotated pane is the one a
-/// reader *reads*. The raw pane is the one they *check* — it is the answer to
-/// "the pretty view might be misleading me" — and checking is done a line at
-/// a time, against the line you are already on. So stacked, the raw pane is a
-/// strip of [`RAW_STRIP_ROWS`] lines and the annotated pane takes everything
-/// else.
-///
-/// # Why it is not behind a toggle
-///
-/// The point of the raw pane is to be there without being asked for: a pane
-/// behind a disclosure triangle is a pane the reader forgets exists, and the
-/// one time it matters is the one time nobody clicks. So the strip is always
-/// drawn, never collapsed, and all of the raw text is reachable in it —
-/// scrolled directly, or by scrolling the annotated pane, which drags the
-/// strip to the same place in the command. See [`ScrollLink`].
-///
-/// The share is still a ceiling on top of the strip, for the short window
-/// where six rows would be most of what there is.
-///
-/// `bar` is what a horizontal scroll bar will take out of the box, which is
-/// its allocated width where the strip is going to grow one and zero where it
-/// is not. It is added rather than absorbed, because [`RAW_STRIP_ROWS`] is a
-/// count of rows of *command* and a bar is not one: a strip that paid for its
-/// own bar out of its six rows would show five and a sliver of the sixth, and
-/// a row cut off halfway is the thing this whole pass is about.
-fn raw_ceiling(available: f32, row: f32, bar: f32) -> f32 {
-    (RAW_STRIP_ROWS * row + bar).min(available * RAW_SHARE)
 }
 
 /// The width of one character of the font both panes and both diff views draw
@@ -4576,7 +4289,7 @@ mod tests {
         let mut seen: Option<Vec<String>> = None;
         for width in (600..1500).step_by(37) {
             let size = egui::vec2(width as f32, 700.0);
-            let frames = frames_in(&ctx, &payload, size, SETTLED);
+            let frames = frames_in(&ctx, &payload, size, SETTLED, false);
             let lines: Vec<Vec<String>> = frames
                 .iter()
                 .map(|frame| {
@@ -5104,35 +4817,6 @@ mod tests {
     }
 
     #[test]
-    fn the_stacked_raw_pane_is_a_strip_and_not_a_share_of_the_window() {
-        // The bug: stacking is chosen because the command is long, and a
-        // 40% share handed the least reading room to the longest commands.
-        let row = 22.0;
-        let strip = RAW_STRIP_ROWS * row;
-        assert_eq!(raw_ceiling(600.0, row, 0.0), strip, "a tall window still gets a strip");
-        assert!(
-            raw_ceiling(600.0, row, 0.0) < 600.0 * RAW_SHARE,
-            "the strip is not an improvement on the share it replaced"
-        );
-        // And the share is still the backstop, for a window too short for
-        // even six rows to be a strip rather than the whole of it.
-        assert_eq!(raw_ceiling(100.0, row, 0.0), 100.0 * RAW_SHARE);
-        assert!(raw_ceiling(100.0, row, 0.0) < 50.0, "the pane a reader falls back to took half");
-        assert_eq!(raw_ceiling(0.0, row, 0.0), 0.0, "no window is no ceiling, not a panic");
-        assert!(raw_ceiling(600.0, row, 0.0) > 0.0, "the raw text is not on screen at all");
-
-        // A strip that is going to grow a horizontal bar gets the bar's room
-        // on top of its six rows rather than out of them: six rows of command
-        // is what the constant means, and five and a sliver is not six.
-        assert_eq!(raw_ceiling(600.0, row, 14.0), strip + 14.0, "the bar came out of the rows");
-        assert!(
-            raw_ceiling(600.0, row, 14.0) < 600.0 * RAW_SHARE,
-            "the bar pushed the strip past the share that is still its ceiling"
-        );
-        assert_eq!(raw_ceiling(100.0, row, 14.0), 100.0 * RAW_SHARE, "the share still caps it");
-    }
-
-    #[test]
     fn a_font_the_window_cannot_measure_still_leaves_a_column_of_some_width() {
         // `advance` floors at one point, so a font that reported nothing
         // gives a very narrow column rather than an infinitely wide one --
@@ -5172,51 +4856,6 @@ mod tests {
 
         assert_eq!(widest_line(&spans), "echo $HOME \u{2192} /home/u ".chars().count());
         assert!(widest_line(&spans) > widest_line(&classify("echo $HOME")), "the note is free");
-    }
-
-    #[test]
-    fn the_two_panes_share_the_rule_the_diff_uses() {
-        // One question -- can a column this wide hold the widest thing that
-        // would go in it? -- and one answer, so the two views cannot drift
-        // apart about what "fits" means.
-        assert!(fits_two_columns(40, 40), "a line that exactly fits does");
-        assert!(!fits_two_columns(41, 40), "one character over does not");
-        assert!(fits_two_columns(0, 40), "nothing to draw fits");
-        assert!(!fits_two_columns(0, 0), "a column with no room falls back however short");
-
-        assert_eq!(command_view(40, 40), CommandView::SideBySide);
-        assert_eq!(command_view(41, 40), CommandView::Stacked);
-        assert_eq!(diff_view(40, 40), DiffView::SideBySide);
-        assert_eq!(diff_view(41, 40), DiffView::Unified);
-    }
-
-    #[test]
-    fn one_caption_names_both_panes_and_keeps_what_each_of_them_promises() {
-        // The panes carry no labels of their own any more -- two labels are
-        // two rows when the panes are stacked -- so the claim that made the
-        // raw pane worth having has to survive here, in both arrangements.
-        for (view, first, second) in [
-            (CommandView::SideBySide, "Left", "Right"),
-            (CommandView::Stacked, "Above", "Below"),
-        ] {
-            let caption = command_caption(view, 214, 40);
-            assert!(caption.contains(first), "the first pane is not named: {caption}");
-            assert!(caption.contains(second), "the second pane is not named: {caption}");
-            assert!(
-                caption.contains("no colour"),
-                "the raw pane's promise is gone: {caption}"
-            );
-            assert!(
-                caption.contains("hatch's notes, not the command"),
-                "the annotated pane's warning is gone: {caption}"
-            );
-        }
-
-        // And the fallback still says what was too long and what to do.
-        let stacked = command_caption(CommandView::Stacked, 214, 40);
-        assert!(stacked.contains("214"), "the fallback does not say what was too long");
-        assert!(stacked.contains("40"), "nor what it was too long for");
-        assert!(stacked.contains("widen"), "nor what the reader can do about it");
     }
 
     // ---- keeping the two stacked panes together ----------------------------
@@ -5312,288 +4951,6 @@ mod tests {
         assert_eq!(line_at(50.0, 10.0, &[]), 0, "a pane with no lines is on line zero");
     }
 
-    #[test]
-    fn a_pane_that_has_never_been_drawn_still_gets_a_guess_at_its_reach() {
-        // All this is now: the one frame before a pane has reported how far
-        // it really reaches. It was once the whole answer, and the bug is
-        // what that cost -- see `max_offset` and `PaneAt`.
-        assert_eq!(max_offset(10, 10.0, 40.0), 60.0);
-        assert_eq!(max_offset(3, 10.0, 40.0), 0.0, "a pane that fits does not scroll");
-        assert_eq!(max_offset(0, 10.0, 40.0), 0.0);
-    }
-
-    #[test]
-    fn a_pane_that_ran_out_of_command_is_told_apart_from_one_a_reader_moved() {
-        // The distinction the whole fix rests on. Both panes end up at their
-        // maximum; only one of them was asked for something else.
-        let end = PaneAt { offset: 100.0, max: 100.0 };
-
-        assert!(end.clamped(140.0), "a pane asked for more than it has was not read as clamped");
-        assert!(!end.clamped(100.0), "a pane given exactly its maximum had nothing to clamp");
-        assert!(
-            !end.clamped(20.0),
-            "a reader who scrolled a pane to its end was read as the pane running out"
-        );
-        // The epsilon is the same everywhere: a request larger than the
-        // maximum by less than one is the rounding a scroll area does to
-        // itself, not a request it cannot honour.
-        assert!(!end.clamped(100.0 + SCROLL_EPSILON));
-        assert!(end.clamped(100.0 + SCROLL_EPSILON * 1.01));
-        // And a pane that is nowhere near its maximum did not get there by
-        // being clamped to it, whatever it was asked for.
-        assert!(!PaneAt { offset: 40.0, max: 100.0 }.clamped(140.0));
-    }
-
-    #[test]
-    fn the_pane_the_reader_is_scrolling_is_handed_back_its_own_offset() {
-        // The driver must never be pulled away from where the reader put it,
-        // which is also what stops the two panes fighting: it is asked for
-        // exactly what it reported, so it never disagrees.
-        let (raw, annotated) = linked_panes();
-        let link = ScrollLink { driver: Pane::Raw, offset: 13.0 };
-
-        assert_eq!(requested_offset(link, Pane::Raw, &raw, &raw, 10.0, 100.0), 13.0);
-        // Raw line one is annotated line two, and there is room for it.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 20.0), 20.0);
-        // A pane with nowhere to scroll stays at its top rather than being
-        // asked for an offset it would draw as blank space.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 0.0), 0.0);
-    }
-
-    /// A pane at `offset` with room to spare below it, so that nothing it
-    /// hands back can be explained by it running out of command.
-    fn freely(offset: f32) -> PaneAt {
-        PaneAt { offset, max: offset + 1_000.0 }
-    }
-
-    #[test]
-    fn whichever_pane_moved_is_the_one_the_other_follows() {
-        let link = ScrollLink { driver: Pane::Raw, offset: 10.0 };
-
-        // Nobody moved: both handed back what they were given.
-        assert_eq!(drove(link, freely(10.0), 10.0, freely(20.0), 20.0), link);
-        // The follower moved, so it takes over.
-        assert_eq!(
-            drove(link, freely(10.0), 10.0, freely(55.0), 20.0),
-            ScrollLink { driver: Pane::Annotated, offset: 55.0 }
-        );
-        // The driver moved, and stays the driver at its new place.
-        assert_eq!(
-            drove(link, freely(44.0), 10.0, freely(20.0), 20.0),
-            ScrollLink { driver: Pane::Raw, offset: 44.0 }
-        );
-        // Rounding inside a scroll area is not a reader, and half a logical
-        // pixel exactly is the line: smaller than anything a hand produces
-        // and larger than anything a scroll area rounds by.
-        assert_eq!(drove(link, freely(10.2), 10.0, freely(20.0), 20.1), link);
-        assert_eq!(
-            drove(
-                link,
-                freely(10.0 + SCROLL_EPSILON),
-                10.0,
-                freely(20.0 + SCROLL_EPSILON),
-                20.0
-            ),
-            link,
-            "a pane that moved by exactly the epsilon was read as a reader"
-        );
-        assert_eq!(
-            drove(link, freely(10.0), 10.0, freely(20.0 + SCROLL_EPSILON * 1.01), 20.0),
-            ScrollLink { driver: Pane::Annotated, offset: 20.0 + SCROLL_EPSILON * 1.01 },
-            "a pane that moved by more than the epsilon was read as rounding"
-        );
-        assert_eq!(
-            drove(link, freely(10.0 + SCROLL_EPSILON * 1.01), 10.0, freely(20.0), 20.0),
-            ScrollLink { driver: Pane::Raw, offset: 10.0 + SCROLL_EPSILON * 1.01 }
-        );
-    }
-
-    #[test]
-    fn a_follower_with_nothing_further_to_show_does_not_take_the_reader_s_pane() {
-        // The bug, in the three numbers it comes down to. The reader is
-        // holding the raw pane at 40; the annotated pane is asked for 90,
-        // has 70, and says 70. Reading that as a reader scrolling handed the
-        // driver's role to a pane nobody touched.
-        let link = ScrollLink { driver: Pane::Raw, offset: 40.0 };
-        let ran_out = PaneAt { offset: 70.0, max: 70.0 };
-
-        assert_eq!(drove(link, freely(40.0), 40.0, ran_out, 90.0), link);
-        // What must still work: the reader takes a pane over by scrolling it,
-        // including by scrolling it to its very end. The pane is in the same
-        // place as above and the only difference is what it was asked for.
-        assert_eq!(
-            drove(link, freely(40.0), 40.0, ran_out, 20.0),
-            ScrollLink { driver: Pane::Annotated, offset: 70.0 },
-            "a reader who scrolled the follower to its end could not take it over"
-        );
-        // And the driver's own clamp is taken at face value, because it
-        // cannot cost it a role it already has: a window made taller leaves
-        // the link carrying an offset the pane no longer has, and this is
-        // where it is corrected.
-        let stale = ScrollLink { driver: Pane::Annotated, offset: 90.0 };
-        assert_eq!(
-            drove(stale, freely(40.0), 40.0, ran_out, 90.0),
-            ScrollLink { driver: Pane::Annotated, offset: 70.0 }
-        );
-    }
-
-    #[test]
-    fn a_linked_pane_settles_rather_than_oscillating() {
-        // The failure this shape exists to avoid: an offset fed back into the
-        // pane that produced it, with the two dragging each other a little
-        // further apart every frame. Two frames of the real arithmetic, with
-        // the reader scrolling once and then stopping.
-        let (raw, annotated) = linked_panes();
-        let (row, reach) = (10.0, 20.0);
-        let mut link = ScrollLink::default();
-
-        // Frame one: the reader drags the raw pane to its second line.
-        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, reach);
-        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, reach);
-        link = drove(link, freely(10.0), want_raw, freely(want_annotated), want_annotated);
-        assert_eq!(link, ScrollLink { driver: Pane::Raw, offset: 10.0 });
-
-        // Frame two: nobody touches anything, and both panes hand back what
-        // they were asked for.
-        let want_raw = requested_offset(link, Pane::Raw, &raw, &raw, row, reach);
-        let want_annotated = requested_offset(link, Pane::Annotated, &annotated, &raw, row, reach);
-        assert_eq!(want_raw, 10.0, "the driver was pulled off its own line");
-        assert_eq!(want_annotated, 20.0, "the follower is on the line the driver is on");
-        assert_eq!(
-            drove(link, freely(want_raw), want_raw, freely(want_annotated), want_annotated),
-            link,
-            "a frame nobody scrolled changed the shared position"
-        );
-    }
-
-    #[test]
-    fn a_wrapped_follower_lands_on_the_linked_line_and_never_past_it() {
-        // The bound on the estimate: egui wraps at or before the character
-        // count says, so this can put the follower a row or two above the
-        // line the driver is on -- showing context before it -- and never
-        // below it, which is the direction that would hide the line the
-        // reader was looking for.
-        let source = "aaaaaaaaaa; bb";
-        let raw = pane_lines(&classify(source), None);
-        let annotated = pane_lines(&render_command(source, &BTreeMap::new()), Some(4));
-        let link = ScrollLink { driver: Pane::Raw, offset: 0.0 };
-
-        // One raw line, so the follower is asked for the top whatever the
-        // wrapping below it.
-        assert_eq!(requested_offset(link, Pane::Annotated, &annotated, &raw, 10.0, 20.0), 0.0);
-        // And the wrapping really is counted: the second segment does not
-        // start on row one.
-        assert!(annotated.lines[1].row > 1, "the wrapped first line took one row");
-    }
-
-    /// One window's two stacked panes, drawn for real, frame by frame.
-    ///
-    /// The scroll link is a conversation between this file's arithmetic and a
-    /// real scroll area, and what a scroll area does with an offset it cannot
-    /// honour is the whole of what the conversation goes wrong over. So the
-    /// test below draws real panes, sends real pointer events at them and
-    /// reads the link back out of egui's own store, rather than asserting
-    /// against numbers this file made up about a layout it did not perform.
-    struct StackedWindow {
-        ctx: egui::Context,
-        raw: Spans,
-        annotated: Spans,
-        longest: usize,
-        blocks: Vec<Block>,
-        size: egui::Vec2,
-        time: f64,
-    }
-
-    impl StackedWindow {
-        /// A window of `size` showing `source` in both panes.
-        fn showing(source: &str, size: egui::Vec2) -> StackedWindow {
-            let ctx = egui::Context::default();
-            crate::prompt_ui::apply_faces(&ctx);
-            crate::prompt_ui::apply_font_size(&ctx, 16.0);
-            theme::apply(&ctx, theme::Theme::Dark);
-            let home = BTreeMap::from([("HOME".to_string(), "/home/alex".to_string())]);
-            let annotated = render_command(source, &home);
-            let raw = classify(source);
-            let longest = widest_line(&annotated).max(widest_line(&raw));
-            // From the same source the panes are drawn from, so a real frame
-            // exercises the gutter rather than a window that never has one.
-            let blocks = blocks(source);
-            StackedWindow { ctx, raw, annotated, longest, blocks, size, time: 0.0 }
-        }
-
-        /// One frame's worth of input: the window, the clock and the reader.
-        ///
-        /// A clock that advances, because egui animates a scroll bar into
-        /// view: in a window where no time passes it never finishes
-        /// arriving, and the panes are never the ones a reader sees.
-        fn input(&mut self, events: Vec<egui::Event>) -> egui::RawInput {
-            self.time += 1.0 / 60.0;
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
-                time: Some(self.time),
-                events,
-                ..Default::default()
-            }
-        }
-
-        /// Which arrangement this window's panes are in, measured in the
-        /// window itself: the rule is a question about width, and a test that
-        /// assumed the answer would go on passing after it changed.
-        fn view(&mut self) -> CommandView {
-            let longest = self.longest;
-            let input = self.input(Vec::new());
-            let mut view = None;
-            let mut out = self.ctx.run_ui(input, |ui| {
-                view = Some(command_view(longest, column_chars(pane_chars(ui, 2), 0)));
-            });
-            out.textures_delta.clear();
-            view.expect("the frame ran")
-        }
-
-        /// One frame, with whatever the reader did during it.
-        fn frame(&mut self, events: Vec<egui::Event>) -> Drawn {
-            let input = self.input(events);
-            let (raw, annotated, longest) = (&self.raw, &self.annotated, self.longest);
-            let blocks = &self.blocks;
-            let mut out =
-                self.ctx.run_ui(input, |ui| draw_command(ui, annotated, raw, longest, blocks));
-            let text = drawn_text(&out);
-            // epaint refuses to be dropped holding texture deltas nobody
-            // applied.
-            out.textures_delta.clear();
-            let link = self.ctx.data(|data| data.get_temp(scroll_link_id())).unwrap_or_default();
-            Drawn { link, text }
-        }
-
-        /// Press at `at` and keep the button down there for `frames` frames,
-        /// as a reader holding a scroll handle does.
-        fn holding(&mut self, at: egui::Pos2, frames: usize) -> Vec<Drawn> {
-            self.frame(vec![
-                egui::Event::PointerMoved(at),
-                egui::Event::PointerButton {
-                    pos: at,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ]);
-            (0..frames).map(|_| self.frame(vec![egui::Event::PointerMoved(at)])).collect()
-        }
-    }
-
-    /// What one frame left behind: where the two panes settled, and what the
-    /// reader could see.
-    #[derive(Debug, Clone, PartialEq)]
-    struct Drawn {
-        /// Which pane the other one is following, and from where.
-        link: ScrollLink,
-        /// Every line of the command a reader could actually see, and the
-        /// height it was drawn at. Two frames that put the same text in the
-        /// same places are two frames a reader cannot tell apart, which is
-        /// the whole of what "it jumps" means.
-        text: Vec<(String, i32)>,
-    }
-
     /// Every string a frame drew where its own pane could show it.
     ///
     /// Clipped by hand, because a scroll area lays its whole content out and
@@ -5626,125 +4983,6 @@ mod tests {
         into
     }
 
-    /// How many characters of the pane's own font a window of `size` believes
-    /// one full-width pane holds.
-    ///
-    /// The count [`pane_lines`] wraps its estimate at. It is still an
-    /// under-count of what the real pane fits — [`pane_chars`] floors, and
-    /// the scroll bar's column is subtracted whether or not the pane grows
-    /// one — so the estimate still reaches more rows than the pane does, and
-    /// the guard that tells a clamp from a reader is still load-bearing. What
-    /// it no longer is is a whole bar out: the bars take the column this
-    /// subtracts. See [`text_width`].
-    fn estimated_pane_chars(size: egui::Vec2) -> usize {
-        let ctx = egui::Context::default();
-        crate::prompt_ui::apply_faces(&ctx);
-        crate::prompt_ui::apply_font_size(&ctx, 16.0);
-        theme::apply(&ctx, theme::Theme::Dark);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let mut chars = 0;
-        let mut out = ctx.run_ui(input, |ui| chars = pane_chars(ui, 1));
-        out.textures_delta.clear();
-        chars
-    }
-
-    #[test]
-    fn a_pane_held_at_its_end_stays_there_for_as_long_as_it_is_held() {
-        // The bug, in the reader's words: "the scroll bar jumps when reaching
-        // the end, so I can never see the final part of the command". With a
-        // handle held at the bottom, the two panes took the driver's role
-        // from each other every other frame, and the pane the reader had hold
-        // of was dragged back up the command on each of them.
-        //
-        // What made it possible: the follower's maximum was estimated from a
-        // character count, the estimate came out a row high, the scroll area
-        // clamped a request it could not honour, and `drove` read the clamp
-        // as the reader scrolling. Every term of that is a real layout's, so
-        // this asserts against a real layout.
-
-        // Every line one character wider than the annotated pane is thought
-        // to hold, and so two rows to the estimate and one row to the pane:
-        // forty lines the estimate believes are eighty. That is the whole
-        // failure, arranged rather than hoped for -- the estimate has the
-        // pane reaching twice as far down the command as it does.
-        let size = egui::vec2(900.0, 700.0);
-        let width = estimated_pane_chars(size);
-        let mut command = String::new();
-        for n in 0..40 {
-            // Exactly as many characters as the estimate believes fit. The
-            // line the pane draws is one wider, because the terminator is
-            // drawn and counted too -- which is the character over.
-            let mut line = format!("cat /tmp/{n:02}/");
-            while line.chars().count() < width {
-                line.push('x');
-            }
-            command.push_str(&line);
-            command.push('\n');
-        }
-        let mut window = StackedWindow::showing(&command, size);
-        assert_eq!(
-            widest_line(&window.annotated),
-            width + 1,
-            "the lines are not the one character over the estimate this is about"
-        );
-        assert_eq!(
-            window.view(),
-            CommandView::Stacked,
-            "side by side panes are not linked, so this would assert nothing"
-        );
-        // Frames enough to settle: a pane learns its size from the frame
-        // before, a reader does not scroll what they have not been shown, and
-        // a solid scroll bar animates its column in rather than appearing
-        // with it — so for the eighth of a second that takes, the viewport is
-        // still narrowing and a pane's maximum offset is still growing. The
-        // clock advances a sixtieth per frame; this is three times the
-        // animation.
-        for _ in 0..16 {
-            window.frame(Vec::new());
-        }
-
-        // The raw strip's own scroll handle, taken to the bottom of its bar
-        // and held there. The strip is the pane the reader reaches for to
-        // check a line, and it is the one whose follower wraps.
-        let grab = egui::pos2(window.size.x - 9.0, 180.0);
-        let held = window.holding(grab, 8);
-
-        // The grab landed and the strip went somewhere, or the rest of this
-        // asserts nothing about a scroll bar.
-        assert!(
-            held.iter().any(|f| f.link.driver == Pane::Raw && f.link.offset > 0.0),
-            "nothing took hold of the raw strip's scroll bar"
-        );
-        let (first, rest) = held.split_first().expect("the reader held it for some frames");
-        assert_eq!(
-            first.link.driver,
-            Pane::Raw,
-            "the pane the reader is holding lost the link to the pane they are not touching"
-        );
-        // The annotated pane is the lower two thirds of this window, and a
-        // pane asked for an offset it has nothing at draws its whole content
-        // above itself. The reader would be holding the raw strip at the end
-        // of the command with blank space where the annotated form of it
-        // should be.
-        for drawn in &held {
-            assert!(
-                drawn.text.iter().any(|(_, row)| *row as f32 > window.size.y / 2.0),
-                "the annotated pane showed nothing at all: {:?}",
-                drawn.text
-            );
-        }
-        for (frame, drawn) in rest.iter().enumerate() {
-            assert_eq!(
-                drawn.link, first.link,
-                "frame {frame} moved a pane the reader had not let go of"
-            );
-            assert_eq!(drawn.text, first.text, "frame {frame} drew the command somewhere else");
-        }
-    }
-
 
     // ---- saying how much of a pane is out of sight -------------------------
 
@@ -5758,7 +4996,12 @@ mod tests {
     /// animating its column in, and for a caption built from the frame before
     /// to catch up with the panes under it.
     fn settled_text(payload: &Payload, size: egui::Vec2) -> Vec<(String, i32)> {
-        frames_of(payload, size, SETTLED).pop().expect("some frames were drawn")
+        settled_showing(payload, size, false)
+    }
+
+    /// The same, in whichever of the two renderings is asked for.
+    fn settled_showing(payload: &Payload, size: egui::Vec2, original: bool) -> Vec<(String, i32)> {
+        frames_of(payload, size, SETTLED, original).pop().expect("some frames were drawn")
     }
 
     /// Frames enough for everything in this window to stop moving.
@@ -5779,8 +5022,13 @@ mod tests {
     }
 
     /// What a window of `size` drew on each of its first `frames` frames.
-    fn frames_of(payload: &Payload, size: egui::Vec2, frames: u32) -> Vec<Vec<(String, i32)>> {
-        frames_in(&a_drawing_context(), payload, size, frames)
+    fn frames_of(
+        payload: &Payload,
+        size: egui::Vec2,
+        frames: u32,
+        original: bool,
+    ) -> Vec<Vec<(String, i32)>> {
+        frames_in(&a_drawing_context(), payload, size, frames, original)
     }
 
     /// The same, in a context that has already drawn something.
@@ -5789,6 +5037,7 @@ mod tests {
         payload: &Payload,
         size: egui::Vec2,
         frames: u32,
+        original: bool,
     ) -> Vec<Vec<(String, i32)>> {
         let shown = Shown::of(payload).expect("a real payload");
         (0..frames)
@@ -5798,7 +5047,9 @@ mod tests {
                     time: Some(ctx.input(|i| i.time) + f64::from(frame + 1) / 60.0),
                     ..Default::default()
                 };
-                let mut out = ctx.run_ui(input, |ui| draw_payload(ui, &shown));
+                let mut out = ctx.run_ui(input, |ui| {
+                    draw_payload(ui, &shown, original);
+                });
                 let text = drawn_text(&out);
                 out.textures_delta.clear();
                 text
@@ -5874,56 +5125,19 @@ mod tests {
     }
 
     #[test]
-    fn side_by_side_speaks_for_whichever_pane_is_the_worse_off() {
-        // The two panes are the same height and hold two renderings of one
-        // command, and which of them has the most rows is not something a
-        // reader should have to be told. So one sentence, made true of both
-        // by taking the larger row count against the smaller viewport.
-        let seen = CommandRows {
-            raw: Rows { of: 60, shown: 25 },
-            annotated: Rows { of: 63, shown: 24 },
-        };
-        assert_eq!(seen.worst(), Rows { of: 63, shown: 24 });
-        let note = command_note(CommandView::SideBySide, seen, 40, 120);
-        assert!(note.contains("63"), "the worse pane's row count is not the one quoted: {note}");
-        assert!(note.contains("the panes"), "one sentence did not speak for both: {note}");
-        // Side by side is only offered when every line fits its column whole,
-        // so nothing can be off to the side and nothing says it is -- even
-        // when the numbers handed in would say so anywhere else.
-        assert!(!note.contains("sideways"), "side by side claimed a line ran off it: {note}");
-
-        // Stacked, the strip's own six rows are hatch's layout decision and
-        // not news; the pane the reader reads is the one reported.
-        let note = command_note(CommandView::Stacked, seen, 218, 123);
-        assert!(note.contains("the pane below"), "the wrong pane is reported: {note}");
-        assert!(note.contains("24"), "the annotated pane's figures are not the ones used: {note}");
-        assert!(note.contains("the strip"), "nothing said the strip loses text sideways: {note}");
-        assert!(note.contains("218"), "nor how far the lines run: {note}");
-
-        // And a window showing all of both panes says neither thing.
-        let whole = CommandRows {
-            raw: Rows { of: 6, shown: 20 },
-            annotated: Rows { of: 8, shown: 20 },
-        };
-        assert_eq!(command_note(CommandView::Stacked, whole, 40, 123), "");
-        assert_eq!(command_note(CommandView::SideBySide, whole, 40, 123), "");
-    }
-
-    #[test]
     fn a_command_that_runs_past_the_bottom_of_its_pane_says_so_in_the_window() {
         // The reader's report: "when the command has lines beyond what's
         // being seen we need some sign. why: scrollbar is tiny, easy to think
         // it ends". Asserted against a real window, because what a pane
         // manages to show is a fact about a layout and nothing else knows it.
         //
-        // Sixty short lines: every one of them fits a column, so this is the
-        // side-by-side arrangement, and the two panes are level.
+        // Sixty short lines in one full-area pane.
         let long = (0..60).map(|n| format!("echo {n}")).collect::<Vec<_>>().join("\n");
         let text = settled_text(&a_command(&long), a_window());
         let note = out_of_sight_line(&text)
             .unwrap_or_else(|| panic!("a 60-row command in a 700-point window said nothing"));
         assert!(note.contains("60"), "the notice does not say how long the command is: {note}");
-        assert!(note.contains("the panes"), "nor which arrangement it is about: {note}");
+        assert!(note.contains("the pane"), "nor what it is about: {note}");
 
         // And a command that fits says nothing, so the line means something
         // when it is there.
@@ -5936,21 +5150,23 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_runs_off_the_raw_strip_says_so_too() {
-        // The strip deliberately does not reflow -- that is the promise the
-        // caption makes for it -- so a long line runs past the right edge and
+    fn a_line_that_runs_off_the_original_says_so_too() {
+        // The original deliberately does not reflow -- that is the promise
+        // its caption makes -- so a long line runs past the right edge and
         // stops there, with a horizontal scroll bar as the only sign it did
-        // not end. In a root request the strip ends part-way through `run0`'s
-        // argument list.
+        // not end. The annotated rendering wraps, so it has nothing off to
+        // the side and says nothing about any; this is the one rendering the
+        // sideways notice is for.
         let wide = format!("echo {}", "x".repeat(400));
-        let text = settled_text(&a_command(&format!("{wide}\n{wide}\n{wide}")), a_window());
+        let command = a_command(&format!("{wide}\n{wide}\n{wide}"));
+        let text = settled_showing(&command, a_window(), true);
         let note = out_of_sight_line(&text)
             .unwrap_or_else(|| panic!("a 405-character line said nothing: {text:?}"));
         assert!(note.contains("sideways"), "nothing said which way the rest of it is: {note}");
         // 406 and not 405: the `↵` that ends each line is drawn, so it is
         // counted -- the same rule the fit measurement uses.
         assert!(note.contains("406"), "nor how far the lines run: {note}");
-        assert!(note.contains("the strip"), "nor which pane loses them: {note}");
+        assert!(note.contains("the pane"), "nor where they are lost: {note}");
     }
 
     #[test]
@@ -6047,7 +5263,7 @@ mod tests {
         for height in [260.0_f32, 420.0] {
             for width in (460..=1500).step_by(7) {
                 let size = egui::vec2(width as f32, height);
-                let frames = frames_in(&ctx, &payload, size, SETTLED);
+                let frames = frames_in(&ctx, &payload, size, SETTLED, true);
                 let notes: Vec<_> =
                     frames.iter().rev().take(4).map(|frame| out_of_sight_line(frame)).collect();
                 assert!(
@@ -6062,7 +5278,13 @@ mod tests {
         // And the sweep really did draw the sentence it is about -- both
         // halves of it -- rather than passing over three hundred windows that
         // had nothing to say.
-        assert!(down > 200, "only {down} of the swept windows reported rows out of sight");
+        //
+        // The floor is a hundred rather than two: this sweeps the original,
+        // which does not reflow, so a wide window fits a command in fewer
+        // rows than the wrapped rendering needs and fewer of them overflow.
+        // What the number is for is proving the sweep drew the sentence at
+        // all, and a third of three hundred windows does that.
+        assert!(down > 100, "only {down} of the swept windows reported rows out of sight");
         assert!(across > 100, "only {across} of them reported a line running off the side");
     }
 

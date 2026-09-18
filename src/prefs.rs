@@ -147,6 +147,21 @@ pub struct Prefs {
     /// than of a tick made in front of this command — see
     /// `CLOSE_WATCHING_ALWAYS` in `crate::prompt_ui`.
     pub stream: bool,
+    /// Whether the command panes show the exact text rather than the
+    /// annotated rendering.
+    ///
+    /// Written by the "Show the original text" checkbox. A view choice and
+    /// nothing else: both panes draw every byte of the command, so this
+    /// decides which of the two renderings is on screen and never what is in
+    /// it. See `crate::prompt_ui::panes` for why the two are alternatives now
+    /// rather than neighbours.
+    ///
+    /// Remembered, unlike the review box, because it is a statement about how
+    /// a person reads rather than about one command: somebody who wants the
+    /// bytes unannotated wants them on every window, and having to say so
+    /// again each time is the kind of friction that ends in nobody checking
+    /// anything.
+    pub show_original: bool,
     /// Whether the command should be given a terminal of its own.
     ///
     /// Written by the "Run it in a terminal" checkbox. **Not a display
@@ -442,13 +457,13 @@ mod tests {
         assert_eq!(file.read(), Prefs::default());
         assert_eq!(
             Prefs::default(),
-            Prefs { close_on_decide: false, stream: false, terminal: false }
+            Prefs { close_on_decide: false, stream: false, terminal: false, show_original: false }
         );
 
-        file.write(&Prefs { close_on_decide: true, stream: true, terminal: true });
+        file.write(&Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false });
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: true, terminal: true },
+            Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false },
             "a fresh window did not read back all three"
         );
     }
@@ -464,6 +479,7 @@ mod tests {
             close_on_decide: true,
             stream: true,
             terminal: false,
+            show_original: false,
         });
 
         // A second window that opened before any of that and knows nothing
@@ -472,7 +488,7 @@ mod tests {
 
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: true, terminal: true },
+            Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false },
             "a window writing one box trampled the others"
         );
     }
@@ -487,7 +503,7 @@ mod tests {
         PrefsFile::at(&paths).update(|prefs| prefs.stream = true);
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: false, stream: true, terminal: false }
+            Prefs { close_on_decide: false, stream: true, terminal: false, show_original: false }
         );
     }
 
