@@ -1956,9 +1956,128 @@ fn newline_already_ends_the_line(command: &str, after: usize, next: Option<&Boun
 /// no longer holds: the builder refuses the out-of-order push. A panicking
 /// prompt window is a dead prompt window, and hatch treats that as a denial,
 /// so failing this way fails closed.
+/// A name the command sets for itself, and what it sets it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Assignment {
+    /// Where it takes effect: the end of the segment that performs it. A
+    /// reference before this offset is not covered by it, because the shell
+    /// had not run it yet.
+    at: usize,
+    name: String,
+    /// The value, when it can be worked out exactly. `None` is *set, and
+    /// hatch is not going to guess* -- which is a different thing from unset
+    /// and is drawn as nothing at all rather than as a claim.
+    value: Option<String>,
+}
+
+/// The names this command sets for itself, in the order it sets them.
+///
+/// # Why this exists
+///
+/// `R=/srv; cp $R/a $R/b` drew `$R` as **unset**, twice, because the
+/// environment the daemon resolved against is the one the child will start
+/// with and `R` is not in it. That is a false statement of the useful kind:
+/// the reader is being told the expansion is empty when the command sets it
+/// two words earlier, and the shape is an ordinary one for an agent to write.
+///
+/// # Only an assignment the shell keeps
+///
+/// A segment made of nothing but assignments sets them for the rest of the
+/// command. `A=1 cmd` does not: it puts `A` in *that command's* environment
+/// and leaves the shell's alone, so a later `$A` there is not this one. The
+/// rule is therefore the whole segment or nothing, which is also the shape
+/// the request came in as -- names declared at the top.
+///
+/// # Only a value that is already what it will be
+///
+/// The value is taken as written and expanded no further. Anything holding a
+/// `$`, a quote, a backslash, a glob or a substitution yields `None`: working
+/// those out means being a shell, and being approximately a shell in a window
+/// whose whole claim is that it shows what will run is the wrong kind of
+/// clever. `~/` is the one exception, resolved through `HOME` when the
+/// environment has one, because it is the common case and it is exact.
+///
+/// A here-document body is skipped. It is data rather than shell, so an
+/// `A=1` in a config file being written is not an assignment, and the same
+/// flag that keeps a `;` in a body from being a separator keeps this out.
+fn assignments(command: &str, env: &BTreeMap<String, String>) -> Vec<Assignment> {
+    // Bytes no assignment may be read out of: a here-document body, and a
+    // comment. Both are already decided by the one scan every other pass
+    // reads, so this cannot disagree with them.
+    let mut inert = vec![false; command.len()];
+    for scanned in scan(command) {
+        if scanned.here.is_some() || scanned.comment {
+            for byte in &mut inert[scanned.offset..scanned.offset + scanned.ch.len_utf8()] {
+                *byte = true;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for segment in segments(command) {
+        if inert[segment.clone()].iter().any(|byte| *byte) {
+            continue;
+        }
+        let words: Vec<&str> = command[segment.clone()].split_ascii_whitespace().collect();
+        if words.is_empty() || !words.iter().all(|word| assigned_name(word).is_some()) {
+            continue;
+        }
+        for word in words {
+            let name = assigned_name(word).expect("every word was checked above");
+            let raw = &word[name.len() + 1..];
+            out.push(Assignment {
+                at: segment.end,
+                name: name.to_string(),
+                value: assigned_value(raw, env),
+            });
+        }
+    }
+    out
+}
+
+/// The name a word assigns to, or `None` if it does not assign at all.
+///
+/// The shell's rule: a name, then `=`. Not `=x`, not `1A=x`, not `A[0]=x` --
+/// an array element is an assignment the shell understands and this does not,
+/// so it is left alone rather than read as a name containing a bracket.
+fn assigned_name(word: &str) -> Option<&str> {
+    let (name, _) = word.split_once('=')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_').then_some(name)
+}
+
+/// What a written value is worth, or `None` when hatch will not say.
+fn assigned_value(raw: &str, env: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = env.get("HOME")?;
+        return assigned_value(rest, env).map(|rest| format!("{home}/{rest}"));
+    }
+    let opaque = |ch: char| {
+        matches!(ch, '$' | '`' | '\'' | '"' | '\\' | '*' | '?' | '[' | ']' | '~' | '{' | '}')
+    };
+    (!raw.contains(opaque)).then(|| raw.to_string())
+}
+
+/// What the command itself says a name is worth at `at`, if anything.
+///
+/// The last assignment before that offset wins, which is the shell's own
+/// answer: a name set twice is worth what it was set to most recently.
+fn assigned_at<'a>(
+    assignments: &'a [Assignment],
+    name: &str,
+    at: usize,
+) -> Option<&'a Assignment> {
+    assignments.iter().rev().find(|held| held.name == name && held.at <= at)
+}
+
 pub fn annotate_variables(spans: Spans, env: &BTreeMap<String, String>) -> Spans {
     let source = spans.source();
     let references = references(source);
+    let set_here = assignments(source, env);
     let mut builder = SpanBuilder::new(source);
     let mut next = 0;
 
@@ -1987,10 +2106,18 @@ pub fn annotate_variables(spans: Spans, env: &BTreeMap<String, String>) -> Spans
             builder.push_to(reference.start, SpanKind::Plain);
             let name = variable_name(&source[reference.clone()])
                 .expect("the scanner matched this range as a whole reference");
-            // Defanged on the way in, not on the way out: the value is not
-            // approved text and cannot be a span, so the window has no chip
-            // machinery to protect it with. See `unicode::defang`.
-            let resolved = env.get(name).map(|value| unicode::defang(value));
+            // What the command sets for itself beats the environment it will
+            // start in, because it happens second. A name it sets to
+            // something hatch will not work out is left untagged: no chip, no
+            // claim -- see `assignments`.
+            let resolved = match assigned_at(&set_here, name, reference.start) {
+                Some(Assignment { value: None, .. }) => {
+                    builder.push_to(reference.end, SpanKind::Plain);
+                    continue;
+                }
+                Some(Assignment { value: Some(value), .. }) => Some(unicode::defang(value)),
+                None => env.get(name).map(|value| unicode::defang(value)),
+            };
             builder.push_to(reference.end, SpanKind::Variable { resolved });
         }
 
@@ -4122,6 +4249,96 @@ mod tests {
         let spans = rendered("$A", &env);
         assert_eq!(spans.len(), 1);
         assert_eq!(variables(&spans), vec![("$A", Some("1"))]);
+    }
+
+    // ---- names the command sets for itself ---------------------------------
+
+    #[test]
+    fn an_assignment_earlier_in_the_command_resolves_a_later_reference() {
+        // The reported shape: `unset` twice, about a name the command sets
+        // two words earlier.
+        let spans = rendered("R=/srv; cp $R/a $R/b", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$R", Some("/srv")), ("$R", Some("/srv"))]);
+    }
+
+    #[test]
+    fn an_assignment_after_the_reference_does_not_reach_back() {
+        // The shell runs them in order and so does this: at the `$R` there is
+        // no `R` yet, and saying otherwise would describe a command that ran
+        // in a different order from the one on screen.
+        let spans = rendered("echo $R; R=/srv", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$R", None)]);
+    }
+
+    #[test]
+    fn the_last_assignment_before_a_reference_is_the_one_that_counts() {
+        let spans = rendered("R=/a; R=/b; echo $R", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$R", Some("/b"))]);
+    }
+
+    #[test]
+    fn what_the_command_sets_beats_the_environment_it_starts_in() {
+        let spans = rendered("R=/mine; echo $R", &env(&[("R", "/theirs")]));
+        assert_eq!(variables(&spans), vec![("$R", Some("/mine"))]);
+    }
+
+    #[test]
+    fn an_assignment_in_front_of_a_command_sets_nothing_afterwards() {
+        // `A=1 cmd` puts `A` in that command's environment and leaves the
+        // shell's alone, so the later `$A` is not this one. Reading it as one
+        // would be a claim about a variable that does not exist by then.
+        let spans = rendered("A=1 ls; echo $A", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$A", None)]);
+    }
+
+    #[test]
+    fn a_value_hatch_will_not_work_out_is_not_claimed_either_way() {
+        // Neither a value nor `unset`: the name *is* set, so `unset` would be
+        // wrong, and what it is set to needs a shell. So nothing is drawn on
+        // it at all -- no chip, no claim.
+        for command in ["A=$B; echo $A", "A=$(date); echo $A", "A=*.txt; echo $A"] {
+            let spans = rendered(command, &env(&[]));
+            let said = variables(&spans);
+            assert!(
+                !said.iter().any(|(text, _)| *text == "$A"),
+                "{command} claimed something about $A: {said:?}"
+            );
+        }
+        // The `$B` inside the first one is a reference in its own right and
+        // is still read as one: what is withheld is the claim about `$A`, not
+        // every claim on the line.
+        let spans = rendered("A=$B; echo $A", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$B", None)]);
+    }
+
+    #[test]
+    fn a_home_relative_value_resolves_through_the_environment() {
+        // The one expansion worked out here, because it is the common case
+        // and it is exact.
+        let spans = rendered("P=~/.config; echo $P", &env(&[("HOME", "/home/u")]));
+        assert_eq!(variables(&spans), vec![("$P", Some("/home/u/.config"))]);
+        // And with no `HOME` to resolve it through, nothing is claimed.
+        let spans = rendered("P=~/.config; echo $P", &env(&[]));
+        assert_eq!(variables(&spans), vec![]);
+    }
+
+    #[test]
+    fn an_assignment_in_a_here_document_body_is_not_an_assignment() {
+        // A body is a file being written, not shell. The same flag that stops
+        // a `;` in one from being a separator stops this.
+        let spans = rendered("cat <<'EOF' > f\nA=1\nEOF\necho $A", &env(&[]));
+        assert_eq!(variables(&spans), vec![("$A", None)], "a config file set a variable");
+    }
+
+    #[test]
+    fn a_word_that_only_looks_like_an_assignment_is_left_alone() {
+        assert_eq!(assigned_name("A=1"), Some("A"));
+        assert_eq!(assigned_name("_x9=1"), Some("_x9"));
+        assert_eq!(assigned_name("=1"), None, "no name at all");
+        assert_eq!(assigned_name("1A=1"), None, "a name cannot start with a digit");
+        assert_eq!(assigned_name("A[0]=1"), None, "an array element is not modelled");
+        assert_eq!(assigned_name("--flag"), None);
+        assert_eq!(assigned_name("a.b=1"), None);
     }
 
     #[test]
