@@ -1767,6 +1767,13 @@ pub fn segment_breaking_at(command: &str, at: Option<usize>) -> Spans {
                 if newline_already_ends_the_line(command, token.end, found.get(index + 1)) {
                     continue;
                 }
+                // The blanks the author left after the separator belong to
+                // the line the separator ends, not to the one that follows.
+                // See `blanks_after`.
+                let after = blanks_after(command, token.end);
+                if asked.is_none_or(|at| at >= after) {
+                    unicode::classify_into(&mut builder, after);
+                }
             }
             // The newline goes *through* the classifier rather than around
             // it, which is what makes it a chip and not a drawn-as-itself
@@ -1816,6 +1823,37 @@ fn take_break(builder: &mut SpanBuilder<'_>, asked: &mut Option<usize>, before: 
         }
         _ => {}
     }
+}
+
+/// Where the run of blanks immediately after `at` ends.
+///
+/// Spaces and tabs only, and never a newline: a newline ends the line by
+/// itself and is drawn as a chip by the pass that owns it.
+///
+/// # Why they move
+///
+/// `a; b` is two commands with a space between them, and the space is there
+/// because somebody typed the separator and then a space. Left at the front
+/// of the following segment it became that segment's first character, and
+/// since every segment after the first begins that way, every drawn line
+/// after the first began one column in. A reader sees a column and reads
+/// nesting; there is none, and the lines that really are nested got the same
+/// one column as the ones that are not.
+///
+/// So the blanks are drawn at the end of the line their separator ends. This
+/// moves no byte and removes none: the spans are pushed in the same order
+/// over the same source, [`super::unrender`] concatenates the same text, and
+/// the raw pane is not touched at all. What changes is which side of a line
+/// break the blanks sit on, and a line break is layout — see the module docs
+/// on why breaks are metadata rather than characters.
+///
+/// A caller that asked for a break of its own inside the run keeps it: the
+/// run is left alone in that case rather than swallowing a break somebody
+/// placed deliberately.
+fn blanks_after(command: &str, at: usize) -> usize {
+    command[at..]
+        .find(|c: char| c != ' ' && c != '\t')
+        .map_or(command.len(), |offset| at + offset)
 }
 
 /// Whether the author's own newline is already going to end the line this
@@ -3519,20 +3557,20 @@ mod tests {
         assert_eq!(spans.len(), 4, "a, the separator, the space, and b");
         assert_eq!(spans[1].text(), ";");
         assert!(!spans[1].break_before(), "layout never lands on the separator itself");
-        assert!(spans[2].break_before(), "it lands on the span after it");
         assert_eq!(spans[2].text(), " ", "and no whitespace is trimmed to tidy the line");
+        assert!(!spans[2].break_before(), "the blanks stay on the line the separator ends");
+        assert!(spans[3].break_before(), "the break lands where the next command starts");
         assert_eq!(spans[3].text(), "b");
     }
 
     #[test]
     fn every_separator_gets_a_break_after_it() {
-        // The trailing space belongs to the run, not to the separator that
-        // comes after it: nothing is trimmed on either side of a boundary.
-        // The break lands on the space that follows each separator, which is
-        // where the segment's own text begins: the highlight pass cuts the
-        // command word out of the run after it, and the space is what is left
-        // starting where the run did.
-        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec![" "; 4]);
+        // Nothing is trimmed on either side of a boundary, and the break
+        // lands where the next command starts rather than on the blanks in
+        // front of it. Those blanks are still drawn -- at the end of the line
+        // their separator ends, where they are not read as an indent. See
+        // `blanks_after`.
+        assert_eq!(breaks(&render_command("a; b && c || d | e")), vec!["b", "c", "d", "e"]);
     }
 
     #[test]
@@ -3623,7 +3661,7 @@ mod tests {
         // ` b c` as one line and put the reader's eye back where it started.
         let line = "a; b c; d";
         let at = line.find('c').unwrap();
-        assert_eq!(breaks(&broken_at(line, at)), vec![" ", "c", " "]);
+        assert_eq!(breaks(&broken_at(line, at)), vec!["b", "c", "d"]);
         assert_eq!(unrender(&broken_at(line, at)), line);
     }
 
@@ -3813,7 +3851,7 @@ mod tests {
         // The rule gives way to the author's newline; it does not give away
         // segmentation. `&& b` is a segment with something in it and starts a
         // line of its own, exactly as it would without a newline anywhere.
-        assert_eq!(drawn_lines(&render_command("a && b\nc")), vec!["a &&", " b\u{21B5}", "c"]);
+        assert_eq!(drawn_lines(&render_command("a && b\nc")), vec!["a && ", "b\u{21B5}", "c"]);
     }
 
     #[test]
@@ -4094,7 +4132,7 @@ mod tests {
         let env = env(&[("A", "1")]);
 
         let spans = rendered("x; $A", &env);
-        assert_eq!(breaks(&spans), vec![" "], "the space is still what starts the line");
+        assert_eq!(breaks(&spans), vec!["$A"], "the reference starts the line, not the space");
 
         let spans = rendered("x;$A", &env);
         assert_eq!(breaks(&spans), vec!["$A"]);

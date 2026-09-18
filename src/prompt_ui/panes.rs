@@ -1546,6 +1546,19 @@ const BLOCK_MINIMUM_LINES: usize = 2;
 /// enough to be obvious would be a step wide enough to matter at depth four.
 const BRACKET_STEP_CHARS: usize = 1;
 
+/// Characters of indentation per level of nesting.
+///
+/// Two, which is the shell's own convention and what a person writing the
+/// command by hand would have used. One was what the old rendering gave
+/// every line after a separator, whether or not it was inside anything, and
+/// a column that means "this is nested" has to be wide enough not to be read
+/// as the column that used to mean nothing.
+///
+/// It is not four: the pane is one half of a window, the deepest sample here
+/// nests four times, and sixteen characters of margin on the lines that most
+/// need reading is a worse trade than a shallower step.
+const INDENT_CHARS: usize = 2;
+
 /// How thick a bracket is drawn, in points.
 ///
 /// A hairline. It is furniture and it is next to the thing it is describing,
@@ -1577,27 +1590,56 @@ struct Bracket {
     first: usize,
     /// The last, which is never the first — see [`BLOCK_MINIMUM_LINES`].
     last: usize,
-    /// Which column of the gutter it is drawn in: zero at the outside, one
-    /// step further in for each bracket that encloses it.
-    step: usize,
 }
 
-/// The whole gutter for one rendering.
+/// The whole gutter for one rendering: one bracket per construct worth
+/// drawing, and nothing at all for a command with no structure.
 ///
-/// `steps` is how many columns of nesting are in use, which is what the
-/// gutter is *wide*. It is zero for a command with no structure worth
-/// drawing — the ordinary case, and the one where all of this costs the pane
-/// nothing at all, not even a column of its width.
+/// # Why a bracket no longer steps
+///
+/// It used to be drawn one column further into the gutter for each block
+/// that enclosed it, because the gutter was the only thing saying how deep
+/// anything was. The lines themselves now say it — see [`line_indent`] — and
+/// two marks for one fact is one too many: a reader counting columns and a
+/// reader reading indentation would be answering the same question twice and
+/// could be told different things by a bug in either.
+///
+/// So depth is the indentation's to say, and a bracket says the other thing,
+/// which indentation cannot: where the construct *begins and ends*. Each one
+/// is drawn one step to the left of its own first line, so it sits beside the
+/// block it is about however deep that is.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Gutter {
-    steps: usize,
     brackets: Vec<Bracket>,
 }
 
 impl Gutter {
     /// Whether anything is drawn at all.
     fn is_empty(&self) -> bool {
-        self.steps == 0
+        self.brackets.is_empty()
+    }
+
+    /// The deepest any line is indented, for the caller that has to know how
+    /// much width the indentation will take before any of it is drawn.
+    fn deepest(&self) -> usize {
+        (0..self.brackets.iter().map(|bracket| bracket.last + 1).max().unwrap_or(0))
+            .map(|line| self.indent(line))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How many brackets enclose line `index` without starting or ending on
+    /// it, which is how far that line is indented.
+    ///
+    /// A block's own first and last lines are *not* indented by it: `for` and
+    /// `done` belong to the construct rather than to its body, and indenting
+    /// them would put the word that opens a block one column right of the
+    /// line above it for no reason a reader could name.
+    fn indent(&self, index: usize) -> usize {
+        self.brackets
+            .iter()
+            .filter(|bracket| bracket.first < index && index < bracket.last)
+            .count()
     }
 }
 
@@ -1657,17 +1699,18 @@ fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
         if last + 1 - first < BLOCK_MINIMUM_LINES {
             continue;
         }
-        // How many brackets already placed enclose this one. The blocks
-        // arrive in source order with the outermost first, so everything that
-        // could enclose it has been seen.
-        let step = brackets
-            .iter()
-            .filter(|drawn| drawn.first <= first && last <= drawn.last)
-            .count();
-        brackets.push(Bracket { first, last, step });
+        // Two constructs can cover exactly the same drawn lines -- a subshell
+        // holding nothing but a loop is the ordinary case -- and they are one
+        // bracket, not two. Two strokes would land on the same pixels, and
+        // counting both would indent the body twice for one step a reader can
+        // see. The text still says there are two: the `(` and the `for` are
+        // both on the line it opens on.
+        if brackets.iter().any(|drawn| drawn.first == first && drawn.last == last) {
+            continue;
+        }
+        brackets.push(Bracket { first, last });
     }
-    let steps = brackets.iter().map(|bracket| bracket.step + 1).max().unwrap_or(0);
-    Gutter { steps, brackets }
+    Gutter { brackets }
 }
 
 /// Where one drawn line of a pane begins: in the source, and on screen.
@@ -2234,8 +2277,11 @@ fn draw_command(ui: &mut Ui, annotated: &Spans, raw: &Spans, longest: usize, blo
             // The raw pane does not reflow, so one line is one row there; the
             // annotated pane wraps at the width of one full-width box.
             let raw_rows = pane_lines(raw, None);
+            // The gutter column and the deepest indent both come out of the
+            // width the text has left to wrap in.
+            let furniture = BRACKET_STEP_CHARS + gutter.deepest() * INDENT_CHARS;
             let annotated_rows =
-                pane_lines(annotated, Some(pane_chars(ui, 1).saturating_sub(gutter.steps * BRACKET_STEP_CHARS)));
+                pane_lines(annotated, Some(pane_chars(ui, 1).saturating_sub(furniture)));
             let (link, reach) = ui.data(|data| {
                 (
                     data.get_temp::<ScrollLink>(scroll_link_id()).unwrap_or_default(),
@@ -3104,23 +3150,24 @@ fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gut
         return;
     }
     let ink = palette(ui).quiet;
-    let step = advance(ui) * BRACKET_STEP_CHARS as f32;
-    let width = step * gutter.steps as f32;
+    let advance = advance(ui);
+    let step = advance * BRACKET_STEP_CHARS as f32;
     let mut rows: Vec<egui::Rect> = Vec::new();
-    for line in lines(spans) {
+    for (index, line) in lines(spans).into_iter().enumerate() {
+        let inset = step + advance * (gutter.indent(index) * INDENT_CHARS) as f32;
         let drawn = ui
             .horizontal_top(|ui| {
                 // Otherwise the gap egui puts between two widgets in a row
                 // would appear between the gutter and the text, and the text
                 // would not start where the gutter says it does.
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add_space(width);
+                ui.add_space(inset);
                 draw_line(ui, line, weight).rect
             })
             .inner;
         rows.push(drawn);
     }
-    paint_brackets(ui, &rows, gutter, step, width, ink);
+    paint_brackets(ui, &rows, gutter, step, ink);
 }
 
 /// Paint one stroke per bracket, from the rows the lines landed on.
@@ -3130,14 +3177,7 @@ fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gut
 /// says everything between them is inside. Nothing is drawn for a line that
 /// was never laid out, which is how a bracket over a line the pane did not
 /// reach draws nothing rather than a stroke to a rectangle that is not there.
-fn paint_brackets(
-    ui: &Ui,
-    rows: &[egui::Rect],
-    gutter: &Gutter,
-    step: f32,
-    width: f32,
-    ink: Color32,
-) {
+fn paint_brackets(ui: &Ui, rows: &[egui::Rect], gutter: &Gutter, step: f32, ink: Color32) {
     let painter = ui.painter();
     let stroke = egui::Stroke::new(BRACKET_STROKE, ink);
     let tick = step * BRACKET_TICK;
@@ -3145,10 +3185,13 @@ fn paint_brackets(
         let (Some(first), Some(last)) = (rows.get(bracket.first), rows.get(bracket.last)) else {
             continue;
         };
-        // Measured from the text's own left edge, so the gutter follows the
-        // text when the pane is scrolled sideways instead of sitting at a
-        // fixed place on the screen with the command sliding past it.
-        let x = first.left() - width + bracket.step as f32 * step;
+        // One step to the left of the block's own first line. Measured from
+        // the text rather than from the pane, so it follows the text when the
+        // pane is scrolled sideways instead of sitting at a fixed place on
+        // screen with the command sliding past it -- and so a bracket around
+        // an indented block sits beside that block rather than out at the
+        // margin with a stretch of nothing between them.
+        let x = first.left() - step;
         let top = first.top() + BRACKET_INSET;
         let bottom = last.bottom() - BRACKET_INSET;
         if bottom <= top {
@@ -3424,18 +3467,15 @@ mod tests {
     use crate::render::unicode::classify;
     use crate::swap::Principal;
 
-    /// The gutter a command gets, as `(first line, last line, step)` per
-    /// bracket, with the number of columns it takes.
-    fn bracketed(source: &str) -> (usize, Vec<(usize, usize, usize)>) {
+    /// The gutter a command gets: the lines each bracket spans, and how far
+    /// each drawn line is indented.
+    fn bracketed(source: &str) -> (Vec<(usize, usize)>, Vec<usize>) {
         let spans = render_command(source, &BTreeMap::new());
-        let drawn = gutter(&lines(&spans), &blocks(source));
+        let drawn_lines = lines(&spans);
+        let drawn = gutter(&drawn_lines, &blocks(source));
         (
-            drawn.steps,
-            drawn
-                .brackets
-                .iter()
-                .map(|bracket| (bracket.first, bracket.last, bracket.step))
-                .collect(),
+            drawn.brackets.iter().map(|bracket| (bracket.first, bracket.last)).collect(),
+            (0..drawn_lines.len()).map(|line| drawn.indent(line)).collect(),
         )
     }
 
@@ -3539,36 +3579,43 @@ mod tests {
         // The ordinary case, and the one that has to cost nothing: a pane
         // with no brackets is laid out exactly as it was before there were
         // any.
-        let (steps, brackets) = bracketed("ls -l /tmp");
-        assert_eq!(steps, 0);
+        let (brackets, indents) = bracketed("ls -l /tmp");
         assert_eq!(brackets, vec![]);
+        assert!(indents.iter().all(|indent| *indent == 0), "{indents:?}");
     }
 
     #[test]
     fn a_loop_is_bracketed_from_its_first_drawn_line_to_its_last() {
         let source = "for x in a b; do\n  echo $x\ndone";
         let shown = drawn_lines(source);
-        let (steps, brackets) = bracketed(source);
-        assert_eq!(steps, 1);
+        let (brackets, indents) = bracketed(source);
         assert_eq!(brackets.len(), 1, "{brackets:?}");
-        let (first, last, step) = brackets[0];
-        assert_eq!(step, 0);
+        let (first, last) = brackets[0];
         assert!(shown[first].starts_with("for x"), "opens on {:?}", shown[first]);
         assert!(shown[last].contains("done"), "closes on {:?}", shown[last]);
         assert_eq!(last, shown.len() - 1, "the loop does not reach its last line");
+        // The words that open and close a loop belong to the loop, not to its
+        // body, so neither of them is indented by it.
+        assert_eq!(indents[first], 0, "{indents:?}");
+        assert_eq!(indents[last], 0, "{indents:?}");
+        assert!(
+            indents[first + 1..last].iter().all(|indent| *indent == 1),
+            "the body is one level in: {indents:?}"
+        );
     }
 
     #[test]
-    fn a_loop_inside_a_loop_is_drawn_one_step_in() {
+    fn a_loop_inside_a_loop_is_indented_one_level_further() {
         let source = "for a in 1; do\n  for b in 2; do\n    echo $b\n  done\ndone";
-        let (steps, brackets) = bracketed(source);
-        assert_eq!(steps, 2, "{brackets:?}");
+        let (brackets, indents) = bracketed(source);
         assert_eq!(brackets.len(), 2, "{brackets:?}");
-        assert_eq!(brackets[0].2, 0);
-        assert_eq!(brackets[1].2, 1);
-        // And the inner one really is inside the outer one, which is what the
-        // step is claiming.
+        // The inner loop really is inside the outer one.
         assert!(brackets[0].0 <= brackets[1].0 && brackets[1].1 <= brackets[0].1);
+        // The innermost line is two levels in, and nothing is deeper than the
+        // nesting the parse found.
+        assert_eq!(indents.iter().copied().max(), Some(2), "{indents:?}");
+        assert_eq!(indents[0], 0, "the outer `for` is at the margin: {indents:?}");
+        assert_eq!(indents[indents.len() - 1], 0, "and so is its `done`: {indents:?}");
     }
 
     #[test]
@@ -3577,50 +3624,99 @@ mod tests {
         // lines and does get one. A block that stays on one line after
         // segmentation has nothing to bracket: the mark would open and close
         // on the same row and say what the row already says.
-        let (_, several) = bracketed("{ a; b; }");
+        let (several, _) = bracketed("{ a; b; }");
         assert_eq!(several.len(), 1, "{several:?}");
-        let (steps, none) = bracketed("(true)");
+        let (none, indents) = bracketed("(true)");
         assert_eq!(none, vec![], "a subshell on one line drew a bracket");
-        assert_eq!(steps, 0);
+        assert!(indents.iter().all(|indent| *indent == 0), "{indents:?}");
     }
 
     #[test]
-    fn two_constructs_over_the_same_lines_are_two_brackets_side_by_side() {
-        // A subshell wrapping nothing but a loop covers exactly the lines the
-        // loop does. Both are real and both are drawn, so the gutter has to
-        // say there are two of them — which is what a column each is for.
+    fn two_constructs_over_the_same_lines_are_one_bracket() {
+        // A subshell holding nothing but a loop covers exactly the lines the
+        // loop does. Two strokes would be drawn on the same pixels, and two
+        // counts would indent the body twice for one step a reader can see.
         let source = "(for x in a b; do\n  echo $x\ndone)";
-        let (steps, brackets) = bracketed(source);
-        assert_eq!(steps, 2, "{brackets:?}");
-        assert_eq!(brackets.len(), 2, "{brackets:?}");
-        assert_eq!(brackets[0].2, 0);
-        assert_eq!(brackets[1].2, 1);
-        assert_eq!(
-            (brackets[0].0, brackets[0].1),
-            (brackets[1].0, brackets[1].1),
-            "the two cover the same lines, so neither may be shortened to fit"
+        let (brackets, indents) = bracketed(source);
+        assert_eq!(brackets.len(), 1, "{brackets:?}");
+        assert_eq!(indents.iter().copied().max(), Some(1), "the body was indented twice over");
+        // And both constructs are still legible, because both words are on
+        // the line the bracket opens on.
+        let shown = drawn_lines(source);
+        assert!(shown[brackets[0].0].contains('('), "{shown:?}");
+        assert!(shown[brackets[0].0].contains("for"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_one_line_loop_indents_its_body_and_nothing_else() {
+        // The shape this was reported on: a loop written on one line, where
+        // every drawn line comes from a separator rather than a newline. It
+        // used to draw every one of them one column in, which said "nested"
+        // about the commands before and after the loop as loudly as about the
+        // ones inside it.
+        let source = "for i in $(seq 40); do test -S a && break; sleep 1; done; echo up";
+        let shown = drawn_lines(source);
+        let (brackets, indents) = bracketed(source);
+        assert_eq!(brackets.len(), 1, "{brackets:?}");
+
+        // The loop's own words sit at the margin, and so does what follows it.
+        let opens = shown.iter().position(|line| line.contains("for i")).expect("the for line");
+        let closes = shown.iter().position(|line| line.starts_with("done")).expect("the done line");
+        let after = shown.iter().position(|line| line.contains("echo up")).expect("the last line");
+        assert_eq!(indents[opens], 0, "{shown:?} {indents:?}");
+        assert_eq!(indents[closes], 0, "{shown:?} {indents:?}");
+        assert_eq!(indents[after], 0, "a command after the loop was drawn inside it");
+
+        // And everything between them is inside it, exactly once.
+        assert!(
+            indents[opens + 1..closes].iter().all(|indent| *indent == 1),
+            "{shown:?} {indents:?}"
+        );
+        // No drawn line begins with the space its separator left behind.
+        assert!(
+            shown.iter().all(|line| !line.starts_with(' ')),
+            "a line still opens on the separator's blank: {shown:?}"
         );
     }
 
     #[test]
-    fn a_step_names_a_column_a_reader_can_count() {
-        // Every step from zero up to the widest one in use is occupied by
-        // some bracket. A gutter three columns wide with nothing in the
-        // middle column would be counting blocks the reader cannot see.
+    fn indentation_never_skips_a_level() {
+        // A reader reads depth off the left edge, so a step from one line to
+        // the next has to be a step they can account for. Two levels at once
+        // would be a jump to a column with nothing above it.
         for source in [
             "for x in a b; do\n  echo $x\ndone",
             "for a in 1; do\n  for b in 2; do\n    echo $b\n  done\ndone",
             "(for x in a b; do\n  echo $x\ndone)",
             "while read -r l; do\n  case $l in\n    a) echo 1;;\n  esac\ndone",
+            "R=/a; P=/b",
         ] {
-            let (steps, brackets) = bracketed(source);
-            for step in 0..steps {
+            let (_, indents) = bracketed(source);
+            for pair in indents.windows(2) {
                 assert!(
-                    brackets.iter().any(|(_, _, at)| *at == step),
-                    "step {step} of {steps} is empty in {source:?}: {brackets:?}"
+                    pair[1] <= pair[0] + 1,
+                    "indentation jumped from {} to {} in {source:?}: {indents:?}",
+                    pair[0],
+                    pair[1]
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_separator_alone_indents_nothing() {
+        // The complaint this answers: every line after a `;` used to start
+        // one column in, whether or not it was inside anything, because the
+        // space the author typed after the separator became that line's first
+        // character. Two commands in a row are not nested and are drawn as
+        // they are.
+        let (brackets, indents) = bracketed("R=/a; P=/b; echo done");
+        assert_eq!(brackets, vec![]);
+        assert_eq!(indents, vec![0, 0, 0], "a sibling command was indented");
+        // And the blanks are still on screen, at the end of the line their
+        // separator ends.
+        let shown = drawn_lines("R=/a; P=/b");
+        assert_eq!(shown, vec!["R=/a; ", "P=/b"]);
     }
 
     #[test]
@@ -4969,7 +5065,7 @@ mod tests {
         assert_eq!(widest_line(&classify("ls -l")), 5);
         assert_eq!(
             widest_line(&render_command("ls -l; rm -rf target", &BTreeMap::new())),
-            " rm -rf target".chars().count(),
+            "rm -rf target".chars().count(),
             "the two segments are two lines and the longer one wins"
         );
         // A chip is one character in the command and one or five on screen.
@@ -5057,8 +5153,8 @@ mod tests {
         assert_eq!(rows_of(&raw), vec![(0, 0), (7, 1)], "the raw pane breaks only at the newline");
         assert_eq!(
             rows_of(&annotated),
-            vec![(0, 0), (3, 1), (7, 2)],
-            "the annotated pane breaks at the `;` too"
+            vec![(0, 0), (4, 1), (7, 2)],
+            "the annotated pane breaks at the `;` too, after the space it left"
         );
         assert_eq!((raw.rows, annotated.rows), (2, 3));
     }
