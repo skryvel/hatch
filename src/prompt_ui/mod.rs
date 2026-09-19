@@ -8670,7 +8670,98 @@ mod tests {
         assert!(drawn.contains("name[RLO]txt"), "{drawn}");
         assert!(!drawn.contains('\u{202E}') && !drawn.contains('\u{200B}'), "{drawn}");
         assert!(drawn.contains("output cap cut it short"), "a cut capture read as the whole: {drawn}");
-        assert!(drawn.contains("It printed nothing here."), "{drawn}");
+        // The stream the command never wrote to is accounted for rather
+        // than silently absent. One pane where there are normally two has to
+        // be readable as "it printed nothing" and not as "hatch is not
+        // showing you this", on a screen whose whole subject is what is and
+        // is not passed on.
+        assert!(drawn.contains("stderr: the command printed nothing there"), "{drawn}");
+        assert!(
+            !drawn.contains("stderr — 0 of 0 lines"),
+            "an empty stream still took a pane's worth of screen: {drawn}"
+        );
+    }
+
+    /// The same review with `stderr` never written to, which is what most
+    /// commands leave behind.
+    fn a_review_with_nothing_on_stderr() -> Review {
+        let mut review = a_review();
+        review.output = crate::review::Sections::Streams {
+            stdout: crate::review::Captured {
+                text: "ok: one\ntoken=hunter2\nok: two\n".to_string(),
+                truncated: false,
+            },
+            stderr: crate::review::Captured { text: String::new(), truncated: false },
+        };
+        review
+    }
+
+    #[test]
+    fn the_stream_a_command_never_wrote_to_gives_its_half_of_the_screen_back() {
+        // Widths off real frames, because the thing being tested is a
+        // layout: `ui.columns` is told how many panes there are, and a pane
+        // that was merely skipped in the loop would leave its column behind
+        // as empty screen.
+        let widest = |review: Review| {
+            let (mut app, _sink) = a_reviewing_window_of(review);
+            let ctx = egui::Context::default();
+            apply_faces(&ctx);
+            apply_font_size(&ctx, 16.0);
+            let shapes = a_settled_frame(&mut app, &ctx, past_the_guard());
+            stroked_rects(&shapes)
+                .into_iter()
+                .map(|(rect, _)| rect.width())
+                .fold(0.0_f32, f32::max)
+        };
+
+        let both = widest(a_review());
+        let one = widest(a_review_with_nothing_on_stderr());
+        assert!(
+            one > both * 1.5,
+            "the empty stream kept its column: one pane {one}, two panes {both}"
+        );
+    }
+
+    #[test]
+    fn hiding_an_empty_pane_changes_nothing_about_what_is_sent() {
+        // The one way this could have gone wrong. The daemon reads a release
+        // against the capture it is about and refuses a shape that does not
+        // match -- see `Reviewed::of` -- so a window that stopped sending a
+        // section because it stopped drawing it would have every review of a
+        // quiet command released as nothing.
+        let (mut app, sink) = a_reviewing_window_of(a_review_with_nothing_on_stderr());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let send = drawn_at(&mut app, &ctx, reviewing::SEND_LABEL, now).expect("Send is not drawn");
+        click_at(&mut app, &ctx, send.center(), now);
+
+        let Some(Release::Send { output, .. }) = the_release(&sink) else { panic!("nothing sent") };
+        let crate::review::Sections::Streams { stdout, stderr } = output else {
+            panic!("the release changed shape with the drawing");
+        };
+        assert_eq!(stdout, "ok: one\ntoken=hunter2\nok: two\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn a_command_that_printed_nothing_at_all_still_draws_a_review() {
+        // `ui.columns(0, ..)` divides the width by zero. A command that runs
+        // and prints on neither stream is ordinary, and the review of it is
+        // a real question: the reader still chooses whether the agent is
+        // told the command ran.
+        let mut review = a_review();
+        review.output = crate::review::Sections::Streams {
+            stdout: crate::review::Captured { text: String::new(), truncated: false },
+            stderr: crate::review::Captured { text: String::new(), truncated: false },
+        };
+        let (mut app, _sink) = a_reviewing_window_of(review);
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(drawn.contains("stdout: the command printed nothing there"), "{drawn}");
+        assert!(drawn.contains("stderr: the command printed nothing there"), "{drawn}");
+        assert!(drawn.contains(reviewing::SEND_LABEL), "there is nothing left to answer with: {drawn}");
     }
 
     #[test]

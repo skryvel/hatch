@@ -85,6 +85,16 @@ pub const WITHHOLD_LABEL: &str = "Send nothing";
 /// What happens when the review clock runs out, said beside it.
 pub const EXPIRY: &str = "When it runs out, nothing is sent.";
 
+/// What is said in place of a pane for a stream the command never wrote to.
+///
+/// It names the stream and says the command is the reason it is empty. The
+/// distinction it carries is the whole point of drawing anything at all: a
+/// missing pane could mean hatch withheld something, and this is a screen
+/// whose entire subject is what is and is not being passed on.
+fn nothing_printed(section: Section) -> String {
+    format!("{}: the command printed nothing there, so there is no pane for it.", section.name())
+}
+
 /// The label on the note field.
 ///
 /// The same words as the field beside the verdict, because it is the same
@@ -489,11 +499,32 @@ impl PromptApp {
             .map(|counts| counts.iter().map(|(_, lines)| *lines).collect());
         let captured: Vec<(Section, Captured)> =
             review.output.iter().map(|(section, captured)| (section, captured.clone())).collect();
-        let count = captured.len();
-        ui.columns(count, |columns| {
-            for (index, (column, (section, captured))) in
-                columns.iter_mut().zip(&captured).enumerate()
-            {
+
+        // A pane over nothing is a column of empty screen where the output
+        // the reader is actually deciding about could have been. The index
+        // is carried along because `released` and `redacted` are parallel to
+        // the *whole* capture, not to what is drawn of it.
+        let drawn: Vec<usize> =
+            (0..captured.len()).filter(|&index| !captured[index].1.text.is_empty()).collect();
+        for (section, _) in captured.iter().filter(|(_, c)| c.text.is_empty()) {
+            // Said, and not merely left out. A reader looking at one pane
+            // where there are normally two has to be able to tell "the
+            // command printed nothing there" from "hatch is not showing you
+            // this", and only one of those is true.
+            ui.label(
+                egui::RichText::new(nothing_printed(*section))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+        // Nothing is still nothing: the command ran and printed on neither
+        // stream, and `ui.columns(0, ..)` divides the width by zero.
+        if drawn.is_empty() {
+            return;
+        }
+        ui.columns(drawn.len(), |columns| {
+            for (column, &index) in columns.iter_mut().zip(&drawn) {
+                let (section, captured) = &captured[index];
                 let sent = released.as_ref().map(|texts| texts[index].as_str());
                 let changed = redacted.as_ref().map(|counts| counts[index]);
                 self.section_pane(column, *section, captured, sent, changed);
@@ -621,11 +652,15 @@ impl PromptApp {
             }
             let Some(sent) = sent else { return };
             if sent.is_empty() {
-                let said = match captured.text.is_empty() {
-                    true => "It printed nothing here.",
-                    false => "None of this will be sent.",
-                };
-                ui.label(egui::RichText::new(said).color(ui.visuals().weak_text_color()));
+                // One reason only. A section the command printed nothing on
+                // has no pane to say it in -- see `nothing_printed`, which
+                // says it instead -- so everything that reaches here is a
+                // section the *filters* emptied, which is a thing the reader
+                // did and needs to see they did.
+                ui.label(
+                    egui::RichText::new("None of this will be sent.")
+                        .color(ui.visuals().weak_text_color()),
+                );
                 return;
             }
             // Revealed line by line, so a character that would draw as
