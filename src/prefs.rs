@@ -57,7 +57,7 @@
 //! so a reader sees either the whole of the old file or the whole of the new
 //! one and never a truncated one.
 //!
-//! What the rename does not do is merge, and there are three preferences in
+//! What the rename does not do is merge, and there are several preferences in
 //! the file now rather than one — which is the case an earlier version of
 //! this paragraph left a note about. A window that serialized its own struct
 //! would write back its own stale copy of the other two, undoing a change the
@@ -89,7 +89,7 @@ use crate::paths::Paths;
 /// preference is added — and, just as importantly, a file written by a *newer*
 /// build loads here without its unknown keys stopping anything. Every default
 /// is `false`, which is not an accident of the derive: the file's absence and
-/// the file saying "no to all three" have to be the same window, because a
+/// the file saying "no to every one of them" have to be the same window, because a
 /// first run and an unreadable file both produce the absence.
 ///
 /// # What may go in here, and the one that nearly may not
@@ -162,6 +162,33 @@ pub struct Prefs {
     /// again each time is the kind of friction that ends in nobody checking
     /// anything.
     pub show_original: bool,
+    /// Whether a finished command's output waits on the reader's screen
+    /// before it reaches the agent.
+    ///
+    /// Written by the "Show me the output before it is sent" checkbox. An
+    /// earlier version of this struct refused it, on the ground that whether
+    /// *this* command's output might carry something that must not leave the
+    /// machine is a judgement about this command, read on the screen -- `cat`
+    /// on a file with a key in it, and not `ls` on the directory it is in.
+    ///
+    /// It is here because that argument turned out to describe a use nobody
+    /// has. In practice a person who wants to read what goes back wants to
+    /// read it, and having to say so again on every window is the friction
+    /// that ends in nobody reading anything -- the same argument
+    /// `show_original` makes.
+    ///
+    /// What a remembered tick costs, and it is real: every approved run now
+    /// waits for a second answer before the agent hears anything, so every
+    /// call blocks for however long the reader takes to come back to it, up
+    /// to [`crate::config::Config::review_timeout_secs`].
+    ///
+    /// What it cannot do is let anything *out*. A remembered `true` only ever
+    /// puts more output in front of a person, and every ending that is not an
+    /// answer -- the deadline included -- withholds. That is the opposite
+    /// direction from `terminal`, which is why this one does not need
+    /// `terminal`'s paragraph of hedging: the way this preference fails is
+    /// that an agent is told less than it could have been.
+    pub review: bool,
     /// Whether the command should be given a terminal of its own.
     ///
     /// Written by the "Run it in a terminal" checkbox. **Not a display
@@ -449,22 +476,38 @@ mod tests {
 
     #[test]
     fn every_box_is_remembered_on_its_own_and_none_of_them_is_the_default() {
-        // Three preferences, three keys, and a default of `false` for each:
-        // the file's absence and the file saying no to all three have to be
-        // the same window, because a first run produces the absence.
+        // One key per box, and a default of `false` for each: the file's
+        // absence and the file saying no to all of them have to be the same
+        // window, because a first run produces the absence. Every field is
+        // written out rather than spread from a default, so a box added
+        // later cannot join the file without a test saying what it does when
+        // nobody has ever ticked it.
         let (_root, paths) = a_layout();
         let file = PrefsFile::at(&paths);
         assert_eq!(file.read(), Prefs::default());
         assert_eq!(
             Prefs::default(),
-            Prefs { close_on_decide: false, stream: false, terminal: false, show_original: false }
+            Prefs {
+                close_on_decide: false,
+                stream: false,
+                terminal: false,
+                show_original: false,
+                review: false,
+            }
         );
 
-        file.write(&Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false });
+        let every = Prefs {
+            close_on_decide: true,
+            stream: true,
+            terminal: true,
+            show_original: true,
+            review: true,
+        };
+        file.write(&every);
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false },
-            "a fresh window did not read back all three"
+            every,
+            "a fresh window did not read back every box"
         );
     }
 
@@ -480,6 +523,7 @@ mod tests {
             stream: true,
             terminal: false,
             show_original: false,
+            review: true,
         });
 
         // A second window that opened before any of that and knows nothing
@@ -488,7 +532,13 @@ mod tests {
 
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: true, terminal: true, show_original: false },
+            Prefs {
+                close_on_decide: true,
+                stream: true,
+                terminal: true,
+                show_original: false,
+                review: true,
+            },
             "a window writing one box trampled the others"
         );
     }
@@ -503,7 +553,13 @@ mod tests {
         PrefsFile::at(&paths).update(|prefs| prefs.stream = true);
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: false, stream: true, terminal: false, show_original: false }
+            Prefs {
+                close_on_decide: false,
+                stream: true,
+                terminal: false,
+                show_original: false,
+                review: false,
+            }
         );
     }
 

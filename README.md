@@ -88,7 +88,7 @@ same thing.*
   `Shift+Enter` approves, `Esc` denies, and `Alt+S`, `Alt+C` and `Alt+R` work
   the three boxes.
   Tick *Close when I decide* once and it is remembered, along with whether you
-  stream and whether you want a terminal. Once the command is running the note
+  stream, whether you want a terminal and whether you read the output first. Once the command is running the note
   field is gone and bare letters are free, so `e`, `o` or Space keeps the
   window — during the run or after it — `Alt+C` takes the output and `Esc`
   closes the window when there is nothing left running in it.
@@ -707,15 +707,27 @@ through the agent whatever model provider it talks to. There was no way to
 approve `cat` on a file with one secret in it. **Show me the output before it
 is sent**, on the row beside the terminal box, is that way.
 
-**It is off by default and never remembered.** Its three neighbours are written
-to `prefs.toml`; this one opens unticked in every window. It is a judgement
-about the command on the screen — `cat` on a file with a key in it, not `ls` on
-its directory — and a reviewed run waits for a second answer before the agent
-hears anything, so a tick that persisted would quietly turn every later
-approval into two decisions. It applies to commands only: a write returns no
-output. Ticked, it greys **Close when I decide** with *You asked to see its
-output first.*, because a window that has gone cannot ask, and a run under
-review offers no Keep, because it does not end in a viewer.
+**It is off by default and remembered once you tick it**, like its three
+neighbours. It was not, for a long time, and the argument against was a good
+one: whether *this* command's output might carry something that must not leave
+the machine is a judgement about this command — `cat` on a file with a key in
+it, not `ls` on its directory — and a reviewed run waits for a second answer
+before the agent hears anything, so a tick that persisted would put a person in
+the return path of every call afterwards.
+
+What changed is use. Somebody who wants to read what goes back wants to read
+it, and a tick they must make again on every window is the friction that ends
+in nobody reading anything. The cost is real and the window says it rather than
+hiding it: a remembered tick greys **Close when I decide** with *You read every
+run's output first, so every run waits for you.* — different words from the
+*You asked to see its output first.* you get when you ticked it here, because
+only one of those is true about a window you have not read yet.
+
+What a remembered tick cannot do is let anything out. It only ever puts more
+output in front of a person, and every ending that is not an answer — the
+review deadline included — sends nothing. It applies to commands only: a write
+returns no output. A run under review offers no Keep, because it does not end
+in a viewer.
 
 **When the command finishes, the window shows its output as it will go.**
 stdout and stderr are two panes, side by side, each captioned with how many of
@@ -1199,7 +1211,7 @@ which is also what the XDG spec asks for: state that persists between restarts
 belongs under the state directory.
 
 Nothing about it can stop a window opening. A missing, unreadable or malformed
-`prefs.toml` is a window with all three at their defaults — refusing to open one
+`prefs.toml` is a window with every box at its default — refusing to open one
 would resolve as a denial of a request nobody was ever shown — and the next tick
 rewrites the file. Several windows can be open at once and two of them saving in
 the same instant is ordinary; each write reads the file, changes the one box

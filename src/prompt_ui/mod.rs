@@ -395,10 +395,24 @@ const CLOSE_WATCHING_ALWAYS: &str = "You stream every run.";
 /// window that has gone cannot show the output, and the output then goes
 /// nowhere at all rather than to the reader, so the tick would not merely lose
 /// a view — it would lose the output. Only one sentence, where streaming has
-/// two, because the box it is about is never remembered: whoever ticked it did
-/// so in front of this command. Measured with the others in
+/// two sentences, and it has two for the same reason they do: see
+/// [`CLOSE_REVIEWING_ALWAYS`]. Measured with the others in
 /// [`PromptApp::close_width`], so that ticking it cannot move the buttons.
 const CLOSE_REVIEWING: &str = "You asked to see its output first.";
+
+/// The same greyed box, when nobody chose it in front of this command.
+///
+/// [`CLOSE_WATCHING_ALWAYS`]'s reason, for the box beside it: reviewing is
+/// remembered now, so "you asked to see its output first" is a sentence that
+/// can be false about a window whose command the reader has not read yet.
+/// It carries the cost as well as the choice, which its streaming
+/// counterpart does not have to: a remembered stream changes what the reader
+/// sees, and a remembered review puts a person back in the return path of
+/// every approved run. The agent's call waits for a second answer each time.
+/// That was the whole argument against remembering this box, and the answer
+/// to it is that the window says so rather than that the tick is forgotten.
+const CLOSE_REVIEWING_ALWAYS: &str =
+    "You read every run's output first, so every run waits for you.";
 
 /// What the running window says once the reader has kept it.
 ///
@@ -1652,29 +1666,33 @@ pub(crate) struct PromptApp {
     terminal: bool,
     /// The Show me the output before it is sent checkbox.
     ///
-    /// # Why this one is not remembered
+    /// # Why this one is remembered, having once not been
     ///
-    /// Its three neighbours are written to `prefs.toml` the moment they are
-    /// clicked, and this one never is, and it opens unticked in every window.
-    /// Two reasons, and either would be enough.
+    /// Remembered, like the other three, and this was argued the other way
+    /// for a long time: whether *this* command's output might carry
+    /// something that must not leave the machine is a judgement about this
+    /// command, read on the screen -- `cat` on a file with a key in it, and
+    /// not `ls` on the directory it is in.
     ///
-    /// **It is a choice about the command on the screen.** The other three
-    /// are standing preferences about how a person likes their windows — watch
-    /// the output, get out of the way, give things a terminal — and they are
-    /// right for the next command as often as for this one. Whether this
-    /// command's output might carry something that must not leave the machine
-    /// is a judgement about this command, made reading it: `cat` on a file
-    /// with a key in it, and not `ls` on the directory it is in.
+    /// What settled it was use. A person who wants to read what goes back
+    /// wants to read it, and a tick they have to make again on every window
+    /// is the friction that ends in nobody reading anything.
     ///
-    /// **Reviewing puts a person back in the return path.** Every reviewed
-    /// run waits for a second answer before the agent hears anything, up to
-    /// the approval's own ten minutes. Remembered, one tick on one sensitive
-    /// command would turn every later approval into two decisions and every
-    /// later call into one that blocks for however long the reader takes to
-    /// get back to it; the fast path would stop being fast for a reason
-    /// nobody could see on the screen. So it costs one click, each time, on
-    /// the command it is for.
+    /// **Reviewing puts a person back in the return path**, and a remembered
+    /// tick does that to every run: each one waits for a second answer
+    /// before the agent hears anything, so each call blocks for as long as
+    /// the reader takes to come back to it. That cost is real and is the
+    /// reason this is drawn as loudly as it is -- see
+    /// [`REVIEW_EVERY_RUN`], which is what the window says about a tick it
+    /// did not get in front of this command.
+    ///
+    /// It cannot let anything out. See [`crate::prefs::Prefs::review`], and
+    /// [`CLOSE_REVIEWING_ALWAYS`] for what the window says about a tick it
+    /// did not get in front of this command.
     review: bool,
+    /// Whether the tick above came out of the file rather than out of this
+    /// window, on the same terms as [`PromptApp::stream_is_remembered`].
+    review_is_remembered: bool,
     /// What the reader has done to the output under review, once there is
     /// one. See [`reviewing::Draft`].
     draft: reviewing::Draft,
@@ -1723,10 +1741,11 @@ impl PromptApp {
             stream: remembered.stream,
             show_original: remembered.show_original,
             stream_is_remembered: remembered.stream,
+            review_is_remembered: remembered.review,
             close_on_decide: remembered.close_on_decide,
             prefs,
             terminal: remembered.terminal,
-            review: false,
+            review: remembered.review,
             draft: reviewing::Draft::default(),
             note: String::new(),
             guard: Guard::new(Instant::now()),
@@ -2365,11 +2384,11 @@ impl PromptApp {
                 // Dead, or never drawn. Either way nothing is written down.
                 false => self.refused = Some((toggle, Instant::now())),
             },
-            // Nothing is written down either way: this box is the one of the
-            // four that is never remembered, so there is no preference to
-            // set and none to leave alone. See `PromptApp::review`.
+            // Through the same setter the click goes through, so the
+            // keyboard and the mouse cannot end up remembering different
+            // things -- which is this method's whole claim.
             guard::Toggle::Review => match self.runs() {
-                true => self.review = !self.review,
+                true => self.set_review(!self.review),
                 // A write prints nothing, so there is no output to hold back
                 // and no box on screen to have pressed.
                 false => self.refused = Some((toggle, Instant::now())),
@@ -3011,7 +3030,8 @@ impl PromptApp {
             + 4.0 * ui.spacing().item_spacing.x;
 
         let mut changed = false;
-        let review = &mut self.review;
+        let mut review_changed = false;
+        let mut reviewing_now = self.review;
         // `beside` is whether the row is one row: the gap is a distance along
         // it, and in the stacked fallback it would be a blank line instead.
         let mut controls = |ui: &mut egui::Ui, beside: bool| {
@@ -3027,10 +3047,12 @@ impl PromptApp {
             }
             // Not written down when it changes, unlike the box before it: see
             // `PromptApp::review` for why this one is never remembered.
-            ui.add(egui::Checkbox::new(
-                review,
-                with_chord(egui::RichText::new(REVIEW_LABEL), guard::REVIEW_CHORD),
-            ));
+            review_changed = ui
+                .add(egui::Checkbox::new(
+                    &mut reviewing_now,
+                    with_chord(egui::RichText::new(REVIEW_LABEL), guard::REVIEW_CHORD),
+                ))
+                .changed();
         };
         if width <= ui.available_width() {
             centred_row(ui, width, |ui| controls(ui, true));
@@ -3055,6 +3077,13 @@ impl PromptApp {
             if changed {
                 self.prefs.update(|prefs| prefs.terminal = ticked);
             }
+        }
+        // Written down on the click, like the other three, and only on a
+        // click: `set_review` is also what clears the "this came out of the
+        // file" flag, and a window that called it every frame would report a
+        // remembered tick as one made in front of this command.
+        if review_changed {
+            self.set_review(reviewing_now);
         }
     }
 
@@ -3177,17 +3206,31 @@ impl PromptApp {
         //
         // Reviewing is asked first. Both are grey for the same reason, and
         // this is the one chosen in front of this command every time.
-        let said = match (live, self.reviews(), self.stream_is_remembered) {
+        let said = match (live, self.reviews(), self.review_is_remembered) {
             (true, _, _) => CLOSE_COST,
-            (false, true, _) => CLOSE_REVIEWING,
-            (false, false, false) => CLOSE_WATCHING,
-            (false, false, true) => CLOSE_WATCHING_ALWAYS,
+            (false, true, true) => CLOSE_REVIEWING_ALWAYS,
+            (false, true, false) => CLOSE_REVIEWING,
+            (false, false, _) => match self.stream_is_remembered {
+                false => CLOSE_WATCHING,
+                true => CLOSE_WATCHING_ALWAYS,
+            },
         };
         let colour = match self.refusing(guard::Toggle::Close) {
             true => ui.visuals().warn_fg_color,
             false => ui.visuals().weak_text_color(),
         };
         ui.label(egui::RichText::new(said).small().color(colour));
+    }
+
+    /// Take the reader's answer about reviewing, and write it down.
+    ///
+    /// [`PromptApp::set_stream`]'s reasons, for the third box.
+    fn set_review(&mut self, ticked: bool) {
+        self.review = ticked;
+        // They have now said something about this command, so the sentence
+        // under the close box is about this command again.
+        self.review_is_remembered = false;
+        self.prefs.update(|prefs| prefs.review = ticked);
     }
 
     /// Take the reader's answer about closing, and write it down.
@@ -7500,10 +7543,11 @@ mod tests {
     }
 
     #[test]
-    fn the_review_chord_ticks_the_box_and_writes_nothing_down() {
-        // The one box of the four that is never remembered, so the chord for
-        // it must not start remembering it: a standing "hold every command's
-        // output" is a decision nobody made per command.
+    fn the_review_chord_ticks_the_box_and_writes_it_down() {
+        // The chord and the click are one control, so they go through one
+        // setter. A chord that ticked the box without writing it down would
+        // leave the window and the file disagreeing about a standing choice,
+        // with nothing on screen saying which one the next window will get.
         let (_root, paths) = a_prefs_file();
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         let ctx = egui::Context::default();
@@ -7515,14 +7559,16 @@ mod tests {
         assert!(app.reviews(), "Alt+R did not reach the box");
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs::default(),
-            "the review chord wrote a preference that outlives this window"
+            Prefs { review: true, ..Prefs::default() },
+            "the chord ticked the box without writing it down, or wrote more than the one box"
         );
 
         // And back, because a chord that could only ever tick would be half a
-        // control.
+        // control -- and because turning a standing choice off has to be as
+        // cheap as turning it on.
         a_live_frame(&mut app, &ctx, vec![chord(egui::Key::R, egui::Modifiers::ALT)], now);
         assert!(!app.reviews(), "the untick did not reach the box");
+        assert!(!PrefsFile::at(&paths).read().review, "the untick did not reach the file");
     }
 
     #[test]
@@ -7706,6 +7752,7 @@ mod tests {
             close_on_decide: true,
             terminal: false,
             show_original: false,
+            review: false,
         });
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
@@ -7806,7 +7853,13 @@ mod tests {
         app.set_close_on_decide(true);
         assert_eq!(
             PrefsFile::at(&paths).read(),
-            Prefs { close_on_decide: true, stream: false, terminal: true, show_original: false },
+            Prefs {
+                close_on_decide: true,
+                stream: false,
+                terminal: true,
+                show_original: false,
+                review: false,
+            },
             "this window trampled what the one beside it saved"
         );
     }
@@ -7873,7 +7926,13 @@ mod tests {
         // window that closed on a tick nobody could see would be deciding
         // something no control on it admits to.
         let (_root, paths) = a_prefs_file();
-        let stored = Prefs { close_on_decide: true, stream: true, terminal: false, show_original: false };
+        let stored = Prefs {
+            close_on_decide: true,
+            stream: true,
+            terminal: false,
+            show_original: false,
+            review: false,
+        };
         PrefsFile::at(&paths).write(&stored);
         let (mut app, sink) = a_write_window_remembering(PrefsFile::at(&paths));
         let ctx = egui::Context::default();
@@ -8410,21 +8469,68 @@ mod tests {
     }
 
     #[test]
-    fn ticking_the_review_box_is_remembered_by_nothing() {
-        // The one box on the window that is not a preference: it is about
-        // this command. Clicked on a real frame, it asks for a review, and
-        // neither the file nor the next window knows it ever did.
+    fn ticking_the_review_box_is_remembered_and_unticking_it_is_too() {
+        // Clicked on a real frame, so what is being tested is the box and
+        // not the setter behind it.
         let (_root, paths) = a_prefs_file();
-        let stored = Prefs { close_on_decide: false, stream: true, terminal: false, show_original: false };
+        let stored = Prefs {
+            close_on_decide: false,
+            stream: true,
+            terminal: false,
+            show_original: false,
+            review: false,
+        };
         PrefsFile::at(&paths).write(&stored);
         let (app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
 
         assert!(app.reviews(), "the click did not reach the box");
         assert!(matches!(app.approval(), Verdict::Approve { review: true, .. }), "{:?}", app.approval());
-        assert_eq!(PrefsFile::at(&paths).read(), stored, "a review was written down as a preference");
+        assert_eq!(
+            PrefsFile::at(&paths).read(),
+            Prefs { review: true, ..stored },
+            "the tick reached the file, or reached more of it than the one box"
+        );
 
         let (next, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
-        assert!(!next.reviews(), "the next window opened already reviewing");
+        assert!(next.reviews(), "the next window did not open reviewing");
+
+        // And back off again. A preference that could only ever be turned on
+        // would be one the window offers no way out of.
+        let (after, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
+        assert!(!after.reviews(), "the second click did not untick it");
+        assert!(!PrefsFile::at(&paths).read().review, "unticking it was not written down");
+    }
+
+    #[test]
+    fn a_remembered_review_says_it_is_a_standing_choice_and_what_it_costs() {
+        // The whole argument against remembering this box was that a tick
+        // made on one sensitive command would silently put a person in the
+        // return path of every call afterwards. It is remembered now, so the
+        // answer has to be that the window says so -- on a window whose
+        // command the reader has not read yet, in words that are true of a
+        // choice made some other day.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { review: true, ..Prefs::default() });
+        let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
+        let drawn = window_text_sized(&mut app, opening_size());
+
+        assert!(app.reviews(), "the file's tick did not reach the window");
+        assert!(drawn.contains(CLOSE_REVIEWING_ALWAYS), "{drawn}");
+        assert!(
+            drawn.contains("waits for you"),
+            "the standing tick does not say what it costs: {drawn}"
+        );
+        assert!(
+            !drawn.contains(CLOSE_REVIEWING),
+            "it claimed the reader asked for this one: {drawn}"
+        );
+
+        // And once they touch the box, it is about this command again.
+        let (mut mine, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
+        mine.set_review(true);
+        let drawn = window_text_sized(&mut mine, opening_size());
+        assert!(drawn.contains(CLOSE_REVIEWING), "{drawn}");
+        assert!(!drawn.contains(CLOSE_REVIEWING_ALWAYS), "{drawn}");
     }
 
     #[test]
