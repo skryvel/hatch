@@ -3007,7 +3007,7 @@ impl PromptApp {
             }
             + PRIMARY_GAP
             + checkbox
-            + text_width(ui, REVIEW_LABEL, egui::TextStyle::Button)
+            + keyed_width(ui, REVIEW_LABEL, guard::REVIEW_CHORD)
             + 4.0 * ui.spacing().item_spacing.x;
 
         let mut changed = false;
@@ -3027,7 +3027,10 @@ impl PromptApp {
             }
             // Not written down when it changes, unlike the box before it: see
             // `PromptApp::review` for why this one is never remembered.
-            ui.checkbox(review, REVIEW_LABEL).on_hover_text(guard::REVIEW_CHORD);
+            ui.add(egui::Checkbox::new(
+                review,
+                with_chord(egui::RichText::new(REVIEW_LABEL), guard::REVIEW_CHORD),
+            ));
         };
         if width <= ui.available_width() {
             centred_row(ui, width, |ui| controls(ui, true));
@@ -3063,9 +3066,13 @@ impl PromptApp {
     fn stream_box(&mut self, ui: &mut egui::Ui, can_stream: bool) {
         let mut ticked = self.streams();
         let changed = ui
-            .add_enabled(can_stream, egui::Checkbox::new(&mut ticked, STREAM_LABEL))
-            .on_hover_text(guard::STREAM_CHORD)
-            .on_disabled_hover_text(guard::STREAM_CHORD)
+            .add_enabled(
+                can_stream,
+                egui::Checkbox::new(
+                    &mut ticked,
+                    with_chord(egui::RichText::new(STREAM_LABEL), guard::STREAM_CHORD),
+                ),
+            )
             .changed();
         if changed {
             self.set_stream(ticked);
@@ -3125,7 +3132,7 @@ impl PromptApp {
         let box_ = ui.spacing().icon_width + ui.spacing().icon_spacing;
         // `Button` and not `Body`: that is the style a checkbox draws its own
         // label in.
-        let label = text_width(ui, STREAM_LABEL, egui::TextStyle::Button);
+        let label = keyed_width(ui, STREAM_LABEL, guard::STREAM_CHORD);
         let dead = match self.in_a_terminal() {
             true => {
                 ui.spacing().item_spacing.x
@@ -3153,9 +3160,13 @@ impl PromptApp {
         let live = !self.streams() && !self.reviews();
         let mut ticked = self.closes_on_decide();
         let changed = ui
-            .add_enabled(live, egui::Checkbox::new(&mut ticked, CLOSE_LABEL))
-            .on_hover_text(guard::CLOSE_CHORD)
-            .on_disabled_hover_text(guard::CLOSE_CHORD)
+            .add_enabled(
+                live,
+                egui::Checkbox::new(
+                    &mut ticked,
+                    with_chord(egui::RichText::new(CLOSE_LABEL), guard::CLOSE_CHORD),
+                ),
+            )
             .changed();
         if changed {
             self.set_close_on_decide(ticked);
@@ -3198,7 +3209,7 @@ impl PromptApp {
         let box_ = ui.spacing().icon_width + ui.spacing().icon_spacing;
         // `Button` and not `Body`: that is the style a checkbox draws its own
         // label in.
-        let label = box_ + text_width(ui, CLOSE_LABEL, egui::TextStyle::Button);
+        let label = box_ + keyed_width(ui, CLOSE_LABEL, guard::CLOSE_CHORD);
         let said = text_width(ui, CLOSE_COST, egui::TextStyle::Small)
             .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small))
             .max(text_width(ui, CLOSE_WATCHING_ALWAYS, egui::TextStyle::Small))
@@ -3630,15 +3641,45 @@ fn primary(ui: &egui::Ui, label: &str, chord: &str) -> egui::Button<'static> {
     keyed(strong(label), chord).min_size(primary_button(ui))
 }
 
+/// What a control says about itself: what it does, and the key that does the
+/// same thing.
+///
+/// The one place a shortcut is put on a control, so nothing can acquire a key
+/// and be left saying nothing about it. Two atoms rather than one string, so
+/// the chord is drawn in hatch's own quiet voice beside the label rather than
+/// inside it -- and so a checkbox can say it the same way a button does,
+/// which is the whole reason this is not simply part of [`keyed`].
+///
+/// A tooltip is not an alternative. It is read by people who already suspect
+/// there is something to read, and a shortcut nobody has heard of is exactly
+/// the thing they do not suspect; that is the same argument the terminal
+/// box's warning makes for being beside its box rather than behind a hover.
+fn with_chord(label: egui::RichText, chord: &str) -> (egui::RichText, egui::RichText) {
+    (label, egui::RichText::new(chord).small().weak())
+}
+
+/// How wide a control labelled `label` is once [`with_chord`] has put `chord`
+/// beside it, without the control's own furniture.
+///
+/// The gap is egui's, read from the same figure its atom layout uses, so a
+/// row measured with this and drawn by that cannot disagree. A chord written
+/// over two lines is as wide as its widest.
+fn keyed_width(ui: &egui::Ui, label: &str, chord: &str) -> f32 {
+    let chord = chord
+        .lines()
+        .map(|line| text_width(ui, line, egui::TextStyle::Small))
+        .fold(0.0, f32::max);
+    text_width(ui, label, egui::TextStyle::Button) + ui.spacing().icon_spacing + chord
+}
+
 /// A button with the key that does the same thing printed beside what it
 /// does, at whatever size the button already was.
 ///
-/// The one place a shortcut is put on a button, so a control cannot acquire a
-/// key and be left saying nothing about it. What [`primary`] adds on top is
-/// the size: the two that decide, and the one with a countdown on it, are
-/// drawn at a minimum the cluster around them is measured from.
+/// What [`primary`] adds on top is the size: the two that decide, and the one
+/// with a countdown on it, are drawn at a minimum the cluster around them is
+/// measured from.
 fn keyed(label: egui::RichText, chord: &str) -> egui::Button<'static> {
-    egui::Button::new((label, egui::RichText::new(chord).small().weak()))
+    egui::Button::new(with_chord(label, chord))
 }
 
 #[cfg(test)]
@@ -5358,6 +5399,65 @@ mod tests {
         )];
         app.state.handle(DaemonMsg::Request(Box::new(request)));
         app
+    }
+
+    #[test]
+    fn every_key_the_guard_takes_is_printed_on_the_control_it_works() {
+        // The rule this file keeps for the buttons, kept for everything: a
+        // shortcut nobody can see is discoverable by reading the source, and
+        // a window whose fastest controls are secrets is one people work
+        // slowly and carefully around. `guard::with_chord` is where a label
+        // acquires its chord; this is what stops a control acquiring a key
+        // without going through it.
+        //
+        // Read off drawn frames rather than from the constants, because the
+        // failure being guarded against is exactly a chord that exists in
+        // `guard` and reaches no screen -- which a test over the constants
+        // alone would pass.
+        let asking = window_text_sized(&mut a_window_showing("rm -rf target"), opening_size());
+        for chord in [
+            guard::APPROVE_CHORD,
+            guard::DENY_CHORD,
+            guard::STREAM_CHORD,
+            guard::CLOSE_CHORD,
+            guard::REVIEW_CHORD,
+        ] {
+            assert!(asking.contains(chord), "{chord:?} works here and is not on screen: {asking}");
+        }
+
+        // A dead box keeps saying which key it is. Being unavailable is not
+        // being unexplained, and a chord that vanished when its box greyed
+        // out would teach the reader it had stopped existing -- see
+        // `REFUSAL_NOTICE`, which is what the key actually does there.
+        let mut streaming = a_window_showing("rm -rf target");
+        streaming.set_stream(true);
+        let drawn = window_text_sized(&mut streaming, opening_size());
+        assert!(
+            drawn.contains(guard::CLOSE_CHORD),
+            "the close box went quiet about its key when it went grey: {drawn}"
+        );
+
+        let finished = window_text(&mut a_finished_window_showing("echo marker", "printed\n"), true);
+        for chord in [guard::KEEP_KEYS, guard::COPY_CHORD, guard::DENY_CHORD] {
+            assert!(
+                finished.contains(chord),
+                "{chord:?} works on a finished window and is not on it: {finished}"
+            );
+        }
+
+        let (mut app, _sink) = a_reviewing_window();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let shapes = a_settled_frame(&mut app, &ctx, past_the_guard());
+        let reviewing: String =
+            text_rects(&shapes).into_iter().map(|(text, _)| text + "\n").collect();
+        for chord in [guard::APPROVE_CHORD, guard::DENY_CHORD] {
+            assert!(
+                reviewing.contains(chord),
+                "{chord:?} answers a review and is not on its screen: {reviewing}"
+            );
+        }
     }
 
     #[test]
