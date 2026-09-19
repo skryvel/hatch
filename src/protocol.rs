@@ -972,9 +972,25 @@ pub enum Release {
         /// sentence or a log line some day; a string that never crosses the
         /// pipe cannot.
         kept: Vec<String>,
+        /// What the reader wants to say about the output they are releasing.
+        ///
+        /// On both arms, because the arm a person chose does not change who
+        /// the words were for -- the same reasoning `PromptApp::act` gives
+        /// for the note beside a verdict going with an approval as well as a
+        /// denial. Empty when nobody typed anything.
+        note: String,
     },
     /// Send none of it.
-    Withhold,
+    Withhold {
+        /// Why, in the reader's own words, and the one thing the agent is
+        /// given when the output is not.
+        ///
+        /// This is the arm the note matters most on. Withholding tells the
+        /// agent to stop asking and to ask the person instead -- see
+        /// `crate::server::Withheld::sentence` -- and without a note that
+        /// leaves them with a refusal and no way to act on it.
+        note: String,
+    },
 }
 
 /// The agent-facing verdict set.
@@ -1480,17 +1496,19 @@ mod tests {
             .map(PromptMsg::Verdict)
             .chain([
                 PromptMsg::Kill,
-                PromptMsg::Release(Release::Withhold),
+                PromptMsg::Release(Release::Withhold { note: String::new() }),
                 PromptMsg::Release(Release::Send {
                     output: Sections::Streams {
                         stdout: "error: one\n".to_string(),
                         stderr: String::new(),
                     },
                     kept: vec!["error".to_string()],
+                    note: String::new(),
                 }),
                 PromptMsg::Release(Release::Send {
                     output: Sections::Transcript { transcript: "edited\n".to_string() },
                     kept: Vec::new(),
+                    note: "I took the tokens out".to_string(),
                 }),
             ])
             .collect();
@@ -1776,12 +1794,18 @@ mod tests {
         let encoded = encode(&PromptMsg::Release(Release::Send {
             output: Sections::Streams { stdout: "ok\n".to_string(), stderr: String::new() },
             kept: Vec::new(),
+            note: String::new(),
         }))
         .expect("encodes");
         let json: serde_json::Value = serde_json::from_str(&encoded).expect("JSON");
         let mut keys: Vec<&str> = json.as_object().expect("an object").keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["kept", "output", "release", "type"], "{encoded}");
+        // `note` is on this list deliberately, and is the only field here
+        // that carries words rather than output: it is what the person typed
+        // about what they are releasing, and it is theirs to send. Drop
+        // patterns are still absent, and still for the reason `Release`
+        // gives -- they would name what was removed.
+        assert_eq!(keys, ["kept", "note", "output", "release", "type"], "{encoded}");
     }
 
     // ---- renderings across the pipe ----------------------------------------

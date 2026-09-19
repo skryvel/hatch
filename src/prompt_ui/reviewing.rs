@@ -85,6 +85,24 @@ pub const WITHHOLD_LABEL: &str = "Send nothing";
 /// What happens when the review clock runs out, said beside it.
 pub const EXPIRY: &str = "When it runs out, nothing is sent.";
 
+/// The label on the note field.
+///
+/// The same words as the field beside the verdict, because it is the same
+/// thing for the same reader: a note that goes to the agent in their name.
+/// Which screen it was typed on is hatch's business, not something a person
+/// should have to hold two vocabularies for. The daemon is what distinguishes
+/// them where it matters -- see `crate::server::REVIEW_NOTE_PREFIX`.
+pub const NOTE_LABEL: &str = "Note to the agent";
+
+/// What the note field says about itself.
+///
+/// It names the thing a reader cannot otherwise tell from the screen: that
+/// these words go *whichever* button is pressed. Withholding is where that
+/// matters -- a person who sends nothing has the most to say and the least
+/// reason to expect a field above two buttons to survive the one that sends
+/// nothing.
+pub const NOTE_HINT: &str = "Goes to the agent either way, including when you send nothing.";
+
 /// The three fields' labels.
 pub const KEEP_LABEL: &str = "Keep only lines containing";
 pub const DROP_LABEL: &str = "Drop lines containing";
@@ -202,6 +220,14 @@ pub struct Draft {
     redact_field: String,
     /// The text as the reader has edited it, once they have started to.
     edits: Option<Sections<String>>,
+    /// What the reader wants to say to the agent about this output.
+    ///
+    /// Here and not on [`PromptApp`] beside the verdict's note, for the same
+    /// reason the rest of this struct is here: it belongs to the output being
+    /// reviewed. The verdict's note has already been sent by the time this
+    /// screen exists, and a field that arrived pre-filled with it would offer
+    /// to send the same sentence twice.
+    note: String,
 }
 
 impl Draft {
@@ -362,7 +388,21 @@ impl Draft {
     /// an edit has made untrue is not repeated.
     pub fn release(&self, output: &Sections<Captured>) -> Option<Release> {
         let result = self.result(output).ok()?;
-        Some(Release::Send { output: result, kept: self.patterns(Filter::Keep) })
+        Some(Release::Send {
+            output: result,
+            kept: self.patterns(Filter::Keep),
+            note: self.note.clone(),
+        })
+    }
+
+    /// The field the note is typed into.
+    pub fn note(&mut self) -> &mut String {
+        &mut self.note
+    }
+
+    /// What has been typed into it.
+    pub fn note_text(&self) -> &str {
+        &self.note
     }
 }
 
@@ -381,7 +421,12 @@ impl PromptApp {
 
     /// Send none of it.
     pub(super) fn withhold_review(&mut self) {
-        let frame = self.state.release(Release::Withhold);
+        // The note goes with a withholding as it goes with a send. This is
+        // the arm it matters most on: the agent is told to stop asking and
+        // to ask the person instead, and without their words that is a
+        // refusal with nothing to act on.
+        let note = self.draft.note_text().to_string();
+        let frame = self.state.release(Release::Withhold { note });
         answer(&mut self.out, &mut self.state, frame);
     }
 
@@ -605,6 +650,44 @@ impl PromptApp {
     /// buttons' place, disabled while the typing guard is shut and with the
     /// same sentence painted across them: this is a decision in the same
     /// window, and a keystroke meant for another window must not make it.
+    /// One row: what the reader wants to say about the output they are
+    /// deciding on.
+    ///
+    /// # Why this screen has one at all
+    ///
+    /// The note beside a verdict is written before anybody knows what the
+    /// command will print. This one is written while reading it, which is
+    /// where a person actually has something to say: *I took the tokens out*,
+    /// *it failed because the disk is full*, *stop retrying this*. Until it
+    /// existed the only way to say any of that was to edit the output itself
+    /// and type a sentence into it -- which made a person's words
+    /// indistinguishable from the command's, and cost the agent the one thing
+    /// it could otherwise rely on, that the text under `stdout:` is what the
+    /// command printed.
+    ///
+    /// Outside the guard, unlike the buttons below it. The guard exists to
+    /// stop a keystroke meant for another window *deciding* something, and
+    /// typing here decides nothing: the note reaches the agent only on the
+    /// frame Send or Withhold produces, both of which are guarded as they
+    /// always were.
+    fn review_note_row(&mut self, ui: &mut egui::Ui) {
+        let quiet = ui.visuals().weak_text_color();
+        let height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body));
+        let width = cluster_width(ui);
+        ui.vertical_centered(|ui| {
+            super::centred_row(ui, width, |ui| {
+                ui.label(egui::RichText::new(NOTE_LABEL).small().color(quiet));
+                // Never negative, however narrow the window has been dragged.
+                let room = ui.available_width().max(height);
+                ui.add_sized(
+                    egui::vec2(room, height),
+                    egui::TextEdit::singleline(self.draft.note()),
+                );
+            });
+            ui.label(egui::RichText::new(NOTE_HINT).small().color(quiet));
+        });
+    }
+
     pub(super) fn review_row(&mut self, ui: &mut egui::Ui, guard_open: bool) {
         let visuals = ui.visuals().clone();
         let runs = self.runs();
@@ -625,6 +708,8 @@ impl PromptApp {
                 );
             }
         });
+        ui.add_space(6.0);
+        self.review_note_row(ui);
         ui.add_space(6.0);
 
         let sendable = self
@@ -709,7 +794,7 @@ mod tests {
     #[test]
     fn an_untouched_draft_sends_the_output_as_it_was_captured() {
         let draft = Draft::default();
-        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+        let Some(Release::Send { output: sent, kept, .. }) = draft.release(&output()) else {
             panic!("an untouched draft could not be sent");
         };
         assert_eq!(sent, output().map(|_, captured| captured.text.clone()));
@@ -741,14 +826,14 @@ mod tests {
         draft.field(Filter::Keep).push_str("error");
         draft.add(Filter::Keep);
         draft.field(Filter::Drop).push_str("on std");
-        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+        let Some(Release::Send { output: sent, kept, .. }) = draft.release(&output()) else {
             panic!("no answer");
         };
         assert_eq!(kept, ["error".to_string()]);
         assert_eq!(stdout_of(&sent), "error: two\n");
         let Sections::Streams { stderr, .. } = &sent else { panic!() };
         assert!(stderr.is_empty(), "the drop filter did not reach stderr");
-        let encoded = crate::protocol::encode(&Release::Send { output: sent.clone(), kept }).unwrap();
+        let encoded = crate::protocol::encode(&Release::Send { output: sent.clone(), kept, note: String::new() }).unwrap();
         assert!(!encoded.contains("on std"), "the drop pattern rode along: {encoded}");
     }
 
@@ -777,13 +862,13 @@ mod tests {
         // thing on it that could not go taken out.
         let mut draft = Draft::default();
         draft.field(Filter::Redact).push_str("hunter\\d");
-        let Some(Release::Send { output: sent, kept }) = draft.release(&output()) else {
+        let Some(Release::Send { output: sent, kept, .. }) = draft.release(&output()) else {
             panic!("no answer");
         };
         assert_eq!(stdout_of(&sent), "ok: one\ntoken=[redacted]\nerror: two\n");
         assert!(kept.is_empty(), "a redaction was claimed as a keep pattern");
         let encoded =
-            crate::protocol::encode(&Release::Send { output: sent.clone(), kept }).unwrap();
+            crate::protocol::encode(&Release::Send { output: sent.clone(), kept, note: String::new() }).unwrap();
         assert!(!encoded.contains("hunter"), "the redaction or its subject rode along: {encoded}");
     }
 

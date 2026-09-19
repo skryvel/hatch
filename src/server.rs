@@ -2889,6 +2889,10 @@ impl Daemon {
                 CallToolResult::error(vec![ContentBlock::text(text)])
             }
         };
+        // On every arm above, including the elevation failures: a person who
+        // read the output and wrote something about it said it about this
+        // operation, whatever hatch made of how it ended.
+        let result = with_review_note(result, reviewed.as_ref());
         Step { verdict, result, windup, status }
     }
 
@@ -2918,7 +2922,7 @@ impl Daemon {
         // A run the window cannot be told the end of is a run it cannot ask
         // about either; see `finished_frame` for why that arm is not reached.
         let Some(frame) = frame else {
-            return Reviewed::Withheld(Withheld::Unasked);
+            return Reviewed::unanswered(Withheld::Unasked);
         };
         let wait = Duration::from_secs(self.config.review_timeout_secs());
         let expires_at = tokio::time::Instant::now() + wait;
@@ -2929,7 +2933,7 @@ impl Daemon {
         };
         let outbox = session.outbox();
         if !(outbox.review(review).await && outbox.finished(frame).await) {
-            return Reviewed::Withheld(Withheld::Unasked);
+            return Reviewed::unanswered(Withheld::Unasked);
         }
 
         let answer = tokio::select! {
@@ -2937,17 +2941,17 @@ impl Daemon {
             // answer in the same instant as the deadline is an answer.
             biased;
             answer = session.release() => answer,
-            () = caller.cancelled.cancelled() => return Reviewed::Withheld(Withheld::CallGone),
-            () = caller.hung_up() => return Reviewed::Withheld(Withheld::CallGone),
+            () = caller.cancelled.cancelled() => return Reviewed::unanswered(Withheld::CallGone),
+            () = caller.hung_up() => return Reviewed::unanswered(Withheld::CallGone),
             () = tokio::time::sleep_until(expires_at) => {
-                return Reviewed::Withheld(Withheld::NotInTime { secs: wait.as_secs() });
+                return Reviewed::unanswered(Withheld::NotInTime { secs: wait.as_secs() });
             }
         };
         match answer {
-            Err(_gone) => Reviewed::Withheld(Withheld::WindowGone),
-            Ok(Release::Withhold) => Reviewed::Withheld(Withheld::ByUser),
-            Ok(Release::Send { output: released, kept }) => {
-                Reviewed::of(&captured, released, &kept)
+            Err(_gone) => Reviewed::unanswered(Withheld::WindowGone),
+            Ok(Release::Withhold { note }) => Reviewed::Withheld(Withheld::ByUser, note),
+            Ok(Release::Send { output: released, kept, note }) => {
+                Reviewed::of(&captured, released, &kept, note)
             }
         }
     }
@@ -3586,11 +3590,11 @@ fn describe_run(
         text.push_str("killed: the user pressed Kill while it ran\n");
     }
     let released = match reviewed {
-        Some(Reviewed::Withheld(why)) => {
+        Some(Reviewed::Withheld(why, _)) => {
             text.push_str(&format!("\n{}\n", why.sentence()));
             return text;
         }
-        Some(Reviewed::Sent { sections, kept }) => {
+        Some(Reviewed::Sent { sections, kept, .. }) => {
             text.push_str(match sections.iter().any(|(_, _, trimmed)| trimmed.is_trimmed()) {
                 true => {
                     "reviewed: the user read this output before it was released to you and \
@@ -3670,9 +3674,18 @@ enum Reviewed {
         /// Empty unless every one of them could be believed; see
         /// [`Reviewed::of`].
         kept: Vec<String>,
+        /// What the reader said about it. Empty when they said nothing.
+        note: String,
     },
-    /// None of it reached the agent, and why.
-    Withheld(Withheld),
+    /// None of it reached the agent, why, and whatever the reader said about
+    /// it.
+    ///
+    /// The words ride beside the reason rather than inside it, so that
+    /// [`Withheld`] stays what it is: the set of ways output does not reach
+    /// an agent, only one of which is a person choosing. The string is empty
+    /// on every one of the others, because on those there was nobody there
+    /// to type it.
+    Withheld(Withheld, String),
 }
 
 /// Why reviewed output reached the agent as nothing.
@@ -3733,6 +3746,23 @@ impl Withheld {
 }
 
 impl Reviewed {
+    /// Output that did not reach the agent for a reason nobody chose.
+    ///
+    /// Every withholding but the reader's own goes through here, and the
+    /// empty note is the point of it: a daemon-decided ending has no
+    /// person's words behind it and must not be able to acquire any.
+    fn unanswered(why: Withheld) -> Reviewed {
+        debug_assert!(why != Withheld::ByUser, "the reader's own choice can carry their words");
+        Reviewed::Withheld(why, String::new())
+    }
+
+    /// What the reader said, whichever way they answered.
+    fn note(&self) -> &str {
+        match self {
+            Reviewed::Sent { note, .. } | Reviewed::Withheld(_, note) => note,
+        }
+    }
+
     /// Read a release against the output it is about.
     ///
     /// What was done to each section is worked out here from the two texts —
@@ -3745,9 +3775,16 @@ impl Reviewed {
     /// A release shaped differently from the capture — two streams answered
     /// with a transcript — is not a release of this output, and nothing is
     /// sent on it.
-    fn of(captured: &Sections<Captured>, released: Sections<String>, kept: &[String]) -> Reviewed {
+    fn of(
+        captured: &Sections<Captured>,
+        released: Sections<String>,
+        kept: &[String],
+        note: String,
+    ) -> Reviewed {
         let Some(pairs) = captured.zip(&released) else {
-            return Reviewed::Withheld(Withheld::Unreadable);
+            // The note goes with the output it was written about. An answer
+            // hatch cannot read is not one it can carry half of.
+            return Reviewed::unanswered(Withheld::Unreadable);
         };
         let (matcher, kept) = match Matcher::new(kept) {
             Ok(matcher) => (matcher, crate::review::meaningful(kept)),
@@ -3766,14 +3803,14 @@ impl Reviewed {
             true => kept,
             false => Vec::new(),
         };
-        Reviewed::Sent { sections, kept }
+        Reviewed::Sent { sections, kept, note }
     }
 
     /// Which line the audit log gets.
     fn log_end(&self) -> ReviewEnd {
         match self {
-            Reviewed::Withheld(Withheld::ByUser) => ReviewEnd::Withheld,
-            Reviewed::Withheld(_) => ReviewEnd::Unreviewed,
+            Reviewed::Withheld(Withheld::ByUser, _) => ReviewEnd::Withheld,
+            Reviewed::Withheld(..) => ReviewEnd::Unreviewed,
             // The most that was done to any section: one edited section makes
             // the output edited, whatever was only filtered beside it.
             Reviewed::Sent { sections, .. } => {
@@ -3822,6 +3859,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// is the one place it can be got wrong.
 const USER_NOTE_PREFIX: &str = "the user's note: ";
 
+/// The same, for words written at the review rather than at the verdict.
+///
+/// Two labels and not one, because a person can write both on the same
+/// operation and they are about different things: the first was typed before
+/// anybody knew what the command would print, and the second while reading
+/// it. A reply carrying two blocks under one label would be a person
+/// apparently saying two things at once about the same moment.
+///
+/// It says *when* rather than *which screen*, because the agent has no
+/// concept of hatch's screens and the timing is the part that changes what
+/// the words mean.
+const REVIEW_NOTE_PREFIX: &str = "the user's note, written while reading this output: ";
+
 /// Put the user's note at the end of an approved operation's result, in their
 /// name.
 ///
@@ -3852,6 +3902,24 @@ fn with_note(mut result: CallToolResult, note: &str) -> CallToolResult {
         return result;
     }
     result.content.push(ContentBlock::text(format!("\n\n{USER_NOTE_PREFIX}{note}")));
+    result
+}
+
+/// Put what the reader said at the review at the end of that run's result.
+///
+/// At the end, and never beside the "reviewed:" line it is about, for the
+/// reason [`with_note`] gives and one more that is specific to this screen:
+/// the output's own sections follow that line. A note with a line break in it
+/// sitting above them could be read as a section heading -- a person who
+/// typed `stdout:` would appear to be labelling the command's output -- and
+/// the end of the result is the one position where everything after the
+/// prefix is unambiguously theirs.
+fn with_review_note(result: CallToolResult, reviewed: Option<&Reviewed>) -> CallToolResult {
+    let Some(note) = reviewed.map(Reviewed::note).filter(|note| !note.trim().is_empty()) else {
+        return result;
+    };
+    let mut result = result;
+    result.content.push(ContentBlock::text(format!("\n\n{REVIEW_NOTE_PREFIX}{note}")));
     result
 }
 
@@ -8992,14 +9060,14 @@ later"), "");
         }
 
         fn sends_everything(review: &protocol::Review) -> Release {
-            Release::Send { output: shaped(review, str::to_string), kept: Vec::new() }
+            Release::Send { output: shaped(review, str::to_string), kept: Vec::new(), note: String::new() }
         }
 
         fn keeps_errors(review: &protocol::Review) -> Release {
             let keep = Matcher::new(&["error"]).unwrap();
             Release::Send {
                 output: shaped(review, |text| crate::review::filter(text, &keep, &Matcher::none())),
-                kept: vec!["error".to_string()],
+                kept: vec!["error".to_string()], note: String::new()
             }
         }
 
@@ -9007,25 +9075,90 @@ later"), "");
             let drop = Matcher::new(&["token"]).unwrap();
             Release::Send {
                 output: shaped(review, |text| crate::review::filter(text, &Matcher::none(), &drop)),
-                kept: Vec::new(),
+                kept: Vec::new(), note: String::new()
             }
         }
 
         fn redacts_by_hand(review: &protocol::Review) -> Release {
             Release::Send {
                 output: shaped(review, |text| text.replace("hunter2", "[gone]")),
-                kept: Vec::new(),
+                kept: Vec::new(), note: String::new()
             }
         }
 
         fn withholds(_: &protocol::Review) -> Release {
-            Release::Withhold
+            Release::Withhold { note: String::new() }
+        }
+
+        /// A reader who sends nothing and says why.
+        fn withholds_with_a_reason(_: &protocol::Review) -> Release {
+            Release::Withhold { note: "it is all secrets, ask me for what you need".to_string() }
+        }
+
+        /// A reader who sends the output and says what they did to it.
+        fn sends_with_a_reason(review: &protocol::Review) -> Release {
+            let drop = Matcher::new(&["token"]).unwrap();
+            Release::Send {
+                output: shaped(review, |text| crate::review::filter(text, &Matcher::none(), &drop)),
+                kept: Vec::new(),
+                note: "I took the tokens out, the rest is as it ran".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_reader_who_sends_nothing_can_still_say_why() {
+            // The arm the note matters most on. Without it the agent is told
+            // to stop asking and to ask the person instead, and given
+            // nothing to ask about.
+            let harness =
+                Harness::new(vec![reviewed().reviewing(Reviewer::Answers(withholds_with_a_reason))]);
+            let command = a_secret_to_print(&harness);
+            let text = result_text(
+                &within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await,
+            );
+
+            assert!(text.contains("chose to release none of it"), "{text}");
+            assert!(text.contains("it is all secrets, ask me for what you need"), "{text}");
+            // Named as the person's, and named as written at the review. An
+            // agent that read this as hatch's own account of the output
+            // would be taking an instruction from the wrong party.
+            assert!(text.contains(REVIEW_NOTE_PREFIX), "the note is unattributed: {text}");
+            // And none of the output still means none of the output. A note
+            // is not a crack in the withholding.
+            assert!(!text.contains("hunter2"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn a_note_written_at_the_review_is_told_apart_from_one_written_at_the_verdict() {
+            // Both are "the user's note" and they are about different
+            // moments: one was typed before anybody knew what the command
+            // would print, the other while reading it. One label over two
+            // blocks would be a person apparently saying two things at once.
+            let harness =
+                Harness::new(vec![reviewed().reviewing(Reviewer::Answers(sends_with_a_reason))]);
+            let text = result_text(
+                &within(harness.daemon.run_command(
+                    run_of("echo kept; echo token=hunter2"),
+                    Caller::quiet(),
+                ))
+                .await,
+            );
+
+            assert!(text.contains("I took the tokens out"), "{text}");
+            assert!(text.contains(REVIEW_NOTE_PREFIX), "{text}");
+            // The note ends the result, after the output it is about. A note
+            // with a line break in it above the sections could be read as a
+            // heading over them.
+            let at = text.find(REVIEW_NOTE_PREFIX).unwrap();
+            assert!(at > text.find("stdout").unwrap(), "the note came before the output: {text}");
+            assert!(!text.contains("hunter2"), "{text}");
         }
 
         fn answers_some_other_review(_: &protocol::Review) -> Release {
             Release::Send {
                 output: Sections::Transcript { transcript: "invented\n".to_string() },
                 kept: Vec::new(),
+                note: String::new(),
             }
         }
 

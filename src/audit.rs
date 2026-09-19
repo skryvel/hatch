@@ -323,6 +323,16 @@ pub struct RunDetail {
     /// the one copy of it that survives, in a file whose whole purpose is to
     /// be read back later. What is here is only which of the endings it was,
     /// which is what somebody working out what reached the agent needs.
+    ///
+    /// The note the reader writes at the review is not here either, and that
+    /// is a decision rather than an omission. The note beside a *verdict* is
+    /// recorded -- see `note` on the record itself -- because it is written
+    /// about a command, before anybody has seen a byte of output. This one is
+    /// written while reading output the person may be about to withhold, which
+    /// makes it the likeliest place in hatch for somebody to quote the very
+    /// thing they are keeping back. It already reached the agent; a second
+    /// copy in this file would be the durable one, in the file the review
+    /// exists to keep such text out of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewEnd>,
 }

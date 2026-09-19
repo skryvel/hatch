@@ -101,8 +101,11 @@ same thing.*
   going to the agent. Keep only the lines containing `error`, drop the ones
   containing `token`, or edit a line by hand; what is drawn is what goes. The
   agent is told its view was trimmed — which keep filter, if one was used, but
-  never what was dropped or what an edit changed. If you do not answer in time,
-  nothing is sent.
+  never what was dropped or what an edit changed. There is a note field on that
+  screen too, and it goes whichever button you press: sending nothing is the
+  case where the agent most needs your words, because all it is otherwise told
+  is to stop asking and ask you. If you do not answer in time, nothing is
+  sent.
 - **You can watch it, and stop it.** Output streams into the window while the
   command runs, with a Kill button. A command that needs a keyboard gets a real
   terminal, and the window says plainly that everything typed in there goes
@@ -192,6 +195,14 @@ back with something better instead of seeing a broken server. An approval
 carries the note too, after what hatch has to say about what happened and
 labelled `the user's note:` — the agent is never left to guess which half of an
 answer a person wrote.
+
+A review has a note of its own, labelled `the user's note, written while
+reading this output:`. Two labels rather than one because a person can write
+both on the same command and they are about different moments: the first
+before anybody knew what it would print, the second while reading it. The
+verdict's note is recorded in the log; this one deliberately is not, because it
+is written while reading output the person may be about to withhold, and a copy
+in the log would outlive the decision to keep it back.
 
 "Stop, let's sync" is the one answer that says nothing about the request. Deny
 is a judgement and invites a better version of the same idea; this says the

@@ -8201,11 +8201,11 @@ mod tests {
     #[test]
     fn the_answer_to_a_review_leaves_once_and_takes_the_window_with_it() {
         let mut state = a_reviewing_state();
-        let first = state.release(Release::Withhold);
-        assert_eq!(first, Some(PromptMsg::Release(Release::Withhold)));
+        let first = state.release(Release::Withhold { note: String::new() });
+        assert_eq!(first, Some(PromptMsg::Release(Release::Withhold { note: String::new() })));
         assert!(state.should_close());
         assert_eq!(state.broken(), None, "an answered review is not a failure");
-        assert_eq!(state.release(Release::Withhold), None, "it answered twice");
+        assert_eq!(state.release(Release::Withhold { note: String::new() }), None, "it answered twice");
         assert_eq!(state.decide(approved(false)), None, "a review became a second verdict");
     }
 
@@ -8213,9 +8213,9 @@ mod tests {
     fn nothing_but_a_review_can_be_answered_as_one() {
         let mut state = PromptState::new();
         state.handle(DaemonMsg::Request(Box::new(a_request(90))));
-        assert_eq!(state.release(Release::Withhold), None, "a release came out of an approval window");
+        assert_eq!(state.release(Release::Withhold { note: String::new() }), None, "a release came out of an approval window");
         state.decide(approved_for_review());
-        assert_eq!(state.release(Release::Withhold), None, "a release came out of a running window");
+        assert_eq!(state.release(Release::Withhold { note: String::new() }), None, "a release came out of a running window");
     }
 
     #[test]
@@ -8446,7 +8446,7 @@ mod tests {
 
         // And what goes is what was drawn.
         a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], now);
-        let Some(Release::Send { output, kept }) = the_release(&sink) else {
+        let Some(Release::Send { output, kept, .. }) = the_release(&sink) else {
             panic!("the chord did not send");
         };
         let crate::review::Sections::Streams { stdout, stderr } = output else { panic!() };
@@ -8473,7 +8473,66 @@ mod tests {
         let (mut app, sink) = a_reviewing_window();
         a_settled_frame(&mut app, &ctx, now);
         a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Escape, egui::Modifiers::NONE)], now);
-        assert_eq!(the_release(&sink), Some(Release::Withhold));
+        assert_eq!(the_release(&sink), Some(Release::Withhold { note: String::new() }));
+    }
+
+    #[test]
+    fn a_note_typed_at_the_review_goes_whichever_button_is_pressed() {
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        // Typed into the real field on a real frame, not set on the draft:
+        // the thing being tested is that the row on the screen is wired to
+        // the answer, and a field nothing reaches would pass that on a
+        // struct and fail on the window.
+        let typed = |app: &mut PromptApp, sink: &Arc<std::sync::Mutex<Vec<u8>>>| {
+            let label = drawn_at(app, &ctx, reviewing::NOTE_LABEL, now)
+                .expect("the note field is not drawn on the review screen");
+            click_at(app, &ctx, egui::pos2(label.right() + 60.0, label.center().y), now);
+            a_live_frame(app, &ctx, vec![egui::Event::Text("ask me instead".to_string())], now);
+            assert!(sink.lock().unwrap().is_empty(), "typing a note answered the review");
+        };
+
+        // Send carries it.
+        let (mut app, sink) = a_reviewing_window();
+        typed(&mut app, &sink);
+        let send = drawn_at(&mut app, &ctx, reviewing::SEND_LABEL, now).expect("Send is not drawn");
+        click_at(&mut app, &ctx, send.center(), now);
+        let Some(Release::Send { note, .. }) = the_release(&sink) else { panic!("nothing sent") };
+        assert_eq!(note, "ask me instead");
+
+        // And so does the button that sends nothing, which is the arm this
+        // matters most on: without the note the agent is told to ask the
+        // person and given nothing to ask about.
+        let (mut app, sink) = a_reviewing_window();
+        typed(&mut app, &sink);
+        let nothing = drawn_at(&mut app, &ctx, reviewing::WITHHOLD_LABEL, now)
+            .expect("Send nothing is not drawn");
+        click_at(&mut app, &ctx, nothing.center(), now);
+        assert_eq!(
+            the_release(&sink),
+            Some(Release::Withhold { note: "ask me instead".to_string() }),
+            "the words went with the output they were about"
+        );
+    }
+
+    #[test]
+    fn the_note_at_the_review_does_not_arrive_holding_what_was_sent_with_the_verdict() {
+        // The verdict's note went when the verdict did. A field that opened
+        // pre-filled with it would offer to send the same sentence twice,
+        // and a reader who pressed Send without reading the field would.
+        let (mut app, sink) = a_reviewing_window();
+        app.note = "go on then".to_string();
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let send = drawn_at(&mut app, &ctx, reviewing::SEND_LABEL, now).expect("Send is not drawn");
+        click_at(&mut app, &ctx, send.center(), now);
+        let Some(Release::Send { note, .. }) = the_release(&sink) else { panic!("nothing sent") };
+        assert!(note.is_empty(), "the verdict's note came back at the review: {note}");
     }
 
     #[test]
@@ -8545,7 +8604,7 @@ mod tests {
         let ctx = egui::Context::default();
         apply_faces(&ctx);
         a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)], past_the_guard());
-        let Some(Release::Send { output, kept }) = the_release(&sink) else { panic!("nothing sent") };
+        let Some(Release::Send { output, kept, .. }) = the_release(&sink) else { panic!("nothing sent") };
         let crate::review::Sections::Streams { stdout, .. } = output else { panic!() };
         assert_eq!(stdout, "ok: one\ntoken=[redacted]\nok: two\n");
         assert!(kept.is_empty(), "a redaction was claimed to the agent as a keep pattern");
