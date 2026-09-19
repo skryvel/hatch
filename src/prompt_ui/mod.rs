@@ -1913,7 +1913,13 @@ impl PromptApp {
     /// Matched exhaustively on purpose. A new phase is a new answer to this
     /// question, and the compiler is the only thing that will insist somebody
     /// gives one.
-    fn keyboard(&self) -> Keyboard {
+    fn keyboard(&self, ctx: &egui::Context) -> Keyboard {
+        // Asked of egui and not of the draft: a window can be in its editing
+        // mode with the keyboard on a button. See
+        // `reviewing::editing_has_the_keyboard`.
+        if self.state.phase() == Phase::Reviewing && reviewing::editing_has_the_keyboard(ctx) {
+            return Keyboard::Composing;
+        }
         match self.state.phase() {
             // A running window has no text field either -- the note went with
             // the question -- and `e`, `o` and Space mean there what they mean
@@ -2032,7 +2038,7 @@ impl eframe::App for PromptApp {
         // Before anything is drawn, and before any widget sees the frame.
         // Whatever the guard did not hand back is gone from this frame.
         let now = Instant::now();
-        let keyboard = self.keyboard();
+        let keyboard = self.keyboard(ctx);
         for action in intercept(&mut self.guard, ctx, keyboard, now) {
             self.act(ctx, action);
         }
@@ -7235,7 +7241,7 @@ mod tests {
         let mut out = ctx.run_ui(raw_sized(events, opening_size()), |ui| {
             // The order `logic` runs them in: the guard takes what it is
             // owed out of the frame before any widget is built.
-            let keyboard = app.keyboard();
+            let keyboard = app.keyboard(ui.ctx());
             let decided = intercept(&mut app.guard, ui.ctx(), keyboard, at);
             for action in decided {
                 app.act(ui.ctx(), action);

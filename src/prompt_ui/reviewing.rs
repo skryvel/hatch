@@ -134,6 +134,37 @@ pub fn refusal_said(error: &PatternError) -> String {
 pub const EDIT_LABEL: &str = "Edit the text by hand";
 pub const UNEDIT_LABEL: &str = "Undo my edits";
 
+/// The id of the editor for the section called `name`.
+///
+/// Absolute rather than salted into whatever `Ui` happens to be drawing it,
+/// because the caller that needs it is not drawing anything: the guard asks,
+/// before any widget sees the frame, whether the thing holding the keyboard
+/// is a text editor. See [`editing_has_the_keyboard`].
+fn editor_id(name: &str) -> egui::Id {
+    egui::Id::new(("hatch-review-editor", name))
+}
+
+/// Whether one of the review editors holds the keyboard right now.
+///
+/// The question a bare Enter turns on. Enter is the guard's own key
+/// everywhere else -- if it reached a widget, egui would activate whatever
+/// holds focus and the guard would be advice rather than a rule -- and a
+/// text editor is the one widget for which that is not true, because what
+/// Enter does there is type a character.
+///
+/// Asked of egui rather than of the draft's own editing flag, and the
+/// difference is the whole safety of it: *being* in the editing mode is not
+/// the same as the editor having the keyboard, and it is the second that
+/// says a keypress is going into text rather than into a button.
+pub fn editing_has_the_keyboard(ctx: &egui::Context) -> bool {
+    let focused = ctx.memory(|memory| memory.focused());
+    focused.is_some_and(|id| {
+        [Section::Stdout, Section::Stderr, Section::Transcript]
+            .iter()
+            .any(|section| editor_id(section.name()) == id)
+    })
+}
+
 /// What the reader is told while editing.
 pub const EDITING_NOTE: &str = "Editing the text itself: the agent is told it was edited, not \
      what changed. The filters are set aside until you undo your edits.";
@@ -532,6 +563,11 @@ impl PromptApp {
                 scroll.show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(text)
+                            // An id of its own, and an absolute one, so the
+                            // guard can ask whether *this* holds the keyboard
+                            // before it lets a bare Enter through. See
+                            // `editor_id`.
+                            .id(editor_id(name))
                             .code_editor()
                             .desired_width(f32::INFINITY),
                     );

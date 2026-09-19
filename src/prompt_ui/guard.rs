@@ -268,6 +268,20 @@ pub enum Keyboard {
     /// free, and the things they do are keeping the window, putting its
     /// output on the clipboard and closing it.
     Watching,
+    /// A window that is asking, with one of its *multiline* editors holding
+    /// the keyboard.
+    ///
+    /// Everything [`Keyboard::Asking`] means, and one key more: a bare Enter
+    /// is a character. It is the single exemption in this module and it is
+    /// narrow on purpose -- the caller asks egui which widget has focus, not
+    /// merely whether the window is in an editing mode, because being in the
+    /// mode is not the same as the keypress going into text rather than into
+    /// a button.
+    ///
+    /// The approve chords still approve. A reader who has learned that
+    /// Ctrl+Enter sends must not find that it types a newline because their
+    /// cursor happened to be in a field.
+    Composing,
 }
 
 /// Which of the window's boxes a chord flips.
@@ -447,12 +461,21 @@ impl Guard {
             // the outermost of three locks on one door rather than the only
             // one; it is here because an `Action` that cannot be carried out
             // is a thing for a later reader to wonder about.
-            Some(Key::Enter) => {
-                match open && keyboard == Keyboard::Asking && is_approve_chord(modifiers) {
-                    true => Action::Approve,
-                    false => Action::Ignored,
+            Some(Key::Enter) if !open => Action::Ignored,
+            Some(Key::Enter) if is_approve_chord(modifiers) => {
+                match keyboard {
+                    Keyboard::Asking | Keyboard::Composing => Action::Approve,
+                    Keyboard::Watching => Action::Ignored,
                 }
             }
+            // The exemption, and the only one. A bare Enter reaches a
+            // multiline editor that holds the keyboard, because there it
+            // types a character rather than activating anything. Everywhere
+            // else it stays the guard's own key.
+            Some(Key::Enter) => match keyboard == Keyboard::Composing && modifiers.is_none() {
+                true => Action::Passthrough,
+                false => Action::Ignored,
+            },
             Some(Key::Escape) => {
                 if open && modifiers.is_none() {
                     Action::Deny
@@ -683,8 +706,57 @@ mod tests {
         guard.classify(event, m, Keyboard::Watching, now)
     }
 
+    /// The same, with a multiline editor holding the keyboard.
+    fn composing(guard: &Guard, event: &egui::Event, m: Modifiers, now: Instant) -> Action {
+        guard.classify(event, m, Keyboard::Composing, now)
+    }
+
     fn press(key: Key, modifiers: Modifiers) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn a_bare_enter_types_a_newline_in_an_editor_and_nowhere_else() {
+        // The report: Enter added no line while editing the text a review
+        // will send. It could not -- Enter is this module's own key
+        // everywhere, because a key that reached a widget would activate
+        // whatever holds focus and make the guard advice rather than a rule.
+        // A text editor is the one widget where that is not what Enter does.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(2_000);
+        let enter = press(Key::Enter, Modifiers::NONE);
+
+        assert_eq!(composing(&guard, &enter, Modifiers::NONE, now), Action::Passthrough);
+        // And nowhere else: the same key on the same window, with the
+        // keyboard anywhere but in an editor, is still taken.
+        assert_eq!(asking(&guard, &enter, Modifiers::NONE, now), Action::Ignored);
+        assert_eq!(watched(&guard, &enter, Modifiers::NONE, now), Action::Ignored);
+    }
+
+    #[test]
+    fn an_editor_does_not_swallow_the_chord_that_sends() {
+        // A reader who has learned that Ctrl+Enter sends must not find it
+        // typing a newline because their cursor was in a field.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(2_000);
+        for modifiers in [Modifiers::CTRL, Modifiers::SHIFT] {
+            let chord = press(Key::Enter, modifiers);
+            assert_eq!(composing(&guard, &chord, modifiers, now), Action::Approve, "{modifiers:?}");
+        }
+    }
+
+    #[test]
+    fn an_editor_gets_no_exemption_from_the_guard_itself() {
+        // The burst that arrives as a window opens is the thing this module
+        // exists to stop, and a window that happened to open with a field
+        // focused must not be the one that lets it in.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let inside = clock.at(100);
+        let enter = press(Key::Enter, Modifiers::NONE);
+        assert_eq!(composing(&guard, &enter, Modifiers::NONE, inside), Action::Ignored);
     }
 
     #[test]
