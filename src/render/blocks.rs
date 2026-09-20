@@ -144,6 +144,12 @@ pub enum BlockKind {
     /// Two or more commands joined by `|`. A pipeline of one command is not a
     /// pipeline; see [`blocks`].
     Pipeline,
+    /// Two or more pipelines joined by `&&` or `||`: one statement whose
+    /// parts run, or do not run, on what the part before them did.
+    ///
+    /// A single pipeline is not one, for [`BlockKind::Pipeline`]'s reason:
+    /// every command in a script would otherwise be a block.
+    AndOr,
 }
 
 impl BlockKind {
@@ -156,7 +162,20 @@ impl BlockKind {
             Self::Subshell => "subshell",
             Self::BraceGroup => "group",
             Self::Pipeline => "pipeline",
+            Self::AndOr => "and-or",
         }
+    }
+
+    /// Whether the construct's last drawn line is a word that closes it,
+    /// rather than the last member of it.
+    ///
+    /// `done`, `esac`, `fi`, `)` and `}` belong to the construct at the
+    /// construct's own level, so the line they are on is not indented by it.
+    /// A pipeline and an and-or list end with no word of their own: their
+    /// last line is the last thing they run, and it is as much inside them
+    /// as the lines above it.
+    pub fn closed_by_a_word(self) -> bool {
+        !matches!(self, Self::Pipeline | Self::AndOr)
     }
 }
 
@@ -402,6 +421,17 @@ fn walk_list(list: &ast::CompoundList, out: &mut Walk<'_>) {
 }
 
 fn walk_and_or(list: &ast::AndOrList, out: &mut Walk<'_>) {
+    // A list of one pipeline is that pipeline, on `walk_pipeline`'s reasoning:
+    // a bracket around every statement in a script says nothing. Two or more
+    // is a statement whose second half runs on what its first half did, and
+    // the parts after the first are members of it rather than new statements
+    // -- which is the fact the indentation is there to carry.
+    if !list.additional.is_empty()
+        && let (Some(first), Some(last)) =
+            (list.first.location(), pipelines(list).last().and_then(ast::Pipeline::location))
+    {
+        out.push(BlockKind::AndOr, &brush_parser::SourceSpan { start: first.start, end: last.end });
+    }
     walk_pipeline(&list.first, out);
     for extra in &list.additional {
         match extra {
@@ -549,6 +579,35 @@ mod tests {
         // and a bracket that is always there says nothing.
         assert_eq!(drawn("ls -l"), vec![]);
         assert_eq!(drawn("echo hi > /tmp/x"), vec![]);
+    }
+
+    #[test]
+    fn two_pipelines_joined_by_an_operator_are_one_statement() {
+        // `sed` here runs only if the test passed, so it is a member of the
+        // statement the test opens and not a statement of its own. The block
+        // is what lets the pane draw it that way.
+        let source = "[ -n \"$f\" ] &&\nsed -n '1,40p' \"$f\"";
+        assert_eq!(drawn(source), vec![("and-or", source, 0)]);
+        // `||` is the same construct: which operator joined them decides when
+        // the second half runs, not whether the two are one statement.
+        assert_eq!(drawn("a || b"), vec![("and-or", "a || b", 0)]);
+    }
+
+    #[test]
+    fn one_pipeline_on_its_own_is_not_a_statement_worth_bracketing() {
+        // `a_pipeline_of_one_command_is_not_a_pipeline`'s reasoning, one
+        // level up: every statement in every script would be a block.
+        assert_eq!(drawn("ls -l"), vec![]);
+        assert_eq!(drawn("a; b; c"), vec![]);
+    }
+
+    #[test]
+    fn a_pipeline_inside_a_statement_is_nested_in_it() {
+        let source = "grep -o x foo | sort -u &&\necho found";
+        let found = drawn(source);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0], ("and-or", source, 0), "{found:?}");
+        assert_eq!(found[1], ("pipeline", "grep -o x foo | sort -u", 1), "{found:?}");
     }
 
     #[test]

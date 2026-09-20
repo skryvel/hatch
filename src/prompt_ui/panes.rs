@@ -50,7 +50,7 @@ use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
-use crate::render::blocks::{Block, BlockKind, blocks};
+use crate::render::blocks::{Block, blocks};
 use crate::render::language::{Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
@@ -1656,7 +1656,7 @@ fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
         brackets.push(Bracket {
             first,
             last,
-            closed_by_a_word: block.kind() != BlockKind::Pipeline,
+            closed_by_a_word: block.kind().closed_by_a_word(),
         });
     }
     Gutter { brackets }
@@ -3439,8 +3439,7 @@ mod tests {
         // ones inside it.
         let source = "for i in $(seq 40); do test -S a && break; sleep 1; done; echo up";
         let shown = drawn_lines(source);
-        let (brackets, indents) = bracketed(source);
-        assert_eq!(brackets.len(), 1, "{brackets:?}");
+        let (_, indents) = bracketed(source);
 
         // The loop's own words sit at the margin, and so does what follows it.
         let opens = shown.iter().position(|line| line.contains("for i")).expect("the for line");
@@ -3450,16 +3449,47 @@ mod tests {
         assert_eq!(indents[closes], 0, "{shown:?} {indents:?}");
         assert_eq!(indents[after], 0, "a command after the loop was drawn inside it");
 
-        // And everything between them is inside it, exactly once.
+        // And everything between them is inside it, at least once. `break` is
+        // inside twice over -- the loop, and the `&&` whose left half decides
+        // whether it runs at all -- which is what the and-or bracket is for.
         assert!(
-            indents[opens + 1..closes].iter().all(|indent| *indent == 1),
+            indents[opens + 1..closes].iter().all(|indent| *indent >= 1),
             "{shown:?} {indents:?}"
         );
+        let conditional =
+            shown.iter().position(|line| line.starts_with("break")).expect("the break line");
+        assert_eq!(indents[conditional], 2, "{shown:?} {indents:?}");
         // No drawn line begins with the space its separator left behind.
         assert!(
             shown.iter().all(|line| !line.starts_with(' ')),
             "a line still opens on the separator's blank: {shown:?}"
         );
+    }
+
+    #[test]
+    fn what_runs_only_if_the_test_passed_is_drawn_inside_it() {
+        // The shape this was reported on. `[ -n "$f" ] &&` ended its line and
+        // `sed` began the next one at the margin, which drew the second half
+        // of one statement as a new statement -- as if it ran either way.
+        let source = "[ -n \"$f\" ] &&\nsed -n '1,40p' \"$f\"";
+        let (brackets, indents) = bracketed(source);
+        assert_eq!(indents, vec![0, 1], "{indents:?}");
+        assert_eq!(brackets.len(), 1, "{brackets:?}");
+        // And the bracket runs to the end, because an and-or list closes with
+        // no word of its own: the last thing it runs is a member of it.
+        assert_eq!(brackets[0], (0, 1), "{brackets:?}");
+    }
+
+    #[test]
+    fn a_fallback_that_stays_on_the_line_is_not_indented_off_it() {
+        // `||` keeps its right half on the same line -- see `ends_a_line` --
+        // so the statement is one drawn line and there is nothing to indent
+        // or bracket. The and-or block is found either way; the length filter
+        // is what drops it, and this is the case that filter is load-bearing
+        // for, because `cmd || true` is the commonest and-or there is.
+        let (brackets, indents) = bracketed("podman ps || true");
+        assert_eq!(indents, vec![0], "{indents:?}");
+        assert!(brackets.is_empty(), "{brackets:?}");
     }
 
     #[test]
