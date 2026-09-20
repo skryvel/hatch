@@ -58,18 +58,21 @@
 //!
 //! # Two things the parser does not give, and what is done about each
 //!
-//! **`if … fi` gets no bracket.** Not a judgement — a bug upstream. Every
-//! other rule in that grammar computes its end from the token that closes the
-//! construct; the `if` rule binds the closing `fi` and then takes its end
-//! from the *opening* keyword instead, so an `IfClauseCommand` reports a span
-//! covering the two characters `if`. A bracket drawn from it would cover one
-//! row of a construct that is often ten, which is worse than no bracket,
-//! and a bracket drawn from the last child instead would stop one row short
-//! of the `fi` and quietly claim the block ends where it does not. So `if`
-//! draws nothing until the span is right, and the walk still descends
-//! *inside* it, because the blocks nested in its arms are unaffected by it.
-//! `an_if_is_walked_into_but_never_drawn` pins this, so the day it is fixed
-//! the test says what to delete.
+//! **`if … fi` reports the wrong end.** A bug upstream: every other rule in
+//! that grammar computes its end from the token that closes the construct,
+//! and the `if` rule binds the closing `fi` and then takes its end from the
+//! *opening* keyword instead, so an `IfClauseCommand` reports a span covering
+//! the two characters `if`.
+//!
+//! The end is recovered here rather than waited for, because an `if` is too
+//! common a thing to leave unbracketed and the arms inside one then sit at
+//! the margin as though they were not inside anything. What it is recovered
+//! from is the `fi` *token* at or after the last arm's last pipeline — see
+//! [`Walk::closing_fi`], which is also where the reasons that is exact are.
+//! Everything else the parse says about an `if` is right, its arms included;
+//! only the one number is wrong. When upstream fixes it this can go back to
+//! reading `clause.loc`, and `an_if_runs_from_its_keyword_to_its_fi` is the
+//! test that says so.
 //!
 //! **`( (` is read as `((`.** Upstream treats a subshell opened immediately
 //! inside another as the arithmetic `((`, ignoring the space between them.
@@ -132,6 +135,8 @@ pub enum BlockKind {
     Loop,
     /// `case … esac`.
     Case,
+    /// `if … fi`, including its `elif` and `else` arms.
+    If,
     /// `( … )`, which runs in a shell of its own.
     Subshell,
     /// `{ …; }`, which groups without a subshell.
@@ -147,6 +152,7 @@ impl BlockKind {
         match self {
             Self::Loop => "loop",
             Self::Case => "case",
+            Self::If => "if",
             Self::Subshell => "subshell",
             Self::BraceGroup => "group",
             Self::Pipeline => "pipeline",
@@ -216,10 +222,11 @@ pub fn blocks(source: &str) -> Vec<Block> {
         return Vec::new();
     };
 
-    let mut found = Vec::new();
+    let mut walk = Walk { out: Vec::new(), tokens: &tokens };
     for list in &program.complete_commands {
-        walk_list(list, &mut found);
+        walk_list(list, &mut walk);
     }
+    let found = walk.out;
 
     let offsets = ByteOffsets::of(source);
     let mut out = Vec::with_capacity(found.len());
@@ -318,17 +325,83 @@ fn set_depths(blocks: &mut [Block]) {
 /// A construct found in the parse, before its offsets have been converted.
 type Found = (BlockKind, (usize, usize));
 
-fn push(out: &mut Vec<Found>, kind: BlockKind, span: &brush_parser::SourceSpan) {
-    out.push((kind, (span.start.index, span.end.index)));
+/// What the walk carries: where blocks are collected, and the token list the
+/// one construct that needs it reads.
+///
+/// A struct rather than a second parameter on six functions, because only
+/// [`Walk::closing_fi`] uses the tokens and threading them by hand would put
+/// an argument nothing reads into every signature between here and there.
+struct Walk<'a> {
+    out: Vec<Found>,
+    /// The same tokens the parse was built from, in source order.
+    tokens: &'a [brush_parser::Token],
 }
 
-fn walk_list(list: &ast::CompoundList, out: &mut Vec<Found>) {
+impl Walk<'_> {
+    fn push(&mut self, kind: BlockKind, span: &brush_parser::SourceSpan) {
+        self.out.push((kind, (span.start.index, span.end.index)));
+    }
+
+    /// Where the `fi` that closes an `if` beginning before `after` ends.
+    ///
+    /// # Why the token list rather than the span
+    ///
+    /// The `if` rule upstream reports an end taken from its opening keyword
+    /// -- see the module docs -- so the span says the construct is two
+    /// characters long. Everything else about the parse is right, including
+    /// where each of the arms' pipelines ends, and `fi` is a reserved word:
+    /// the first `fi` *token* at or after the last arm's last pipeline is the
+    /// one that closes this `if`, whatever is nested inside the arms.
+    ///
+    /// It is the token list and not the text because a token cannot be a
+    /// substring of something else. `fifo` is one word, `"fi"` is a word
+    /// whose text includes its quotes, and a `fi` in a comment is not a token
+    /// at all -- none of the three can be mistaken for the keyword here, and
+    /// all three could be by a search over the source.
+    ///
+    /// `None` when there is no such token, which is the shape every doubt in
+    /// this module takes: no answer, so no bracket.
+    fn closing_fi(&self, after: usize) -> Option<usize> {
+        self.tokens
+            .iter()
+            .filter_map(|token| match token {
+                brush_parser::Token::Word(text, span) if text == "fi" => Some(span),
+                _ => None,
+            })
+            .find(|span| span.start.index >= after)
+            .map(|span| span.end.index)
+    }
+}
+
+/// Where the last thing in `list` ends, as the parse reports it.
+///
+/// Zero for a list with nothing in it, which is what an `if` with an empty
+/// arm has: the caller takes the largest of these against the `if`'s own
+/// start, so an empty arm contributes nothing rather than moving the search
+/// backwards.
+fn ends_at(list: &ast::CompoundList) -> usize {
+    list.0
+        .iter()
+        .filter_map(|item| pipelines(&item.0).filter_map(ast::Pipeline::location).last())
+        .map(|span| span.end.index)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Every pipeline in one and-or list, in source order.
+fn pipelines(list: &ast::AndOrList) -> impl Iterator<Item = &ast::Pipeline> {
+    std::iter::once(&list.first).chain(list.additional.iter().map(|extra| match extra {
+        ast::AndOr::And(pipeline) | ast::AndOr::Or(pipeline) => pipeline,
+    }))
+}
+
+fn walk_list(list: &ast::CompoundList, out: &mut Walk<'_>) {
     for item in &list.0 {
         walk_and_or(&item.0, out);
     }
 }
 
-fn walk_and_or(list: &ast::AndOrList, out: &mut Vec<Found>) {
+fn walk_and_or(list: &ast::AndOrList, out: &mut Walk<'_>) {
     walk_pipeline(&list.first, out);
     for extra in &list.additional {
         match extra {
@@ -337,20 +410,20 @@ fn walk_and_or(list: &ast::AndOrList, out: &mut Vec<Found>) {
     }
 }
 
-fn walk_pipeline(pipeline: &ast::Pipeline, out: &mut Vec<Found>) {
+fn walk_pipeline(pipeline: &ast::Pipeline, out: &mut Walk<'_>) {
     // A pipeline of one command is a command. Bracketing it would put a
     // bracket around most lines of most commands, which says nothing.
     if pipeline.seq.len() > 1
         && let Some(span) = pipeline.location()
     {
-        push(out, BlockKind::Pipeline, &span);
+        out.push(BlockKind::Pipeline, &span);
     }
     for command in &pipeline.seq {
         walk_command(command, out);
     }
 }
 
-fn walk_command(command: &ast::Command, out: &mut Vec<Found>) {
+fn walk_command(command: &ast::Command, out: &mut Walk<'_>) {
     match command {
         ast::Command::Simple(_) | ast::Command::ExtendedTest(..) => {}
         ast::Command::Compound(compound, _) => walk_compound(compound, out),
@@ -358,24 +431,24 @@ fn walk_command(command: &ast::Command, out: &mut Vec<Found>) {
     }
 }
 
-fn walk_compound(compound: &ast::CompoundCommand, out: &mut Vec<Found>) {
+fn walk_compound(compound: &ast::CompoundCommand, out: &mut Walk<'_>) {
     use ast::CompoundCommand as Compound;
     match compound {
         Compound::ForClause(clause) => {
-            push(out, BlockKind::Loop, &clause.loc);
+            out.push(BlockKind::Loop, &clause.loc);
             walk_list(&clause.body.list, out);
         }
         Compound::ArithmeticForClause(clause) => {
-            push(out, BlockKind::Loop, &clause.loc);
+            out.push(BlockKind::Loop, &clause.loc);
             walk_list(&clause.body.list, out);
         }
         Compound::WhileClause(clause) | Compound::UntilClause(clause) => {
-            push(out, BlockKind::Loop, &clause.2);
+            out.push(BlockKind::Loop, &clause.2);
             walk_list(&clause.0, out);
             walk_list(&clause.1.list, out);
         }
         Compound::CaseClause(clause) => {
-            push(out, BlockKind::Case, &clause.loc);
+            out.push(BlockKind::Case, &clause.loc);
             for item in &clause.cases {
                 if let Some(commands) = &item.cmd {
                     walk_list(commands, out);
@@ -383,27 +456,36 @@ fn walk_compound(compound: &ast::CompoundCommand, out: &mut Vec<Found>) {
             }
         }
         Compound::Subshell(shell) => {
-            push(out, BlockKind::Subshell, &shell.loc);
+            out.push(BlockKind::Subshell, &shell.loc);
             walk_list(&shell.list, out);
         }
         Compound::BraceGroup(group) => {
-            push(out, BlockKind::BraceGroup, &group.loc);
+            out.push(BlockKind::BraceGroup, &group.loc);
             walk_list(&group.list, out);
         }
-        // Walked into, never drawn. The span an `if` reports covers the two
-        // characters of the keyword, so there is nothing here to draw a
-        // bracket from; what is nested in its arms is unaffected. See the
-        // module docs.
+        // The one construct whose end the parse does not give; see the
+        // module docs and [`Walk::closing_fi`]. Its arms are walked either
+        // way, so what is nested inside them is drawn whether or not the
+        // `fi` is found.
         Compound::IfClause(clause) => {
-            walk_list(&clause.condition, out);
-            walk_list(&clause.then, out);
+            let start = clause.loc.start.index;
+            let mut last = clause.loc.end.index;
+            let mut arms = |list: &ast::CompoundList, out: &mut Walk<'_>| {
+                last = last.max(ends_at(list));
+                walk_list(list, out);
+            };
+            arms(&clause.condition, out);
+            arms(&clause.then, out);
             if let Some(elses) = &clause.elses {
                 for arm in elses {
                     if let Some(condition) = &arm.condition {
-                        walk_list(condition, out);
+                        arms(condition, out);
                     }
-                    walk_list(&arm.body, out);
+                    arms(&arm.body, out);
                 }
+            }
+            if let Some(end) = out.closing_fi(last) {
+                out.out.push((BlockKind::If, (start, end)));
             }
         }
         Compound::Coprocess(process) => walk_command(&process.body, out),
@@ -476,18 +558,44 @@ mod tests {
     }
 
     #[test]
-    fn an_if_is_walked_into_but_never_drawn() {
-        // The `if` itself draws nothing: the span it reports covers the two
-        // characters of the keyword. What is nested in its arms is not
-        // affected by that and is still found. When the upstream span is
-        // fixed, this test is the one that says what to change.
+    fn an_if_runs_from_its_keyword_to_its_fi() {
+        // The end comes from the `fi` token, because the parse does not
+        // give it -- see `Walk::closing_fi`. What is nested in the arms is
+        // found either way, and now sits a step inside the `if` that holds
+        // it rather than at the margin.
         let source = "if [ -f x ]; then\n  for y in 1 2; do\n    echo $y\n  done\nfi";
         let found = drawn(source);
-        assert_eq!(found.len(), 1, "an if drew something: {found:?}");
-        assert_eq!(found[0].0, "loop");
-        assert!(found[0].1.starts_with("for y"), "{found:?}");
-        // Depth is zero because the if it sits in is not a block.
-        assert_eq!(found[0].2, 0, "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, "if");
+        assert_eq!(found[0].1, source, "the if does not cover itself: {found:?}");
+        assert_eq!(found[0].2, 0);
+        assert_eq!(found[1].0, "loop");
+        assert_eq!(found[1].2, 1, "the loop is not inside the if: {found:?}");
+    }
+
+    #[test]
+    fn an_if_with_every_arm_ends_at_the_last_fi_and_not_an_earlier_one() {
+        // The search starts after the last arm's last pipeline, so a nested
+        // `if` inside an arm -- whose own `fi` comes first in the source --
+        // cannot be mistaken for this one's.
+        let source = "if a; then\n  if b; then c; fi\nelif d; then\n  e\nelse\n  f\nfi";
+        let found = drawn(source);
+        let outer = found.iter().find(|b| b.0 == "if" && b.2 == 0).expect("{found:?}");
+        assert_eq!(outer.1, source, "the outer if stopped at the inner fi: {found:?}");
+        let inner = found.iter().find(|b| b.0 == "if" && b.2 == 1).expect("{found:?}");
+        assert_eq!(inner.1, "if b; then c; fi", "{found:?}");
+    }
+
+    #[test]
+    fn a_word_that_merely_reads_as_fi_does_not_close_an_if() {
+        // `fi` closes an `if` as a token and not as text. An argument that
+        // happens to be the letters, a word with them inside it, and a
+        // quoted one are none of them the keyword -- and the search starts
+        // past the arms anyway, which is what keeps the first two out of it.
+        let source = "if a; then\n  echo fi fifo \"fi\"\nfi";
+        let found = drawn(source);
+        let block = found.iter().find(|b| b.0 == "if").expect("no if drawn");
+        assert_eq!(block.1, source, "an if ended on something that was not its fi: {found:?}");
     }
 
     #[test]
