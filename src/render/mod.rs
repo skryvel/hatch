@@ -7,6 +7,7 @@
 //! construction rather than by review.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 pub mod blocks;
 pub mod command;
@@ -109,8 +110,62 @@ pub fn render_command_breaking_at(
     env: &BTreeMap<String, String>,
     at: Option<usize>,
 ) -> Spans {
+    render_command_reinterpreting(command, env, at, None)
+}
+
+/// [`render_command_breaking_at`], and one run of the line read as a shell
+/// script in its own right rather than as the string it is to the shell that
+/// will receive it.
+///
+/// # What this is for
+///
+/// The same caller, and the same line. An elevated `run_command` request runs
+/// as `run0 … -- bash -c '<script>'`, where the script is one argument: to
+/// the shell it is a single word, and every pass below is right to read it as
+/// one. On screen that is the wrong answer to a different question. A reader
+/// approving forty lines of shell would be shown forty lines drawn as one
+/// quoted string — no separators, no command names, no resolved variables,
+/// and no structure for the pane to indent or bracket — because hatch put
+/// them inside quotes on the reader's behalf.
+///
+/// So the run is rendered again, on its own, and the result is spliced in
+/// where the string was. It is the same four passes over a smaller source:
+/// the script is shell, it is about to be run as shell, and reading it as
+/// shell is the honest rendering.
+///
+/// # What it changes, and what it cannot
+///
+/// Not one character. Every span the inner rendering produces covers the same
+/// bytes it covered as part of the string, shifted to where that string sits,
+/// and the quotes around it stay outside as their own spans. The result tiles
+/// the same source as before, so `tests/fidelity.rs` is as blind to this as
+/// it is to a line break, and the bytes the reader approves are the bytes
+/// that run.
+///
+/// # Why it can decline
+///
+/// The range comes from
+/// [`crate::exec::elevate::ElevatedArgv::script_at`], which only offers one
+/// when the quoting left the script's bytes alone. Two more doubts are
+/// answered here, both by drawing the line exactly as it would have been
+/// drawn without this: a range that is not on character boundaries, and a
+/// span of the outer rendering that straddles the range and could not be cut
+/// without its kind coming to describe text it does not fit. Neither can be
+/// produced by anything known today, and both are checked rather than
+/// asserted, because the fallback is a rendering this window already draws
+/// every day and a panic is a dead window.
+pub fn render_command_reinterpreting(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    at: Option<usize>,
+    script: Option<Range<usize>>,
+) -> Spans {
     let segmented = command::segment_breaking_at(command, at);
-    let spans = command::highlight(command::annotate_variables(segmented, env));
+    let outer = command::highlight(command::annotate_variables(segmented, env));
+    let spans = match script {
+        Some(script) => reinterpret(outer, env, script),
+        None => outer,
+    };
     if let Some(at) = at {
         assert!(
             spans.iter().any(|span| span.range().start == at && span.break_before()),
@@ -123,6 +178,97 @@ pub fn render_command_breaking_at(
     spans
 }
 
+/// Render `spans.source()[script]` as a command of its own and put the result
+/// in place of whatever covered it. See [`render_command_reinterpreting`].
+///
+/// Returns `spans` unchanged for every doubt. This function is the one that
+/// decides, so that its caller has one thing to say about the answer: the
+/// line is drawn with the script read as shell, or it is drawn as it always
+/// was.
+fn reinterpret(spans: Spans, env: &BTreeMap<String, String>, script: Range<usize>) -> Spans {
+    let source = spans.source().to_string();
+    if script.start >= script.end
+        || script.end > source.len()
+        || !source.is_char_boundary(script.start)
+        || !source.is_char_boundary(script.end)
+    {
+        return spans;
+    }
+    let inner = render_command(&source[script.clone()], env);
+    match spliced(&source, &spans, &inner, script.start) {
+        Some(merged) => merged,
+        None => spans,
+    }
+}
+
+/// The outer spans with `inner`'s spans in place of the run they cover,
+/// rebuilt through [`SpanBuilder`] like every other rendering that crosses a
+/// boundary.
+///
+/// `None` when a span of the outer rendering reaches into the run and could
+/// not be cut at its edge: a [`SpanKind::Chip`] stands for one codepoint and
+/// a [`SpanKind::Variable`] for one whole reference, and a piece of either
+/// would be a kind describing text it does not fit. Neither can straddle the
+/// edge of a quoted argument — one is a single codepoint and the other
+/// cannot contain a quote — so this is a check that has never fired and is
+/// here because the alternative to checking is a panic in a prompt window.
+fn spliced(source: &str, outer: &Spans, inner: &Spans, at: usize) -> Option<Spans> {
+    let end = at + inner.source().len();
+    let mut builder = SpanBuilder::new(source);
+    let mut put = false;
+    for span in outer.iter() {
+        let range = span.range();
+        let clear = range.end <= at || range.start >= end;
+        if clear {
+            if span.break_before() {
+                builder.break_next();
+            }
+            builder.push_to(range.end, span.kind().clone());
+            continue;
+        }
+        // Only a span that reaches out of the run has to survive being cut.
+        // One that lies inside it is replaced whole, whatever kind it is —
+        // the newline chips the outer pass put in the string are the ordinary
+        // case, and the inner rendering produces its own.
+        let straddles = range.start < at || range.end > end;
+        if straddles && matches!(span.kind(), SpanKind::Chip { .. } | SpanKind::Variable { .. }) {
+            return None;
+        }
+        // The part in front of the run keeps the kind it had: the opening
+        // quote is still part of the string it opens.
+        if range.start < at {
+            if span.break_before() {
+                builder.break_next();
+            }
+            builder.push_to(at, span.kind().clone());
+        }
+        if !put {
+            // A script that is drawn on more than one line starts on one.
+            // `bash -c '` is the last thing on the wrapper's line and the
+            // script begins under it, rather than the first of forty lines
+            // being the one that shares a line with the wrapper. A script
+            // that fits on one line stays where it is: a line of its own
+            // would be a line spent saying nothing.
+            if inner.iter().any(Span::break_before) {
+                builder.break_next();
+            }
+            for nested in inner.iter() {
+                if nested.break_before() {
+                    builder.break_next();
+                }
+                builder.push_to(at + nested.range().end, nested.kind().clone());
+            }
+            put = true;
+        }
+        // And so does the part behind it. No break: the closing quote ends
+        // the line the script's last line is on, rather than starting one.
+        if range.end > end {
+            builder.push_to(range.end, span.kind().clone());
+        }
+    }
+    put.then(|| builder.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +278,100 @@ mod tests {
     /// so they mostly render against an empty one.
     fn render_command(command: &str) -> Spans {
         super::render_command(command, &BTreeMap::new())
+    }
+
+    /// The shape the one caller has: a wrapper, then a quoted script.
+    fn wrapped(script: &str) -> (String, Range<usize>) {
+        let line = format!("run0 --pipe -- bash -c '{script}'");
+        let at = "run0 --pipe -- bash -c '".len();
+        (line, at..at + script.len())
+    }
+
+    #[test]
+    fn a_script_inside_the_quotes_is_read_as_a_script() {
+        // Without this the whole of it is one `Quoted` span: no separators,
+        // no command names, no resolved variables, and nothing for the pane
+        // to indent. It is shell, and it is about to be run as shell.
+        let (line, script) = wrapped("cd /tmp; rm -rf x");
+        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(script));
+        let inside: Vec<(&str, &SpanKind)> =
+            spans.iter().map(|span| (span.text(), span.kind())).collect();
+        assert!(inside.contains(&("cd", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&("rm", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&(";", &SpanKind::Separator)), "{inside:?}");
+        // The quotes stay outside it. They are what make the script one word
+        // to the shell, and the reader is looking at where that word begins.
+        assert_eq!(spans.first().map(Span::text), Some("run0"));
+        assert_eq!(spans.last().map(Span::text), Some("'"));
+        assert_eq!(spans.last().map(Span::kind), Some(&SpanKind::Quoted));
+        assert_eq!(unrender(&spans), line);
+    }
+
+    #[test]
+    fn reading_it_again_moves_no_character() {
+        // The whole of what this is allowed to change is what a span says
+        // about text. `tests/fidelity.rs` is blind to it for the reason it is
+        // blind to a line break, and this is that claim stated where the
+        // splice happens.
+        let (line, script) = wrapped("echo $HOME\nfor f in a b; do\n  cat \"$f\"\ndone");
+        let env = BTreeMap::from([("HOME".to_string(), "/home/x".to_string())]);
+        let spans = render_command_reinterpreting(&line, &env, None, Some(script.clone()));
+        assert_eq!(unrender(&spans), line);
+        assert!(spans.covers_source(), "the spliced spans do not tile the line");
+        // And the value comes from the environment the command will get,
+        // which is the thing a reader cannot work out from the text.
+        let resolved: Vec<(&str, &SpanKind)> = spans
+            .iter()
+            .filter(|span| matches!(span.kind(), SpanKind::Variable { .. }))
+            .map(|span| (span.text(), span.kind()))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("$HOME", &SpanKind::Variable { resolved: Some("/home/x".to_string()) }),
+                // The loop variable is the child's own and hatch does not set
+                // it, which `None` says and is right to say: see
+                // `SpanKind::Variable`.
+                ("$f", &SpanKind::Variable { resolved: None }),
+            ],
+            "{resolved:?}"
+        );
+        // Every span of the script lies inside the quotes, so the pane can
+        // ask which bytes were read again and get an answer about the run
+        // rather than about the whole line.
+        let nested: Vec<Range<usize>> = spans
+            .iter()
+            .map(Span::range)
+            .filter(|range| script.start <= range.start && range.end <= script.end)
+            .collect();
+        assert!(nested.len() > 1, "{nested:?}");
+    }
+
+    #[test]
+    fn the_line_break_the_caller_asked_for_survives_the_splice() {
+        // The two facts the caller supplies are independent, and the splice
+        // rebuilds every span: a break dropped on the way through would put
+        // the command back behind the wall of wrapper it was moved out from.
+        let (line, script) = wrapped("id -u");
+        let at = line.find("bash").expect("the wrapper");
+        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), Some(at), Some(script));
+        let broken = spans.iter().find(|span| span.range().start == at).expect("a span at the seam");
+        assert!(broken.break_before(), "the break at the seam was lost");
+    }
+
+    #[test]
+    fn a_range_that_is_not_a_run_of_the_line_draws_the_line_as_it_was() {
+        // Every doubt draws what hatch drew before there was a splice. None
+        // of these can be produced by `ElevatedArgv::script_at`, which is the
+        // reason to check rather than to assert: the fallback is a rendering
+        // this window draws every day, and a panic is a dead window.
+        let (line, _) = wrapped("id -u");
+        let plain = render_command(&line);
+        for doubt in [0..0, Range { start: 5, end: 4 }, 3..line.len() + 1] {
+            let spans =
+                render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(doubt.clone()));
+            assert_eq!(spans, plain, "{doubt:?} was not declined");
+        }
     }
 
     #[test]

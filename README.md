@@ -182,7 +182,13 @@ nobody is interrupted.
 Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 — never as a string handed to a second shell. With `root: true` the argv
 becomes `run0 --pipe --setenv=… -- bash -c '<command>'`, and the window shows
-that whole line, wrapper and `--setenv` pairs included.
+that whole line, wrapper and `--setenv` pairs included. The command inside
+those quotes is one word to `bash -c` and is drawn as the shell it is about to
+be run as — separators, command names, resolved variables and block brackets
+all inside a single shell argument — with a line above the panes saying that
+the quotes are hatch's and the reading is hatch's. A command containing a `'`
+is drawn as the string it is: quoting rewrites those bytes, so there is
+nothing honest to read.
 
 Deletes and renames are deliberately not file operations. They are
 `run_command("rm …")` and `run_command("mv …")`, so the destructive verb is on
@@ -383,8 +389,8 @@ ran as root.
 header the word ROOT is reversed out of a filled red block, and above the panes
 a warning explains that a root command may be given a terminal where an
 ordinary one gets a pipe. The command is the run0 line, with the approved
-command beginning on its own line below run0's own
-options.](media/approval-root.png)
+command beginning on its own line below run0's own options and drawn as shell
+inside the quotes hatch wrapped it in.](media/approval-root.png)
 
 <sub>`hatch preview root --shot media/approval-root.png`</sub>
 

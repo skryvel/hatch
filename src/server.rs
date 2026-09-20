@@ -185,7 +185,7 @@ use crate::protocol::{
     Payload, Release, Request as PromptRequest, ReviseKind, Unanswered, Unheard, Verdict,
 };
 use crate::render::diff::{FileDiff, diff_files};
-use crate::render::render_command_breaking_at;
+use crate::render::render_command_reinterpreting;
 use crate::render::roster::roster;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
@@ -2450,7 +2450,7 @@ impl Daemon {
         // that is the one the command will actually have — resolving against
         // the spawner's would put a value on screen that the command never
         // sees. See `crate::exec::elevate::Run0::spawner_env`.
-        let (argv, spawn_env, line, break_at, caveat) = if root {
+        let (argv, spawn_env, line, break_at, script_at, caveat) = if root {
             let elevated = match self.elevation.argv(&command, &env) {
                 Ok(elevated) => elevated,
                 // Nothing was rendered and nobody was asked: this build
@@ -2471,6 +2471,11 @@ impl Daemon {
                 // the part they were asked about. Layout only: the line is
                 // the same line. See `ElevatedArgv::inner_at`.
                 elevated.inner_at(),
+                // ...and which of that line is the script the reader came to
+                // read, so it is drawn as the shell it will be run as rather
+                // than as the one word it is to `bash -c`. See
+                // `ElevatedArgv::script_at`.
+                elevated.script_at(),
                 self.elevation.caveat(),
             )
         } else {
@@ -2480,8 +2485,10 @@ impl Daemon {
                 vec!["bash".to_string(), "-c".to_string(), command.clone()],
                 env.clone(),
                 command.clone(),
-                // Nothing to break before: the line an unelevated request
-                // draws is the command the agent wrote and nothing else.
+                // Nothing to break before, and nothing to read again: the
+                // line an unelevated request draws is the command the agent
+                // wrote and nothing else.
+                None,
                 None,
                 None,
             )
@@ -2491,7 +2498,8 @@ impl Daemon {
             false => env.clone(),
         };
 
-        let spans = render_command_breaking_at(&line, &render_env, break_at);
+        let spans =
+            render_command_reinterpreting(&line, &render_env, break_at, script_at.clone());
         // The roster is built from the same line the spans tile, so the list
         // above the panes and the text in them cannot come to describe two
         // different requests -- and against the same `render_env`, because the
@@ -2504,6 +2512,7 @@ impl Daemon {
         let payload =
             Payload::command(&spans, Vec::new(), cwd.clone(), root, interactive)
                 .with_caveat(caveat)
+                .with_script(script_at)
                 .with_runs(runs);
         Rendered::Ready(Box::new(Job {
             detail: detail(&cwd),
@@ -6654,18 +6663,52 @@ later"), "");
         }
 
         #[tokio::test]
+        async fn the_window_is_told_which_of_the_elevated_line_is_the_script() {
+            // The half that could be silently dead. The renderer reads the
+            // script as shell and the window parses it for constructs, and
+            // both need the daemon to say which bytes those are -- a request
+            // that arrived without it would draw forty lines of shell as one
+            // quoted string and nothing would fail.
+            let harness = rooted(
+                vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })],
+                Arc::new(Rehearsed::running(RootOutcome::Ran { exit: Some(0) })),
+            );
+            let script = "for f in a b; do\n  cat $f\ndone";
+            within(harness.daemon.run_command(root_run(script), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let payload = shown.operations.into_iter().next().expect("an operation");
+            let Payload::Command { raw, script: at, .. } = &payload else {
+                panic!("not a command payload");
+            };
+            let at = at.clone().expect("the window was not told where the script is");
+            assert_eq!(&raw[at], script, "{raw}");
+            // And the rendering that arrived reads it as shell: `for` is the
+            // word that names what runs, inside a quoted argument.
+            let spans = payload.rendering().expect("a rendering the window would accept");
+            let named: Vec<&str> = spans
+                .iter()
+                .filter(|span| span.kind() == &crate::render::SpanKind::Command)
+                .map(crate::render::Span::text)
+                .collect();
+            assert!(named.contains(&"for"), "{named:?}");
+            assert!(named.contains(&"cat"), "{named:?}");
+        }
+
+        #[tokio::test]
         async fn an_unelevated_command_draws_neither_the_wrapper_nor_a_caveat() {
             let harness =
                 Harness::new(vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })]);
             within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let Payload::Command { raw, root, caveat, .. } = shown.operations.into_iter().next().expect("an operation") else {
+            let Payload::Command { raw, root, caveat, script, .. } = shown.operations.into_iter().next().expect("an operation") else {
                 panic!("not a command payload");
             };
             assert_eq!(raw, "echo hi");
             assert!(!root);
             assert_eq!(caveat, None, "an ordinary command was given a root warning");
+            assert_eq!(script, None, "a command nobody quoted claimed hatch had quoted it");
         }
 
         #[tokio::test]

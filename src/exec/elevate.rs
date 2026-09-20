@@ -88,9 +88,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 
 use super::lookup::lookup;
-use super::{Env, shell_argv, shell_line};
+use super::{Env, shell_argv, shell_line, shell_quote};
 
 // ---- what every platform must answer ---------------------------------------
 
@@ -192,7 +193,7 @@ pub trait Elevation: Send + Sync {
     /// command gets is the same one the unelevated path uses and the command
     /// travels as a single `execve` argument either way.
     fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        self.elevate(shell_argv(command), env)
+        Ok(self.elevate(shell_argv(command), env)?.over_script(command))
     }
 
     /// [`Self::argv`] for a caller that is only going to draw the line.
@@ -202,7 +203,7 @@ pub trait Elevation: Send + Sync {
     /// one caller is [`crate::preview`], which has no daemon, no verdict
     /// channel and nothing to run a command with.
     fn compose_argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        self.compose(shell_argv(command), env)
+        Ok(self.compose(shell_argv(command), env)?.over_script(command))
     }
 
     /// What a finished elevated run means.
@@ -262,6 +263,9 @@ pub struct ElevatedArgv {
     /// Where the inner argv begins in [`ElevatedArgv::display_line`]. See
     /// [`ElevatedArgv::inner_at`].
     inner_at: Option<usize>,
+    /// Where the shell script under the wrapper is drawn, if this argv has
+    /// one and the quoting left it alone. See [`ElevatedArgv::script_at`].
+    script_at: Option<Range<usize>>,
 }
 
 impl ElevatedArgv {
@@ -291,7 +295,51 @@ impl ElevatedArgv {
         // nothing, and answering honestly costs one word.
         let inner_at = (!inner.is_empty()).then(|| shell_line(&argv).len() + 1);
         argv.extend(inner);
-        ElevatedArgv { argv, inner_at }
+        ElevatedArgv { argv, inner_at, script_at: None }
+    }
+
+    /// The same argv, knowing that its last argument is the shell script
+    /// `script` and where the drawn line puts it.
+    ///
+    /// # Why it is a second step rather than a parameter
+    ///
+    /// [`Self::wrapping`] takes three parts and none of them is a script: a
+    /// root file write's inner argv is `install` and its arguments, with no
+    /// shell under it at all, and an [`Elevation`] implementation composing
+    /// one has no idea whether what it was handed came from a shell wrapper.
+    /// The two functions that do know are [`Elevation::argv`] and
+    /// [`Elevation::compose_argv`], because they are the ones that called
+    /// [`shell_argv`], and both go through here.
+    ///
+    /// # Why the range can be `None` for a script that is really there
+    ///
+    /// [`shell_quote`] leaves a plain word bare and wraps everything else in
+    /// single quotes, where nothing but `'` has any meaning -- so the drawn
+    /// text is the script's own bytes, offset by the opening quote if there
+    /// is one. Unless the script contains a `'`, which it rewrites as
+    /// `'\''`. Then the characters on screen are not the characters of the
+    /// script, and there is no range here that would mean what a caller
+    /// would take it to mean. Saying nothing is the whole of the answer: see
+    /// [`Self::script_at`].
+    fn over_script(mut self, script: &str) -> ElevatedArgv {
+        // The same arithmetic `wrapping` does, on the same grounds: the
+        // rendered last argument begins one byte past the end of everything
+        // in front of it, because `shell_line` quotes each argument and
+        // joins the results with one space.
+        let Some(head) = self.argv.split_last().map(|(_, head)| head) else { return self };
+        let begins = shell_line(head).len() + 1;
+        let quoted = shell_quote(script);
+        self.script_at = if quoted == script {
+            Some(begins..begins + script.len())
+        } else if quoted.len() == script.len() + 2 {
+            // Quoted, and nothing inside the quotes was rewritten: every
+            // rewrite `shell_quote` makes turns one byte into four, so a
+            // length exactly two over is the one case where it only wrapped.
+            Some(begins + 1..begins + 1 + script.len())
+        } else {
+            None
+        };
+        self
     }
 
     /// The elevation program — `argv[0]`, which this type guarantees exists.
@@ -332,6 +380,39 @@ impl ElevatedArgv {
     /// bytes that run.
     pub fn inner_at(&self) -> Option<usize> {
         self.inner_at
+    }
+
+    /// Where the shell script under the wrapper is drawn in
+    /// [`Self::display_line`], as a byte range -- `None` when this argv has
+    /// no script under it, or when quoting it changed its bytes.
+    ///
+    /// A `run_command` request is elevated as `run0 … -- bash -c '<script>'`,
+    /// and the script is one argument. Everything that reads the line reads
+    /// it as one argument too, which is right about the shell and unhelpful
+    /// on screen: a reader approving forty lines of shell gets forty lines
+    /// drawn as one quoted string, with no separators, no command names and
+    /// no resolved variables in any of it. The renderer can do better, and
+    /// the only thing it needs is to be told which bytes are a script rather
+    /// than a string -- which is a fact about how hatch built this line, not
+    /// one recoverable from the line.
+    ///
+    /// # Why it is not searched for
+    ///
+    /// [`Self::inner_at`]'s reason, and one more. A search for the last
+    /// quoted run would sometimes find a quote inside the script, and it
+    /// could not tell a quoting `shell_quote` performed from one the agent
+    /// wrote. This type joined the two halves and can do arithmetic on them.
+    ///
+    /// # Why it fails to silence
+    ///
+    /// The bytes in the range must be the script's own, because a rendering
+    /// of the script is going to be drawn over them and every pass below
+    /// tiles what it is given. A script containing a `'` is rendered
+    /// `'…'\''…'`, which is longer than the script and not equal to it
+    /// anywhere past the first quote; there is no honest range to hand out,
+    /// so none is. The line is then drawn exactly as it is drawn today.
+    pub fn script_at(&self) -> Option<Range<usize>> {
+        self.script_at.clone()
     }
 
     /// The line the window shows, shell-quoted from the argv above.
@@ -1065,11 +1146,20 @@ mod tests {
     fn a_command_is_the_shell_shaped_case_of_the_same_primitive() {
         let (_dir, env) = with_run0();
         let run0 = Run0::new();
+        let shaped = run0.argv("echo hi", &env).unwrap();
+        let primitive = run0.elevate(shell_argv("echo hi"), &env).unwrap();
         assert_eq!(
-            run0.argv("echo hi", &env).unwrap(),
-            run0.elevate(shell_argv("echo hi"), &env).unwrap(),
+            shaped.as_slice(),
+            primitive.as_slice(),
             "the two entry points built different argvs for the same command"
         );
+        assert_eq!(shaped.inner_at(), primitive.inner_at());
+        // The one thing they do not agree on, and the reason the shell-shaped
+        // case exists as its own function: it called `shell_argv` and so
+        // knows its last argument is a script. The primitive was handed a
+        // list of words and has no way to tell a script from a path.
+        assert_eq!(&shaped.display_line()[shaped.script_at().unwrap()], "echo hi");
+        assert_eq!(primitive.script_at(), None);
     }
 
     #[test]
@@ -1240,6 +1330,66 @@ mod tests {
             "{}",
             argv.display_line()
         );
+    }
+
+    // ---- where the script is -----------------------------------------------
+
+    #[test]
+    fn the_line_says_which_of_it_is_the_script() {
+        // The renderer reads the script as shell rather than as the string it
+        // is to the shell that will receive it, and it can only do that over
+        // bytes somebody has vouched for. So the range has to be exactly the
+        // script, on both edges: one byte either way puts a quote inside the
+        // rendering or a character of the script outside it.
+        let (_dir, env) = with_run0();
+        for script in [
+            "id -u",
+            "systemctl status zram0",
+            "set -e\nfor f in a b; do\n  cat \"$f\"\ndone",
+            "echo \"it is\"",
+        ] {
+            let argv = Run0::new().argv(script, &env).unwrap();
+            let line = argv.display_line();
+            let at = argv.script_at().unwrap_or_else(|| panic!("no range for {script:?}"));
+            assert_eq!(&line[at], script, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_script_the_quoting_rewrote_has_no_range_at_all() {
+        // `shell_quote` closes, escapes and reopens a single quote inside an
+        // argument, so the characters on screen past the first `\'` are not
+        // the characters of the script. There is no range that would mean
+        // what a caller would take it to mean, and the answer is to say
+        // nothing rather than to point at text that has been transformed.
+        let (_dir, env) = with_run0();
+        let argv = Run0::new().argv("echo 'it is'", &env).unwrap();
+        assert_eq!(argv.script_at(), None, "{}", argv.display_line());
+    }
+
+    #[test]
+    fn a_root_file_write_has_no_script_under_it() {
+        // `install` and its arguments, with no shell under them at all. A
+        // range here would put a shell rendering over two paths the window
+        // already committed to, which is the re-parse `Elevation::argv`'s
+        // note is about.
+        let (_dir, env) = with_run0();
+        let argv = Run0::new().elevate(argv_of("install -m 600 /tmp/a /tmp/b"), &env).unwrap();
+        assert_eq!(argv.script_at(), None, "{}", argv.display_line());
+    }
+
+    #[test]
+    fn the_preview_and_the_run_agree_about_where_the_script_is() {
+        // `compose_argv` is the path a preview takes and `argv` is the path a
+        // request takes. A window drawn by one and a command run by the other
+        // must be describing the same bytes.
+        let (_dir, env) = with_run0();
+        let script = "for f in a b; do cat \"$f\"; done";
+        let run0 = Run0::new();
+        let shown = run0.compose_argv(script, &env).unwrap();
+        let ran = run0.argv(script, &env).unwrap();
+        assert_eq!(shown.script_at(), ran.script_at());
+        assert_eq!(&shown.display_line()[shown.script_at().unwrap()], script);
     }
 
     // ---- where the line breaks ---------------------------------------------

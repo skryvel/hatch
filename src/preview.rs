@@ -27,7 +27,7 @@
 //! of its own then a preview that looked right would be no evidence that the
 //! real window looks right, and the pictures in the README would be pictures
 //! of something that does not exist. So every sample here is a
-//! [`protocol::Request`] assembled from [`render::render_command_breaking_at`],
+//! [`protocol::Request`] assembled from [`render::render_command_reinterpreting`],
 //! [`Payload::command`], [`Payload::swap`] and [`swap::plan`] — the calls
 //! [`crate::server::Daemon::prepare`](crate::server) makes, in the order it
 //! makes them — and it is handed to [`crate::prompt_ui::PromptApp`], which is
@@ -85,7 +85,7 @@ use crate::prompt_ui::theme::Theme;
 use crate::prompt_ui::{Incoming, Phase, PromptApp};
 use crate::protocol::{DaemonMsg, Payload, Request};
 use crate::render::diff::{FileDiff, diff_files};
-use crate::render::render_command_breaking_at;
+use crate::render::render_command_reinterpreting;
 use crate::render::roster::roster;
 use crate::swap;
 
@@ -322,7 +322,7 @@ fn command_payload(
     let Asked::Command { command, cwd, root, interactive } = asked else {
         anyhow::bail!("a command payload was asked for a swap");
     };
-    let (line, break_at, render_env, caveat) = match root {
+    let (line, break_at, script_at, render_env, caveat) = match root {
         true => {
             let elevated = elevation
                 .compose_argv(command, env)
@@ -330,13 +330,14 @@ fn command_payload(
             (
                 elevated.display_line(),
                 elevated.inner_at(),
+                elevated.script_at(),
                 elevation.child_env(env),
                 elevation.caveat(),
             )
         }
-        false => (command.clone(), None, env.clone(), None),
+        false => (command.clone(), None, None, env.clone(), None),
     };
-    let spans = render_command_breaking_at(&line, &render_env, break_at);
+    let spans = render_command_reinterpreting(&line, &render_env, break_at, script_at.clone());
     // The roster, off the same line and the same environment the daemon uses
     // -- which means a preview of a sample resolves the sample's own names
     // against this machine, exactly as a real request would. A sample that
@@ -349,6 +350,7 @@ fn command_payload(
     // showing a header the daemon cannot currently produce.
     Ok(Payload::command(&spans, Vec::new(), cwd.clone(), *root, *interactive)
         .with_caveat(caveat)
+        .with_script(script_at)
         .with_runs(runs))
 }
 
@@ -587,7 +589,17 @@ pub(crate) fn build(
                 // terminal, and a pager with nothing to read from waits until
                 // hatch kills it. The sample that shows the `--setenv` list
                 // off should be the command the list exists for.
-                command: "systemctl restart service && systemctl status service".to_string(),
+                //
+                // It is a script and not a one-liner because the thing worth
+                // looking at on this window is what happens *inside* the
+                // quotes. hatch puts the whole of an elevated command into
+                // one argument of `bash -c`, and a sample short enough to
+                // read as a string would not show that the pane reads it as
+                // shell -- the separators, the words that name what runs, the
+                // resolved variables, and the brackets down the gutter are
+                // all drawn inside a single shell word. See
+                // `render::render_command_reinterpreting`.
+                command: ROOT_SAMPLE.to_string(),
                 cwd,
                 root: true,
                 interactive: false,
@@ -726,6 +738,20 @@ fi
 find . -name '*.sql.gz' -mtime +30 -print0 |
   xargs -0 --no-run-if-empty rm -v |
   tee -a prune.log";
+
+/// The command behind [`Scenario::Root`].
+///
+/// Short enough to read in one go and structured enough to have something to
+/// say: a loop, a conditional inside it, and a variable the child environment
+/// answers for. Every one of those is drawn inside the quotes `bash -c` will
+/// receive as one word.
+const ROOT_SAMPLE: &str = "\
+systemctl restart service &&
+for unit in service service-worker; do
+  systemctl is-active --quiet $unit ||
+    journalctl -u $unit -n 20 --no-pager
+done
+systemctl status service";
 
 /// The command behind [`Scenario::Long`].
 ///

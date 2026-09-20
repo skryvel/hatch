@@ -267,6 +267,45 @@ pub fn blocks(source: &str) -> Vec<Block> {
     out
 }
 
+/// The constructs in one run of `source`, reported in `source`'s own offsets.
+///
+/// The run is a shell script hatch quoted into a larger line -- an elevated
+/// request is `run0 … -- bash -c '<script>'` -- and the constructs a reader
+/// needs to see are the script's. Parsing the whole line would find none of
+/// them: to a shell the script is one word, which is the right answer to a
+/// different question. See
+/// [`crate::exec::elevate::ElevatedArgv::script_at`].
+///
+/// The script is parsed on its own and every offset is shifted, which is
+/// sound because the range is a run of bytes and a block is a range of them.
+/// Nothing outside the run is looked at, so a wrapper that happened to
+/// contain a `do` cannot put a bracket anywhere.
+///
+/// The run itself is not a block. It has a beginning and an end and a
+/// bracket could be drawn around it, but a bracket says *these lines are one
+/// construct* and the quotes on screen already say that, at both ends, in the
+/// command's own characters. A second mark for the same fact is the thing
+/// [`crate::prompt_ui::panes`]'s gutter is written not to do.
+///
+/// Empty for every doubt [`blocks`] is empty for, and for a range that is not
+/// a run of `source`.
+pub fn blocks_within(source: &str, script: Range<usize>) -> Vec<Block> {
+    if script.start >= script.end
+        || script.end > source.len()
+        || !source.is_char_boundary(script.start)
+        || !source.is_char_boundary(script.end)
+    {
+        return Vec::new();
+    }
+    blocks(&source[script.clone()])
+        .into_iter()
+        .map(|block| Block {
+            range: block.range.start + script.start..block.range.end + script.start,
+            ..block
+        })
+        .collect()
+}
+
 /// Whether `source` nests brackets deeper than `limit`.
 ///
 /// A count of `(` and `{` against their closers, which over-counts — a brace
@@ -579,6 +618,45 @@ mod tests {
         // and a bracket that is always there says nothing.
         assert_eq!(drawn("ls -l"), vec![]);
         assert_eq!(drawn("echo hi > /tmp/x"), vec![]);
+    }
+
+    #[test]
+    fn a_script_quoted_into_a_line_is_parsed_on_its_own() {
+        // The wrapper is not shell hatch is entitled to read -- and it does
+        // not have to be, because the run is a run of bytes and a block is a
+        // range of them. What comes back is in the whole line's offsets.
+        let script = "for f in a b; do\n  cat $f\ndone";
+        let line = format!("run0 -- bash -c '{script}'");
+        let at = line.find(script).expect("the script");
+        let found = blocks_within(&line, at..at + script.len());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(&line[found[0].range()], script);
+        // Parsing the line instead finds nothing: to a shell the script is
+        // one word. That is the whole of what this function is for.
+        assert_eq!(blocks(&line), vec![]);
+    }
+
+    #[test]
+    fn nothing_outside_the_run_can_put_a_bracket_anywhere() {
+        // A wrapper is agent-adjacent text hatch built, and a `done` in it is
+        // not a keyword of the script. Only the run is parsed.
+        let line = "run0 --setenv=X=done -- bash -c 'cat a'";
+        let at = line.find("cat a").expect("the script");
+        assert_eq!(blocks_within(line, at..at + "cat a".len()), vec![]);
+    }
+
+    #[test]
+    fn a_run_that_is_not_a_run_of_the_source_draws_nothing() {
+        // Every doubt in this module has one shape. A caller that has lost
+        // track of which line its offsets are about gets no brackets, rather
+        // than brackets around whatever those offsets happen to hit.
+        let line = "run0 -- bash -c 'for f in a b; do cat $f; done'";
+        for doubt in [0..0, Range { start: 9, end: 8 }, 3..line.len() + 1] {
+            assert_eq!(blocks_within(line, doubt.clone()), vec![], "{doubt:?}");
+        }
+        // Inside a character, not between two.
+        let snowman = "echo '\u{2603} for f in a b; do cat $f; done'";
+        assert_eq!(blocks_within(snowman, 7..snowman.len() - 1), vec![]);
     }
 
     #[test]

@@ -113,7 +113,7 @@ pub fn shell_line(argv: &[String]) -> String {
 }
 
 /// One argument, quoted if it needs it. See [`shell_line`].
-fn shell_quote(arg: &str) -> String {
+pub(crate) fn shell_quote(arg: &str) -> String {
     fn bare(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte)
     }

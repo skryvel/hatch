@@ -50,7 +50,7 @@ use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
-use crate::render::blocks::{Block, blocks};
+use crate::render::blocks::{Block, blocks, blocks_within};
 use crate::render::language::{Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
@@ -144,6 +144,15 @@ pub enum Shown {
         /// How a root command will differ from the same command run
         /// unprivileged, defanged for drawing. `None` when it will not.
         caveat: Option<String>,
+        /// Which of the source is a shell script hatch quoted into the line,
+        /// checked against the rendering — [`Payload::script`].
+        ///
+        /// `None` for every request that is not elevated. Held so the window
+        /// can say so: the daemon already read those bytes as shell and the
+        /// spans arrived that way, and a reader looking at command names and
+        /// resolved variables *inside* a quoted string is owed a sentence
+        /// saying who decided they were shell.
+        script: Option<Range<usize>>,
     },
     /// A file swap, drawn in whichever of the two views fits — see
     /// [`draw_swap`].
@@ -179,6 +188,9 @@ impl Shown {
         match payload {
             Payload::Command { danger, runs, cwd, root, interactive, caveat, .. } => {
                 let annotated = payload.rendering()?;
+                // Checked against the rendering it names, before anything
+                // slices the source with it. See `Payload::script`.
+                let script = payload.script(&annotated)?;
                 // From the rebuilt spans, not from the payload's own `raw`
                 // field: the two are equal by construction, and taking it
                 // from here means every character in either pane came out of
@@ -186,7 +198,15 @@ impl Shown {
                 let source = annotated.source();
                 let raw = classify(source);
                 Ok(Shown::Command {
-                    blocks: blocks(source),
+                    // The script's constructs, not the wrapper's. To a shell
+                    // the whole script is one word, so parsing the line would
+                    // find nothing at all inside the quotes -- which is the
+                    // right answer about the shell and the wrong one about
+                    // what the reader is being asked to approve.
+                    blocks: match &script {
+                        Some(script) => blocks_within(source, script.clone()),
+                        None => blocks(source),
+                    },
                     snippets: snippets(source),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
@@ -202,6 +222,7 @@ impl Shown {
                     // undefanged, and an exception for trusted text is how
                     // the rule stops being one.
                     caveat: caveat.as_deref().map(defang),
+                    script,
                     longest: widest_line(&annotated).max(widest_line(&raw)),
                     raw,
                     annotated,
@@ -1351,9 +1372,17 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool) -> Option<bool> {
     match shown {
         Shown::Command {
-            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, ..
+            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, script, ..
         } => {
-            draw_command_header(ui, scan, snippets, danger, runs, caveat.as_deref());
+            draw_command_header(
+                ui,
+                scan,
+                snippets,
+                script.is_some(),
+                danger,
+                runs,
+                caveat.as_deref(),
+            );
             draw_command(ui, annotated, raw, *longest, blocks, original)
         }
         Shown::Swap { path, plan, rows, longest } => {
@@ -1373,6 +1402,7 @@ fn draw_command_header(
     ui: &mut Ui,
     report: &ScanReport,
     snippets: &[Snippet],
+    script: bool,
     danger: &[String],
     runs: &[Entry],
     caveat: Option<&str>,
@@ -1392,6 +1422,13 @@ fn draw_command_header(
         // what the command carries rather than a warning about it, and the
         // one thing it must not do is compete with a line that is one.
         ui.label(RichText::new(note).small().color(palette.quiet));
+    }
+    if script {
+        // Beside the snippet note, in the same voice, because it is the same
+        // kind of statement: a run of this line is being read as a language,
+        // and the reader is being told which and on whose say-so. See
+        // `SCRIPT_NOTE`.
+        ui.label(RichText::new(SCRIPT_NOTE).small().color(palette.quiet));
     }
     if !danger.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -2066,6 +2103,31 @@ fn command_caption(original: bool) -> &'static str {
 
 /// The label on the box that swaps them.
 const ORIGINAL_LABEL: &str = "Show the original text";
+
+/// What to say about a command hatch quoted into a line of its own making.
+///
+/// Two things, and the first is the one a reader cannot get anywhere else:
+/// **the quotes are hatch's**. The agent sent a command; hatch wrapped it to
+/// run it as root, and the line on screen is therefore not a line the agent
+/// wrote. A reader who does not know that cannot tell which parts of it came
+/// from where, and the quotes are the seam.
+///
+/// The second is what the annotated pane does about it. To `bash -c` the
+/// whole script is one word, and everywhere else in that pane the colour and
+/// the underline are notes over text whose structure hatch and the shell
+/// agree about. Inside these quotes they are not: drawing command names,
+/// separators and brackets in there is hatch reading the word a second way.
+/// The reading is almost certainly right -- the bytes are about to be run as
+/// shell by the very program named on the line -- and it is still a reading,
+/// so it is named rather than left for the reader to notice.
+///
+/// It says *the annotated pane* rather than *this pane* because the header is
+/// drawn above whichever pane is showing, and the sentence has to stay true
+/// when the reader has switched to the original text -- which is exactly
+/// where they would go to check it.
+const SCRIPT_NOTE: &str =
+    "The quotes are hatch's: an elevated command is handed to bash as one argument. The \
+     annotated pane reads what is inside them as the shell it will be run as.";
 
 /// The command, in one pane, in whichever of the two renderings is asked for.
 ///
@@ -3705,6 +3767,83 @@ mod tests {
         )
     }
 
+    /// A payload shaped like an elevated one: a wrapper, then the command as
+    /// one quoted argument, with the run named the way the daemon names it.
+    fn an_elevated_command(script: &str) -> Payload {
+        let line = format!("run0 --pipe -- bash -c '{script}'");
+        let at = "run0 --pipe -- bash -c '".len();
+        let script = at..at + script.len();
+        let env = BTreeMap::from([("HOME".to_string(), "/home/u".to_string())]);
+        let spans = crate::render::render_command_reinterpreting(
+            &line,
+            &env,
+            Some("run0 --pipe -- ".len()),
+            Some(script.clone()),
+        );
+        Payload::command(&spans, Vec::new(), PathBuf::from("/tmp"), true, false)
+            .with_script(Some(script))
+    }
+
+    #[test]
+    fn the_brackets_come_from_the_script_and_not_from_the_wrapper() {
+        // To a shell the whole script is one word, so parsing the line finds
+        // nothing inside the quotes at all -- which is the right answer about
+        // the shell and the wrong one about what the reader is approving.
+        let payload = an_elevated_command("for f in a b; do\n  cat $f\ndone");
+        let Shown::Command { blocks, annotated, .. } =
+            Shown::of(&payload).expect("a real payload")
+        else {
+            panic!("a command payload read as something else")
+        };
+        let found: Vec<&str> =
+            blocks.iter().map(|block| &annotated.source()[block.range()]).collect();
+        assert_eq!(found, vec!["for f in a b; do\n  cat $f\ndone"], "{found:?}");
+
+        // And the same line without the daemon's word for which run is a
+        // script finds nothing, which is what this is worth.
+        let blind = Shown::of(&payload.clone().with_script(None)).expect("a real payload");
+        let Shown::Command { blocks, .. } = blind else { panic!("not a command") };
+        assert!(blocks.is_empty(), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_run_that_is_not_a_run_of_the_command_closes_the_window() {
+        // The window slices its own source with this and parses what comes
+        // out. Every way that could be a lie is refused at the door, on the
+        // same terms as spans that do not tile: see `Payload::script`.
+        let payload = an_elevated_command("id -u");
+        let raw = match &payload {
+            Payload::Command { raw, .. } => raw.clone(),
+            _ => panic!("not a command"),
+        };
+        for doubt in [0..0, Range { start: 4, end: 3 }, 2..raw.len() + 1] {
+            let tampered = payload.clone().with_script(Some(doubt.clone()));
+            assert!(Shown::of(&tampered).is_err(), "{doubt:?} was drawn");
+        }
+        // And a run whose edges are not span edges: `run` is the first three
+        // bytes of `run0`, which no span begins or ends inside.
+        assert!(Shown::of(&payload.with_script(Some(1..3))).is_err());
+    }
+
+    #[test]
+    fn a_line_hatch_quoted_says_so_and_an_ordinary_one_does_not() {
+        // The reader is looking at command names and brackets *inside* a
+        // quoted string, on a line the agent did not write. Who put the
+        // quotes there is not recoverable from the line. See `SCRIPT_NOTE`.
+        let Shown::Command { script, .. } =
+            Shown::of(&an_elevated_command("id -u")).expect("a real payload")
+        else {
+            panic!("not a command")
+        };
+        assert!(script.is_some());
+        let Shown::Command { script, .. } =
+            Shown::of(&a_command("id -u")).expect("a real payload")
+        else {
+            panic!("not a command")
+        };
+        assert_eq!(script, None, "an ordinary command claimed hatch had quoted it");
+    }
+
     // ---- the checked door --------------------------------------------------
 
     #[test]
@@ -3734,6 +3873,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
+            script: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "a window drew a rendering nobody checked");
@@ -3756,6 +3896,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
+            script: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "the title bar and the panes could disagree");
@@ -5119,6 +5260,26 @@ mod tests {
                 text
             })
             .collect()
+    }
+
+    #[test]
+    fn a_window_over_a_quoted_script_says_whose_quotes_those_are() {
+        // Read off a drawn frame rather than off the constant: a note that
+        // exists and is never drawn is the bug this is about. It is on the
+        // header, so it is there in both renderings -- the original text is
+        // exactly where a reader goes to check the reading it describes.
+        let payload = an_elevated_command("for f in a b; do\n  cat $f\ndone");
+        for original in [false, true] {
+            let frame = frames_of(&payload, a_window(), 3, original).pop().expect("a frame");
+            let said = frame.iter().any(|(line, _)| line.contains("The quotes are hatch's"));
+            assert!(said, "nothing said who quoted it, original={original}: {frame:?}");
+        }
+        // And an ordinary command says nothing, because nothing quoted it.
+        let frame = frames_of(&a_command("cat a"), a_window(), 3, false).pop().expect("a frame");
+        assert!(
+            !frame.iter().any(|(line, _)| line.contains("The quotes are hatch's")),
+            "{frame:?}"
+        );
     }
 
     /// The out-of-sight line a window drew, if it drew one.

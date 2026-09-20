@@ -6059,6 +6059,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
+            script: None,
         }];
 
         state.handle(DaemonMsg::Request(Box::new(request)));
