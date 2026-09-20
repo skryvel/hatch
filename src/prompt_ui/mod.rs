@@ -1727,6 +1727,13 @@ pub(crate) struct PromptApp {
     kept: Arc<AtomicBool>,
     /// When something was last put on the clipboard, so the window can say so.
     copied: Option<Instant>,
+    /// A screenful of paging asked for by the keyboard and not yet drawn.
+    ///
+    /// Set where the key is judged and spent where the output is drawn,
+    /// because only the drawing knows how tall a screenful is: the panes are
+    /// laid out by the window's height and the reader's font, neither of
+    /// which the guard is told about.
+    paging: Option<guard::Page>,
     /// The last chord this window could not carry out, and when.
     ///
     /// Read only by the control that was asked for, which flashes the reason
@@ -1768,6 +1775,7 @@ impl PromptApp {
             guard_open: false,
             kept: Arc::new(AtomicBool::new(false)),
             copied: None,
+            paging: None,
             refused: None,
             fatal,
         }
@@ -1954,6 +1962,15 @@ impl PromptApp {
         // `reviewing::editing_has_the_keyboard`.
         if self.state.phase() == Phase::Reviewing && reviewing::editing_has_the_keyboard(ctx) {
             return Keyboard::Composing;
+        }
+        // Nothing on this window has the keyboard, so Space is not going
+        // into a field or onto a checkbox and is free to page the output.
+        // The review screen only: it is the phase with output on it and a
+        // decision to make about it.
+        if self.state.phase() == Phase::Reviewing
+            && ctx.memory(|memory| memory.focused()).is_none()
+        {
+            return Keyboard::Reading;
         }
         match self.state.phase() {
             // A running window has no text field either -- the note went with
@@ -2209,6 +2226,10 @@ impl PromptApp {
         if self.state.runs_as_root() {
             theme::mark_root(ui, window);
         }
+        // Spent, whether or not anything was drawn that could spend it. A
+        // page left lying here would be applied again on the next frame, and
+        // every frame after, which is a window that scrolls on its own.
+        self.paging = None;
     }
 
     /// What a finished streamed run shows: its command, named once, and all
@@ -2291,6 +2312,10 @@ impl PromptApp {
             match action {
                 Action::Approve => self.send_review(),
                 Action::Deny => self.withhold_review(),
+                // The one phase that acts on it. This is where a reader has
+                // output in front of them and a decision to make about it,
+                // which is the whole case for a key that moves it.
+                Action::Scroll(page) => self.page_output(page),
                 Action::Toggle(_)
                 | Action::Keep
                 | Action::Copy
@@ -2316,6 +2341,7 @@ impl PromptApp {
                 Action::Copy if self.state.streaming() => self.copy_output(ctx),
                 Action::Copy => {}
                 Action::Approve
+                | Action::Scroll(_)
                 | Action::Toggle(_)
                 | Action::Ignored
                 | Action::Passthrough => {}
@@ -2349,10 +2375,28 @@ impl PromptApp {
             // Neither is produced outside the phases above -- see
             // [`Keyboard`] -- and a window that is still asking has neither a
             // countdown to stop nor any output to take.
-            Action::Keep | Action::Copy | Action::Ignored | Action::Passthrough => return,
+            // Scroll is not produced here: `keyboard` only reports
+            // `Reading` for the phase that has output to move. See
+            // [`Keyboard::Reading`].
+            Action::Keep
+            | Action::Copy
+            | Action::Scroll(_)
+            | Action::Ignored
+            | Action::Passthrough => return,
         };
         let frame = self.state.decide(verdict);
         answer(&mut self.out, &mut self.state, frame);
+    }
+
+    /// Remember that the reader asked for a screenful, for the drawing half
+    /// of the frame to spend.
+    ///
+    /// The last one wins rather than accumulating. A held-down Space repeats
+    /// faster than frames are drawn, and a queue of pages would carry on
+    /// moving after the key came up — past the thing the reader stopped at,
+    /// which is the one place paging can actually lose somebody.
+    fn page_output(&mut self, page: guard::Page) {
+        self.paging = Some(page);
     }
 
     /// Flip one of the two boxes a chord names, or say why it cannot be.
@@ -5546,7 +5590,9 @@ mod tests {
         let shapes = a_settled_frame(&mut app, &ctx, past_the_guard());
         let reviewing: String =
             text_rects(&shapes).into_iter().map(|(text, _)| text + "\n").collect();
-        for chord in [guard::APPROVE_CHORD, guard::DENY_CHORD] {
+        // Paging has no button to print its key on, so the promise is kept
+        // the only way it can be here: a line beside the output it moves.
+        for chord in [guard::APPROVE_CHORD, guard::DENY_CHORD, guard::PAGE_KEYS] {
             assert!(
                 reviewing.contains(chord),
                 "{chord:?} answers a review and is not on its screen: {reviewing}"
@@ -8830,6 +8876,104 @@ mod tests {
         click_at(&mut app, &ctx, send.center(), now);
         let Some(Release::Send { note, .. }) = the_release(&sink) else { panic!("nothing sent") };
         assert!(note.is_empty(), "the verdict's note came back at the review: {note}");
+    }
+
+    /// A review of output long enough that a pane cannot show all of it.
+    fn a_long_review() -> Review {
+        let mut review = a_review();
+        let text: String = (0..400).map(|n| format!("line {n}\n")).collect();
+        review.output = crate::review::Sections::Streams {
+            stdout: crate::review::Captured { text, truncated: false },
+            stderr: crate::review::Captured { text: String::new(), truncated: false },
+        };
+        review
+    }
+
+    /// Which output lines are on screen in this frame.
+    fn lines_on_screen(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        text_rects(shapes)
+            .into_iter()
+            .map(|(text, _)| text)
+            .filter(|text| text.starts_with("line "))
+            .collect()
+    }
+
+    #[test]
+    fn space_pages_the_output_down_and_shift_space_pages_it_back() {
+        let (mut app, sink) = a_reviewing_window_of(a_long_review());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        let first = lines_on_screen(&a_settled_frame(&mut app, &ctx, now));
+        assert!(first.len() > 3, "the output does not fill a pane: {first:?}");
+        assert_eq!(first.first().map(String::as_str), Some("line 0"));
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], now);
+        let paged = lines_on_screen(&a_settled_frame(&mut app, &ctx, now));
+        assert_ne!(paged.first(), first.first(), "Space did not move the output");
+
+        // A screenful, not the whole thing, and with a line or two of the old
+        // screen still there to place the new one against.
+        let overlap = first.iter().filter(|line| paged.contains(line)).count();
+        assert!(
+            (1..=4).contains(&overlap),
+            "a page kept {overlap} of the old screen: {first:?} then {paged:?}"
+        );
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::SHIFT)], now);
+        let back = lines_on_screen(&a_settled_frame(&mut app, &ctx, now));
+        assert_eq!(back.first(), first.first(), "Shift+Space did not come back");
+
+        assert!(sink.lock().unwrap().is_empty(), "paging answered the review");
+        assert_eq!(app.state.phase(), Phase::Reviewing);
+    }
+
+    #[test]
+    fn space_is_a_space_whenever_a_field_has_the_keyboard() {
+        // The whole safety of the paging key. This screen has four text
+        // fields and three checkboxes on it, and Space belongs to whichever
+        // of them holds the keyboard -- a window that swallowed the space bar
+        // while somebody typed a filter would be unusable for the one thing
+        // the filters are for.
+        let (mut app, _sink) = a_reviewing_window_of(a_long_review());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        let label = drawn_at(&mut app, &ctx, reviewing::DROP_LABEL, now)
+            .expect("the drop filter is not drawn");
+        click_at(&mut app, &ctx, egui::pos2(label.right() + 60.0, label.center().y), now);
+        let before = lines_on_screen(&a_settled_frame(&mut app, &ctx, now));
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], now);
+        a_live_frame(&mut app, &ctx, vec![egui::Event::Text(" ".to_string())], now);
+        let after = lines_on_screen(&a_settled_frame(&mut app, &ctx, now));
+
+        assert_eq!(after.first(), before.first(), "Space paged out of a field it was typed into");
+        assert_eq!(
+            app.draft.field(reviewing::Filter::Drop),
+            " ",
+            "the space never reached the field"
+        );
+    }
+
+    #[test]
+    fn a_page_waits_for_the_guard_like_everything_else() {
+        // A burst arriving as the window opens must not scroll the output
+        // past the part the reader was meant to see first.
+        let (mut app, _sink) = a_reviewing_window_of(a_long_review());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let just_now = Instant::now();
+
+        let first = lines_on_screen(&a_settled_frame(&mut app, &ctx, just_now));
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], just_now);
+        let after = lines_on_screen(&a_settled_frame(&mut app, &ctx, just_now));
+        assert_eq!(after.first(), first.first(), "a keystroke in flight paged the output");
     }
 
     #[test]

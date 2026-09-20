@@ -85,6 +85,48 @@ pub const WITHHOLD_LABEL: &str = "Send nothing";
 /// What happens when the review clock runs out, said beside it.
 pub const EXPIRY: &str = "When it runs out, nothing is sent.";
 
+/// Move this pane by a screenful, if the keyboard asked for one.
+///
+/// # Why a screenful and not a fixed number of lines
+///
+/// The unit a reader thinks in is the thing in front of them. A pane two
+/// lines tall and a pane forty lines tall are the same gesture to the person
+/// pressing the key, and a constant number of rows would be a crawl in one
+/// and a leap in the other.
+///
+/// `KEPT_ROWS` of the old screenful stay, which is what every pager does and
+/// for the reason every pager does it: a page that moved by exactly its own
+/// height leaves the reader with no line in common between the two screens,
+/// and nothing to place the new one against.
+///
+/// Called inside the scroll area, which is what `scroll_with_delta` is
+/// documented against, and once per pane -- so a review with two panes moves
+/// both, which is the honest answer when the reader has not said which one
+/// they mean and both are part of the same decision.
+fn page_by(ui: &egui::Ui, paging: Option<guard::Page>, row: f32) {
+    let Some(page) = paging else { return };
+    // The visible height, not the content height: what is clipped is what is
+    // on the screen.
+    let screenful = (ui.clip_rect().height() - KEPT_ROWS * row).max(row);
+    // Negative moves the content up, which is what "down" means to a reader:
+    // further into the output. See `egui::Ui::scroll_with_delta`.
+    let delta = match page {
+        guard::Page::Down => -screenful,
+        guard::Page::Up => screenful,
+    };
+    // Instantly, not over egui's scroll animation. A reader paging through a
+    // long capture presses this repeatedly, and a third of a second of glide
+    // per press is both sluggish and a moving target for the next one. The
+    // two kept rows are what supplies the continuity an animation would.
+    ui.scroll_with_delta_animation(egui::vec2(0.0, delta), egui::style::ScrollAnimation::none());
+}
+
+/// How much of the old screenful a page keeps.
+///
+/// Two lines: enough to place the new screen against the old, few enough
+/// that paging through a long capture is not mostly re-reading.
+const KEPT_ROWS: f32 = 2.0;
+
 /// What is said in place of a pane for a stream the command never wrote to.
 ///
 /// It names the stream and says the command is the reason it is empty. The
@@ -500,6 +542,12 @@ impl PromptApp {
         let captured: Vec<(Section, Captured)> =
             review.output.iter().map(|(section, captured)| (section, captured.clone())).collect();
 
+        // Said where the output is, because paging is the one thing on this
+        // window with no control to print its key on. See `guard::PAGE_KEYS`.
+        ui.label(
+            egui::RichText::new(guard::PAGE_KEYS).small().color(ui.visuals().weak_text_color()),
+        );
+
         // A pane over nothing is a column of empty screen where the output
         // the reader is actually deciding about could have been. The index
         // is carried along because `released` and `redacted` are parallel to
@@ -627,6 +675,7 @@ impl PromptApp {
         }
 
         let row = ui.text_style_height(&egui::TextStyle::Monospace);
+        let paging = self.paging;
         panes::pane_frame(ui).show(ui, |ui| {
             ui.set_min_height(ui.available_height());
             let scroll = egui::ScrollArea::both()
@@ -670,6 +719,7 @@ impl PromptApp {
             // on every keystroke in a filter.
             let lines: Vec<&str> = review::lines(sent).collect();
             scroll.show_rows(ui, row, lines.len(), |ui, range| {
+                page_by(ui, paging, row);
                 for line in &lines[range] {
                     let bare = line.strip_suffix('\n').unwrap_or(line);
                     ui.add(egui::Label::new(egui::RichText::new(reveal(bare)).monospace()).extend());

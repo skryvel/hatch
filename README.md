@@ -760,8 +760,10 @@ invisible characters left in what you are editing, since the editor is the one
 place they do not draw; and Enter never reaches the field, so an edit can take
 text out but cannot type new lines in.
 
-**Send this** (`Ctrl+Enter`, `Shift+Enter` or `Ctrl+Alt+A`) sends what is on
-the screen.
+`Space` pages the output down and `Shift+Space` pages it back up, whenever no
+field on the screen has the keyboard — so the space bar is still a space while
+you are typing a filter. **Send this** (`Ctrl+Enter`, `Shift+Enter` or
+`Ctrl+Alt+A`) sends what is on the screen.
 **Send nothing** (`Esc`) sends none of it. Both wait out the typing guard,
 which starts again when the review appears: it appears whenever the command
 finishes, and you may be typing somewhere else by then.

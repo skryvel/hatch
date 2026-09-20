@@ -245,6 +245,19 @@ pub const KEEP_KEYS: &str = "E, O\nSpace";
 /// buttons names it.
 pub const COPY_CHORD: &str = "Alt+C";
 
+/// What pages the output under review, printed where that output is.
+///
+/// Not on a button, because there is no button: paging is the one thing this
+/// window does that has no control to hang a label off. So it is a line of
+/// its own beside the panes, which is the same promise kept the only way it
+/// can be kept here -- a shortcut nobody can see is a shortcut nobody has.
+///
+/// Space is what every pager in the world uses, and Shift+Space is what every
+/// one of them uses to go back. Neither collides with the bare letters of a
+/// watched window: those are a different phase, and [`Keyboard`] is how this
+/// module is told which one it is in.
+pub const PAGE_KEYS: &str = "Space pages down, Shift+Space back up.";
+
 /// What the window should do about one input event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -253,6 +266,11 @@ pub enum Action {
     Ignored,
     /// Not the guard's business. Hand it back to the widgets.
     Passthrough,
+    /// Move the output on this window by a screenful.
+    ///
+    /// Decides nothing and changes nothing outside the window, which is why
+    /// it is the one action here that can be repeated freely.
+    Scroll(Page),
     /// A human asked to approve.
     Approve,
     /// A human asked to deny.
@@ -302,6 +320,19 @@ pub enum Keyboard {
     /// Ctrl+Enter sends must not find that it types a newline because their
     /// cursor happened to be in a field.
     Composing,
+    /// A window that is asking with *nothing* on it holding the keyboard.
+    ///
+    /// Everything [`Keyboard::Asking`] means, and one key more: Space pages
+    /// the output down and Shift+Space pages it back up. It is a separate
+    /// state and not a rule inside `Asking` because the difference is the
+    /// whole safety of it — this window has text fields and checkboxes on it,
+    /// and Space belongs to whichever of them has the keyboard whenever one
+    /// does. Only when none does is it free to mean something else.
+    ///
+    /// Asked of egui, like [`Keyboard::Composing`], and for the same reason.
+    /// Every button here is unfocusable, so anything holding the keyboard is
+    /// a control Space would otherwise be typing into or activating.
+    Reading,
 }
 
 /// Which of the window's boxes a chord flips.
@@ -488,7 +519,9 @@ impl Guard {
             // `Ctrl+Enter` and waits exactly as long.
             Some(key) if approves(key, modifiers) => match (open, keyboard) {
                 (false, _) => Action::Ignored,
-                (true, Keyboard::Asking | Keyboard::Composing) => Action::Approve,
+                (true, Keyboard::Asking | Keyboard::Composing | Keyboard::Reading) => {
+                    Action::Approve
+                }
                 (true, Keyboard::Watching) => Action::Ignored,
             },
             // The exemption, and the only one. A bare Enter reaches a
@@ -504,6 +537,27 @@ impl Guard {
                     Action::Deny
                 } else {
                     Action::Ignored
+                }
+            }
+            // Paging, on a window that is asking and has nobody's cursor in
+            // it. Judged before the watching arm below, which gives Space its
+            // other meaning -- the two never meet, because a window is either
+            // asking or watching and [`Keyboard`] is how this module is told
+            // which.
+            //
+            // On the guard's clock like everything else, although it decides
+            // nothing: a burst that arrives as the window opens must not
+            // scroll the output the reader is about to be shown past the part
+            // they were meant to see first.
+            Some(Key::Space) if keyboard == Keyboard::Reading => {
+                match (open, modifiers.shift, modifiers.ctrl || modifiers.alt || modifiers.command)
+                {
+                    (true, false, false) => Action::Scroll(Page::Down),
+                    (true, true, false) => Action::Scroll(Page::Up),
+                    // Anything else held is somebody part-way through a chord
+                    // this window does not have, on the same exactness the
+                    // rest of the module keeps.
+                    _ => Action::Ignored,
                 }
             }
             // A window with nothing to type into. Judged before the box
@@ -588,6 +642,15 @@ fn approves(key: Key, m: Modifiers) -> bool {
         Key::A => control && m.alt && !m.shift,
         _ => false,
     }
+}
+
+/// Which way a screenful of output moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// Further into the output.
+    Down,
+    /// Back towards the start.
+    Up,
 }
 
 /// Which box, if any, this key and these modifiers flip.
