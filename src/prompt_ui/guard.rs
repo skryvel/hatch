@@ -141,16 +141,35 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// shortcut nobody has, and a shortcut printed loosely is worse than none: a
 /// reader who is told "Ctrl+Enter" and finds that Ctrl+Shift+Enter works too
 /// has learned that the window is approximate about what it accepts. It is
-/// not. [`is_approve_chord`] takes Control *or* Shift and refuses every other
-/// modifier held with either, and this string names exactly that and nothing
-/// else.
+/// not. [`approves`] is the rule, and this string names exactly what it takes
+/// and nothing else.
 ///
-/// # Why both are printed, on two lines
+/// # Why all three are printed, a chord per line
 ///
-/// There are two chords and one button, so the label either names both or
-/// hides one. It names both: a shortcut that works and is not written down is
-/// exactly the state this label was added to end, and adding a second
+/// There are three chords and one button, so the label either names them all
+/// or hides one. It names them all: a shortcut that works and is not written
+/// down is exactly the state this label was added to end, and adding an
 /// undocumented one would be undoing that while claiming to extend it.
+///
+/// # Why there is a third at all
+///
+/// Both Enter chords need the right hand. A reader whose right hand is on
+/// the mouse -- which is most of them, most of the time, because that is
+/// where the buttons are -- has no keyboard approval at all, and the whole
+/// point of putting these on the button was that answering should not cost a
+/// trip across the desk. `Ctrl+Alt+A` is reachable by the left hand alone.
+///
+/// `Ctrl+Alt` is the one combination [`toggle_chord`] refuses on the grounds
+/// that a desktop may have claimed it. That argument still holds and is the
+/// accepted cost here: a compositor that grabs `Ctrl+Alt+A` means hatch never
+/// sees the event, so the chord does not work and nothing else happens
+/// either. It cannot misfire, only fail to fire, and the two Enter chords are
+/// still there.
+///
+/// It is also why the letter may not be carried by `Alt` alone. `Alt+A` with
+/// nothing else held is one keystroke away from the box chords beside it, and
+/// on a window with a text field on it a bare-ish letter approving a command
+/// is the burst-of-keystrokes hazard this whole module exists for.
 ///
 /// One line was tried first and does not fit. The hint may not widen the
 /// button — the two buttons that decide are centred in a rect measured from
@@ -159,15 +178,16 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// that minimum at the smaller font sizes a reader may configure, and the
 /// alternatives that do fit on one line are abbreviations — a `⇧` or a `↵`,
 /// which is a glyph gamble and a puzzle in a window whose whole job is to be
-/// unambiguous. Two short lines fit at every size, spell both chords out, and
-/// use the height the button already has and was not using.
+/// unambiguous. Short lines fit at every size and spell every chord out.
 ///
 /// So the label is a chord per line. That it still fits the button the window
-/// already had is `the_shortcut_hints_fit_the_buttons_that_were_already_there`;
+/// already had — in height as well as width, which is what the third line
+/// spends — is
+/// `the_shortcut_hints_fit_the_buttons_that_were_already_there`;
 /// `the_buttons_name_exactly_the_chords_the_guard_takes` reads it the way a
-/// user does — both lines — and holds the rule to it, so the two cannot drift
+/// user does — every line — and holds the rule to it, so the two cannot drift
 /// apart.
-pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter";
+pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nCtrl+Alt+A";
 
 /// What the Deny button says the keyboard shortcut is.
 ///
@@ -462,12 +482,15 @@ impl Guard {
             // one; it is here because an `Action` that cannot be carried out
             // is a thing for a later reader to wonder about.
             Some(Key::Enter) if !open => Action::Ignored,
-            Some(Key::Enter) if is_approve_chord(modifiers) => {
-                match keyboard {
-                    Keyboard::Asking | Keyboard::Composing => Action::Approve,
-                    Keyboard::Watching => Action::Ignored,
-                }
-            }
+            // Every approval, whichever key carries it. Judged after the
+            // shut-guard arm above for Enter, and with its own shut check
+            // for the rest: `Ctrl+Alt+A` is as much a decision as
+            // `Ctrl+Enter` and waits exactly as long.
+            Some(key) if approves(key, modifiers) => match (open, keyboard) {
+                (false, _) => Action::Ignored,
+                (true, Keyboard::Asking | Keyboard::Composing) => Action::Approve,
+                (true, Keyboard::Watching) => Action::Ignored,
+            },
             // The exemption, and the only one. A bare Enter reaches a
             // multiline editor that holds the keyboard, because there it
             // types a character rather than activating anything. Everywhere
@@ -548,14 +571,28 @@ impl Guard {
 /// not three modifiers — a Linux backend sets `ctrl` and `command` together
 /// for a single key — so any of them counts as Control being held, and the
 /// exactness that matters is that nothing else is.
-fn is_approve_chord(m: Modifiers) -> bool {
+fn approves(key: Key, m: Modifiers) -> bool {
     let control = m.ctrl || m.command || m.mac_cmd;
-    (control && !m.alt && !m.shift) || (m.shift && !m.alt && !control)
+    match key {
+        Key::Enter => (control && !m.alt && !m.shift) || (m.shift && !m.alt && !control),
+        // The left hand's. Control *and* Alt, and neither on its own: `Alt+A`
+        // sits one keystroke from the box chords, and `Ctrl+A` is select-all
+        // in the field this window has on it.
+        //
+        // Not reachable by a keyboard producing a character. AltGr is a level
+        // shift rather than Alt on X11 and Wayland -- it arrives as
+        // `AltGraph`, off the `Alt` modifier entirely -- and on Windows,
+        // where AltGr really is Ctrl+Alt, winit drops the synthetic Control
+        // for layouts that have one. So no layout can approve a command by
+        // typing a letter into the note field.
+        Key::A => control && m.alt && !m.shift,
+        _ => false,
+    }
 }
 
 /// Which box, if any, this key and these modifiers flip.
 ///
-/// Alt held, and nothing else: the same exactness [`is_approve_chord`] applies,
+/// Alt held, and nothing else: the same exactness [`approves`] applies,
 /// for the same reason. `Ctrl+Alt+S` is a compositor's chord on half the
 /// desktops there are and `Alt+Shift+S` is somebody part-way through a
 /// different one, and a window that took both would be a window that acts on
@@ -602,7 +639,7 @@ fn toggle_chord(key: Key, m: Modifiers) -> Option<Toggle> {
 /// Bare, and exactly bare. `Ctrl+E` is a shell's line editor and `Alt+O` is
 /// halfway into somebody's window-manager chord; neither is a person asking
 /// to keep this window, and a phase that took a letter under any modifier at
-/// all would be the loose matching [`is_approve_chord`] refuses for the same
+/// all would be the loose matching [`approves`] refuses for the same
 /// reason. The copy chord is exact in the other direction: Alt and nothing
 /// else, like the two it shares its keys with.
 fn watching(key: Key, m: Modifiers) -> Option<Action> {
@@ -1082,28 +1119,32 @@ mod tests {
     /// one spelling the label uses; the three spellings the backends send are
     /// the rule's business and are covered below.
     ///
-    /// A label is one chord per line, so this returns one [`Modifiers`] per
-    /// line: a label naming one chord gives a list of one, and the same rule
-    /// covers both kinds of label. Every line has to name the same key, which
-    /// is checked here rather than assumed — a button whose two lines named
-    /// two different keys would be two promises pretending to be one.
-    fn named(label: &str) -> (Key, Vec<Modifiers>) {
-        let mut key: Option<Key> = None;
+    /// A label is one chord per line, so this returns one key-and-modifiers
+    /// pair per line: a label naming one chord gives a list of one, and the
+    /// same rule covers every kind of label.
+    ///
+    /// The lines may name different keys. They could not once — Approve's two
+    /// were both Enter, and this asserted it — and the assertion went when a
+    /// third chord on a different key was added. What it was protecting is
+    /// protected better by the caller, which checks every line against the
+    /// rule with the key that line names.
+    fn named(label: &str) -> Vec<(Key, Modifiers)> {
         let mut chords = Vec::new();
         for line in label.lines() {
             let mut wanted = Modifiers::NONE;
+            let mut key = None;
             let mut parts = line.split('+').peekable();
             while let Some(part) = parts.next() {
                 if parts.peek().is_none() {
-                    let named = match part {
+                    key = Some(match part {
                         "Enter" => Key::Enter,
                         "Esc" => Key::Escape,
+                        "A" => Key::A,
                         "S" => Key::S,
                         "C" => Key::C,
                         "R" => Key::R,
                         other => panic!("{label:?} names a key this test cannot read: {other:?}"),
-                    };
-                    assert_eq!(*key.get_or_insert(named), named, "{label:?} names two keys");
+                    });
                     break;
                 }
                 match part {
@@ -1115,9 +1156,9 @@ mod tests {
                     }
                 }
             }
-            chords.push(wanted);
+            chords.push((key.expect("a label names a key"), wanted));
         }
-        (key.expect("a label names a key"), chords)
+        chords
     }
 
     #[test]
@@ -1144,32 +1185,60 @@ mod tests {
             (CLOSE_CHORD, Action::Toggle(Toggle::Close)),
             (REVIEW_CHORD, Action::Toggle(Toggle::Review)),
         ] {
-            let (key, alternatives) = named(label);
-            for m in every_modifier_combination() {
-                // Control has three spellings and a backend may send any of
-                // them; they are one modifier, and the label spells it once.
-                let control = m.ctrl || m.command || m.mac_cmd;
-                let is_named = alternatives.iter().any(|wanted| {
-                    control == wanted.ctrl && m.shift == wanted.shift && m.alt == wanted.alt
-                });
-                assert_eq!(
-                    asking(&guard, &press(key, m), m, now) == decides,
-                    is_named,
-                    "{label:?} and the guard disagree about {m:?}"
-                );
+            let chords = named(label);
+            // Every key the label mentions, against every modifier
+            // combination there is -- so a label naming two keys is held to
+            // the rule on both, and a chord that works on the wrong one of
+            // them fails here. `Ctrl+Alt+A` approving while `Ctrl+A` does
+            // not is exactly this check.
+            let mut keys: Vec<Key> = chords.iter().map(|(key, _)| *key).collect();
+            keys.dedup();
+            for key in keys {
+                for m in every_modifier_combination() {
+                    // Control has three spellings and a backend may send any
+                    // of them; they are one modifier, and the label spells it
+                    // once.
+                    let control = m.ctrl || m.command || m.mac_cmd;
+                    let is_named = chords.iter().any(|(named_key, wanted)| {
+                        *named_key == key
+                            && control == wanted.ctrl
+                            && m.shift == wanted.shift
+                            && m.alt == wanted.alt
+                    });
+                    assert_eq!(
+                        asking(&guard, &press(key, m), m, now) == decides,
+                        is_named,
+                        "{label:?} and the guard disagree about {key:?} with {m:?}"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn a_label_with_two_chords_in_it_is_read_as_two_and_not_as_one() {
+    fn a_label_with_several_chords_in_it_is_read_as_several_and_not_as_one() {
         // The parser above is the whole of what holds the labels to the rule,
-        // so a parser that quietly read a two-line label as one chord with
-        // both modifiers held would agree with any rule at all.
-        let (key, chords) = named("Ctrl+Enter\nShift+Enter");
-        assert_eq!(key, Key::Enter);
-        assert_eq!(chords, vec![Modifiers::CTRL, Modifiers::SHIFT]);
-        assert_eq!(named("Alt+S").1, vec![Modifiers::ALT]);
+        // so a parser that quietly read a three-line label as one chord with
+        // every modifier held would agree with any rule at all.
+        assert_eq!(
+            named("Ctrl+Enter\nShift+Enter"),
+            vec![(Key::Enter, Modifiers::CTRL), (Key::Enter, Modifiers::SHIFT)]
+        );
+        assert_eq!(named("Alt+S"), vec![(Key::S, Modifiers::ALT)]);
+
+        // Lines naming different keys, and a line naming two modifiers:
+        // both are what the third approval chord needs read correctly, and
+        // neither was possible to write before it existed.
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(
+            named(APPROVE_CHORD),
+            vec![
+                (Key::Enter, Modifiers::CTRL),
+                (Key::Enter, Modifiers::SHIFT),
+                (Key::A, ctrl_alt),
+            ],
+            "the label on the Approve button is not the three chords it looks like"
+        );
     }
 
     #[test]
@@ -1214,7 +1283,7 @@ mod tests {
 
     #[test]
     fn nearly_the_keep_key_is_not_the_keep_key() {
-        // Exact, for the reason `is_approve_chord` is: `Ctrl+E` is a line
+        // Exact, for the reason `approves` is: `Ctrl+E` is a line
         // editor and `Alt+O` is halfway into somebody's window-manager chord,
         // and neither of them is a person asking to keep this window.
         let clock = Clock::new();

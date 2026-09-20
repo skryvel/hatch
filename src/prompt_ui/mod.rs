@@ -280,6 +280,13 @@ const OUTPUT_CAP: usize = 1 << 20;
 /// Multiples and not points, because the font size is the reader's to choose
 /// — see [`crate::config::Config::font_size`] — and a button pinned to 34
 /// points is a button the text grows out of.
+///
+/// The height is a floor rather than the answer: [`primary_button`] takes
+/// whichever is larger of this and what the shortcut label actually needs, so
+/// a chord added to [`guard::APPROVE_CHORD`] cannot leave the two buttons
+/// different sizes. The pair being the same size is the point — Approve is
+/// the one that runs something, and the larger of two buttons is an
+/// invitation dressed as an affordance.
 const PRIMARY_BUTTON_ROWS: egui::Vec2 = egui::vec2(10.0, 2.3);
 
 /// The gap between Approve and Deny.
@@ -588,7 +595,16 @@ const IMMINENT_SCALE: f32 = 1.35;
 
 /// The size of one primary button, against the style in force.
 fn primary_button(ui: &egui::Ui) -> egui::Vec2 {
-    ui.text_style_height(&egui::TextStyle::Button) * PRIMARY_BUTTON_ROWS
+    let row = ui.text_style_height(&egui::TextStyle::Button);
+    // Tall enough for the longest shortcut label, whatever that is now. A
+    // constant would have to be re-derived by hand every time a chord is
+    // added, and the way it fails is the way it failed when the third
+    // approval chord was: the label outgrows the minimum, so Approve draws
+    // taller than Deny, and the button that runs something becomes the
+    // larger of the two. See `PRIMARY_BUTTON_ROWS`.
+    let hint = text_height(ui, guard::APPROVE_CHORD, egui::TextStyle::Small)
+        + 2.0 * ui.spacing().button_padding.y;
+    egui::vec2(row * PRIMARY_BUTTON_ROWS.x, (row * PRIMARY_BUTTON_ROWS.y).max(hint))
 }
 
 /// How wide the controls are: exactly the two primary buttons and the gap
@@ -3461,6 +3477,20 @@ fn flanked_row(ui: &egui::Ui, height: f32, width: f32, flanks: [f32; 2]) -> Plac
 }
 
 /// How wide one string is in the style it will be drawn in.
+/// How tall `text` is drawn, line breaks in it included.
+///
+/// The galley rather than lines multiplied by a line height: egui's own
+/// arithmetic for a multi-line galley is not quite that, and the caller that
+/// needs this is sizing a button around a label. A button measured with a
+/// figure 1 point short of what is drawn in it is a button the label grows
+/// out of.
+fn text_height(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let font = style.resolve(ui.style());
+    ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_no_wrap(text.to_string(), font, egui::Color32::WHITE).size().y
+    })
+}
+
 fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
     let font = style.resolve(ui.style());
     ui.ctx().fonts_mut(|fonts| {
@@ -4002,24 +4032,45 @@ mod tests {
             apply_font_size(&ctx, points);
             let mut measured = Vec::new();
             let mut out = ctx.run_ui(raw_sized(Vec::new(), opening_size()), |ui| {
-                let least = primary_button(ui).x;
+                let least = primary_button(ui);
                 for (label, chord) in
                     [("Approve", guard::APPROVE_CHORD), ("Deny", guard::DENY_CHORD)]
                 {
-                    let width = unfocusable(ui, primary(ui, label, chord)).rect.width();
-                    measured.push((label, width, least));
+                    let size = unfocusable(ui, primary(ui, label, chord)).rect.size();
+                    measured.push((label, size, least));
                 }
             });
             out.textures_delta.clear();
 
             assert_eq!(measured.len(), 2, "the buttons were not drawn");
-            for (label, width, least) in measured {
+            for (label, size, least) in &measured {
                 assert!(
-                    width <= least,
-                    "{label} with its shortcut is {width} wide at {points} points, past the \
-                     {least} the cluster is measured from"
+                    size.x <= least.x,
+                    "{label} with its shortcut is {} wide at {points} points, past the \
+                     {} the cluster is measured from",
+                    size.x,
+                    least.x
+                );
+                // The minimum has to be the answer and not merely a floor:
+                // a label taller than it makes that one button taller, and
+                // `PRIMARY_BUTTON_ROWS` is derived from the longest label
+                // exactly so it cannot.
+                assert!(
+                    size.y <= least.y,
+                    "{label} with its shortcut is {} tall at {points} points, past the \
+                     {} the pair is measured from",
+                    size.y,
+                    least.y
                 );
             }
+            // And so the two come out the same size, which is the half of
+            // this the third approval chord broke: Approve's label is three
+            // lines and Deny's is one, and the larger of two buttons is an
+            // invitation dressed as an affordance.
+            assert_eq!(
+                measured[0].1, measured[1].1,
+                "Approve and Deny are different sizes at {points} points"
+            );
         }
     }
 
@@ -7704,12 +7755,20 @@ mod tests {
     }
 
     #[test]
-    fn both_chords_approve_while_the_note_field_holds_the_keyboard() {
+    fn every_chord_approves_while_the_note_field_holds_the_keyboard() {
         // The guard classifies before any widget sees the frame, so a focused
-        // text field cannot swallow either of them. Asserted for both,
-        // because a rule that held for one and not the other would be exactly
-        // the drift the label is pinned against.
-        for held in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
+        // text field cannot swallow any of them. Asserted for all three,
+        // because a rule that held for one and not the others would be
+        // exactly the drift the label is pinned against.
+        //
+        // The note field is where the left-hand chord has most to prove: it
+        // is carried by a letter, and a letter is what that field is for.
+        let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        for (key, held) in [
+            (egui::Key::Enter, egui::Modifiers::CTRL),
+            (egui::Key::Enter, egui::Modifiers::SHIFT),
+            (egui::Key::A, ctrl_alt),
+        ] {
             let (mut app, sink) = an_awaiting_window();
             let ctx = egui::Context::default();
             apply_faces(&ctx);
@@ -7721,9 +7780,41 @@ mod tests {
             a_live_frame(&mut app, &ctx, vec![egui::Event::Text("go on".to_string())], now);
             assert_eq!(app.note, "go on", "the click did not reach the note field");
 
-            a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Enter, held)], now);
+            a_live_frame(&mut app, &ctx, vec![chord(key, held)], now);
             let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
-            assert!(out.contains("approve"), "{held:?} did not approve: {out:?}");
+            assert!(out.contains("approve"), "{key:?} with {held:?} did not approve: {out:?}");
+            assert!(
+                !out.contains("go on a") && !out.contains("go ona"),
+                "the chord typed its letter into the note as well: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_letter_that_carries_an_approval_is_still_a_letter_without_its_chord() {
+        // `A` approves only with Control *and* Alt. The window has a text
+        // field on it, so every other way of pressing that key has to reach
+        // the field -- including the near misses, which is where a rule
+        // matched loosely would show up as a window that eats what you type.
+        let ctrl_alt_shift =
+            egui::Modifiers { ctrl: true, alt: true, shift: true, ..egui::Modifiers::NONE };
+        for held in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::ALT,
+            egui::Modifiers::SHIFT,
+            ctrl_alt_shift,
+        ] {
+            let (mut app, sink) = an_awaiting_window();
+            let ctx = egui::Context::default();
+            apply_faces(&ctx);
+            let now = past_the_guard();
+            click_into_the_note_field(&mut app, &ctx, now);
+            a_live_frame(&mut app, &ctx, vec![chord(egui::Key::A, held)], now);
+            assert!(
+                sink.lock().expect("sink").is_empty(),
+                "A with {held:?} approved a command"
+            );
+            assert_eq!(app.state.phase(), Phase::AwaitingVerdict, "{held:?}");
         }
     }
 

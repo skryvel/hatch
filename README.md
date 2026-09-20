@@ -84,9 +84,10 @@ same thing.*
   focus before, all land right then. Blocked events are dropped before any
   widget sees them, so nothing arrives late. Escape denies only when pressed
   bare. The interval is deliberately not a config key.
-- **One keystroke, and the window gets out of the way.** `Ctrl+Enter` or
-  `Shift+Enter` approves, `Esc` denies, and `Alt+S`, `Alt+C` and `Alt+R` work
-  the three boxes.
+- **One keystroke, and the window gets out of the way.** `Ctrl+Enter`,
+  `Shift+Enter` or `Ctrl+Alt+A` approves — the last of those reachable by the
+  left hand alone, for when the right one is on the mouse — `Esc` denies, and
+  `Alt+S`, `Alt+C` and `Alt+R` work the three boxes.
   Tick *Close when I decide* once and it is remembered, along with whether you
   stream, whether you want a terminal and whether you read the output first. Once the command is running the note
   field is gone and bare letters are free, so `e`, `o` or Space keeps the
@@ -576,8 +577,9 @@ has no line for, which is not the same as a blank line.*
 **The typing guard.** Every input is inert for 750 ms after the window gains
 focus, and events delivered during that interval are dropped rather than
 buffered and replayed. Enter is never a default-activate: approving takes a
-click, Ctrl+Enter or Shift+Enter, and Esc is guarded on the same terms. All of
-them are printed on the buttons, and printed exactly: `Ctrl+Shift+Enter` is
+click, Ctrl+Enter, Shift+Enter or Ctrl+Alt+A, and Esc is guarded on the same
+terms. All of them are printed on the buttons, and printed exactly:
+`Ctrl+Shift+Enter` is
 deliberately inert although each of its halves approves on its own, so a label
 loose enough for a reader to expect it to work would be the window promising
 something it refuses. A person mid-burst at another window cannot approve
@@ -758,7 +760,8 @@ invisible characters left in what you are editing, since the editor is the one
 place they do not draw; and Enter never reaches the field, so an edit can take
 text out but cannot type new lines in.
 
-**Send this** (`Ctrl+Enter` or `Shift+Enter`) sends what is on the screen.
+**Send this** (`Ctrl+Enter`, `Shift+Enter` or `Ctrl+Alt+A`) sends what is on
+the screen.
 **Send nothing** (`Esc`) sends none of it. Both wait out the typing guard,
 which starts again when the review appears: it appears whenever the command
 finishes, and you may be typing somewhere else by then.
