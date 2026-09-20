@@ -1772,6 +1772,16 @@ pub fn segment_breaking_at(command: &str, at: Option<usize>) -> Spans {
                 if !ends_a_line(&command[token.start..token.end]) {
                     continue;
                 }
+                // And so does the word that carries on a construct whose
+                // header this separator ended. See `continues_a_header`.
+                if continues_a_header(command, blanks_after(command, token.end)) {
+                    continue;
+                }
+                // The first half of a `;;` does not end a line either. See
+                // `opens_a_doubled_separator`.
+                if opens_a_doubled_separator(command, &command[token.start..token.end], token.end) {
+                    continue;
+                }
                 // The blanks the author left after the separator belong to
                 // the line the separator ends, not to the one that follows.
                 // See `blanks_after`.
@@ -1851,6 +1861,54 @@ fn take_break(builder: &mut SpanBuilder<'_>, asked: &mut Option<usize>, before: 
 /// still highlighted as one.
 fn ends_a_line(separator: &str) -> bool {
     separator != "||"
+}
+
+/// Whether this separator is the first `;` of a `;;`.
+///
+/// bash's grammar has one token there — it is what ends a `case` arm — and
+/// the scanner reads two, because two is what it is made of. Broken between
+/// them, the second landed on a line by itself holding nothing but a
+/// semicolon, one for every arm of every `case`. A row that is only
+/// punctuation is a row a reader has to account for and cannot.
+///
+/// The test is the next byte and not the next token: `;;` is the operator and
+/// `; ;` is not, and a separator that skipped blanks to find its partner
+/// would join two things bash does not.
+fn opens_a_doubled_separator(command: &str, separator: &str, end: usize) -> bool {
+    separator == ";" && command[end..].starts_with(';')
+}
+
+/// Whether the word at `at` is one that carries on the construct whose
+/// header the separator before it ended.
+///
+/// `do` and `then`, and no others. The `;` in `for x in a b; do` and in
+/// `if [ -f x ]; then` is not separating two commands — bash's grammar
+/// requires it there, between a construct's header and its body — so a break
+/// after it drew `do` as though it were a statement of its own, one line
+/// down and one column in, which is the shape a reader reads as *something
+/// happens here*. Nothing happens there. It is the same word as the `for`
+/// above it.
+///
+/// `else`, `elif`, `fi`, `done` and `esac` are deliberately not on the list,
+/// although a separator precedes them just as often. Those begin or close an
+/// arm, and a line of their own at their construct's own level is exactly
+/// what they are: `fi` ends the thing `if` opened, and drawing the two at the
+/// same column is the whole point of the indentation around them.
+///
+/// Read off the text and not off a parse, because it is only ever asked
+/// immediately after a separator — which is command position, where these
+/// two words can be nothing but the keyword. The word boundary is what keeps
+/// `docker` and `thenceforth` out of it.
+///
+/// Layout only, like the rest of this: `segments` still ends a segment at the
+/// separator, so what follows is still named and highlighted as it was.
+fn continues_a_header(command: &str, at: usize) -> bool {
+    let rest = &command[at..];
+    ["do", "then"].iter().any(|word| {
+        rest.strip_prefix(word).is_some_and(|tail| {
+            tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || c == ';')
+        })
+    })
 }
 
 /// Where the run of blanks immediately after `at` ends.
@@ -3804,14 +3862,22 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_separators_each_close_a_segment() {
+    fn adjacent_separators_each_close_a_segment_and_share_one_line() {
         // The run between them is empty, which `classify_into` handles as a
-        // no-op. The break from the first lands on the second, because the
-        // second really is the span that follows it.
+        // no-op. Both are still separators and both still close a segment;
+        // what changed is that the line does not break between them, so the
+        // second is not left on a row of its own holding one character. See
+        // `opens_a_doubled_separator`.
         let spans = render_command("a;;b");
         assert_eq!(separators(&spans), vec![";", ";"]);
-        assert_eq!(breaks(&spans), vec![";", "b"]);
+        assert_eq!(breaks(&spans), vec!["b"], "`;;` was drawn across two lines");
         assert_eq!(unrender(&spans), "a;;b");
+
+        // Spaced, they are two separators and bash reads them as two. The
+        // test is the next byte for exactly this reason.
+        let spaced = render_command("a; ;b");
+        assert_eq!(breaks(&spaced), vec![";", "b"], "`; ;` was joined into one");
+        assert_eq!(unrender(&spaced), "a; ;b");
     }
 
     // --- a break the caller asks for --------------------------------------

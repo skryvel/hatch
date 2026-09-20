@@ -3480,6 +3480,40 @@ mod tests {
     }
 
     #[test]
+    fn a_header_keeps_the_word_that_carries_it_on() {
+        // `; do` and `; then` are one line, because the separator in them
+        // ends a construct's header rather than a statement. Drawn as two,
+        // `do` arrived a line down and a column in, which is the shape a
+        // reader reads as something happening.
+        let looped = "for db in a b; do\n  echo $db\ndone";
+        assert_eq!(
+            drawn_lines(looped),
+            vec!["for db in a b; do\n", "  echo $db\n", "done"],
+            "the loop header was split from its do"
+        );
+        let (_, indents) = bracketed(looped);
+        assert_eq!(indents, vec![0, 1, 0], "{indents:?}");
+
+        let branched = "if [ -f x ]; then\n  echo y\nfi";
+        assert_eq!(
+            drawn_lines(branched),
+            vec!["if [ -f x ]; then\n", "  echo y\n", "fi"],
+            "the condition was split from its then"
+        );
+
+        // The closing and branching words are not on that list: a line of
+        // their own at the construct's own level is what they are.
+        let arms = "if a; then b; else c; fi";
+        let lines = drawn_lines(arms);
+        assert!(lines.iter().any(|line| line.trim_start().starts_with("else")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.trim_start().starts_with("fi")), "{lines:?}");
+
+        // And a word that merely begins with one of them is not one.
+        let docker = "cd /srv; docker ps";
+        assert_eq!(drawn_lines(docker).len(), 2, "`docker` was read as `do`");
+    }
+
+    #[test]
     fn indentation_never_skips_a_level() {
         // A reader reads depth off the left edge, so a step from one line to
         // the next has to be a step they can account for. Two levels at once
