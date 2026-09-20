@@ -5857,6 +5857,43 @@ later"), "");
         }
 
         #[tokio::test]
+        async fn a_window_the_agent_dropped_is_reported_to_the_one_that_replaces_it() {
+            // The shape read off a real log: a window ends `disconnected`
+            // inside a second, the agent asks again, and a second window
+            // opens for the same command. From where a reader sits that is a
+            // window that popped up, vanished, and came back -- and it is the
+            // ending that is *least* about them, so the replacement has to
+            // say so. `the_next_window_says_the_last_one_ended_without_anybody`
+            // covers the deadline; this covers the ending that arrives in a
+            // second rather than in ten minutes.
+            let harness = Harness::new(vec![
+                Reply::silent(),
+                Reply::verdict(Verdict::Deny { note: String::new() }),
+            ]);
+            let dropped = Hangup::new();
+            let caller =
+                Caller { cancelled: CancellationToken::new(), hangup: Some(dropped.clone()), progress: None };
+            // The stream ends with no `notifications/cancelled` behind it,
+            // which is what makes this a drop rather than a cancellation.
+            dropped.gone().cancel();
+            let _ = within(harness.daemon.run_command(run_of("true"), caller)).await;
+            let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), 2, "two windows were opened");
+            assert_eq!(seen[1].unanswered.len(), 1, "the second said nothing about the first");
+            assert_eq!(seen[1].unanswered[0].how, Unheard::AgentLeft);
+            assert_eq!(seen[1].unanswered[0].number, seen[0].number);
+            // And the log says which ending it was, with how long the window
+            // stood: a disconnect is over in under a second, and an answered
+            // window is not, which is the difference a reader is trying to
+            // account for.
+            let first = &harness.logged()[0];
+            assert_eq!(first["verdict"], "disconnected");
+            assert!(first["window_ms"].is_u64(), "{first}");
+        }
+
+        #[tokio::test]
         async fn a_notice_is_shown_once_and_not_to_every_window_after() {
             // Drained when it is handed over. A line that appears only when
             // it is true stops being read the moment it starts repeating,
