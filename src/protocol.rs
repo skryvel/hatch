@@ -134,7 +134,6 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::ops::Range;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -143,6 +142,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::Stream;
 use crate::render::diff::{Row, Side};
+use crate::render::language::Snippet;
 use crate::render::{Span, SpanBuilder, SpanKind, Spans, variable_name};
 use crate::swap::SwapPlan;
 
@@ -201,10 +201,10 @@ pub enum ProtocolError {
         /// The variant the caller wanted.
         wanted: &'static str,
     },
-    /// The run a payload calls a shell script is not a run of its command:
-    /// empty, past the end, off a character boundary, or not the text of any
-    /// whole sequence of spans.
-    ScriptNotARun {
+    /// The run a payload calls a program is not a run of its command: empty,
+    /// past the end, off a character boundary, or not the text of any whole
+    /// sequence of spans.
+    ProgramNotARun {
         /// Where the run was said to begin.
         start: usize,
         /// Where it was said to end.
@@ -248,9 +248,9 @@ impl fmt::Display for ProtocolError {
             ProtocolError::DisplayLineDisagrees => {
                 f.write_str("the one-line form does not match the spans it was sent beside")
             }
-            ProtocolError::ScriptNotARun { start, end } => write!(
+            ProtocolError::ProgramNotARun { start, end } => write!(
                 f,
-                "the payload calls {start}..{end} a shell script, which is not a run of its command"
+                "the payload calls {start}..{end} a program, which is not a run of its command"
             ),
             ProtocolError::WrongPayload { wanted } => {
                 write!(f, "this is not a {wanted} payload")
@@ -802,24 +802,27 @@ pub enum Payload {
         /// Required on the wire like every other field: `None` is an explicit
         /// null, not an absent key. See the type's own note on defaults.
         caveat: Option<String>,
-        /// Which bytes of `raw` are a shell script that hatch itself put
-        /// inside quotes — [`crate::exec::elevate::ElevatedArgv::script_at`].
+        /// Which bytes of `raw` are the program hatch itself put inside
+        /// quotes, and what that program is written in.
         ///
-        /// `None` for every request that is not elevated, and for an elevated
-        /// one whose quoting rewrote the script.
+        /// `None` unless hatch built the invocation — an elevated request, or
+        /// one that named an interpreter — and `None` for a program whose
+        /// quoting rewrote its bytes. See
+        /// [`crate::exec::elevate::ElevatedArgv::script_at`] and
+        /// [`crate::exec::interpreter`].
         ///
-        /// The spans already carry the *rendering* of that run: the daemon
-        /// read it as shell and spliced the result in, so the window would
-        /// draw command names and resolved variables inside the quotes
-        /// whether or not this field existed. What it cannot get from the
-        /// spans is which run that was, and two things need it — the pane
-        /// that looks for shell constructs to bracket, which must parse the
-        /// script rather than the wrapper around it, and the line that tells
-        /// the reader the quoted argument is being read as shell.
+        /// The language is the load-bearing half. A shell program is read
+        /// again as shell and the spans arrive that way; a Python one is not,
+        /// and a window that assumed otherwise would bracket Python `for` and
+        /// `done` as shell constructs. It is also not a reading — hatch is
+        /// about to spawn the interpreter named in the argv on this very
+        /// line — which is why it arrives as a
+        /// [`Evidence::Declared`](crate::render::language::Evidence::Declared)
+        /// snippet rather than as something the window works out.
         ///
         /// Checked on arrival like everything else here: see
-        /// [`Payload::script`].
-        script: Option<std::ops::Range<usize>>,
+        /// [`Payload::program`].
+        program: Option<Snippet>,
     },
     /// A file write: one operation of a `batch`.
     Swap {
@@ -856,12 +859,12 @@ impl Payload {
             root,
             interactive,
             caveat: None,
-            script: None,
+            program: None,
         }
     }
 
-    /// The same payload, knowing which of its bytes hatch quoted a shell
-    /// script into. See [`Payload::Command::script`].
+    /// The same payload, knowing which of its bytes hatch quoted a program
+    /// into and what that program is. See [`Payload::Command::program`].
     ///
     /// Separate from [`Payload::command`] for [`Payload::with_caveat`]'s
     /// reason: the one caller that has an elevated line to describe is the
@@ -869,10 +872,10 @@ impl Payload {
     /// nothing by construction rather than by remembering to.
     ///
     /// A no-op on a swap payload, which has no command line at all.
-    pub fn with_script(self, script: Option<std::ops::Range<usize>>) -> Payload {
+    pub fn with_program(self, program: Option<Snippet>) -> Payload {
         match self {
             Payload::Command {
-                script: _,
+                program: _,
                 display_line,
                 spans,
                 raw,
@@ -883,7 +886,7 @@ impl Payload {
                 interactive,
                 caveat,
             } => Payload::Command {
-                script,
+                program,
                 display_line,
                 spans,
                 raw,
@@ -911,7 +914,7 @@ impl Payload {
     /// caveat to attach to one.
     pub fn with_caveat(self, caveat: Option<&str>) -> Payload {
         match self {
-            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive, script } => {
+            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive, program } => {
                 Payload::Command {
                     caveat: caveat.map(str::to_string),
                     display_line,
@@ -922,7 +925,7 @@ impl Payload {
                     cwd,
                     root,
                     interactive,
-                    script,
+                    program,
                 }
             }
             swap => swap,
@@ -941,7 +944,7 @@ impl Payload {
     /// A no-op on a swap payload: a swap runs no command.
     pub fn with_runs(self, runs: Vec<crate::render::roster::Entry>) -> Payload {
         match self {
-            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat, script } => {
+            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat, program } => {
                 Payload::Command {
                     runs,
                     display_line,
@@ -952,7 +955,7 @@ impl Payload {
                     root,
                     interactive,
                     caveat,
-                    script,
+                    program,
                 }
             }
             swap => swap,
@@ -999,16 +1002,17 @@ impl Payload {
     /// [`ProtocolError::ScriptNotARun`], on any of the three. A frame naming
     /// a run that is not one is refused rather than drawn in part, like every
     /// other malformed rendering here.
-    pub fn script(&self, rendering: &Spans) -> Result<Option<Range<usize>>, ProtocolError> {
-        let Payload::Command { script, raw, .. } = self else {
+    pub fn program(&self, rendering: &Spans) -> Result<Option<Snippet>, ProtocolError> {
+        let Payload::Command { program, raw, .. } = self else {
             return Err(ProtocolError::WrongPayload { wanted: "command" });
         };
-        let Some(script) = script.clone() else { return Ok(None) };
-        let refuse = Err(ProtocolError::ScriptNotARun { start: script.start, end: script.end });
-        if script.start >= script.end
-            || script.end > raw.len()
-            || !raw.is_char_boundary(script.start)
-            || !raw.is_char_boundary(script.end)
+        let Some(program) = program.clone() else { return Ok(None) };
+        let at = program.range();
+        let refuse = Err(ProtocolError::ProgramNotARun { start: at.start, end: at.end });
+        if at.start >= at.end
+            || at.end > raw.len()
+            || !raw.is_char_boundary(at.start)
+            || !raw.is_char_boundary(at.end)
         {
             return refuse;
         }
@@ -1017,10 +1021,10 @@ impl Payload {
         let edge = |at: usize| {
             at == raw.len() || rendering.iter().any(|span| span.range().start == at)
         };
-        if !edge(script.start) || !edge(script.end) {
+        if !edge(at.start) || !edge(at.end) {
             return refuse;
         }
-        Ok(Some(script))
+        Ok(Some(program))
     }
 
     /// The diff rows, each rebuilt through [`SpanBuilder`].
@@ -1778,10 +1782,10 @@ mod tests {
                 "display_line",
                 "interactive",
                 "kind",
+                "program",
                 "raw",
                 "root",
                 "runs",
-                "script",
                 "spans"
             ]
         );

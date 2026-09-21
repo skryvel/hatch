@@ -144,6 +144,10 @@ pub fn render_command_breaking_at(
 ///
 /// # Why it can decline
 ///
+/// A program in a language hatch has no reader for is left exactly as it is:
+/// drawn as the data it is, every byte as itself, which is what the raw pane
+/// does with everything. Only a shell program is read again.
+///
 /// The range comes from
 /// [`crate::exec::elevate::ElevatedArgv::script_at`], which only offers one
 /// when the quoting left the script's bytes alone. Two more doubts are
@@ -158,12 +162,28 @@ pub fn render_command_reinterpreting(
     command: &str,
     env: &BTreeMap<String, String>,
     at: Option<usize>,
-    script: Option<Range<usize>>,
+    program: Option<&language::Snippet>,
 ) -> Spans {
     let segmented = command::segment_breaking_at(command, at);
     let outer = command::highlight(command::annotate_variables(segmented, env));
-    let spans = match script {
-        Some(script) => reinterpret(outer, env, script),
+    // The language decides, here and not at the two call sites. Splicing a
+    // shell rendering over Python would mark `import` as the word that names
+    // what runs and `for` as the head of a loop -- a reading of the wrong
+    // language drawn with the confidence of the right one -- and a gate each
+    // caller applies for itself is a gate one of them can be written without.
+    // One of them was.
+    // Every doubt about the range is answered once, here, so neither of the
+    // two passes below has to carry the same four checks.
+    let named = program.filter(|program| is_a_run_of(command, &program.range()));
+    let spans = match named {
+        Some(program) if program.language() == language::Language::Shell => {
+            reinterpret(outer, env, program.range())
+        }
+        // A program hatch has no reader for keeps the rendering it had, and
+        // is only cut out of the spans around it: the quotes hatch wrote
+        // become spans of their own, so the run is addressable by everything
+        // downstream without one character of it being drawn differently.
+        Some(program) => divide(outer, program.range()),
         None => outer,
     };
     if let Some(at) = at {
@@ -178,6 +198,83 @@ pub fn render_command_reinterpreting(
     spans
 }
 
+/// [`render_command_reinterpreting`], and the program only if the rendering
+/// really does begin and end where it says.
+///
+/// The one function both callers use, because the alternative was a rule each
+/// of them applied for itself and one of them was written without it. What
+/// comes back is a pair that cannot disagree: a payload built from these two
+/// says the same thing about the same bytes, and
+/// [`crate::protocol::Payload::program`] is free to refuse any other pairing
+/// on arrival without a caller having to remember why.
+///
+/// The program is dropped rather than the rendering refused, because a
+/// dropped program costs a sentence in the header and a lost bracket, and a
+/// refused rendering is a window that will not open.
+pub fn render_command_naming(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    at: Option<usize>,
+    program: Option<language::Snippet>,
+) -> (Spans, Option<language::Snippet>) {
+    let spans = render_command_reinterpreting(command, env, at, program.as_ref());
+    let edge = |offset: usize| {
+        offset == command.len() || spans.iter().any(|span| span.range().start == offset)
+    };
+    let kept = program.filter(|program| {
+        let at = program.range();
+        edge(at.start) && edge(at.end)
+    });
+    (spans, kept)
+}
+
+/// Whether `at` names a run of `source`: non-empty, inside it, and on
+/// character boundaries at both ends.
+fn is_a_run_of(source: &str, at: &Range<usize>) -> bool {
+    at.start < at.end
+        && at.end <= source.len()
+        && source.is_char_boundary(at.start)
+        && source.is_char_boundary(at.end)
+}
+
+/// The same spans, cut at the edges of `at` and nowhere else.
+///
+/// Every kind is kept, so nothing is drawn differently: this only makes a run
+/// of the source addressable as a whole sequence of spans. Returns the spans
+/// unchanged when an edge falls inside a span that cannot be cut -- a
+/// [`SpanKind::Chip`] stands for one codepoint and a [`SpanKind::Variable`]
+/// for one whole reference -- which no edge of a quoted argument can do, and
+/// which is checked because the alternative is a panic in a prompt window.
+fn divide(spans: Spans, at: Range<usize>) -> Spans {
+    let source = spans.source().to_string();
+    // A program written on more than one line starts on one, under the
+    // invocation rather than beside it -- `spliced`'s rule, for `spliced`'s
+    // reason, and the two must not differ: a reader should not be able to
+    // tell whether hatch can read a program from where its first line sits.
+    let alone = source[at.clone()].contains('\n');
+    let mut builder = SpanBuilder::new(&source);
+    for span in spans.iter() {
+        let range = span.range();
+        let cuts: Vec<usize> =
+            [at.start, at.end].into_iter().filter(|cut| range.start < *cut && *cut < range.end).collect();
+        if !cuts.is_empty() && matches!(span.kind(), SpanKind::Chip { .. } | SpanKind::Variable { .. })
+        {
+            return spans;
+        }
+        if span.break_before() {
+            builder.break_next();
+        }
+        for cut in cuts {
+            builder.push_to(cut, span.kind().clone());
+            if alone && cut == at.start {
+                builder.break_next();
+            }
+        }
+        builder.push_to(range.end, span.kind().clone());
+    }
+    builder.finish()
+}
+
 /// Render `spans.source()[script]` as a command of its own and put the result
 /// in place of whatever covered it. See [`render_command_reinterpreting`].
 ///
@@ -187,13 +284,7 @@ pub fn render_command_reinterpreting(
 /// was.
 fn reinterpret(spans: Spans, env: &BTreeMap<String, String>, script: Range<usize>) -> Spans {
     let source = spans.source().to_string();
-    if script.start >= script.end
-        || script.end > source.len()
-        || !source.is_char_boundary(script.start)
-        || !source.is_char_boundary(script.end)
-    {
-        return spans;
-    }
+    debug_assert!(is_a_run_of(&source, &script));
     let inner = render_command(&source[script.clone()], env);
     match spliced(&source, &spans, &inner, script.start) {
         Some(merged) => merged,
@@ -280,11 +371,11 @@ mod tests {
         super::render_command(command, &BTreeMap::new())
     }
 
-    /// The shape the one caller has: a wrapper, then a quoted script.
-    fn wrapped(script: &str) -> (String, Range<usize>) {
+    /// The shape the one caller has: a wrapper, then a quoted program.
+    fn wrapped(script: &str) -> (String, language::Snippet) {
         let line = format!("run0 --pipe -- bash -c '{script}'");
         let at = "run0 --pipe -- bash -c '".len();
-        (line, at..at + script.len())
+        (line, language::Snippet::declared(at..at + script.len(), language::Language::Shell))
     }
 
     #[test]
@@ -293,7 +384,7 @@ mod tests {
         // no command names, no resolved variables, and nothing for the pane
         // to indent. It is shell, and it is about to be run as shell.
         let (line, script) = wrapped("cd /tmp; rm -rf x");
-        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(script));
+        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(&script));
         let inside: Vec<(&str, &SpanKind)> =
             spans.iter().map(|span| (span.text(), span.kind())).collect();
         assert!(inside.contains(&("cd", &SpanKind::Command)), "{inside:?}");
@@ -315,7 +406,7 @@ mod tests {
         // splice happens.
         let (line, script) = wrapped("echo $HOME\nfor f in a b; do\n  cat \"$f\"\ndone");
         let env = BTreeMap::from([("HOME".to_string(), "/home/x".to_string())]);
-        let spans = render_command_reinterpreting(&line, &env, None, Some(script.clone()));
+        let spans = render_command_reinterpreting(&line, &env, None, Some(&script));
         assert_eq!(unrender(&spans), line);
         assert!(spans.covers_source(), "the spliced spans do not tile the line");
         // And the value comes from the environment the command will get,
@@ -339,12 +430,72 @@ mod tests {
         // Every span of the script lies inside the quotes, so the pane can
         // ask which bytes were read again and get an answer about the run
         // rather than about the whole line.
+        let at = script.range();
         let nested: Vec<Range<usize>> = spans
             .iter()
             .map(Span::range)
-            .filter(|range| script.start <= range.start && range.end <= script.end)
+            .filter(|range| at.start <= range.start && range.end <= at.end)
             .collect();
         assert!(nested.len() > 1, "{nested:?}");
+    }
+
+    #[test]
+    fn a_program_in_a_language_hatch_cannot_read_is_left_exactly_as_it_is() {
+        // `import` is not a command, `for` heads no loop and `sorted(...)` is
+        // no pipeline. Marking any of them would be a reading of the wrong
+        // language drawn with the confidence of the right one -- and the
+        // gate is here rather than at the call sites because a rule each
+        // caller applies for itself is one a caller can be written without.
+        let (line, shell) = wrapped("for f in a b; do echo $f; done");
+        let python = language::Snippet::declared(shell.range(), language::Language::Python);
+        let read = render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(&python));
+        let named: Vec<&str> = read
+            .iter()
+            .filter(|span| span.kind() == &SpanKind::Command)
+            .map(Span::text)
+            .collect();
+        assert_eq!(named, vec!["run0"], "{named:?}");
+        // The same bytes read as shell do get marked, which is what makes the
+        // comparison worth making.
+        let as_shell = render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(&shell));
+        let as_shell: Vec<&str> = as_shell
+            .iter()
+            .filter(|span| span.kind() == &SpanKind::Command)
+            .map(Span::text)
+            .collect();
+        assert_eq!(as_shell, vec!["run0", "for", "do", "done"], "{as_shell:?}");
+        assert_eq!(unrender(&read), line);
+    }
+
+    #[test]
+    fn a_program_nobody_reads_is_still_a_whole_run_of_the_spans() {
+        // Nothing about it is drawn differently, but its edges become span
+        // edges, so everything downstream can point at it -- and
+        // `Payload::program` can refuse any pairing that cannot.
+        let (line, shell) = wrapped("print(1)");
+        let python = language::Snippet::declared(shell.range(), language::Language::Python);
+        let (spans, kept) = render_command_naming(&line, &BTreeMap::new(), None, Some(python));
+        let at = kept.expect("the program survived the rendering").range();
+        assert!(spans.iter().any(|span| span.range().start == at.start), "{spans:?}");
+        assert!(spans.iter().any(|span| span.range().end == at.end), "{spans:?}");
+        assert_eq!(
+            spans.iter().find(|span| span.range() == at).map(Span::text),
+            Some("print(1)")
+        );
+        assert_eq!(unrender(&spans), line);
+        assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn a_rendering_that_cannot_carry_the_claim_comes_back_without_it() {
+        // Dropped rather than refused: a dropped program costs a sentence in
+        // the header, and a refused rendering is a window that will not open.
+        let (line, _) = wrapped("id -u");
+        let nonsense =
+            language::Snippet::declared(Range { start: 9, end: 8 }, language::Language::Python);
+        let (spans, kept) = render_command_naming(&line, &BTreeMap::new(), None, Some(nonsense));
+        assert_eq!(kept, None);
+        assert_eq!(unrender(&spans), line);
     }
 
     #[test]
@@ -354,7 +505,7 @@ mod tests {
         // the command back behind the wall of wrapper it was moved out from.
         let (line, script) = wrapped("id -u");
         let at = line.find("bash").expect("the wrapper");
-        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), Some(at), Some(script));
+        let spans = render_command_reinterpreting(&line, &BTreeMap::new(), Some(at), Some(&script));
         let broken = spans.iter().find(|span| span.range().start == at).expect("a span at the seam");
         assert!(broken.break_before(), "the break at the seam was lost");
     }
@@ -368,8 +519,9 @@ mod tests {
         let (line, _) = wrapped("id -u");
         let plain = render_command(&line);
         for doubt in [0..0, Range { start: 5, end: 4 }, 3..line.len() + 1] {
+            let program = language::Snippet::declared(doubt.clone(), language::Language::Shell);
             let spans =
-                render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(doubt.clone()));
+                render_command_reinterpreting(&line, &BTreeMap::new(), None, Some(&program));
             assert_eq!(spans, plain, "{doubt:?} was not declined");
         }
     }

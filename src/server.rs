@@ -176,6 +176,9 @@ use crate::audit::{
 };
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
+use crate::exec::interpreter::Interpreter;
+use crate::exec::{last_argument_at, shell_line};
+use crate::render::language::{Language, Snippet};
 use crate::exec::elevate::{Elevation, RootOutcome};
 use crate::exec::env::build_child_env;
 use crate::exec::{Chunk, Env, Output, RunOpts};
@@ -185,7 +188,7 @@ use crate::protocol::{
     Payload, Release, Request as PromptRequest, ReviseKind, Unanswered, Unheard, Verdict,
 };
 use crate::render::diff::{FileDiff, diff_files};
-use crate::render::render_command_reinterpreting;
+use crate::render::render_command_naming;
 use crate::render::roster::roster;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
@@ -260,8 +263,19 @@ const MAX_UNANSWERED: usize = 8;
 pub struct RunCommandParams {
     /// The one-line intent, as the user should read it.
     pub title: String,
-    /// The command, as a shell would run it.
+    /// The command, as a shell would run it — or, with `run_with`, the
+    /// program that interpreter is to be handed.
     pub command: String,
+    /// What reads `command`. The shell when absent.
+    ///
+    /// `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`, `zsh`, with a
+    /// version suffix and a directory both allowed. The program travels as
+    /// one argument, so nothing in it is quoted, split or expanded on the way
+    /// — which is the point of saying it here rather than writing
+    /// `python3 - <<'PY'` into `command` and hoping the quoting survives two
+    /// readers.
+    #[serde(default)]
+    pub run_with: Option<String>,
     /// Why this is needed now.
     pub reason: String,
     /// Run the command as root.
@@ -293,7 +307,7 @@ pub struct RunCommandParams {
 /// so no rule can be added to one of them and forgotten in the other.
 impl From<RunCommandParams> for BatchParams {
     fn from(params: RunCommandParams) -> BatchParams {
-        let RunCommandParams { title, command, reason, root, cwd, interactive } = params;
+        let RunCommandParams { title, command, run_with, reason, root, cwd, interactive } = params;
         BatchParams {
             title,
             reason,
@@ -302,6 +316,7 @@ impl From<RunCommandParams> for BatchParams {
                 content: None,
                 patch: None,
                 command: Some(command),
+                run_with,
                 cwd,
                 interactive: Some(interactive),
                 root,
@@ -360,9 +375,14 @@ pub struct OperationParams {
     /// A file write: a unified diff against the file's current contents.
     #[serde(default)]
     pub patch: Option<String>,
-    /// A command: the command, as a shell would run it.
+    /// A command: the command, as a shell would run it — or, with `run_with`,
+    /// the program that interpreter is to be handed.
     #[serde(default)]
     pub command: Option<String>,
+    /// A command: what reads it. The shell when absent. See
+    /// [`RunCommandParams::run_with`].
+    #[serde(default)]
+    pub run_with: Option<String>,
     /// A command: absolute working directory. Defaults to `HOME`.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -431,10 +451,17 @@ pub enum Operation {
         /// Write it as root.
         root: bool,
     },
-    /// Run one command through a shell.
+    /// Run one command through an interpreter.
     Command {
         /// The command line, as the agent wrote it.
         command: String,
+        /// What reads it: the shell unless the request named something else.
+        ///
+        /// Resolved at the boundary rather than carried as the name the agent
+        /// wrote, so that a name hatch cannot hand a program to is refused
+        /// with a sentence before anything renders -- and so that nothing
+        /// downstream has to know there was ever a choice.
+        interpreter: Interpreter,
         /// Where to run it, when the agent said.
         cwd: Option<String>,
         /// Whether the agent asked for a terminal.
@@ -518,7 +545,7 @@ impl Operation {
     /// `field` spells a field's name the way the agent would find it in what
     /// it sent. See [`Batch::of`].
     fn of(params: OperationParams, field: &dyn Fn(&str) -> String) -> Result<Operation, String> {
-        let OperationParams { path, content, patch, command, cwd, interactive, root } = params;
+        let OperationParams { path, content, patch, command, run_with, cwd, interactive, root } = params;
         match (path, command) {
             (Some(_), Some(_)) => Err(at_the_boundary(
                 &format!(
@@ -542,9 +569,13 @@ impl Operation {
                 // than ignored. hatch will not guess whether a write carrying
                 // `cwd` was meant to be a command, and an ignored field is a
                 // part of the call the agent believes was honoured.
-                if let Some(stray) = [("cwd", cwd.is_some()), ("interactive", interactive.is_some())]
-                    .into_iter()
-                    .find_map(|(name, present)| present.then_some(name))
+                if let Some(stray) = [
+                    ("cwd", cwd.is_some()),
+                    ("interactive", interactive.is_some()),
+                    ("run_with", run_with.is_some()),
+                ]
+                .into_iter()
+                .find_map(|(name, present)| present.then_some(name))
                 {
                     return Err(at_the_boundary(
                         &format!(
@@ -552,8 +583,9 @@ impl Operation {
                             field(stray)
                         ),
                         "A write lands at the path it names and runs nothing, so there is no \
-                         working directory or terminal for it to use. Leave the field out, or \
-                         send the command it was meant for as an operation of its own.",
+                         working directory, terminal or interpreter for it to use. Leave the \
+                         field out, or send the command it was meant for as an operation of its \
+                         own.",
                     ));
                 }
                 within_cap(&field("path"), &path, MAX_FIELD_BYTES)?;
@@ -609,13 +641,58 @@ impl Operation {
                 if let Some(cwd) = &cwd {
                     within_cap(&field("cwd"), cwd, MAX_FIELD_BYTES)?;
                 }
+                let interpreter = match &run_with {
+                    None => Interpreter::shell(),
+                    Some(name) => {
+                        within_cap(&field("run_with"), name, MAX_FIELD_BYTES)?;
+                        // Refused with the list rather than guessed at. hatch
+                        // has to know *how* a program is handed to an
+                        // interpreter -- `-c` here, `-e` there -- and an
+                        // invented flag builds an argv that fails at the far
+                        // end with the reader having approved something that
+                        // never ran. See `crate::exec::interpreter`.
+                        Interpreter::named(name).ok_or_else(|| {
+                            at_the_boundary(
+                                &format!(
+                                    "`{}` names {name:?}, which hatch does not know how to hand \
+                                     a program to",
+                                    field("run_with")
+                                ),
+                                &format!(
+                                    "It knows {}. A version suffix and a directory are fine — \
+                                     `python3.12` and `/usr/bin/node` both work. To run anything \
+                                     else, write the invocation out in `command`, which is a \
+                                     shell line and can run any program on the machine.",
+                                    listed_names(&Interpreter::known())
+                                ),
+                            )
+                        })?
+                    }
+                };
                 Ok(Operation::Command {
                     command,
+                    interpreter,
                     cwd,
                     interactive: interactive.unwrap_or(false),
                     root,
                 })
             }
+        }
+    }
+}
+
+/// `a`, `b` and `c`, backticked, for a refusal that names a list.
+///
+/// The window has its own [`crate::prompt_ui::panes`] version for prose it
+/// draws; this one is for text an agent reads, where a name is a token to
+/// copy rather than a word in a sentence.
+fn listed_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => format!("`{only}`"),
+        [head @ .., last] => {
+            let head: Vec<String> = head.iter().map(|name| format!("`{name}`")).collect();
+            format!("{} and `{last}`", head.join(", "))
         }
     }
 }
@@ -1027,6 +1104,14 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          that. Batch related commands into a single command — chain them with `&&`, or write a \
          short script — instead of making a run of separate calls, because each extra call is \
          another interruption.\n\
+         \n\
+         To run a program that is not shell, name what should read it in `run_with` — \
+         `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`, `zsh` — and put the program \
+         itself in `command`. It travels as a single argument, so nothing in it is quoted, \
+         split or expanded on the way, and the person sees it drawn as a program rather than \
+         as one long string. Prefer this to wrapping a here-document in a shell command: \
+         `run_with: \"python3\"` says in one field what `python3 - <<'PY' … PY` says in two \
+         layers of quoting, and it cannot come apart on a quote character.\n\
          \n\
          The person may refuse the command, ask you to explain it, ask for a form of it that \
          is easier to read, or decide to run it themselves. You get back what actually \
@@ -2343,8 +2428,8 @@ impl Daemon {
         let mut refusals = Vec::new();
         for (index, operation) in operations.into_iter().enumerate() {
             let prepared = match operation {
-                Operation::Command { command, cwd, interactive, root } => {
-                    self.prepare_run(command, cwd, interactive, root)
+                Operation::Command { command, interpreter, cwd, interactive, root } => {
+                    self.prepare_run(command, interpreter, cwd, interactive, root)
                 }
                 Operation::Write { path, source, root } => self.prepare_swap(path, source, root),
             };
@@ -2380,6 +2465,7 @@ impl Daemon {
     fn prepare_run(
         &self,
         command: String,
+        interpreter: Interpreter,
         given_cwd: Option<String>,
         interactive: bool,
         root: bool,
@@ -2451,7 +2537,7 @@ impl Daemon {
         // the spawner's would put a value on screen that the command never
         // sees. See `crate::exec::elevate::Run0::spawner_env`.
         let (argv, spawn_env, line, break_at, script_at, caveat) = if root {
-            let elevated = match self.elevation.argv(&command, &env) {
+            let elevated = match self.elevation.argv_with(&interpreter, &command, &env) {
                 Ok(elevated) => elevated,
                 // Nothing was rendered and nobody was asked: this build
                 // cannot elevate here at all, which is a fact about the
@@ -2479,27 +2565,42 @@ impl Daemon {
                 self.elevation.caveat(),
             )
         } else {
-            (
-                // A direct argv, never a string handed to another shell: the
-                // rendering below is a rendering *of these three arguments*.
-                vec!["bash".to_string(), "-c".to_string(), command.clone()],
-                env.clone(),
-                command.clone(),
-                // Nothing to break before, and nothing to read again: the
-                // line an unelevated request draws is the command the agent
-                // wrote and nothing else.
-                None,
-                None,
-                None,
-            )
+            // A direct argv, never a string handed to another shell: the
+            // rendering below is a rendering *of these three arguments*.
+            let argv = interpreter.argv(&command);
+            match interpreter.language() {
+                // The shell, which is what every request got before there was
+                // anything to name: the line is the command the agent wrote
+                // and nothing else, because `bash -c` is the documented
+                // default and drawing it would put six characters of hatch's
+                // own in front of every command on every window.
+                Language::Shell => (argv, env.clone(), command.clone(), None, None, None),
+                // Anything else is drawn as the invocation it is. A reader
+                // shown twenty lines of Python with no sign of what will read
+                // them has been told the least useful true thing about the
+                // request -- and the one fact that decides what those lines
+                // do is the program named in front of them.
+                _ => {
+                    let line = shell_line(&argv);
+                    let at = last_argument_at(&argv);
+                    (argv, env.clone(), line, None, at, None)
+                }
+            }
         };
         let render_env = match root {
             true => self.elevation.child_env(&env),
             false => env.clone(),
         };
 
-        let spans =
-            render_command_reinterpreting(&line, &render_env, break_at, script_at.clone());
+        // Whether the program is read again as shell, and whether the
+        // rendering can carry a claim about it at all, are both the
+        // renderer's: see `render_command_naming`.
+        let (spans, program) = render_command_naming(
+            &line,
+            &render_env,
+            break_at,
+            script_at.map(|at| Snippet::declared(at, interpreter.language())),
+        );
         // The roster is built from the same line the spans tile, so the list
         // above the panes and the text in them cannot come to describe two
         // different requests -- and against the same `render_env`, because the
@@ -2512,7 +2613,7 @@ impl Daemon {
         let payload =
             Payload::command(&spans, Vec::new(), cwd.clone(), root, interactive)
                 .with_caveat(caveat)
-                .with_script(script_at)
+                .with_program(program)
                 .with_runs(runs);
         Rendered::Ready(Box::new(Job {
             detail: detail(&cwd),
@@ -4677,6 +4778,7 @@ mod tests {
 
     fn run_params(field: &str, value: String) -> RunCommandParams {
         let mut p = RunCommandParams {
+            run_with: None,
             title: "t".to_string(),
             command: "c".to_string(),
             reason: "r".to_string(),
@@ -4702,6 +4804,7 @@ mod tests {
     /// One file write, on its own in a batch, with nothing in it set.
     fn a_write() -> OperationParams {
         OperationParams {
+            run_with: None,
             path: None,
             content: None,
             patch: None,
@@ -4888,6 +4991,7 @@ mod tests {
         // command would have made. If `run_command` ever grows a field the
         // batch does not carry, this is where it has nowhere to go.
         let params = RunCommandParams {
+            run_with: None,
             title: "Install ripgrep".to_string(),
             command: "pacman -S ripgrep".to_string(),
             reason: "the search is slow".to_string(),
@@ -4902,6 +5006,7 @@ mod tests {
                 title: "Install ripgrep".to_string(),
                 reason: "the search is slow".to_string(),
                 operations: vec![Operation::Command {
+                    interpreter: Interpreter::shell(),
                     command: "pacman -S ripgrep".to_string(),
                     cwd: Some("/srv".to_string()),
                     interactive: true,
@@ -4925,6 +5030,65 @@ mod tests {
         })
         .expect("and so does the same call spelled as a batch");
         assert_eq!(batch, spelled_as_a_batch);
+    }
+
+    #[test]
+    fn a_request_may_name_what_reads_its_command() {
+        // The whole point: the program travels as one argument, so nothing
+        // in it is quoted, split or expanded on the way. The alternative an
+        // agent reaches for is `bash -c` wrapping `python3 - <<PY`, which is
+        // two layers of quoting over a program that is not shell.
+        let mut params = run_params("command", "print('hi')".to_string());
+        params.run_with = Some("python3".to_string());
+        let batch = check_run_command(params).expect("a named interpreter passes the boundary");
+        let [Operation::Command { command, interpreter, .. }] = &batch.operations[..] else {
+            panic!("{:?}", batch.operations)
+        };
+        assert_eq!(command, "print('hi')");
+        assert_eq!(interpreter.argv(command), vec!["python3", "-c", "print('hi')"]);
+        assert_eq!(interpreter.language(), Language::Python);
+    }
+
+    #[test]
+    fn a_request_that_names_nothing_gets_the_shell_it_always_got() {
+        let batch = check_run_command(run_params("command", "ls -l".to_string())).expect("passes");
+        let [Operation::Command { command, interpreter, .. }] = &batch.operations[..] else {
+            panic!("{:?}", batch.operations)
+        };
+        assert_eq!(interpreter.argv(command), crate::exec::shell_argv("ls -l"));
+    }
+
+    #[test]
+    fn an_interpreter_hatch_cannot_hand_a_program_to_is_refused_with_the_list() {
+        // Refused, not guessed at. hatch has to know *how* a program is given
+        // to an interpreter, and an invented flag builds an argv that fails
+        // at the far end with the reader having approved something that never
+        // ran. The sentence has to leave the agent somewhere to go, so it
+        // names both the list and the way round it.
+        let mut params = run_params("command", "SELECT 1".to_string());
+        params.run_with = Some("psql".to_string());
+        let message = check_run_command(params).expect_err("an unknown interpreter is refused");
+
+        assert!(message.contains("psql"), "the name it refused is not in it: {message}");
+        for known in ["`python`", "`node`", "`bash`"] {
+            assert!(message.contains(known), "the list is not in it: {message}");
+        }
+        assert!(message.contains("`command`"), "no way round it was offered: {message}");
+        assert!(
+            !message.contains("nobody decided"),
+            "a boundary refusal read as a denial: {message}"
+        );
+    }
+
+    #[test]
+    fn a_file_write_that_names_an_interpreter_is_refused() {
+        // A write lands bytes and runs nothing. An ignored field is a part of
+        // the call the agent believes was honoured.
+        let mut params = write_params("content", "c".to_string());
+        params.operations[0].run_with = Some("python3".to_string());
+        let message = Batch::of(params).expect_err("a write with an interpreter is refused");
+        assert!(message.contains("run_with"), "{message}");
+        assert!(message.contains("only a command has"), "{message}");
     }
 
     #[test]
@@ -5625,6 +5789,7 @@ later"), "");
 
         fn run_of(command: &str) -> RunCommandParams {
             RunCommandParams {
+                run_with: None,
                 title: "a test".to_string(),
                 command: command.to_string(),
                 reason: "because a test asked".to_string(),
@@ -5871,12 +6036,29 @@ later"), "");
                 Reply::verdict(Verdict::Deny { note: String::new() }),
             ]);
             let dropped = Hangup::new();
-            let caller =
-                Caller { cancelled: CancellationToken::new(), hangup: Some(dropped.clone()), progress: None };
+            let caller = Caller {
+                cancelled: CancellationToken::new(),
+                hangup: Some(dropped.clone()),
+                progress: None,
+            };
+            // The drop has to land *after* the window is up, and the wait is
+            // not politeness: a request whose caller is already gone is
+            // abandoned at the queue and never opens one at all -- which is
+            // the right answer and the opposite of what this is about. A
+            // window nobody can answer is the one thing a reader sees.
+            let daemon = Arc::clone(&harness.daemon);
+            let first = tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await });
+            let prompter = Arc::clone(&harness.prompter);
+            within(async move {
+                while prompter.seen().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
             // The stream ends with no `notifications/cancelled` behind it,
             // which is what makes this a drop rather than a cancellation.
             dropped.gone().cancel();
-            let _ = within(harness.daemon.run_command(run_of("true"), caller)).await;
+            let _ = within(first).await.expect("the first call finished");
             let _ = within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
 
             let seen = harness.prompter.seen();
@@ -6590,10 +6772,17 @@ later"), "");
                 // the alias has to open the window the batch does, field for
                 // field, or it is not an alias.
                 let operation = match &sample.asked {
-                    crate::preview::Asked::Command { command, cwd, root, interactive } => {
+                    crate::preview::Asked::Command {
+                        command,
+                        run_with,
+                        cwd,
+                        root,
+                        interactive,
+                    } => {
                         daemon
                             .run_command(
                                 RunCommandParams {
+                                    run_with: run_with.clone(),
                                     title: sample.title.clone(),
                                     command: command.clone(),
                                     reason: sample.reason.clone(),
@@ -6606,6 +6795,7 @@ later"), "");
                             .await;
                         OperationParams {
                             command: Some(command.clone()),
+                            run_with: run_with.clone(),
                             cwd: Some(cwd.display().to_string()),
                             interactive: Some(*interactive),
                             root: *root,
@@ -6715,11 +6905,12 @@ later"), "");
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
             let payload = shown.operations.into_iter().next().expect("an operation");
-            let Payload::Command { raw, script: at, .. } = &payload else {
+            let Payload::Command { raw, program, .. } = &payload else {
                 panic!("not a command payload");
             };
-            let at = at.clone().expect("the window was not told where the script is");
-            assert_eq!(&raw[at], script, "{raw}");
+            let program = program.clone().expect("the window was not told where the script is");
+            assert_eq!(&raw[program.range()], script, "{raw}");
+            assert_eq!(program.language(), Language::Shell);
             // And the rendering that arrived reads it as shell: `for` is the
             // word that names what runs, inside a quoted argument.
             let spans = payload.rendering().expect("a rendering the window would accept");
@@ -6733,19 +6924,93 @@ later"), "");
         }
 
         #[tokio::test]
+        async fn a_named_interpreter_is_on_the_line_and_its_program_is_not_read_as_shell() {
+            let harness =
+                Harness::new(vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })]);
+            // Double quotes on purpose: a program containing a `'` is one
+            // `shell_quote` rewrites, and hatch declines to name a run whose
+            // drawn bytes are not the program's own. That is its own case,
+            // covered in `exec::mod`.
+            let program = "for f in [\"a\", \"b\"]:\n    print(f)";
+            let mut params = run_of(program);
+            params.run_with = Some("python3".to_string());
+            within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let payload = shown.operations.into_iter().next().expect("an operation");
+            let Payload::Command { raw, program: at, .. } = &payload else {
+                panic!("not a command payload");
+            };
+            // The invocation is on the line. A reader shown twenty lines of
+            // Python with no sign of what will read them has been told the
+            // least useful true thing about the request.
+            assert!(raw.starts_with("python3 -c "), "{raw}");
+            let at = at.clone().expect("the window was not told where the program is");
+            assert_eq!(&raw[at.range()], program, "{raw}");
+            assert_eq!(at.language(), Language::Python);
+
+            // And it is drawn as the data it is. `for` here is Python's, and
+            // marking it as the word that names what runs -- or bracketing it
+            // to a `done` that is not there -- would be a reading of the
+            // wrong language with the confidence of the right one.
+            let spans = payload.rendering().expect("a rendering the window would accept");
+            let named: Vec<&str> = spans
+                .iter()
+                .filter(|span| span.kind() == &crate::render::SpanKind::Command)
+                .map(crate::render::Span::text)
+                .collect();
+            assert_eq!(named, vec!["python3"], "{named:?}");
+            assert_eq!(crate::render::unrender(&spans), *raw);
+        }
+
+        #[tokio::test]
+        async fn a_root_request_that_names_an_interpreter_wraps_that_one() {
+            // `run0 … -- python3 -c '<program>'`, and not a shell in between:
+            // a shell under it would re-parse the program at a level the
+            // reader was never shown.
+            let elevation = Arc::new(Rehearsed::recording(RootOutcome::Ran { exit: Some(0) }));
+            let harness = rooted(
+                vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })],
+                Arc::clone(&elevation) as Arc<_>,
+            );
+            let mut params = root_run("print(1)");
+            params.run_with = Some("python3".to_string());
+            within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let Payload::Command { raw, program, .. } =
+                shown.operations.into_iter().next().expect("an operation")
+            else {
+                panic!("not a command payload");
+            };
+            // The elevation was handed the interpreter's argv, not a shell
+            // wrapping it: a shell under it would re-parse the program at a
+            // level the reader was never shown.
+            assert_eq!(
+                elevation.seen(),
+                vec![vec!["python3".to_string(), "-c".to_string(), "print(1)".to_string()]]
+            );
+            assert!(raw.ends_with("python3 -c 'print(1)'"), "{raw}");
+            assert!(!raw.contains("bash"), "a shell was put under it: {raw}");
+            let program = program.expect("the window was not told where the program is");
+            assert_eq!(&raw[program.range()], "print(1)", "{raw}");
+            assert_eq!(program.language(), Language::Python);
+        }
+
+        #[tokio::test]
         async fn an_unelevated_command_draws_neither_the_wrapper_nor_a_caveat() {
             let harness =
                 Harness::new(vec![Reply::verdict(Verdict::Deny { note: "no".to_string() })]);
             within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
 
             let shown = harness.prompter.seen().into_iter().next().expect("a window");
-            let Payload::Command { raw, root, caveat, script, .. } = shown.operations.into_iter().next().expect("an operation") else {
+            let Payload::Command { raw, root, caveat, program, .. } = shown.operations.into_iter().next().expect("an operation") else {
                 panic!("not a command payload");
             };
             assert_eq!(raw, "echo hi");
             assert!(!root);
             assert_eq!(caveat, None, "an ordinary command was given a root warning");
-            assert_eq!(script, None, "a command nobody quoted claimed hatch had quoted it");
+            assert_eq!(program, None, "a command nobody quoted claimed hatch had quoted it");
         }
 
         #[tokio::test]

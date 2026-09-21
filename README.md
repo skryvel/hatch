@@ -180,7 +180,16 @@ naming the hunk, the line and what was found there; nothing is rendered and
 nobody is interrupted.
 
 Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
-— never as a string handed to a second shell. With `root: true` the argv
+— never as a string handed to a second shell. A request can name something
+else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`,
+`zsh` — and then `command` is a program for that interpreter, handed to it as
+one argument. The window draws the invocation with the program under it,
+names the language, and says the quotes are hatch's. A shell program is read
+again as shell; hatch has no reader for the others and does not pretend to —
+they are drawn exactly as they were sent. A name that is not on the list is
+refused with the list, because hatch has to know how a given interpreter takes
+a program (`-c` here, `-e` there) and a guessed flag builds an argv that fails
+after somebody has approved it. With `root: true` the argv
 becomes `run0 --pipe --setenv=… -- bash -c '<command>'`, and the window shows
 that whole line, wrapper and `--setenv` pairs included. The command inside
 those quotes is one word to `bash -c` and is drawn as the shell it is about to

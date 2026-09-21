@@ -91,7 +91,8 @@ use std::fmt;
 use std::ops::Range;
 
 use super::lookup::lookup;
-use super::{Env, shell_argv, shell_line, shell_quote};
+use super::interpreter::Interpreter;
+use super::{Env, last_argument_at, shell_line};
 
 // ---- what every platform must answer ---------------------------------------
 
@@ -193,7 +194,28 @@ pub trait Elevation: Send + Sync {
     /// command gets is the same one the unelevated path uses and the command
     /// travels as a single `execve` argument either way.
     fn argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        Ok(self.elevate(shell_argv(command), env)?.over_script(command))
+        self.argv_with(&Interpreter::shell(), command, env)
+    }
+
+    /// [`Self::argv`], for a request that named what should read `command`.
+    ///
+    /// The interpreter supplies the argv in place of [`shell_argv`] and
+    /// nothing else changes: the program is still one `execve` argument, the
+    /// wrapper in front of it is still this mechanism's, and
+    /// [`ElevatedArgv::script_at`] still names the bytes it occupies. A root
+    /// Python program is `run0 … -- python3 -c '<program>'`, which is the
+    /// line the reader is shown and the line that runs.
+    ///
+    /// # Errors
+    ///
+    /// [`Unavailable`], on exactly [`Self::available`]'s terms.
+    fn argv_with(
+        &self,
+        interpreter: &Interpreter,
+        command: &str,
+        env: &Env,
+    ) -> Result<ElevatedArgv, Unavailable> {
+        Ok(self.elevate(interpreter.argv(command), env)?.over_script(command))
     }
 
     /// [`Self::argv`] for a caller that is only going to draw the line.
@@ -203,7 +225,21 @@ pub trait Elevation: Send + Sync {
     /// one caller is [`crate::preview`], which has no daemon, no verdict
     /// channel and nothing to run a command with.
     fn compose_argv(&self, command: &str, env: &Env) -> Result<ElevatedArgv, Unavailable> {
-        Ok(self.compose(shell_argv(command), env)?.over_script(command))
+        self.compose_argv_with(&Interpreter::shell(), command, env)
+    }
+
+    /// [`Self::compose_argv`], for a request that named an interpreter.
+    ///
+    /// # Errors
+    ///
+    /// [`Unavailable`], when this mechanism has no elevation to compose.
+    fn compose_argv_with(
+        &self,
+        interpreter: &Interpreter,
+        command: &str,
+        env: &Env,
+    ) -> Result<ElevatedArgv, Unavailable> {
+        Ok(self.compose(interpreter.argv(command), env)?.over_script(command))
     }
 
     /// What a finished elevated run means.
@@ -322,23 +358,8 @@ impl ElevatedArgv {
     /// would take it to mean. Saying nothing is the whole of the answer: see
     /// [`Self::script_at`].
     fn over_script(mut self, script: &str) -> ElevatedArgv {
-        // The same arithmetic `wrapping` does, on the same grounds: the
-        // rendered last argument begins one byte past the end of everything
-        // in front of it, because `shell_line` quotes each argument and
-        // joins the results with one space.
-        let Some(head) = self.argv.split_last().map(|(_, head)| head) else { return self };
-        let begins = shell_line(head).len() + 1;
-        let quoted = shell_quote(script);
-        self.script_at = if quoted == script {
-            Some(begins..begins + script.len())
-        } else if quoted.len() == script.len() + 2 {
-            // Quoted, and nothing inside the quotes was rewritten: every
-            // rewrite `shell_quote` makes turns one byte into four, so a
-            // length exactly two over is the one case where it only wrapped.
-            Some(begins + 1..begins + 1 + script.len())
-        } else {
-            None
-        };
+        debug_assert_eq!(self.argv.last().map(String::as_str), Some(script));
+        self.script_at = last_argument_at(&self.argv);
         self
     }
 
@@ -1084,6 +1105,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
+    use crate::exec::shell_argv;
 
     /// A `PATH` with a real executable `run0` on it, so [`Run0::available`]
     /// answers yes without anything being elevated. The directory is the whole

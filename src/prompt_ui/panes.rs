@@ -51,7 +51,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
 use crate::render::blocks::{Block, blocks, blocks_within};
-use crate::render::language::{Snippet, snippets};
+use crate::render::language::{Evidence, Language, Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
@@ -144,15 +144,14 @@ pub enum Shown {
         /// How a root command will differ from the same command run
         /// unprivileged, defanged for drawing. `None` when it will not.
         caveat: Option<String>,
-        /// Which of the source is a shell script hatch quoted into the line,
-        /// checked against the rendering — [`Payload::script`].
+        /// Which of the source is a program hatch quoted into the line, and
+        /// what it is written in — [`Payload::program`], checked.
         ///
-        /// `None` for every request that is not elevated. Held so the window
-        /// can say so: the daemon already read those bytes as shell and the
-        /// spans arrived that way, and a reader looking at command names and
-        /// resolved variables *inside* a quoted string is owed a sentence
-        /// saying who decided they were shell.
-        script: Option<Range<usize>>,
+        /// `None` unless hatch built the invocation. Held so the window can
+        /// say so: the line is not one the agent wrote, the quotes around the
+        /// program are hatch's, and a reader is owed a sentence saying who
+        /// decided what those bytes are.
+        program: Option<Snippet>,
     },
     /// A file swap, drawn in whichever of the two views fits — see
     /// [`draw_swap`].
@@ -189,8 +188,8 @@ impl Shown {
             Payload::Command { danger, runs, cwd, root, interactive, caveat, .. } => {
                 let annotated = payload.rendering()?;
                 // Checked against the rendering it names, before anything
-                // slices the source with it. See `Payload::script`.
-                let script = payload.script(&annotated)?;
+                // slices the source with it. See `Payload::program`.
+                let program = payload.program(&annotated)?;
                 // From the rebuilt spans, not from the payload's own `raw`
                 // field: the two are equal by construction, and taking it
                 // from here means every character in either pane came out of
@@ -203,11 +202,29 @@ impl Shown {
                     // find nothing at all inside the quotes -- which is the
                     // right answer about the shell and the wrong one about
                     // what the reader is being asked to approve.
-                    blocks: match &script {
-                        Some(script) => blocks_within(source, script.clone()),
+                    blocks: match &program {
+                        // Only a shell program has shell constructs in it. A
+                        // Python one would have its `for` and its `done`
+                        // bracketed as though they were a loop and its
+                        // closing word, which is a reading of the wrong
+                        // language drawn with the confidence of the right
+                        // one.
+                        Some(program) if program.language() == Language::Shell => {
+                            blocks_within(source, program.range())
+                        }
+                        Some(_) => Vec::new(),
                         None => blocks(source),
                     },
-                    snippets: snippets(source),
+                    // The declared one first: it is the outermost thing on
+                    // the line and the only one that is a fact rather than a
+                    // reading. A here-document *inside* a declared program is
+                    // still found, because `snippets` reads the whole source
+                    // and hatch's shell scanner is what finds bodies.
+                    snippets: program
+                        .clone()
+                        .into_iter()
+                        .chain(snippets(source))
+                        .collect(),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
                     runs: runs.clone(),
@@ -222,7 +239,7 @@ impl Shown {
                     // undefanged, and an exception for trusted text is how
                     // the rule stops being one.
                     caveat: caveat.as_deref().map(defang),
-                    script,
+                    program,
                     longest: widest_line(&annotated).max(widest_line(&raw)),
                     raw,
                     annotated,
@@ -562,19 +579,34 @@ pub fn draw_unanswered(ui: &mut Ui, items: &[Unanswered]) {
 /// carrying both is longer than the row it has -- so several are named and
 /// the reasons are left to the text, which is on screen anyway.
 pub fn snippet_note(found: &[Snippet]) -> Option<String> {
-    let [only] = found else {
-        let mut named: Vec<&str> = found.iter().map(|s| s.language().name()).collect();
-        named.dedup();
-        return match named.len() {
-            0 => None,
-            _ => Some(format!("Its here-documents read as {}.", listed(named.into_iter().map(str::to_string)))),
-        };
-    };
-    Some(format!(
-        "Its here-document reads as {}, {}.",
-        only.language().name(),
-        only.evidence().because()
-    ))
+    // A program the request named an interpreter for is not a reading of a
+    // here-document and must not be described as one -- and it is a fact
+    // rather than a reading, so it says so without hedging. At most one of
+    // them: a request names one interpreter.
+    let (declared, bodies): (Vec<&Snippet>, Vec<&Snippet>) =
+        found.iter().partition(|found| found.evidence() == Evidence::Declared);
+    let mut said: Vec<String> = declared
+        .first()
+        .map(|only| format!("The argument below it is a {} program.", only.language().name()))
+        .into_iter()
+        .collect();
+    match bodies.as_slice() {
+        [] => {}
+        [only] => said.push(format!(
+            "Its here-document reads as {}, {}.",
+            only.language().name(),
+            only.evidence().because()
+        )),
+        several => {
+            let mut named: Vec<&str> = several.iter().map(|s| s.language().name()).collect();
+            named.dedup();
+            said.push(format!(
+                "Its here-documents read as {}.",
+                listed(named.into_iter().map(str::to_string))
+            ));
+        }
+    }
+    (!said.is_empty()).then(|| said.join(" "))
 }
 
 /// How many of the rows are marked as changed.
@@ -1372,13 +1404,13 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool) -> Option<bool> {
     match shown {
         Shown::Command {
-            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, script, ..
+            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, program, ..
         } => {
             draw_command_header(
                 ui,
                 scan,
                 snippets,
-                script.is_some(),
+                program.as_ref().map(Snippet::language),
                 danger,
                 runs,
                 caveat.as_deref(),
@@ -1402,7 +1434,7 @@ fn draw_command_header(
     ui: &mut Ui,
     report: &ScanReport,
     snippets: &[Snippet],
-    script: bool,
+    program: Option<Language>,
     danger: &[String],
     runs: &[Entry],
     caveat: Option<&str>,
@@ -1423,12 +1455,11 @@ fn draw_command_header(
         // one thing it must not do is compete with a line that is one.
         ui.label(RichText::new(note).small().color(palette.quiet));
     }
-    if script {
+    if let Some(language) = program {
         // Beside the snippet note, in the same voice, because it is the same
-        // kind of statement: a run of this line is being read as a language,
-        // and the reader is being told which and on whose say-so. See
-        // `SCRIPT_NOTE`.
-        ui.label(RichText::new(SCRIPT_NOTE).small().color(palette.quiet));
+        // kind of statement: a run of this line is a program, and the reader
+        // is being told whose quotes it is in. See `program_note`.
+        ui.label(RichText::new(program_note(language)).small().color(palette.quiet));
     }
     if !danger.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -2104,7 +2135,7 @@ fn command_caption(original: bool) -> &'static str {
 /// The label on the box that swaps them.
 const ORIGINAL_LABEL: &str = "Show the original text";
 
-/// What to say about a command hatch quoted into a line of its own making.
+/// What to say about a program hatch quoted into a line of its own making.
 ///
 /// Two things, and the first is the one a reader cannot get anywhere else:
 /// **the quotes are hatch's**. The agent sent a command; hatch wrapped it to
@@ -2125,9 +2156,28 @@ const ORIGINAL_LABEL: &str = "Show the original text";
 /// drawn above whichever pane is showing, and the sentence has to stay true
 /// when the reader has switched to the original text -- which is exactly
 /// where they would go to check it.
-const SCRIPT_NOTE: &str =
-    "The quotes are hatch's: an elevated command is handed to bash as one argument. The \
-     annotated pane reads what is inside them as the shell it will be run as.";
+fn program_note(language: Language) -> &'static str {
+    match language {
+        // The shell case, and the one where the pane is doing something to
+        // the program the reader cannot see it doing: to the shell that will
+        // receive it the whole thing is one word, so every command name,
+        // separator and bracket inside those quotes is hatch reading that
+        // word a second way.
+        Language::Shell => {
+            "The quotes are hatch's: the command is handed to the shell as one argument. The \
+             annotated pane reads what is inside them as the shell it will be run as."
+        }
+        // Everything else. hatch has no reader for these and does not pretend
+        // to: the program is drawn as the data it is, every byte as itself,
+        // which is what the pane does with anything it has nothing to say
+        // about. The sentence says so rather than leaving a reader to wonder
+        // why Python has no colour in it.
+        _ => {
+            "The quotes are hatch's: the program is handed to the interpreter named in front of \
+             it as one argument. hatch does not read it — it is drawn exactly as it was sent."
+        }
+    }
+}
 
 /// The command, in one pane, in whichever of the two renderings is asked for.
 ///
@@ -3770,18 +3820,23 @@ mod tests {
     /// A payload shaped like an elevated one: a wrapper, then the command as
     /// one quoted argument, with the run named the way the daemon names it.
     fn an_elevated_command(script: &str) -> Payload {
+        an_invocation(script, Language::Shell)
+    }
+
+    /// The same, for a program in a language hatch has no reader for.
+    fn an_invocation(script: &str, language: Language) -> Payload {
         let line = format!("run0 --pipe -- bash -c '{script}'");
         let at = "run0 --pipe -- bash -c '".len();
-        let script = at..at + script.len();
+        let program = Snippet::declared(at..at + script.len(), language);
         let env = BTreeMap::from([("HOME".to_string(), "/home/u".to_string())]);
         let spans = crate::render::render_command_reinterpreting(
             &line,
             &env,
             Some("run0 --pipe -- ".len()),
-            Some(script.clone()),
+            Some(&program),
         );
         Payload::command(&spans, Vec::new(), PathBuf::from("/tmp"), true, false)
-            .with_script(Some(script))
+            .with_program(Some(program))
     }
 
     #[test]
@@ -3801,9 +3856,40 @@ mod tests {
 
         // And the same line without the daemon's word for which run is a
         // script finds nothing, which is what this is worth.
-        let blind = Shown::of(&payload.clone().with_script(None)).expect("a real payload");
+        let blind = Shown::of(&payload.clone().with_program(None)).expect("a real payload");
         let Shown::Command { blocks, .. } = blind else { panic!("not a command") };
         assert!(blocks.is_empty(), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_program_hatch_cannot_read_gets_no_brackets_and_says_so() {
+        // Python's `for` is not a loop hatch can bracket and its `done` is
+        // not a closing word. Drawing either would be a reading of the wrong
+        // language with the confidence of the right one, so the pane draws
+        // the program as the data it is -- and the header says that is what
+        // it is doing, because a reader owed an explanation for why Python
+        // has no colour in it will otherwise invent one.
+        let payload = an_invocation("for f in a b:\n    print(f)", Language::Python);
+        let Shown::Command { blocks, snippets, .. } =
+            Shown::of(&payload).expect("a real payload")
+        else {
+            panic!("not a command")
+        };
+        assert!(blocks.is_empty(), "{blocks:?}");
+        assert_eq!(snippets.len(), 1, "{snippets:?}");
+        assert_eq!(snippets[0].language(), Language::Python);
+        assert_eq!(snippets[0].evidence(), Evidence::Declared);
+
+        let note = snippet_note(&snippets).expect("a program on the line said nothing about itself");
+        assert!(note.contains("Python"), "{note}");
+        assert!(!note.contains("here-document"), "a named program was called a body: {note}");
+        // And the shell case still brackets, which is what makes the
+        // difference worth drawing.
+        let shell = an_elevated_command("for f in a b; do\n  cat $f\ndone");
+        let Shown::Command { blocks, .. } = Shown::of(&shell).expect("a real payload") else {
+            panic!("not a command")
+        };
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
     }
 
     #[test]
@@ -3817,12 +3903,17 @@ mod tests {
             _ => panic!("not a command"),
         };
         for doubt in [0..0, Range { start: 4, end: 3 }, 2..raw.len() + 1] {
-            let tampered = payload.clone().with_script(Some(doubt.clone()));
+            let tampered = payload
+                .clone()
+                .with_program(Some(Snippet::declared(doubt.clone(), Language::Shell)));
             assert!(Shown::of(&tampered).is_err(), "{doubt:?} was drawn");
         }
         // And a run whose edges are not span edges: `run` is the first three
         // bytes of `run0`, which no span begins or ends inside.
-        assert!(Shown::of(&payload.with_script(Some(1..3))).is_err());
+        assert!(
+            Shown::of(&payload.with_program(Some(Snippet::declared(1..3, Language::Shell))))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3830,18 +3921,18 @@ mod tests {
         // The reader is looking at command names and brackets *inside* a
         // quoted string, on a line the agent did not write. Who put the
         // quotes there is not recoverable from the line. See `SCRIPT_NOTE`.
-        let Shown::Command { script, .. } =
+        let Shown::Command { program, .. } =
             Shown::of(&an_elevated_command("id -u")).expect("a real payload")
         else {
             panic!("not a command")
         };
-        assert!(script.is_some());
-        let Shown::Command { script, .. } =
+        assert!(program.is_some());
+        let Shown::Command { program, .. } =
             Shown::of(&a_command("id -u")).expect("a real payload")
         else {
             panic!("not a command")
         };
-        assert_eq!(script, None, "an ordinary command claimed hatch had quoted it");
+        assert_eq!(program, None, "an ordinary command claimed hatch had quoted it");
     }
 
     // ---- the checked door --------------------------------------------------
@@ -3873,7 +3964,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
-            script: None,
+            program: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "a window drew a rendering nobody checked");
@@ -3896,7 +3987,7 @@ mod tests {
             root,
             interactive,
             caveat: None,
-            script: None,
+            program: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "the title bar and the panes could disagree");

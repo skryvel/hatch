@@ -85,7 +85,9 @@ use crate::prompt_ui::theme::Theme;
 use crate::prompt_ui::{Incoming, Phase, PromptApp};
 use crate::protocol::{DaemonMsg, Payload, Request};
 use crate::render::diff::{FileDiff, diff_files};
-use crate::render::render_command_reinterpreting;
+use crate::exec::interpreter::Interpreter;
+use crate::render::language::{Language, Snippet};
+use crate::render::render_command_naming;
 use crate::render::roster::roster;
 use crate::swap;
 
@@ -216,13 +218,23 @@ pub enum Scenario {
     /// because it deliberately draws nothing -- see
     /// [`crate::render::blocks`].
     Blocks,
+    /// A Python program, named as one: the invocation on the line above it
+    /// and the program itself drawn as the data it is.
+    ///
+    /// Its own sample because the thing to look at is what hatch does *not*
+    /// do. The program has a `for`, a `#`, a `$` and a first word that is not
+    /// a program, and none of them is marked: they are Python's, and hatch
+    /// has no reader for Python. The shell samples above are the comparison
+    /// -- the same characters, a row or two of scrolling away, drawn as the
+    /// shell they are there.
+    Program,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 9] {
+    pub(crate) fn all() -> [Scenario; 10] {
         [
             Scenario::Command,
             Scenario::Chips,
@@ -233,6 +245,7 @@ impl Scenario {
             Scenario::Redirect,
             Scenario::Heredoc,
             Scenario::Blocks,
+            Scenario::Program,
         ]
     }
 }
@@ -251,6 +264,8 @@ pub(crate) enum Asked {
     /// A command, as `run_command` or a batch would send it.
     Command {
         command: String,
+        /// What the request named in `run_with`, if it named anything.
+        run_with: Option<String>,
         cwd: PathBuf,
         root: bool,
         interactive: bool,
@@ -319,13 +334,18 @@ fn command_payload(
     env: &std::collections::BTreeMap<String, String>,
     asked: &Asked,
 ) -> anyhow::Result<Payload> {
-    let Asked::Command { command, cwd, root, interactive } = asked else {
+    let Asked::Command { command, run_with, cwd, root, interactive } = asked else {
         anyhow::bail!("a command payload was asked for a swap");
+    };
+    let interpreter = match run_with {
+        None => Interpreter::shell(),
+        Some(name) => Interpreter::named(name)
+            .ok_or_else(|| anyhow::anyhow!("no sample may name an interpreter hatch refuses"))?,
     };
     let (line, break_at, script_at, render_env, caveat) = match root {
         true => {
             let elevated = elevation
-                .compose_argv(command, env)
+                .compose_argv_with(&interpreter, command, env)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             (
                 elevated.display_line(),
@@ -335,9 +355,22 @@ fn command_payload(
                 elevation.caveat(),
             )
         }
-        false => (command.clone(), None, None, env.clone(), None),
+        false => match interpreter.language() {
+            Language::Shell => (command.clone(), None, None, env.clone(), None),
+            _ => {
+                let argv = interpreter.argv(command);
+                let line = crate::exec::shell_line(&argv);
+                let at = crate::exec::last_argument_at(&argv);
+                (line, None, at, env.clone(), None)
+            }
+        },
     };
-    let spans = render_command_reinterpreting(&line, &render_env, break_at, script_at.clone());
+    let (spans, program) = render_command_naming(
+        &line,
+        &render_env,
+        break_at,
+        script_at.map(|at| Snippet::declared(at, interpreter.language())),
+    );
     // The roster, off the same line and the same environment the daemon uses
     // -- which means a preview of a sample resolves the sample's own names
     // against this machine, exactly as a real request would. A sample that
@@ -350,7 +383,7 @@ fn command_payload(
     // showing a header the daemon cannot currently produce.
     Ok(Payload::command(&spans, Vec::new(), cwd.clone(), *root, *interactive)
         .with_caveat(caveat)
-        .with_script(script_at)
+        .with_program(program)
         .with_runs(runs))
 }
 
@@ -426,6 +459,7 @@ pub(crate) fn build(
     let sample = match scenario {
         Scenario::Command => {
             let asked = Asked::Command {
+                run_with: None,
                 command: "cd $HOME/src/service &&\ncargo build --release --locked &&\n\
                           systemctl --user restart service"
                     .to_string(),
@@ -445,6 +479,7 @@ pub(crate) fn build(
         }
         Scenario::Comment => {
             let asked = Asked::Command {
+                run_with: None,
                 // Three things to look at, in the order they appear. The
                 // first comment holds every separator hatch knows and not one
                 // of them starts a segment -- while the `&&` on the line
@@ -471,6 +506,7 @@ pub(crate) fn build(
         }
         Scenario::Redirect => {
             let asked = Asked::Command {
+                run_with: None,
                 // Four things to look at. The `>|` on the last line is one
                 // operator and the `|` two rows above it is a segment
                 // boundary, in the same colours and three rows apart. The
@@ -496,6 +532,7 @@ pub(crate) fn build(
         }
         Scenario::Heredoc => {
             let asked = Asked::Command {
+                run_with: None,
                 // Four things to look at, and each of them is a pair. The
                 // `&&` and the `#` in the body are data and the `&&` on the
                 // last line is a boundary; the `$HOME` on the first line
@@ -523,6 +560,7 @@ pub(crate) fn build(
         }
         Scenario::Blocks => {
             let asked = Asked::Command {
+                run_with: None,
                 command: BLOCKS_SAMPLE.to_string(),
                 cwd,
                 root: false,
@@ -540,6 +578,7 @@ pub(crate) fn build(
         }
         Scenario::Chips => {
             let asked = Asked::Command {
+                run_with: None,
                 // The second line is the whole argument for the rendering.
                 // U+202E reverses everything after it inside the quotes, so
                 // the filename reads as `gnp.txt.exe` and is not one; U+00A0
@@ -582,8 +621,27 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::Program => {
+            let asked = Asked::Command {
+                run_with: Some("python3".to_string()),
+                command: PROGRAM_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "Collect the version field out of every JSON file here".to_string(),
+                reason: "Four of them disagree and the one that is right is the one the \
+                         installer reads."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &asked)?,
+                asked,
+            }
+        }
         Scenario::Root => {
             let asked = Asked::Command {
+                run_with: None,
                 // `systemctl status` is the reason the elevated line carries
                 // `--setenv=PAGER=cat`: a root command can find itself on a
                 // terminal, and a pager with nothing to read from waits until
@@ -616,6 +674,7 @@ pub(crate) fn build(
         }
         Scenario::Long => {
             let asked = Asked::Command {
+                run_with: None,
                 command: LONG_COMMAND.to_string(),
                 cwd,
                 root: false,
@@ -738,6 +797,19 @@ fi
 find . -name '*.sql.gz' -mtime +30 -print0 |
   xargs -0 --no-run-if-empty rm -v |
   tee -a prune.log";
+
+/// The program behind [`Scenario::Program`].
+///
+/// Every line of it would mean something to hatch's shell scanner and means
+/// something else here: `#` opens a comment in both, `for` names no program,
+/// `$` is not an expansion, and `sorted(...)` is not a pipeline. Drawn as
+/// data, none of it is marked -- which is the sample.
+const PROGRAM_SAMPLE: &str = "\
+import json, pathlib
+seen = {}
+for path in sorted(pathlib.Path(\".\").rglob(\"*.json\")):
+    seen[path.name] = json.loads(path.read_text()).get(\"version\")
+print(json.dumps(seen, indent=2))";
 
 /// The command behind [`Scenario::Root`].
 ///

@@ -49,6 +49,7 @@
 pub mod elevate;
 pub mod env;
 pub mod interactive;
+pub mod interpreter;
 pub mod lookup;
 
 use std::collections::BTreeMap;
@@ -110,6 +111,48 @@ pub fn shell_argv(command: &str) -> Vec<String> {
 /// nothing in hatch feeds this string back to a shell.
 pub fn shell_line(argv: &[String]) -> String {
     argv.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
+}
+
+/// Where the last argument's own bytes are drawn in [`shell_line`] of
+/// `argv` -- `None` when quoting rewrote them, or when there is no argv.
+///
+/// The one place this arithmetic is done. Two callers need it and both are
+/// about the same fact: hatch built an argv whose last argument is a program,
+/// and the window is going to draw that program as what it is rather than as
+/// a string. See [`elevate::ElevatedArgv::script_at`] and
+/// [`crate::exec::interpreter`].
+///
+/// # Arithmetic, not a search
+///
+/// [`shell_line`] quotes each argument and joins the results with one space,
+/// so the rendered last argument begins exactly one byte past the end of
+/// everything in front of it. A search would have to tell a quote hatch added
+/// from one the agent wrote, and would sometimes find the wrong one.
+///
+/// # Why it declines
+///
+/// [`shell_quote`] leaves a plain word bare and wraps everything else in
+/// single quotes, where nothing but `'` has any meaning -- so the drawn text
+/// is the argument itself, offset by the opening quote if there is one.
+/// Unless the argument contains a `'`, which it rewrites as `'\''`: each one
+/// turns a byte into four, so a rendering exactly two bytes longer than the
+/// argument is the one case where it only wrapped. Anything else and the
+/// characters on screen are not the characters of the argument, and there is
+/// no range here that would mean what a caller would take it to mean.
+pub fn last_argument_at(argv: &[String]) -> Option<std::ops::Range<usize>> {
+    let (last, head) = argv.split_last()?;
+    // One past the end of the rendered head, or the start of the line when
+    // there is no head: a one-argument argv renders as that argument alone,
+    // with no space in front of it to skip.
+    let begins = match head.is_empty() {
+        true => 0,
+        false => shell_line(head).len() + 1,
+    };
+    let quoted = shell_quote(last);
+    if quoted == *last {
+        return Some(begins..begins + last.len());
+    }
+    (quoted.len() == last.len() + 2).then(|| begins + 1..begins + 1 + last.len())
 }
 
 /// One argument, quoted if it needs it. See [`shell_line`].

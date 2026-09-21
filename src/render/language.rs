@@ -44,7 +44,8 @@ use std::ops::Range;
 /// Short on purpose. Each entry has to be worth a reader's attention in a
 /// window about to run something, and a list that tried to be exhaustive
 /// would be a list nobody had checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Language {
     Python,
     JavaScript,
@@ -79,7 +80,7 @@ impl Language {
     /// `/usr/bin/env python3.12` and `python3.12` are one answer. A version
     /// suffix is cut because an interpreter's name carries one and the
     /// language does not.
-    fn of_program(word: &str) -> Option<Language> {
+    pub(crate) fn of_program(word: &str) -> Option<Language> {
         let name = word.rsplit('/').next()?;
         let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
         Some(match stem {
@@ -118,12 +119,18 @@ impl Language {
 /// Where a reading came from, so a reader knows what to disbelieve.
 ///
 /// Ordered by how exact it is, and that order is the one [`snippets`] tries
-/// them in. A `#!` line is the body naming its own interpreter and cannot be
-/// argued with. A command running `python3` is the convention of the program
-/// being invoked. A filename is the weakest -- a `.py` says what somebody
-/// intends to call the file, which is usually but not always what is in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// them in. A request that *named* the interpreter is not a reading at all --
+/// hatch built the argv from it and is about to spawn exactly that program,
+/// so there is nothing here to disbelieve. A `#!` line is the body naming its
+/// own interpreter and cannot be argued with. A command running `python3` is
+/// the convention of the program being invoked. A filename is the weakest --
+/// a `.py` says what somebody intends to call the file, which is usually but
+/// not always what is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Evidence {
+    /// The request named the interpreter, and hatch put it in the argv.
+    Declared,
     /// The body's own `#!` line.
     Shebang,
     /// The program the line above it runs.
@@ -136,6 +143,10 @@ impl Evidence {
     /// The clause the window uses to say where a reading came from.
     pub fn because(self) -> &'static str {
         match self {
+            // No clause at all. The other three name something a reader could
+            // go and check; this one is the argv on the line above, which
+            // they are already looking at.
+            Self::Declared => "the request named it",
             Self::Shebang => "from its own `#!` line",
             Self::Interpreter => "from the program it is given to",
             Self::Filename => "from the name of the file it is written to",
@@ -144,7 +155,7 @@ impl Evidence {
 }
 
 /// One embedded program: where it is, what it reads as, and on what evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snippet {
     range: Range<usize>,
     language: Language,
@@ -152,6 +163,17 @@ pub struct Snippet {
 }
 
 impl Snippet {
+    /// The program a request named an interpreter for.
+    ///
+    /// The only constructor outside this module, and the only one that takes
+    /// its language rather than reading it: [`snippets`] finds embedded
+    /// programs by looking at a command, and this one is not found -- hatch
+    /// was told, built the argv, and knows the bytes because it put them
+    /// there. See [`crate::exec::interpreter`].
+    pub fn declared(range: Range<usize>, language: Language) -> Snippet {
+        Snippet { range, language, evidence: Evidence::Declared }
+    }
+
     /// The bytes of the command this covers.
     pub fn range(&self) -> Range<usize> {
         self.range.clone()
