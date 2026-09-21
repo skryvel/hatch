@@ -113,6 +113,53 @@ pub fn shell_line(argv: &[String]) -> String {
     argv.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
 }
 
+/// The line a window draws for an argv whose last argument is a program, and
+/// where that program begins in it.
+///
+/// Everything in front of the program is [`shell_line`]'s work, unchanged.
+/// The program itself is drawn **verbatim** -- not quoted, not escaped, not
+/// one character different from the bytes the interpreter will receive.
+///
+/// # Why the program is not quoted
+///
+/// Quoting it buys one thing and costs another, and for this argument the
+/// trade goes the other way round from every other.
+///
+/// What it buys is the argument *boundary*: `shell_line` exists so that
+/// `rm 'my file'` never draws as `rm my file`, two arguments where one runs.
+/// That is worth a great deal for a list of short words nobody can otherwise
+/// tell apart.
+///
+/// What it costs is the program. [`shell_quote`] rewrites every `'` as
+/// `'\''`, so a Clojure program -- where `'` is the quote form and
+/// `(require '[x :as y])` is the ordinary way to write a line -- is drawn
+/// riddled with four-character sequences that are not in it. A reader cannot
+/// check text like that, and checking it is the whole of what the window is
+/// for.
+///
+/// So the boundary is shown some other way: this argument is drawn as a
+/// region the window brackets and captions, which says *these lines are one
+/// argument* in a form a reader can actually use. A wall of `'\''` says the
+/// same thing and says it worse.
+///
+/// Nothing about what runs is touched by any of this. The argv is a list and
+/// `execve` takes a list; quoting never reached it. See
+/// [`crate::render::render_command_naming`], which is what puts the region on
+/// the screen.
+///
+/// `None` for the range when there is no argv, or when the program is empty
+/// -- an empty run is not a place anything begins.
+pub fn invocation_line(argv: &[String]) -> (String, Option<std::ops::Range<usize>>) {
+    let Some((program, head)) = argv.split_last() else { return (String::new(), None) };
+    let mut line = shell_line(head);
+    if !line.is_empty() {
+        line.push(' ');
+    }
+    let at = line.len()..line.len() + program.len();
+    line.push_str(program);
+    (line, (!program.is_empty()).then_some(at))
+}
+
 /// Where the last argument's own bytes are drawn in [`shell_line`] of
 /// `argv` -- `None` when quoting rewrote them, or when there is no argv.
 ///

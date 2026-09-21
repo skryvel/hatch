@@ -50,7 +50,7 @@ use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
-use crate::render::blocks::{Block, blocks, blocks_within};
+use crate::render::blocks::{Block, BlockKind, blocks, program_blocks};
 use crate::render::language::{Evidence, Language, Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
@@ -203,16 +203,15 @@ impl Shown {
                     // right answer about the shell and the wrong one about
                     // what the reader is being asked to approve.
                     blocks: match &program {
-                        // Only a shell program has shell constructs in it. A
-                        // Python one would have its `for` and its `done`
-                        // bracketed as though they were a loop and its
-                        // closing word, which is a reading of the wrong
-                        // language drawn with the confidence of the right
-                        // one.
-                        Some(program) if program.language() == Language::Shell => {
-                            blocks_within(source, program.range())
-                        }
-                        Some(_) => Vec::new(),
+                        // The program is bracketed whatever it is written in
+                        // -- that bracket is the only thing on screen saying
+                        // where it begins and ends -- and only a shell one is
+                        // parsed for constructs inside it.
+                        Some(program) => program_blocks(
+                            source,
+                            &program.range(),
+                            program.language() == Language::Shell,
+                        ),
                         None => blocks(source),
                     },
                     // The declared one first: it is the outermost thing on
@@ -587,6 +586,10 @@ pub fn snippet_note(found: &[Snippet]) -> Option<String> {
         found.iter().partition(|found| found.evidence() == Evidence::Declared);
     let mut said: Vec<String> = declared
         .first()
+        // A shell program says nothing here: `program_note` already says the
+        // whole of it, and better, and two lines saying one fact is how a
+        // line that only appears when it is true stops being read.
+        .filter(|only| only.language() != Language::Shell)
         .map(|only| format!("The argument below it is a {} program.", only.language().name()))
         .into_iter()
         .collect();
@@ -1595,6 +1598,28 @@ struct Bracket {
     /// terminator, and drawing it at the margin says the pipeline ended one
     /// line earlier than it did.
     closed_by_a_word: bool,
+    /// Whether the lines inside it are drawn one step further in.
+    ///
+    /// Every shell construct: nesting is what the indentation is for. Not the
+    /// program a request named an interpreter for, which is a bracket without
+    /// an indent -- it brings its own structure, and Python's indentation is
+    /// its syntax. Stepping all of it right by two would be hatch adding
+    /// structure to text it has just said it does not read. See
+    /// [`crate::render::blocks::BlockKind::indents`].
+    indents: bool,
+    /// Whether this is the frame around the program rather than a bracket
+    /// around a construct inside it.
+    ///
+    /// It gets a column of its own, at the far left, and every other bracket
+    /// is pushed one step right to make room. Without that they collide: the
+    /// program and the outermost construct in it begin on the same drawn
+    /// line, and a bracket sits one step left of its own first line, so the
+    /// two would be one stroke saying two things.
+    ///
+    /// A column rather than a shared one is also what makes it read as a
+    /// frame: it runs down the outside of everything, which is what *this
+    /// whole region is one argument* looks like.
+    frames: bool,
 }
 
 /// The whole gutter for one rendering: one bracket per construct worth
@@ -1624,6 +1649,19 @@ impl Gutter {
         self.brackets.is_empty()
     }
 
+    /// Whether the far-left column is spent on a frame around the program.
+    ///
+    /// One more character of gutter, and only on the windows that have a
+    /// program to frame. See [`Bracket::frames`].
+    fn frames(&self) -> bool {
+        self.brackets.iter().any(|bracket| bracket.frames)
+    }
+
+    /// Steps of gutter in front of the text, before any indentation.
+    fn columns(&self) -> usize {
+        BRACKET_STEP_CHARS * (1 + usize::from(self.frames()))
+    }
+
     /// The deepest any line is indented, for the caller that has to know how
     /// much width the indentation will take before any of it is drawn.
     fn deepest(&self) -> usize {
@@ -1643,6 +1681,7 @@ impl Gutter {
     fn indent(&self, index: usize) -> usize {
         self.brackets
             .iter()
+            .filter(|bracket| bracket.indents)
             .filter(|bracket| {
                 // The last line is inside the block when nothing closes it,
                 // and is the closing word itself when something does.
@@ -1725,6 +1764,8 @@ fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
             first,
             last,
             closed_by_a_word: block.kind().closed_by_a_word(),
+            indents: block.kind().indents(),
+            frames: block.kind() == BlockKind::Program,
         });
     }
     Gutter { brackets }
@@ -2132,25 +2173,53 @@ fn command_caption(original: bool) -> &'static str {
     }
 }
 
+/// The command as a line somebody could paste into a shell.
+///
+/// The drawn line is not one. A program hatch put into an argv is drawn
+/// unquoted, because quoting it would rewrite every `'` in it and a reader
+/// cannot check text like that -- see [`crate::exec::invocation_line`]. That
+/// is right for reading and wrong for pasting: pasted, `bb -e (println 1)`
+/// is four words and an error.
+///
+/// So the one control whose whole purpose is to hand the command to somebody
+/// else quotes the program back. Derived from what is already on screen and
+/// already checked, rather than sent as a second copy of the line that could
+/// drift from the first: the region is a run of the source, and quoting it is
+/// the same function the daemon would have used.
+///
+/// Unchanged for every request that has no program region -- which is every
+/// one that names no interpreter and does not run as root.
+pub fn runnable_line(source: &str, program: Option<&Snippet>) -> String {
+    let Some(at) = program.map(Snippet::range) else { return source.to_string() };
+    if at.start > source.len() || at.end > source.len() {
+        return source.to_string();
+    }
+    format!("{}{}", &source[..at.start], crate::exec::shell_quote(&source[at]))
+}
+
 /// The label on the box that swaps them.
 const ORIGINAL_LABEL: &str = "Show the original text";
 
-/// What to say about a program hatch quoted into a line of its own making.
+/// What to say about a program hatch put into a line of its own making.
 ///
 /// Two things, and the first is the one a reader cannot get anywhere else:
-/// **the quotes are hatch's**. The agent sent a command; hatch wrapped it to
-/// run it as root, and the line on screen is therefore not a line the agent
-/// wrote. A reader who does not know that cannot tell which parts of it came
-/// from where, and the quotes are the seam.
+/// **this run is one argument**. hatch built the line -- the agent sent a
+/// program, and the wrapper in front of it is hatch's -- and the program is
+/// drawn with no quoting at all, so nothing in the text marks where one
+/// argument ends. What marks it is the bracket down the gutter and this
+/// sentence. See [`crate::exec::invocation_line`] for why quoting it would
+/// be the worse trade: `shell_quote` rewrites every `'`, and a Clojure
+/// program is `'` all the way down.
 ///
-/// The second is what the annotated pane does about it. To `bash -c` the
-/// whole script is one word, and everywhere else in that pane the colour and
+/// The second is what the annotated pane does about it. To the shell the
+/// whole command is one word, and everywhere else in that pane the colour and
 /// the underline are notes over text whose structure hatch and the shell
-/// agree about. Inside these quotes they are not: drawing command names,
-/// separators and brackets in there is hatch reading the word a second way.
-/// The reading is almost certainly right -- the bytes are about to be run as
-/// shell by the very program named on the line -- and it is still a reading,
-/// so it is named rather than left for the reader to notice.
+/// agree about. Here they are not: drawing command names, separators and
+/// brackets in there is hatch reading the word a second way. The reading is
+/// almost certainly right -- the bytes are about to be run as shell by the
+/// very program named on the line -- and it is still a reading, so it is
+/// named rather than left for the reader to notice. For a program in a
+/// language hatch has no reader for, the sentence says that instead.
 ///
 /// It says *the annotated pane* rather than *this pane* because the header is
 /// drawn above whichever pane is showing, and the sentence has to stay true
@@ -2161,11 +2230,12 @@ fn program_note(language: Language) -> &'static str {
         // The shell case, and the one where the pane is doing something to
         // the program the reader cannot see it doing: to the shell that will
         // receive it the whole thing is one word, so every command name,
-        // separator and bracket inside those quotes is hatch reading that
-        // word a second way.
+        // separator and bracket in it is hatch reading that word a second
+        // way.
         Language::Shell => {
-            "The quotes are hatch's: the command is handed to the shell as one argument. The \
-             annotated pane reads what is inside them as the shell it will be run as."
+            "The command is one argument to the shell, drawn unquoted — what is on screen is \
+             exactly what the shell receives. The annotated pane reads it as the shell it will \
+             be run as."
         }
         // Everything else. hatch has no reader for these and does not pretend
         // to: the program is drawn as the data it is, every byte as itself,
@@ -2173,8 +2243,8 @@ fn program_note(language: Language) -> &'static str {
         // about. The sentence says so rather than leaving a reader to wonder
         // why Python has no colour in it.
         _ => {
-            "The quotes are hatch's: the program is handed to the interpreter named in front of \
-             it as one argument. hatch does not read it — it is drawn exactly as it was sent."
+            "The program is one argument to the interpreter named in front of it, drawn unquoted \
+             — what is on screen is exactly what the interpreter receives. hatch does not read it."
         }
     }
 }
@@ -2255,7 +2325,7 @@ fn draw_command(
     // any other frame is the reader's own scrolling and is left alone.
     let was = ui.data(|data| data.get_temp::<Showing>(showing_id()).unwrap_or_default());
     let want = (was.original != original).then(|| {
-        let furniture = BRACKET_STEP_CHARS + gutter.deepest() * INDENT_CHARS;
+        let furniture = gutter.columns() + gutter.deepest() * INDENT_CHARS;
         let annotated_lines = pane_lines(annotated, Some(across.saturating_sub(furniture)));
         let raw_lines = pane_lines(raw, None);
         let (from, to) = match original {
@@ -3049,7 +3119,8 @@ fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gut
     let step = advance * BRACKET_STEP_CHARS as f32;
     let mut rows: Vec<egui::Rect> = Vec::new();
     for (index, line) in lines(spans).into_iter().enumerate() {
-        let inset = step + advance * (gutter.indent(index) * INDENT_CHARS) as f32;
+        let inset = advance * gutter.columns() as f32
+            + advance * (gutter.indent(index) * INDENT_CHARS) as f32;
         let drawn = ui
             .horizontal_top(|ui| {
                 // Otherwise the gap egui puts between two widgets in a row
@@ -3086,7 +3157,9 @@ fn paint_brackets(ui: &Ui, rows: &[egui::Rect], gutter: &Gutter, step: f32, ink:
         // screen with the command sliding past it -- and so a bracket around
         // an indented block sits beside that block rather than out at the
         // margin with a stretch of nothing between them.
-        let x = first.left() - step;
+        // One step further left for the frame, which has the outer column to
+        // itself. See `Bracket::frames`.
+        let x = first.left() - step * (1 + usize::from(bracket.frames)) as f32;
         let top = first.top() + BRACKET_INSET;
         let bottom = last.bottom() - BRACKET_INSET;
         if bottom <= top {
@@ -3825,8 +3898,10 @@ mod tests {
 
     /// The same, for a program in a language hatch has no reader for.
     fn an_invocation(script: &str, language: Language) -> Payload {
-        let line = format!("run0 --pipe -- bash -c '{script}'");
-        let at = "run0 --pipe -- bash -c '".len();
+        // Built the way the daemon builds it: the wrapper quoted, the program
+        // verbatim. See `exec::invocation_line`.
+        let line = format!("run0 --pipe -- bash -c {script}");
+        let at = "run0 --pipe -- bash -c ".len();
         let program = Snippet::declared(at..at + script.len(), language);
         let env = BTreeMap::from([("HOME".to_string(), "/home/u".to_string())]);
         let spans = crate::render::render_command_reinterpreting(
@@ -3850,15 +3925,60 @@ mod tests {
         else {
             panic!("a command payload read as something else")
         };
-        let found: Vec<&str> =
-            blocks.iter().map(|block| &annotated.source()[block.range()]).collect();
-        assert_eq!(found, vec!["for f in a b; do\n  cat $f\ndone"], "{found:?}");
+        // The program's own bracket, then the loop inside it. Both cover the
+        // same bytes here, because the program *is* the loop -- and the pane
+        // draws one stroke for the two, which is what `gutter` is for.
+        let found: Vec<(&str, &str)> = blocks
+            .iter()
+            .map(|block| (block.kind().name(), &annotated.source()[block.range()]))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("program", "for f in a b; do\n  cat $f\ndone"),
+                ("loop", "for f in a b; do\n  cat $f\ndone"),
+            ],
+            "{found:?}"
+        );
 
         // And the same line without the daemon's word for which run is a
-        // script finds nothing, which is what this is worth.
+        // program finds the loop at the top level instead, among the
+        // wrapper's own words -- which is what this is worth.
         let blind = Shown::of(&payload.clone().with_program(None)).expect("a real payload");
         let Shown::Command { blocks, .. } = blind else { panic!("not a command") };
-        assert!(blocks.is_empty(), "{blocks:?}");
+        assert!(
+            !blocks.iter().any(|block| block.kind() == crate::render::blocks::BlockKind::Program),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn the_command_somebody_copies_is_one_they_could_paste() {
+        // The drawn line is not: the program is unquoted so a reader can
+        // check it, and pasted that way `bb -e (println 1)` is four words and
+        // an error. The one control that hands the command to something other
+        // than a reader quotes it back.
+        let program = "(require '[babashka.fs :as fs])";
+        let payload = an_invocation(program, Language::Clojure);
+        let Shown::Command { raw, program: at, .. } = Shown::of(&payload).expect("a real payload")
+        else {
+            panic!("not a command")
+        };
+        let line = raw.source();
+        assert!(line.ends_with(program), "the drawn line quoted the program: {line}");
+
+        let copied = runnable_line(line, at.as_ref());
+        assert!(copied.ends_with(r#"'(require '\''[babashka.fs :as fs])'"#), "{copied}");
+        // The wrapper is untouched, and only the program was quoted.
+        assert!(copied.starts_with("run0 --pipe -- bash -c "), "{copied}");
+
+        // A command with no program region is handed over exactly as drawn.
+        let plain = a_command("ls -l");
+        let Shown::Command { raw, program: at, .. } = Shown::of(&plain).expect("a real payload")
+        else {
+            panic!("not a command")
+        };
+        assert_eq!(runnable_line(raw.source(), at.as_ref()), "ls -l");
     }
 
     #[test]
@@ -3875,7 +3995,14 @@ mod tests {
         else {
             panic!("not a command")
         };
-        assert!(blocks.is_empty(), "{blocks:?}");
+        // Bracketed, because that bracket is the only thing on screen saying
+        // where the program begins and ends -- and nothing inside it, because
+        // Python's `for` heads no loop hatch can bracket.
+        assert_eq!(
+            blocks.iter().map(|block| block.kind().name()).collect::<Vec<_>>(),
+            vec!["program"],
+            "{blocks:?}"
+        );
         assert_eq!(snippets.len(), 1, "{snippets:?}");
         assert_eq!(snippets[0].language(), Language::Python);
         assert_eq!(snippets[0].evidence(), Evidence::Declared);
@@ -3889,7 +4016,7 @@ mod tests {
         let Shown::Command { blocks, .. } = Shown::of(&shell).expect("a real payload") else {
             panic!("not a command")
         };
-        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert_eq!(blocks.len(), 2, "the shell half stopped finding constructs: {blocks:?}");
     }
 
     #[test]
@@ -5354,21 +5481,28 @@ mod tests {
     }
 
     #[test]
-    fn a_window_over_a_quoted_script_says_whose_quotes_those_are() {
+    fn a_window_over_a_program_says_it_is_one_argument() {
         // Read off a drawn frame rather than off the constant: a note that
         // exists and is never drawn is the bug this is about. It is on the
         // header, so it is there in both renderings -- the original text is
         // exactly where a reader goes to check the reading it describes.
+        //
+        // And it is the only thing in words that says where the program ends,
+        // because the program is drawn unquoted. See `exec::invocation_line`.
         let payload = an_elevated_command("for f in a b; do\n  cat $f\ndone");
         for original in [false, true] {
             let frame = frames_of(&payload, a_window(), 3, original).pop().expect("a frame");
-            let said = frame.iter().any(|(line, _)| line.contains("The quotes are hatch's"));
-            assert!(said, "nothing said who quoted it, original={original}: {frame:?}");
+            let said = frame.iter().any(|(line, _)| line.contains("is one argument to the shell"));
+            assert!(said, "nothing said it was one argument, original={original}: {frame:?}");
         }
-        // And an ordinary command says nothing, because nothing quoted it.
+        // An ordinary command says nothing: there is no wrapper and no region.
         let frame = frames_of(&a_command("cat a"), a_window(), 3, false).pop().expect("a frame");
+        assert!(!frame.iter().any(|(line, _)| line.contains("one argument")), "{frame:?}");
+        // And a program hatch cannot read says the other half of it.
+        let python = an_invocation("print(1)", Language::Python);
+        let frame = frames_of(&python, a_window(), 3, false).pop().expect("a frame");
         assert!(
-            !frame.iter().any(|(line, _)| line.contains("The quotes are hatch's")),
+            frame.iter().any(|(line, _)| line.contains("hatch does not read it")),
             "{frame:?}"
         );
     }

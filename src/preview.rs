@@ -342,13 +342,14 @@ fn command_payload(
         Some(name) => Interpreter::named(name)
             .ok_or_else(|| anyhow::anyhow!("no sample may name an interpreter hatch refuses"))?,
     };
-    let (line, break_at, script_at, render_env, caveat) = match root {
+    let (line, roster_line, break_at, script_at, render_env, caveat) = match root {
         true => {
             let elevated = elevation
                 .compose_argv_with(&interpreter, command, env)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             (
                 elevated.display_line(),
+                elevated.quoted_line(),
                 elevated.inner_at(),
                 elevated.script_at(),
                 elevation.child_env(env),
@@ -356,12 +357,13 @@ fn command_payload(
             )
         }
         false => match interpreter.language() {
-            Language::Shell => (command.clone(), None, None, env.clone(), None),
+            Language::Shell => {
+                (command.clone(), command.clone(), None, None, env.clone(), None)
+            }
             _ => {
                 let argv = interpreter.argv(command);
-                let line = crate::exec::shell_line(&argv);
-                let at = crate::exec::last_argument_at(&argv);
-                (line, None, at, env.clone(), None)
+                let (line, at) = crate::exec::invocation_line(&argv);
+                (line, crate::exec::shell_line(&argv), None, at, env.clone(), None)
             }
         },
     };
@@ -371,12 +373,17 @@ fn command_payload(
         break_at,
         script_at.map(|at| Snippet::declared(at, interpreter.language())),
     );
-    // The roster, off the same line and the same environment the daemon uses
+    // The roster, off the same argv and the same environment the daemon uses
     // -- which means a preview of a sample resolves the sample's own names
     // against this machine, exactly as a real request would. A sample that
     // named something this machine does not have draws the window that says
     // so, which is the honest picture of what hatch would have shown.
-    let runs = roster(&line, &render_env, cwd);
+    //
+    // The *quoted* rendering, for `Daemon::prepare_run`'s reason: the drawn
+    // line has the program in it unquoted, and a list of what will run must
+    // read that program as the one word it is to `execve`. Off the drawn
+    // line, a Python program's `seen = {}` is a command called `seen`.
+    let runs = roster(&roster_line, &render_env, cwd);
     // Danger markers are display-only and land with the marker heuristics; an
     // empty list has never been a claim that a command is safe. The daemon
     // passes an empty one too, and a sample that invented markers would be

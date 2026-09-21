@@ -176,14 +176,7 @@ pub fn render_command_reinterpreting(
     // two passes below has to carry the same four checks.
     let named = program.filter(|program| is_a_run_of(command, &program.range()));
     let spans = match named {
-        Some(program) if program.language() == language::Language::Shell => {
-            reinterpret(outer, env, program.range())
-        }
-        // A program hatch has no reader for keeps the rendering it had, and
-        // is only cut out of the spans around it: the quotes hatch wrote
-        // become spans of their own, so the run is addressable by everything
-        // downstream without one character of it being drawn differently.
-        Some(program) => divide(outer, program.range()),
+        Some(program) => reinterpret(outer, env, program.range(), program.language()),
         None => outer,
     };
     if let Some(at) = at {
@@ -237,44 +230,6 @@ fn is_a_run_of(source: &str, at: &Range<usize>) -> bool {
         && source.is_char_boundary(at.end)
 }
 
-/// The same spans, cut at the edges of `at` and nowhere else.
-///
-/// Every kind is kept, so nothing is drawn differently: this only makes a run
-/// of the source addressable as a whole sequence of spans. Returns the spans
-/// unchanged when an edge falls inside a span that cannot be cut -- a
-/// [`SpanKind::Chip`] stands for one codepoint and a [`SpanKind::Variable`]
-/// for one whole reference -- which no edge of a quoted argument can do, and
-/// which is checked because the alternative is a panic in a prompt window.
-fn divide(spans: Spans, at: Range<usize>) -> Spans {
-    let source = spans.source().to_string();
-    // A program written on more than one line starts on one, under the
-    // invocation rather than beside it -- `spliced`'s rule, for `spliced`'s
-    // reason, and the two must not differ: a reader should not be able to
-    // tell whether hatch can read a program from where its first line sits.
-    let alone = source[at.clone()].contains('\n');
-    let mut builder = SpanBuilder::new(&source);
-    for span in spans.iter() {
-        let range = span.range();
-        let cuts: Vec<usize> =
-            [at.start, at.end].into_iter().filter(|cut| range.start < *cut && *cut < range.end).collect();
-        if !cuts.is_empty() && matches!(span.kind(), SpanKind::Chip { .. } | SpanKind::Variable { .. })
-        {
-            return spans;
-        }
-        if span.break_before() {
-            builder.break_next();
-        }
-        for cut in cuts {
-            builder.push_to(cut, span.kind().clone());
-            if alone && cut == at.start {
-                builder.break_next();
-            }
-        }
-        builder.push_to(range.end, span.kind().clone());
-    }
-    builder.finish()
-}
-
 /// Render `spans.source()[script]` as a command of its own and put the result
 /// in place of whatever covered it. See [`render_command_reinterpreting`].
 ///
@@ -282,10 +237,29 @@ fn divide(spans: Spans, at: Range<usize>) -> Spans {
 /// decides, so that its caller has one thing to say about the answer: the
 /// line is drawn with the script read as shell, or it is drawn as it always
 /// was.
-fn reinterpret(spans: Spans, env: &BTreeMap<String, String>, script: Range<usize>) -> Spans {
+fn reinterpret(
+    spans: Spans,
+    env: &BTreeMap<String, String>,
+    script: Range<usize>,
+    language: language::Language,
+) -> Spans {
     let source = spans.source().to_string();
     debug_assert!(is_a_run_of(&source, &script));
-    let inner = render_command(&source[script.clone()], env);
+    let text = &source[script.clone()];
+    let inner = match language {
+        // Shell, and about to be run as shell by the program named on the
+        // line: reading it as shell is the honest rendering.
+        language::Language::Shell => render_command(text, env),
+        // Anything else is classified and no more -- every byte drawn as
+        // itself, the unsafe ones chipped, which is exactly what the raw pane
+        // does with everything. It is *not* enough to leave the outer
+        // rendering alone here: the passes above have already read the whole
+        // line as shell, so Python's `import` would be marked as the word
+        // that names what runs and its `#` as a comment. The program is not
+        // in quotes any more -- see `crate::exec::invocation_line` -- so
+        // there is nothing else holding those readings off it.
+        _ => unicode::classify(text),
+    };
     match spliced(&source, &spans, &inner, script.start) {
         Some(merged) => merged,
         None => spans,

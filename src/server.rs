@@ -177,7 +177,7 @@ use crate::audit::{
 use crate::config::{self, Config};
 use crate::denylist::Denylist;
 use crate::exec::interpreter::Interpreter;
-use crate::exec::{last_argument_at, shell_line};
+use crate::exec::{invocation_line, shell_line};
 use crate::render::language::{Language, Snippet};
 use crate::exec::elevate::{Elevation, RootOutcome};
 use crate::exec::env::build_child_env;
@@ -2537,7 +2537,7 @@ impl Daemon {
         // that is the one the command will actually have — resolving against
         // the spawner's would put a value on screen that the command never
         // sees. See `crate::exec::elevate::Run0::spawner_env`.
-        let (argv, spawn_env, line, break_at, script_at, caveat) = if root {
+        let (argv, spawn_env, line, roster_line, break_at, script_at, caveat) = if root {
             let elevated = match self.elevation.argv_with(&interpreter, &command, &env) {
                 Ok(elevated) => elevated,
                 // Nothing was rendered and nobody was asked: this build
@@ -2553,15 +2553,21 @@ impl Daemon {
                 // command line somebody would most want folded away are the
                 // parts that decide what it does.
                 elevated.display_line(),
+                // ...and the same argv with every argument quoted, for the
+                // roster: a list of what will run has to see the program
+                // under the wrapper as the one word it is to `execve`, not
+                // as the shell it may happen to look like. See
+                // `ElevatedArgv::quoted_line`.
+                elevated.quoted_line(),
                 // ...and a break where the approved command begins, so the
                 // reader does not have to walk the whole wrapper to reach
                 // the part they were asked about. Layout only: the line is
                 // the same line. See `ElevatedArgv::inner_at`.
                 elevated.inner_at(),
-                // ...and which of that line is the script the reader came to
-                // read, so it is drawn as the shell it will be run as rather
-                // than as the one word it is to `bash -c`. See
-                // `ElevatedArgv::script_at`.
+                // ...and which of that line is the program the reader came
+                // to read. It is drawn there as itself, unquoted, so this is
+                // what marks it out as one argument. See
+                // `ElevatedArgv::script_at` and `exec::invocation_line`.
                 elevated.script_at(),
                 self.elevation.caveat(),
             )
@@ -2575,16 +2581,19 @@ impl Daemon {
                 // and nothing else, because `bash -c` is the documented
                 // default and drawing it would put six characters of hatch's
                 // own in front of every command on every window.
-                Language::Shell => (argv, env.clone(), command.clone(), None, None, None),
+                Language::Shell => {
+                    let quoted = command.clone();
+                    (argv, env.clone(), command.clone(), quoted, None, None, None)
+                }
                 // Anything else is drawn as the invocation it is. A reader
                 // shown twenty lines of Python with no sign of what will read
                 // them has been told the least useful true thing about the
                 // request -- and the one fact that decides what those lines
                 // do is the program named in front of them.
                 _ => {
-                    let line = shell_line(&argv);
-                    let at = last_argument_at(&argv);
-                    (argv, env.clone(), line, None, at, None)
+                    let (line, at) = invocation_line(&argv);
+                    let quoted = shell_line(&argv);
+                    (argv, env.clone(), line, quoted, None, at, None)
                 }
             }
         };
@@ -2602,13 +2611,21 @@ impl Daemon {
             break_at,
             script_at.map(|at| Snippet::declared(at, interpreter.language())),
         );
-        // The roster is built from the same line the spans tile, so the list
-        // above the panes and the text in them cannot come to describe two
-        // different requests -- and against the same `render_env`, because the
-        // whole claim it makes is about the environment the command receives.
-        // It touches the filesystem, which is why it is here and not in the
-        // window: the child `PATH` is this process's config.
-        let runs = roster(&line, &render_env, &cwd);
+        // The roster is built from the same *argv* the spans are, which is
+        // what keeps the list above the panes and the text in them from
+        // describing two different requests. It is not the same string: the
+        // drawn line has the program in it unquoted, and a list of what will
+        // run has to read that program as the one word it is to `execve`
+        // rather than as the shell it may happen to look like. `roster` reads
+        // a shell line, so it gets the fully quoted rendering of the very
+        // same argv. For every request that names no interpreter the two
+        // strings are identical.
+        //
+        // Against the same `render_env`, because the whole claim it makes is
+        // about the environment the command receives. It touches the
+        // filesystem, which is why it is here and not in the window: the
+        // child `PATH` is this process's config.
+        let runs = roster(&roster_line, &render_env, &cwd);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
         let payload =
@@ -6882,7 +6899,9 @@ later"), "");
             // request that runs `<something> bash -c 'echo hi'` would be the
             // rendering-fidelity failure this whole tool exists to avoid.
             assert!(raw.contains("bash -c"), "the wrapper is not on screen: {raw}");
-            assert!(raw.ends_with("'echo hi'"), "{raw}");
+            // Unquoted: the command is drawn as a region rather than as a
+            // word. See `exec::invocation_line`.
+            assert!(raw.ends_with("bash -c echo hi"), "{raw}");
             assert!(root, "the header would not say ROOT");
             // And the reader is told, before approving, that a root command
             // may behave differently from the same command run as them.
@@ -6991,7 +7010,7 @@ later"), "");
                 elevation.seen(),
                 vec![vec!["python3".to_string(), "-c".to_string(), "print(1)".to_string()]]
             );
-            assert!(raw.ends_with("python3 -c 'print(1)'"), "{raw}");
+            assert!(raw.ends_with("python3 -c print(1)"), "{raw}");
             assert!(!raw.contains("bash"), "a shell was put under it: {raw}");
             let program = program.expect("the window was not told where the program is");
             assert_eq!(&raw[program.range()], "print(1)", "{raw}");

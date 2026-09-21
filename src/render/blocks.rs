@@ -150,6 +150,15 @@ pub enum BlockKind {
     /// A single pipeline is not one, for [`BlockKind::Pipeline`]'s reason:
     /// every command in a script would otherwise be a block.
     AndOr,
+    /// The program hatch quoted into a line of its own making: every line of
+    /// it is one argument to the interpreter named in front of it.
+    ///
+    /// Not a shell construct at all, and the only kind here that does not
+    /// come from a parse. It is drawn for the reason the others are -- to
+    /// say where something begins and ends -- and it is the only thing on
+    /// screen that says so, since the program is no longer in quotes. See
+    /// [`crate::exec::invocation_line`].
+    Program,
 }
 
 impl BlockKind {
@@ -163,6 +172,7 @@ impl BlockKind {
             Self::BraceGroup => "group",
             Self::Pipeline => "pipeline",
             Self::AndOr => "and-or",
+            Self::Program => "program",
         }
     }
 
@@ -175,7 +185,20 @@ impl BlockKind {
     /// last line is the last thing they run, and it is as much inside them
     /// as the lines above it.
     pub fn closed_by_a_word(self) -> bool {
-        !matches!(self, Self::Pipeline | Self::AndOr)
+        !matches!(self, Self::Pipeline | Self::AndOr | Self::Program)
+    }
+
+    /// Whether being inside this construct moves a line to the right.
+    ///
+    /// Every shell construct: that is what the indentation is for. Not
+    /// [`BlockKind::Program`], and the difference is the point of the
+    /// distinction. A program brings its own indentation -- Python's is its
+    /// syntax -- and stepping all of it right by two would be hatch adding
+    /// structure to text it has already said it does not read. The bracket
+    /// still says where the program begins and ends, which is the one thing
+    /// a reader needs from it and the one thing indentation cannot say.
+    pub fn indents(self) -> bool {
+        !matches!(self, Self::Program)
     }
 }
 
@@ -267,43 +290,42 @@ pub fn blocks(source: &str) -> Vec<Block> {
     out
 }
 
-/// The constructs in one run of `source`, reported in `source`'s own offsets.
+/// The program hatch quoted into `line`, and -- when it is shell -- the
+/// constructs inside it, in `line`'s own offsets.
 ///
-/// The run is a shell script hatch quoted into a larger line -- an elevated
-/// request is `run0 … -- bash -c '<script>'` -- and the constructs a reader
-/// needs to see are the script's. Parsing the whole line would find none of
-/// them: to a shell the script is one word, which is the right answer to a
-/// different question. See
-/// [`crate::exec::elevate::ElevatedArgv::script_at`].
+/// The program itself is always a block. It used to not be, on the grounds
+/// that the quotes around it already said *these lines are one thing*; the
+/// quotes are gone -- see [`crate::exec::invocation_line`] -- so this bracket
+/// is now the only thing on screen that says it.
 ///
-/// The script is parsed on its own and every offset is shifted, which is
+/// A shell program is parsed on its own and every offset shifted, which is
 /// sound because the range is a run of bytes and a block is a range of them.
 /// Nothing outside the run is looked at, so a wrapper that happened to
-/// contain a `do` cannot put a bracket anywhere.
+/// contain a `do` cannot put a bracket anywhere. Anything else is not parsed
+/// at all: Python's `for` heads no loop hatch can bracket and its `done` is
+/// not a closing word.
 ///
-/// The run itself is not a block. It has a beginning and an end and a
-/// bracket could be drawn around it, but a bracket says *these lines are one
-/// construct* and the quotes on screen already say that, at both ends, in the
-/// command's own characters. A second mark for the same fact is the thing
-/// [`crate::prompt_ui::panes`]'s gutter is written not to do.
-///
-/// Empty for every doubt [`blocks`] is empty for, and for a range that is not
-/// a run of `source`.
-pub fn blocks_within(source: &str, script: Range<usize>) -> Vec<Block> {
-    if script.start >= script.end
-        || script.end > source.len()
-        || !source.is_char_boundary(script.start)
-        || !source.is_char_boundary(script.end)
+/// Empty for a range that is not a run of `line`, which is the shape every
+/// doubt in this module takes.
+pub fn program_blocks(line: &str, program: &Range<usize>, shell: bool) -> Vec<Block> {
+    if program.start >= program.end
+        || program.end > line.len()
+        || !line.is_char_boundary(program.start)
+        || !line.is_char_boundary(program.end)
     {
         return Vec::new();
     }
-    blocks(&source[script.clone()])
-        .into_iter()
-        .map(|block| Block {
-            range: block.range.start + script.start..block.range.end + script.start,
+    let mut out = vec![Block { range: program.clone(), kind: BlockKind::Program, depth: 0 }];
+    if shell {
+        out.extend(blocks(&line[program.clone()]).into_iter().map(|block| Block {
+            range: block.range.start + program.start..block.range.end + program.start,
+            // One deeper than the parse reported: everything inside the
+            // program is inside the program.
+            depth: block.depth + 1,
             ..block
-        })
-        .collect()
+        }));
+    }
+    out
 }
 
 /// Whether `source` nests brackets deeper than `limit`.
@@ -626,23 +648,60 @@ mod tests {
         // not have to be, because the run is a run of bytes and a block is a
         // range of them. What comes back is in the whole line's offsets.
         let script = "for f in a b; do\n  cat $f\ndone";
-        let line = format!("run0 -- bash -c '{script}'");
+        let line = format!("run0 -- bash -c {script}");
         let at = line.find(script).expect("the script");
-        let found = blocks_within(&line, at..at + script.len());
-        assert_eq!(found.len(), 1, "{found:?}");
+        let found = program_blocks(&line, &(at..at + script.len()), true);
+        // The program itself, then the loop inside it one step deeper.
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].kind(), BlockKind::Program);
         assert_eq!(&line[found[0].range()], script);
-        // Parsing the line instead finds nothing: to a shell the script is
-        // one word. That is the whole of what this function is for.
-        assert_eq!(blocks(&line), vec![]);
+        assert_eq!(found[0].depth(), 0);
+        assert_eq!(found[1].kind(), BlockKind::Loop);
+        assert_eq!(&line[found[1].range()], script);
+        assert_eq!(found[1].depth(), 1, "the loop is not inside the program: {found:?}");
+        // Parsing the whole line instead finds the loop at the top level and
+        // the wrapper's words among its lines, which is the reading this
+        // function exists to avoid.
+        assert_ne!(blocks(&line), found);
+    }
+
+    #[test]
+    fn a_program_hatch_cannot_read_is_bracketed_and_not_parsed() {
+        // The bracket is the only thing on screen that says where the program
+        // begins and ends, so it is drawn whatever the language. What is not
+        // drawn is anything *inside* it: Python's `for` heads no loop hatch
+        // can bracket.
+        let program = "for f in [1, 2]:\n    print(f)";
+        let line = format!("python3 -c {program}");
+        let at = line.find(program).expect("the program");
+        let found = program_blocks(&line, &(at..at + program.len()), false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind(), BlockKind::Program);
+        assert_eq!(&line[found[0].range()], program);
+    }
+
+    #[test]
+    fn a_program_is_bracketed_but_does_not_indent_what_is_in_it() {
+        // The one kind that brackets without indenting: a program brings its
+        // own structure, and stepping all of it right by two would be hatch
+        // adding structure to text it has just said it does not read.
+        assert!(!BlockKind::Program.indents());
+        assert!(!BlockKind::Program.closed_by_a_word());
+        for shell in [BlockKind::Loop, BlockKind::If, BlockKind::Pipeline, BlockKind::AndOr] {
+            assert!(shell.indents(), "{shell:?}");
+        }
     }
 
     #[test]
     fn nothing_outside_the_run_can_put_a_bracket_anywhere() {
         // A wrapper is agent-adjacent text hatch built, and a `done` in it is
         // not a keyword of the script. Only the run is parsed.
-        let line = "run0 --setenv=X=done -- bash -c 'cat a'";
+        let line = "run0 --setenv=X=done -- bash -c cat a";
         let at = line.find("cat a").expect("the script");
-        assert_eq!(blocks_within(line, at..at + "cat a".len()), vec![]);
+        let found = program_blocks(line, &(at..at + "cat a".len()), true);
+        // The program's own bracket and nothing else: no construct inside it,
+        // and the wrapper's `done` is not a keyword of it.
+        assert_eq!(found.iter().map(Block::kind).collect::<Vec<_>>(), vec![BlockKind::Program]);
     }
 
     #[test]
@@ -650,13 +709,13 @@ mod tests {
         // Every doubt in this module has one shape. A caller that has lost
         // track of which line its offsets are about gets no brackets, rather
         // than brackets around whatever those offsets happen to hit.
-        let line = "run0 -- bash -c 'for f in a b; do cat $f; done'";
+        let line = "run0 -- bash -c for f in a b; do cat $f; done";
         for doubt in [0..0, Range { start: 9, end: 8 }, 3..line.len() + 1] {
-            assert_eq!(blocks_within(line, doubt.clone()), vec![], "{doubt:?}");
+            assert_eq!(program_blocks(line, &doubt, true), vec![], "{doubt:?}");
         }
         // Inside a character, not between two.
-        let snowman = "echo '\u{2603} for f in a b; do cat $f; done'";
-        assert_eq!(blocks_within(snowman, 7..snowman.len() - 1), vec![]);
+        let snowman = "echo \u{2603} for f in a b; do cat $f; done";
+        assert_eq!(program_blocks(snowman, &(6..snowman.len()), true), vec![]);
     }
 
     #[test]

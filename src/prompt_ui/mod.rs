@@ -2617,8 +2617,11 @@ impl PromptApp {
         if copy_output {
             self.copy_output(ui.ctx());
         }
-        if copy_command && let Some(Shown::Command { raw, .. }) = self.state.shown() {
-            ui.ctx().copy_text(raw.source().to_string());
+        if copy_command && let Some(Shown::Command { raw, program, .. }) = self.state.shown() {
+            // Quoted back, because this is the one control that hands the
+            // command to something other than a reader. See
+            // `panes::runnable_line`.
+            ui.ctx().copy_text(panes::runnable_line(raw.source(), program.as_ref()));
             self.copied = Some(Instant::now());
         }
     }

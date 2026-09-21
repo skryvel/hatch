@@ -184,9 +184,21 @@ Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`,
 `clj`, `bash`, `sh`, `zsh` — and then `command` is a program for that
 interpreter, handed to it as one argument. The window draws the invocation with the program under it,
-names the language, and says the quotes are hatch's. A shell program is read
+names the language, and frames the program down the gutter. A shell program is read
 again as shell; hatch has no reader for the others and does not pretend to —
-they are drawn exactly as they were sent. A name that is not on the list is
+they are drawn exactly as they were sent.
+
+The program is drawn **unquoted**, so what is on screen is byte for byte what
+the interpreter receives. Quoting it would buy the argument boundary and cost
+the program: `shell_quote` rewrites every `'` as `'\''`, and a Clojure program
+— where `'` is the quote form — comes out riddled with four-character
+sequences that are not in it. A reader cannot check text like that, and
+checking it is the whole of what the window is for. So the boundary is shown
+instead by a frame down the gutter and a line above the panes saying the run
+is one argument. Nothing about what runs changes either way: an argv is a list
+and `execve` takes a list, so quoting never reached it. **Copy command** quotes
+the program back, because that is the one control that hands the line to
+something other than a reader. A name that is not on the list is
 refused with the list, because hatch has to know how a given interpreter takes
 a program (`-c` here, `-e` there, `-M -e` for `clojure`) and a guessed flag
 builds an argv that fails after somebody has approved it. Every one of those

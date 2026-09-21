@@ -92,7 +92,7 @@ use std::ops::Range;
 
 use super::lookup::lookup;
 use super::interpreter::Interpreter;
-use super::{Env, last_argument_at, shell_line};
+use super::{Env, invocation_line, shell_line};
 
 // ---- what every platform must answer ---------------------------------------
 
@@ -359,7 +359,7 @@ impl ElevatedArgv {
     /// [`Self::script_at`].
     fn over_script(mut self, script: &str) -> ElevatedArgv {
         debug_assert_eq!(self.argv.last().map(String::as_str), Some(script));
-        self.script_at = last_argument_at(&self.argv);
+        self.script_at = invocation_line(&self.argv).1;
         self
     }
 
@@ -449,6 +449,27 @@ impl ElevatedArgv {
     /// [`Self::inner_at`] says where the approved command starts, and the
     /// window breaks the line there.
     pub fn display_line(&self) -> String {
+        match self.script_at.is_some() {
+            // The program under the wrapper is drawn as itself. See
+            // [`invocation_line`], and [`Self::script_at`] for what marks it
+            // out once it is on screen.
+            true => invocation_line(self.as_slice()).0,
+            // An argv with no program in it -- `install` and two paths for a
+            // root file write -- is a list of short words, which is exactly
+            // what [`shell_line`]'s quoting is good at.
+            false => shell_line(self.as_slice()),
+        }
+    }
+
+    /// The same argv as a shell line, every argument quoted.
+    ///
+    /// For [`crate::render::roster::roster`], which reads a line to work out
+    /// what will run: it has to see the program under the wrapper as the one
+    /// word it is to `execve`, not as the shell it may happen to look like.
+    /// Both this and [`Self::display_line`] are renderings of the same argv,
+    /// which is what keeps the list beside the panes and the text in them
+    /// from describing two different requests.
+    pub fn quoted_line(&self) -> String {
         shell_line(self.as_slice())
     }
 }
@@ -1336,7 +1357,9 @@ mod tests {
         // empty value is its last character, so it reads as it would be typed.
         assert!(line.contains("--setenv=SYSTEMD_PAGER= "), "{line}");
         assert!(line.contains(" -- bash -c "), "{line}");
-        assert!(line.ends_with("'systemctl status zram0'"), "{line}");
+        // And the command itself unquoted, because it is drawn as a region
+        // rather than as a word. See `exec::invocation_line`.
+        assert!(line.ends_with(" -- bash -c systemctl status zram0"), "{line}");
     }
 
     #[test]
@@ -1346,12 +1369,20 @@ mod tests {
         // reader most needs the line to mean what it says.
         let (_dir, env) = with_run0();
         let argv = Run0::new().argv("echo 'it is'", &env).unwrap();
-        assert_eq!(argv.display_line(), shell_line(argv.as_slice()));
-        assert!(
-            argv.display_line().ends_with(r#"'echo '\''it is'\'''"#),
-            "{}",
-            argv.display_line()
+        assert_eq!(argv.display_line(), invocation_line(argv.as_slice()).0);
+        // The wrapper is quoted and the command is not. Those quotes are the
+        // agent's own and they are on screen as the agent typed them --
+        // `'echo '\''it is'\'''` is what this used to draw, and a reader
+        // cannot check text like that.
+        assert!(argv.display_line().ends_with("bash -c echo 'it is'"), "{}", argv.display_line());
+        assert_eq!(
+            &argv.display_line()[argv.script_at().expect("a program under the wrapper")],
+            "echo 'it is'"
         );
+        // The quoted rendering is still available, and is still every
+        // argument quoted, because the roster reads a shell line.
+        assert_eq!(argv.quoted_line(), shell_line(argv.as_slice()));
+        assert!(argv.quoted_line().ends_with(r#"'echo '\''it is'\'''"#), "{}", argv.quoted_line());
     }
 
     // ---- where the script is -----------------------------------------------
@@ -1378,15 +1409,23 @@ mod tests {
     }
 
     #[test]
-    fn a_script_the_quoting_rewrote_has_no_range_at_all() {
-        // `shell_quote` closes, escapes and reopens a single quote inside an
-        // argument, so the characters on screen past the first `\'` are not
-        // the characters of the script. There is no range that would mean
-        // what a caller would take it to mean, and the answer is to say
-        // nothing rather than to point at text that has been transformed.
+    fn a_program_full_of_quotes_is_drawn_as_itself() {
+        // What this replaces: the program used to be shell-quoted, so
+        // `shell_quote` closed, escaped and reopened every `'` in it and the
+        // range was refused because the characters on screen were not the
+        // characters of the program. Clojure is the case that made that
+        // untenable -- `'` is its quote form, so an ordinary line is riddled
+        // with them -- and the answer was to stop quoting the program rather
+        // than to keep declining to point at it.
         let (_dir, env) = with_run0();
-        let argv = Run0::new().argv("echo 'it is'", &env).unwrap();
-        assert_eq!(argv.script_at(), None, "{}", argv.display_line());
+        let program = "(require '[babashka.fs :as fs]) (println 'ok)";
+        let argv = Run0::new()
+            .argv_with(&Interpreter::named("bb").unwrap(), program, &env)
+            .unwrap();
+        let line = argv.display_line();
+        let at = argv.script_at().expect("a program under the wrapper");
+        assert_eq!(&line[at], program, "{line}");
+        assert!(!line.contains("\\'"), "something escaped a quote: {line}");
     }
 
     #[test]
@@ -1427,7 +1466,7 @@ mod tests {
         let line = elevated.display_line();
         let at = elevated.inner_at().expect("there is a command under the wrapper");
 
-        assert_eq!(&line[at..], "bash -c 'systemctl status zram0'");
+        assert_eq!(&line[at..], "bash -c systemctl status zram0");
         assert_eq!(&line[at - 3..at], "-- ", "the wrapper ends where the command begins");
     }
 
@@ -1463,7 +1502,7 @@ mod tests {
         let line = elevated.display_line();
         let at = elevated.inner_at().unwrap();
 
-        assert_eq!(&line[at..], "bash -c 'git log -- src'");
+        assert_eq!(&line[at..], "bash -c git log -- src");
         assert!(line.matches(" -- ").count() > 1, "the line really is ambiguous: {line}");
     }
 
