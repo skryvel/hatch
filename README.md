@@ -264,8 +264,13 @@ principle" is not a claim that it works.
 
 ```sh
 cargo build --release
-install -Dm755 target/release/hatch ~/.local/bin/hatch
+mkdir -p ~/.local/bin
+install -m755 target/release/hatch ~/.local/bin/hatch
 ```
+
+`mkdir -p` rather than `install -D`: `-D` means *make the leading directories*
+to GNU install and *set DESTDIR* to the BSD one macOS ships, so the one line
+that looked portable was the line that was not.
 
 Start the daemon **outside** the sandbox, as your ordinary user:
 
