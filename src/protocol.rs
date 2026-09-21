@@ -823,6 +823,19 @@ pub enum Payload {
         /// Checked on arrival like everything else here: see
         /// [`Payload::program`].
         program: Option<Snippet>,
+        /// Why this machine cannot give the command a terminal of its own, or
+        /// `None` when it can.
+        ///
+        /// On the wire for [`Payload::Command::caveat`]'s reason, and it is
+        /// the same reason twice: what this says belongs to the machine the
+        /// daemon runs on — which terminal is configured, and whether that
+        /// program is installed — and the window is not the place that knows
+        /// either. The window is where the person who can change it reads it.
+        ///
+        /// A sentence rather than a flag, because a dead control that does
+        /// not say why is the failure this field exists to prevent. See
+        /// [`crate::exec::interactive::NoTerminal::sentence`].
+        no_terminal: Option<String>,
     },
     /// A file write: one operation of a `batch`.
     Swap {
@@ -860,6 +873,7 @@ impl Payload {
             interactive,
             caveat: None,
             program: None,
+            no_terminal: None,
         }
     }
 
@@ -885,6 +899,7 @@ impl Payload {
                 root,
                 interactive,
                 caveat,
+                no_terminal,
             } => Payload::Command {
                 program,
                 display_line,
@@ -896,6 +911,7 @@ impl Payload {
                 root,
                 interactive,
                 caveat,
+                no_terminal,
             },
             swap => swap,
         }
@@ -914,7 +930,7 @@ impl Payload {
     /// caveat to attach to one.
     pub fn with_caveat(self, caveat: Option<&str>) -> Payload {
         match self {
-            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive, program } => {
+            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive, program, no_terminal } => {
                 Payload::Command {
                     caveat: caveat.map(str::to_string),
                     display_line,
@@ -926,8 +942,48 @@ impl Payload {
                     root,
                     interactive,
                     program,
+                    no_terminal,
                 }
             }
+            swap => swap,
+        }
+    }
+
+    /// The same payload, knowing that this machine has no terminal to offer.
+    ///
+    /// Separate from [`Payload::command`] for [`Payload::with_caveat`]'s
+    /// reason exactly: the one place holding the config and a child `PATH` is
+    /// the one place that can answer, and every other call site says nothing
+    /// by construction.
+    ///
+    /// A no-op on a swap payload: a write is not run in a terminal.
+    pub fn with_no_terminal(self, no_terminal: Option<String>) -> Payload {
+        match self {
+            Payload::Command {
+                no_terminal: _,
+                display_line,
+                spans,
+                raw,
+                danger,
+                runs,
+                cwd,
+                root,
+                interactive,
+                caveat,
+                program,
+            } => Payload::Command {
+                no_terminal,
+                display_line,
+                spans,
+                raw,
+                danger,
+                runs,
+                cwd,
+                root,
+                interactive,
+                caveat,
+                program,
+            },
             swap => swap,
         }
     }
@@ -944,7 +1000,7 @@ impl Payload {
     /// A no-op on a swap payload: a swap runs no command.
     pub fn with_runs(self, runs: Vec<crate::render::roster::Entry>) -> Payload {
         match self {
-            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat, program } => {
+            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat, program, no_terminal } => {
                 Payload::Command {
                     runs,
                     display_line,
@@ -956,6 +1012,7 @@ impl Payload {
                     interactive,
                     caveat,
                     program,
+                    no_terminal,
                 }
             }
             swap => swap,
@@ -1782,6 +1839,7 @@ mod tests {
                 "display_line",
                 "interactive",
                 "kind",
+                "no_terminal",
                 "program",
                 "raw",
                 "root",

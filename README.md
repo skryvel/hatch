@@ -922,9 +922,22 @@ runner's path is appended to it, so what goes in the list is everything up to
 but not including the program the terminal is asked to start:
 
 ```toml
-terminal = ["konsole", "--nofork", "-e"]   # the default
+terminal = ["konsole", "--nofork", "-e"]   # the default, on Linux
 terminal = ["kitty"]                       # kitty has no -e
 ```
+
+**The default is empty on every platform but Linux**, because konsole and
+kitty are the only terminals this path has been run against. A build that
+wrote `konsole` into a fresh config on macOS would be telling its owner to go
+and start a KDE program. Name a terminal in the file and it is used on any
+platform.
+
+Where there is no terminal to be had — nothing configured, or the program
+named is not installed — hatch says so before anybody approves anything: the
+**Run it in a terminal** box is drawn dead with a sentence beside it naming
+the cause, and a request that *asked* for a terminal is refused at the
+boundary rather than run without one. A command that needs a terminal and is
+denied one does not fail, it hangs.
 
 `--nofork` on konsole is not decoration. Without it, a konsole started while
 KDE's "run all Konsole windows in a single process" setting is on hands its
@@ -1177,7 +1190,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
-| `terminal` | `["konsole", "--nofork", "-e"]` | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e` |
+| `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
 | `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |
 | `theme` | `"dark"` | `"dark"` or `"light"` |

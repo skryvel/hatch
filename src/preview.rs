@@ -332,6 +332,7 @@ impl Sample {
 fn command_payload(
     elevation: &dyn Elevation,
     env: &std::collections::BTreeMap<String, String>,
+    terminal: &[String],
     asked: &Asked,
 ) -> anyhow::Result<Payload> {
     let Asked::Command { command, run_with, cwd, root, interactive } = asked else {
@@ -391,7 +392,17 @@ fn command_payload(
     Ok(Payload::command(&spans, Vec::new(), cwd.clone(), *root, *interactive)
         .with_caveat(caveat)
         .with_program(program)
-        .with_runs(runs))
+        .with_runs(runs)
+        // Asked of this machine, like the roster and the elevation caveat
+        // beside it, and for the reason all three are: a preview is the
+        // payload the daemon would have sent *here*. A sample that showed a
+        // live terminal control on a machine whose configured terminal is not
+        // installed would be a picture of a window nobody is ever shown.
+        .with_no_terminal(
+            crate::exec::interactive::unavailable(terminal, env)
+                .as_ref()
+                .map(crate::exec::interactive::NoTerminal::sentence),
+        ))
 }
 
 /// The payload for a file write sample.
@@ -480,7 +491,7 @@ pub(crate) fn build(
                          working tree and the toolchain only exists on the host."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -507,7 +518,7 @@ pub(crate) fn build(
                          one part of the line that will not run."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -533,7 +544,7 @@ pub(crate) fn build(
                 reason: "The nightly build has been failing since Tuesday and the log is                          the only copy of why. The report generator reads the two files                          this writes."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -561,7 +572,7 @@ pub(crate) fn build(
                          routes there yet."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -579,7 +590,7 @@ pub(crate) fn build(
                          volume is at 91%."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -608,7 +619,7 @@ pub(crate) fn build(
                 // an ordinary state for a busy agent and the one state the
                 // badge has to be legible in.
                 queue_depth: 2,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -642,7 +653,7 @@ pub(crate) fn build(
                          installer reads."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -675,7 +686,7 @@ pub(crate) fn build(
                          unit's own status is the only place that says why."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }
@@ -693,7 +704,7 @@ pub(crate) fn build(
                          before the freeze tonight."
                     .to_string(),
                 queue_depth: 0,
-                payload: command_payload(elevation, &env, &asked)?,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
                 asked,
             }
         }

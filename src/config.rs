@@ -108,6 +108,12 @@ pub struct Config {
     /// | konsole | `["konsole", "--nofork", "-e"]` | `-e` takes the command and every argument after it |
     /// | kitty | `["kitty"]` | the program is a positional argument; kitty has no `-e`, and passing one makes it parse the line as something else entirely |
     ///
+    /// **Empty is a valid value and the default on every platform but Linux.**
+    /// It means this build has no terminal it has been tested against, and
+    /// the interactive path says so rather than naming a program that is not
+    /// there: see [`default_terminal`] and
+    /// [`crate::exec::interactive::unavailable`].
+    ///
     /// `--nofork` on konsole is not decoration. Without it a konsole started
     /// while the "run all Konsole windows in a single process" setting is on
     /// hands its arguments to the konsole that is already running and returns
@@ -158,6 +164,37 @@ pub struct Config {
     pub exec_env: BTreeMap<String, String>,
 }
 
+/// The terminal an interactive run opens, on the platform this build is for.
+///
+/// Linux gets konsole; every other platform gets nothing, and nothing is the
+/// honest answer rather than a gap. A default is a claim that the program
+/// named works here, and the only terminals this path has been run against
+/// are Linux ones — a macOS build that wrote `konsole` into a fresh config
+/// would be telling its owner to go and start a KDE program.
+///
+/// The absence is not a dead end: [`Config::terminal`] is a config key, and a
+/// machine with a terminal hatch has never heard of is one line away from
+/// using it. What the empty default buys is that the window and the refusal
+/// can say *"no terminal is configured"*, which is true and actionable,
+/// instead of *"konsole could not be started"*, which sends the reader after
+/// a program they were never going to have.
+pub fn default_terminal() -> Vec<String> {
+    terminal_for_os(std::env::consts::OS)
+}
+
+/// The whole of [`default_terminal`] except for asking which platform this
+/// is, so the arm that is not selected here is still covered by tests here.
+///
+/// The same argument [`crate::exec::elevate::platform`] makes: a branch whose
+/// only test run is on the platform where it is never taken is a branch with
+/// no test at all.
+fn terminal_for_os(os: &str) -> Vec<String> {
+    match os {
+        "linux" => ["konsole", "--nofork", "-e"].map(str::to_string).to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut exec_env = BTreeMap::new();
@@ -171,7 +208,7 @@ impl Default for Config {
             exec_timeout_secs: DEFAULT_EXEC_TIMEOUT_SECS,
             output_cap_bytes: 262144,
             exec_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
-            terminal: ["konsole", "--nofork", "-e"].map(str::to_string).to_vec(),
+            terminal: default_terminal(),
             denylist_extra: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),
@@ -855,8 +892,37 @@ mod tests {
         // button reaches nothing, and the run has to be reported as one hatch
         // could not follow. The flag is what makes the default a terminal
         // rather than a message to one.
-        let terminal = Config::default().terminal;
-        assert_eq!(terminal, ["konsole", "--nofork", "-e"]);
+        //
+        // Asked of the Linux arm by name rather than of `Config::default()`,
+        // so that the claim is about konsole wherever this test is run and
+        // not about whatever platform happened to run it.
+        assert_eq!(terminal_for_os("linux"), ["konsole", "--nofork", "-e"]);
+        assert_eq!(Config::default().terminal, terminal_for_os(std::env::consts::OS));
+    }
+
+    #[test]
+    fn a_platform_with_no_tested_terminal_is_given_no_terminal() {
+        // The whole point of the empty default. A macOS build that wrote
+        // konsole into a fresh config would be a build telling its owner to
+        // start a KDE program, and every message afterwards -- the dead
+        // control, the refusal -- would name that program rather than the
+        // fact that this machine has no terminal hatch knows of.
+        //
+        // Testable here because the arm is chosen by value: on this machine
+        // the macOS branch is never taken, and a branch whose only test runs
+        // where it is never taken is a branch with no test at all. The same
+        // argument `exec::elevate::platform` makes.
+        assert!(terminal_for_os("macos").is_empty());
+        assert!(terminal_for_os("freebsd").is_empty());
+    }
+
+    #[test]
+    fn a_configured_terminal_survives_a_platform_that_has_no_default() {
+        // The empty default is a default and not a rule: naming a terminal in
+        // the file is the whole way out of it, and the file wins on every
+        // platform.
+        let parsed: Config = toml::from_str(r#"terminal = ["wezterm", "start", "--"]"#).unwrap();
+        assert_eq!(parsed.terminal, ["wezterm", "start", "--"]);
     }
 
     #[test]

@@ -158,6 +158,76 @@ const TRANSCRIPT: &str = "transcript";
 /// The command's exit status, written when it is over.
 const STATUS: &str = "status";
 
+/// Why this machine cannot give a command a terminal of its own.
+///
+/// Two ways for it to be true and they are worth telling apart, because they
+/// send the reader to different places: nothing is configured — which is the
+/// default anywhere [`crate::config::default_terminal`] has no tested
+/// terminal for — or something is configured and is not installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoTerminal {
+    /// [`crate::config::Config::terminal`] is empty.
+    NotConfigured,
+    /// The program it names was not found on the child's `PATH`, as spelled.
+    NotInstalled(String),
+}
+
+impl NoTerminal {
+    /// The sentence the approval window puts under the dead control.
+    ///
+    /// It names the config key because the reader of this sentence is the one
+    /// person who can change the answer, and a dead control with no way
+    /// forward is a dead end.
+    pub fn sentence(&self) -> String {
+        let cause = match self {
+            NoTerminal::NotConfigured => "No terminal is configured here".to_string(),
+            NoTerminal::NotInstalled(program) => format!("{program} is not installed here"),
+        };
+        format!(
+            "{cause}, so this cannot be given a terminal of its own. \
+             The \"terminal\" key in hatch's config file names one."
+        )
+    }
+
+    /// The same fact as a clause for [`crate::server`]'s refusal text, which
+    /// reads *"hatch refused this before showing it to anyone: …"*.
+    ///
+    /// Addressed to the agent rather than the person, so it says what to do
+    /// instead — asking again without a terminal is a request that can be
+    /// answered, and the agent is the only party that can make it.
+    pub fn clause(&self) -> String {
+        let cause = match self {
+            NoTerminal::NotConfigured => "no terminal is configured on this machine".to_string(),
+            NoTerminal::NotInstalled(program) => {
+                format!("the terminal this machine is configured for, {program}, is not installed")
+            }
+        };
+        format!("{cause}, so a command cannot be given one; ask again without a terminal")
+    }
+}
+
+/// Whether [`run`] could start a terminal at all, asked before anybody is.
+///
+/// Against the child's `PATH`, through the one shared lookup, because the
+/// terminal is spawned with the child's environment and a check against any
+/// other one would answer about a file the spawn will never reach. See
+/// [`super::lookup`], which makes this argument at length.
+///
+/// It is a fact about this instant, like every other lookup: a terminal can be
+/// uninstalled between this answer and the spawn. That is why the spawn still
+/// reports its own failure and this is not treated as a guarantee — what it
+/// buys is that the ordinary case, a machine that simply has no such program,
+/// costs the reader nothing and is explained before they choose.
+pub fn unavailable(terminal: &[String], env: &Env) -> Option<NoTerminal> {
+    let Some(program) = terminal.first() else {
+        return Some(NoTerminal::NotConfigured);
+    };
+    match super::lookup::lookup(program, env) {
+        Some(_) => None,
+        None => Some(NoTerminal::NotInstalled(program.clone())),
+    }
+}
+
 /// The outer runner: start the recording, then record how it ended.
 ///
 /// Every path in it is a quoted expansion of a variable this script sets
@@ -694,6 +764,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         (dir, build_child_env(&Config::default()))
+    }
+
+    #[test]
+    fn a_machine_with_no_terminal_configured_says_so_rather_than_naming_one() {
+        let (_dir, env) = fixture();
+        assert_eq!(unavailable(&[], &env), Some(NoTerminal::NotConfigured));
+
+        // The sentence has to carry the way out of it. A reader who is told
+        // only that a control is dead has been told the half that does not
+        // help them.
+        let said = NoTerminal::NotConfigured.sentence();
+        assert!(said.contains("terminal"), "{said}");
+        assert!(said.contains("config file"), "{said}");
+        assert!(!said.contains("konsole"), "it named a program that was never configured: {said}");
+    }
+
+    #[test]
+    fn a_terminal_that_is_not_installed_is_named_as_spelled() {
+        let (_dir, env) = fixture();
+        let configured = ["a-terminal-nobody-has".to_string(), "-e".to_string()];
+        let why = unavailable(&configured, &env).expect("it is not installed");
+        assert_eq!(why, NoTerminal::NotInstalled("a-terminal-nobody-has".to_string()));
+
+        // As spelled, because the name in the sentence is the name the reader
+        // will go and look for in their config file.
+        assert!(why.sentence().contains("a-terminal-nobody-has"), "{}", why.sentence());
+        assert!(why.clause().contains("a-terminal-nobody-has"), "{}", why.clause());
+    }
+
+    #[test]
+    fn a_terminal_that_is_installed_is_no_obstacle() {
+        let (_dir, env) = fixture();
+        // `bash` rather than a real terminal, for the reason the test
+        // terminal below is bash: what is being checked is the lookup, and
+        // the lookup's whole subject is whether a name resolves on the
+        // child's PATH.
+        assert_eq!(unavailable(&["bash".to_string()], &env), None);
+    }
+
+    #[test]
+    fn the_lookup_is_against_the_path_the_terminal_will_be_spawned_with() {
+        // Not the daemon's own. A terminal found on a PATH the spawn will
+        // never use is a control this window would offer and the spawn would
+        // then fail on -- which is the whole failure this check exists to
+        // move before the question rather than after it.
+        let (_dir, mut env) = fixture();
+        assert_eq!(unavailable(&["bash".to_string()], &env), None);
+        env.insert("PATH".to_string(), "/nowhere".to_string());
+        assert_eq!(
+            unavailable(&["bash".to_string()], &env),
+            Some(NoTerminal::NotInstalled("bash".to_string()))
+        );
     }
 
     /// The terminal a test uses: `bash`, which runs the runner and waits for

@@ -144,6 +144,9 @@ pub enum Shown {
         /// How a root command will differ from the same command run
         /// unprivileged, defanged for drawing. `None` when it will not.
         caveat: Option<String>,
+        /// Why this machine cannot give the command a terminal of its own,
+        /// defanged for drawing. `None` when it can.
+        no_terminal: Option<String>,
         /// Which of the source is a program hatch quoted into the line, and
         /// what it is written in — [`Payload::program`], checked.
         ///
@@ -185,7 +188,7 @@ impl Shown {
     /// The window closes on it rather than drawing part of it.
     pub fn of(payload: &Payload) -> Result<Shown, ProtocolError> {
         match payload {
-            Payload::Command { danger, runs, cwd, root, interactive, caveat, .. } => {
+            Payload::Command { danger, runs, cwd, root, interactive, caveat, no_terminal, .. } => {
                 let annotated = payload.rendering()?;
                 // Checked against the rendering it names, before anything
                 // slices the source with it. See `Payload::program`.
@@ -238,6 +241,11 @@ impl Shown {
                     // undefanged, and an exception for trusted text is how
                     // the rule stops being one.
                     caveat: caveat.as_deref().map(defang),
+                    // Defanged on the same terms as the caveat above it, and
+                    // for the same reason: it is hatch's own sentence, and an
+                    // exception for text hatch trusts is how the rule that
+                    // nothing reaches the screen undefanged stops being one.
+                    no_terminal: no_terminal.as_deref().map(defang),
                     program,
                     longest: widest_line(&annotated).max(widest_line(&raw)),
                     raw,
@@ -260,6 +268,20 @@ impl Shown {
     /// that takes the stream checkbox away from a command.
     pub fn interactive(&self) -> bool {
         matches!(self, Shown::Command { interactive: true, .. })
+    }
+
+    /// Why this machine cannot give the command a terminal of its own, or
+    /// `None` when it can.
+    ///
+    /// The one thing that takes the terminal checkbox away, on the same terms
+    /// as [`Shown::interactive`] taking the stream one: not a rule this
+    /// window enforces but a fact it reports, decided by the daemon because
+    /// the daemon is what holds the config and the child `PATH`.
+    pub fn no_terminal(&self) -> Option<&str> {
+        match self {
+            Shown::Command { no_terminal, .. } => no_terminal.as_deref(),
+            Shown::Swap { .. } => None,
+        }
     }
 
     /// Whether an approval of this would produce output to stream.
@@ -4092,6 +4114,7 @@ mod tests {
             interactive,
             caveat: None,
             program: None,
+            no_terminal: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "a window drew a rendering nobody checked");
@@ -4115,6 +4138,7 @@ mod tests {
             interactive,
             caveat: None,
             program: None,
+            no_terminal: None,
         };
 
         assert!(Shown::of(&payload).is_err(), "the title bar and the panes could disagree");

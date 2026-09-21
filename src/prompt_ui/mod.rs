@@ -1842,8 +1842,18 @@ impl PromptApp {
     /// The other direction is what the control is for. A person reading
     /// `pacman -S foo` can see the confirmation prompt coming when the agent
     /// that wrote the line could not.
+    ///
+    /// And minus the machine having no terminal to give, which is neither
+    /// half's decision to make: a request that asked for one is refused
+    /// before a window opens, so what this covers is a remembered tick
+    /// meeting a machine that cannot honour it. Computed here rather than
+    /// written back into [`PromptApp::terminal`], for the reason
+    /// [`PromptApp::streams`] gives — a preference must survive the one
+    /// command, or the one machine, that cannot act on it.
     fn in_a_terminal(&self) -> bool {
-        self.terminal || self.state.shown().is_some_and(|shown| shown.interactive())
+        let shown = self.state.shown();
+        (self.terminal || shown.is_some_and(|shown| shown.interactive()))
+            && !shown.is_some_and(|shown| shown.no_terminal().is_some())
     }
 
     /// Whether this window is going to show the output as it arrives.
@@ -3079,10 +3089,21 @@ impl PromptApp {
         let quiet = ui.visuals().weak_text_color();
         let warn = ui.visuals().warn_fg_color;
         let mut ticked = self.in_a_terminal();
+        // The sentence beside the box is one slot with two occupants, and
+        // which one it holds is the whole of what this row has to say. What a
+        // terminal costs is worth reading only where there is a terminal to
+        // be had; where there is not, the sentence a reader needs is why the
+        // box is dead. Drawing both would put the price of something
+        // unavailable next to the notice that it is unavailable.
+        let no_terminal = self.state.shown().and_then(Shown::no_terminal).map(str::to_string);
+        let dead = no_terminal.is_some();
         let checkbox = ui.spacing().icon_width + ui.spacing().icon_spacing;
         let width = text_width(ui, TERMINAL_LABEL, egui::TextStyle::Button)
             + checkbox
-            + text_width(ui, TERMINAL_CAPTURE, egui::TextStyle::Small)
+            + match &no_terminal {
+                Some(why) => text_width(ui, why, egui::TextStyle::Small),
+                None => text_width(ui, TERMINAL_CAPTURE, egui::TextStyle::Small),
+            }
             + match asked_for {
                 true => text_width(ui, TERMINAL_ASKED, egui::TextStyle::Small),
                 false => 0.0,
@@ -3099,12 +3120,18 @@ impl PromptApp {
         // it, and in the stacked fallback it would be a blank line instead.
         let mut controls = |ui: &mut egui::Ui, beside: bool| {
             changed |= ui
-                .add_enabled(!asked_for, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL))
+                .add_enabled(!asked_for && !dead, egui::Checkbox::new(&mut ticked, TERMINAL_LABEL))
                 .changed();
             if asked_for {
                 ui.label(egui::RichText::new(TERMINAL_ASKED).small().color(quiet));
             }
-            ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn));
+            match &no_terminal {
+                // Quiet rather than the warning colour: it is an explanation
+                // and not a cost, and there is nothing here for a reader to
+                // weigh. Nothing is going to happen.
+                Some(why) => ui.label(egui::RichText::new(why).small().color(quiet)),
+                None => ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn)),
+            };
             if beside {
                 ui.add_space(PRIMARY_GAP);
             }
@@ -3135,7 +3162,13 @@ impl PromptApp {
         // opened on a request the agent asked a terminal for never writes
         // anything down, so the agent's ask cannot become the reader's
         // standing decision by having been shown to them once.
-        if !asked_for {
+        //
+        // A dead box is gated out of it on the same terms, and that one
+        // matters more than it looks: `ticked` is the effective answer, which
+        // on a machine with no terminal is `false` whatever the reader
+        // prefers. Storing it would let one window opened on such a machine
+        // quietly clear a preference the reader set on another.
+        if !asked_for && !dead {
             self.terminal = ticked;
             if changed {
                 self.prefs.update(|prefs| prefs.terminal = ticked);
@@ -6063,6 +6096,7 @@ mod tests {
             interactive,
             caveat: None,
             program: None,
+            no_terminal: None,
         }];
 
         state.handle(DaemonMsg::Request(Box::new(request)));
@@ -7939,6 +7973,86 @@ mod tests {
         let said = window_text_sized(&mut app, opening_size());
         assert!(said.contains(TERMINAL_LABEL), "the control is not on screen: {said}");
         assert!(said.contains(TERMINAL_CAPTURE), "what it costs is not said: {said}");
+    }
+
+    #[test]
+    fn a_window_on_a_machine_with_no_terminal_says_why_instead_of_what_one_costs() {
+        // The reason the sentence is one slot with two occupants. What a
+        // terminal costs is worth reading where there is a terminal to be
+        // had; where there is not, the sentence a reader needs is the one
+        // saying why the box beside it does nothing.
+        let (_root, paths) = a_prefs_file();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(
+            rx,
+            Box::new(Vec::new()),
+            Arc::new(OnceLock::new()),
+            PrefsFile::at(&paths),
+        );
+        let mut request = a_request(90);
+        request.operations = vec![
+            Payload::command(
+                &render_command("vim /etc/hosts", &BTreeMap::new()),
+                Vec::new(),
+                PathBuf::from("/tmp"),
+                false,
+                false,
+            )
+            .with_no_terminal(Some(
+                crate::exec::interactive::NoTerminal::NotInstalled("konsole".to_string())
+                    .sentence(),
+            )),
+        ];
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(TERMINAL_LABEL), "the control vanished instead of explaining: {said}");
+        assert!(said.contains("konsole"), "the reason is not on screen: {said}");
+        assert!(
+            !said.contains(TERMINAL_CAPTURE),
+            "it priced a terminal nobody can have: {said}"
+        );
+        // And the approval says what will happen, which is a run with no
+        // terminal in it.
+        assert!(
+            matches!(app.approval(), Verdict::Approve { terminal: false, .. }),
+            "it approved a terminal this machine cannot open"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_terminal_does_not_clear_a_remembered_one() {
+        // `ticked` is the *effective* answer, which here is false whatever
+        // the reader prefers. Writing it back would let one window opened on
+        // a machine with no terminal quietly undo a preference set elsewhere
+        // -- and the reader would have no way to see it happen, because the
+        // box they would check is the dead one.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { terminal: true, ..Prefs::default() });
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(
+            rx,
+            Box::new(Vec::new()),
+            Arc::new(OnceLock::new()),
+            PrefsFile::at(&paths),
+        );
+        let mut request = a_request(90);
+        request.operations = vec![
+            Payload::command(
+                &render_command("ls", &BTreeMap::new()),
+                Vec::new(),
+                PathBuf::from("/tmp"),
+                false,
+                false,
+            )
+            .with_no_terminal(Some(
+                crate::exec::interactive::NoTerminal::NotConfigured.sentence(),
+            )),
+        ];
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+
+        window_text_sized(&mut app, opening_size());
+        assert!(PrefsFile::at(&paths).read().terminal, "a dead box cleared a standing preference");
     }
 
     #[test]

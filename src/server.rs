@@ -181,6 +181,7 @@ use crate::exec::{invocation_line, shell_line};
 use crate::render::language::{Language, Snippet};
 use crate::exec::elevate::{Elevation, RootOutcome};
 use crate::exec::env::build_child_env;
+use crate::exec::interactive::NoTerminal;
 use crate::exec::{Chunk, Env, Output, RunOpts};
 use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
@@ -2524,6 +2525,25 @@ impl Daemon {
             }
         }
 
+        // Whether this machine can give a command a terminal at all, asked
+        // once and used twice: to refuse a request that asked for one there
+        // is none of, and to tell the window why its control is dead.
+        //
+        // Against the child's environment, which is the one the terminal is
+        // spawned with -- see `exec::interactive::run`, which is handed this
+        // same `env`.
+        let no_terminal = exec::interactive::unavailable(&self.config.terminal, &env);
+        // A request that asked for a terminal cannot be answered without one,
+        // and the failure it would otherwise reach is the worst shape this
+        // path has: a command that needs a terminal and is denied one does
+        // not fail, it hangs, with nowhere for the person to type. Refused
+        // here for the reason a root request on a machine that cannot elevate
+        // is refused here -- it is a fact about the machine, not a decision
+        // anybody made, and nobody should be asked about it.
+        if interactive && let Some(reason) = &no_terminal {
+            return refuse(refusal_text(&reason.clause()));
+        }
+
         // Everything below is decided twice, once for each path, and the two
         // halves have to agree on three things: the argv that runs, the
         // environment it runs with, and the line the window draws. They are
@@ -2632,7 +2652,8 @@ impl Daemon {
             Payload::command(&spans, Vec::new(), cwd.clone(), root, interactive)
                 .with_caveat(caveat)
                 .with_program(program)
-                .with_runs(runs);
+                .with_runs(runs)
+                .with_no_terminal(no_terminal.as_ref().map(NoTerminal::sentence));
         Rendered::Ready(Box::new(Job {
             detail: detail(&cwd),
             payload,
@@ -6195,6 +6216,74 @@ later"), "");
         }
 
         #[tokio::test]
+        async fn a_request_that_asked_for_a_terminal_this_machine_has_not_got_is_refused() {
+            // Refused rather than answered without one, and the difference is
+            // not a nicety: a command that needs a terminal and is denied one
+            // does not fail, it hangs, with nowhere for the person to type.
+            // The agent asked for a terminal because it knows something about
+            // the command; running it anyway would be hatch overruling that
+            // on a machine that cannot honour it either way.
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.terminal = vec!["a-terminal-nobody-has".to_string()];
+            });
+            let params = RunCommandParams { interactive: true, ..run_of("echo never") };
+            let result = within(harness.daemon.run_command(params, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            // As spelled, so the person reading the agent's transcript can go
+            // and look for that name in the config file.
+            assert!(text.contains("a-terminal-nobody-has"), "{text}");
+            // And the one thing the agent can do about it. A refusal that
+            // names no way forward is a refusal the agent can only repeat.
+            assert!(text.contains("ask again without a terminal"), "{text}");
+            assert!(text.contains("nothing ran"), "{text}");
+            // Before anybody was asked. This costs the person no attention at
+            // all, which is the whole reason it is decided here.
+            assert!(harness.prompter.seen().is_empty(), "somebody was asked about it anyway");
+        }
+
+        #[tokio::test]
+        async fn a_window_on_a_machine_with_no_terminal_is_told_why() {
+            // The other half. The agent asked for nothing, so there is a
+            // command worth approving -- but the control that would give it a
+            // terminal cannot work, and a dead control that does not say why
+            // is the failure this field exists to prevent.
+            let harness = Harness::configured(
+                vec![Reply::verdict(Verdict::Deny { note: String::new() })],
+                |config| config.terminal = Vec::new(),
+            );
+            within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let Payload::Command { no_terminal, .. } =
+                shown.operations.into_iter().next().expect("an operation")
+            else {
+                panic!("not a command payload");
+            };
+            let said = no_terminal.expect("the window was not told");
+            assert!(said.contains("No terminal is configured"), "{said}");
+            assert!(said.contains("config file"), "{said}");
+        }
+
+        #[tokio::test]
+        async fn a_window_on_a_machine_that_has_one_is_told_nothing() {
+            // `None` is the ordinary case and has to stay silent: a sentence
+            // about a terminal that is available would be a notice nobody
+            // needs beside a control that works.
+            let harness = Harness::new(vec![Reply::verdict(Verdict::Deny { note: String::new() })]);
+            within(harness.daemon.run_command(run_of("echo hi"), Caller::quiet())).await;
+
+            let shown = harness.prompter.seen().into_iter().next().expect("a window");
+            let Payload::Command { no_terminal, .. } =
+                shown.operations.into_iter().next().expect("an operation")
+            else {
+                panic!("not a command payload");
+            };
+            assert_eq!(no_terminal, None);
+        }
+
+        #[tokio::test]
         async fn a_terminal_chosen_at_the_window_runs_the_command_in_one() {
             // The direction the control exists for: the agent asked for
             // nothing and the person could see a prompt coming.
@@ -6754,7 +6843,13 @@ later"), "");
                 let dir = tempfile::tempdir().unwrap();
                 let paths = Paths::scratch(dir.path());
                 let mut config = quick(&paths);
-                config.terminal = vec!["bash".to_string()];
+                // A name this machine has not got, deliberately. Nothing is
+                // spawned here -- every scenario is denied -- so the value is
+                // free, and a terminal that *is* installed would make
+                // `no_terminal` null on both sides of the comparison, which
+                // is a field this test could then never see. No sample asks
+                // for a terminal, so nothing is refused for the want of one.
+                config.terminal = vec!["a-terminal-nobody-has".to_string()];
                 // So that the root scenario has something to elevate with on
                 // whatever machine this is running on. The daemon and the
                 // preview are then resolving `run0` off the same `PATH`,
