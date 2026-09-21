@@ -27,8 +27,14 @@
 //! fails at the far end with the reader having approved something that never
 //! ran.
 //!
-//! Every flag here was run before it was written down. `php -r` is absent for
-//! exactly that reason -- plausible, and not checked.
+//! Every flag here was run before it was written down -- spawned as the argv
+//! hatch builds, with no shell in between and stdin closed, and checked for a
+//! clean exit *and* an empty standard error. That second half is why
+//! `clojure` carries `-M -e` rather than the `-e` it also accepts: the short
+//! form works and warns that it is deprecated, onto the stream the command's
+//! own diagnostics come back on. `php -r` is absent because php is not
+//! installed on the machine this was written on -- plausible, and not
+//! checked.
 
 use crate::render::language::Language;
 
@@ -36,7 +42,11 @@ use crate::render::language::Language;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interpreter {
     program: String,
-    flag: &'static str,
+    /// What goes between the program and the program text. Usually one
+    /// option; `clojure` takes two, because the one-option form it also
+    /// accepts prints a deprecation warning onto the command's own stderr --
+    /// which a reader would read as the command's.
+    flags: &'static [&'static str],
     language: Language,
 }
 
@@ -46,15 +56,22 @@ pub struct Interpreter {
 /// version suffix and the `.exe` nobody writes here -- so `python3`,
 /// `python3.12` and `/usr/bin/python3` are one entry and none of them is
 /// rewritten into another. See [`Interpreter::named`].
-const KNOWN: &[(&str, &str, Language)] = &[
-    ("bash", "-c", Language::Shell),
-    ("sh", "-c", Language::Shell),
-    ("zsh", "-c", Language::Shell),
-    ("python", "-c", Language::Python),
-    ("node", "-e", Language::JavaScript),
-    ("ruby", "-e", Language::Ruby),
-    ("perl", "-e", Language::Perl),
-    ("lua", "-e", Language::Lua),
+const KNOWN: &[(&str, &[&str], Language)] = &[
+    ("bash", &["-c"], Language::Shell),
+    ("sh", &["-c"], Language::Shell),
+    ("zsh", &["-c"], Language::Shell),
+    ("python", &["-c"], Language::Python),
+    ("node", &["-e"], Language::JavaScript),
+    ("ruby", &["-e"], Language::Ruby),
+    ("perl", &["-e"], Language::Perl),
+    ("lua", &["-e"], Language::Lua),
+    ("bb", &["-e"], Language::Clojure),
+    // `-M -e` and not the `-e` this also accepts: the short form works and
+    // warns that it is deprecated, and the warning lands on the command's own
+    // standard error, where a reader has every reason to read it as the
+    // command's. `bb` needs no such thing.
+    ("clojure", &["-M", "-e"], Language::Clojure),
+    ("clj", &["-M", "-e"], Language::Clojure),
 ];
 
 impl Interpreter {
@@ -72,8 +89,8 @@ impl Interpreter {
             .rsplit('/')
             .next()?
             .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-        let (_, flag, language) = KNOWN.iter().find(|(known, _, _)| *known == stem)?;
-        Some(Interpreter { program: name.to_string(), flag, language: *language })
+        let (_, flags, language) = KNOWN.iter().find(|(known, _, _)| *known == stem)?;
+        Some(Interpreter { program: name.to_string(), flags, language: *language })
     }
 
     /// The shell every request gets when it names no interpreter.
@@ -82,7 +99,7 @@ impl Interpreter {
     /// here so that the default and the named case are one code path and
     /// cannot come to build different argvs.
     pub fn shell() -> Interpreter {
-        Interpreter { program: "bash".to_string(), flag: "-c", language: Language::Shell }
+        Interpreter { program: "bash".to_string(), flags: &["-c"], language: Language::Shell }
     }
 
     /// What the program is written in.
@@ -95,22 +112,29 @@ impl Interpreter {
         &self.program
     }
 
-    /// `<program> <flag> <source>` -- the argv that runs `source`.
+    /// `<program> <flags…> <source>` -- the argv that runs `source`.
     ///
-    /// Three arguments, never a concatenation: the program travels as a
+    /// Separate arguments, never a concatenation: the program travels as a
     /// single `execve` argument from here to the interpreter that reads it,
     /// so every quote, space and newline in it is data rather than structure
     /// some layer in between already acted on. [`super::shell_argv`]'s note,
     /// generalised.
     pub fn argv(&self, source: &str) -> Vec<String> {
-        vec![self.program.clone(), self.flag.to_string(), source.to_string()]
+        let mut argv = Vec::with_capacity(self.flags.len() + 2);
+        argv.push(self.program.clone());
+        argv.extend(self.flags.iter().map(|flag| (*flag).to_string()));
+        argv.push(source.to_string());
+        argv
     }
 
-    /// Where `source` begins in the argv this produces.
+    /// Where `source` sits in the argv this produces.
     ///
-    /// Always the last of three, and named rather than left as `len() - 1` so
-    /// that the two places that have to agree about it say the same word.
-    pub const SOURCE_AT: usize = 2;
+    /// Always last, which is what [`super::last_argument_at`] relies on, and
+    /// said here rather than left as `len() - 1` at each of the places that
+    /// have to agree about it.
+    pub fn source_at(&self) -> usize {
+        self.flags.len() + 1
+    }
 
     /// Every name a request may use, for the sentence that refuses the
     /// others.
@@ -145,6 +169,24 @@ mod tests {
         assert_eq!(Interpreter::named("lua").unwrap().argv("x")[1], "-e");
         assert_eq!(Interpreter::named("bash").unwrap().argv("x")[1], "-c");
         assert_eq!(Interpreter::named("sh").unwrap().argv("x")[1], "-c");
+        assert_eq!(Interpreter::named("bb").unwrap().argv("x")[1], "-e");
+        // Two options, and the reason is not style: `clojure -e` runs and
+        // warns that it is deprecated, onto the command's own stderr.
+        assert_eq!(Interpreter::named("clojure").unwrap().argv("x"), vec!["clojure", "-M", "-e", "x"]);
+        assert_eq!(Interpreter::named("clj").unwrap().argv("x"), vec!["clj", "-M", "-e", "x"]);
+    }
+
+    #[test]
+    fn the_program_is_the_last_argument_however_many_options_precede_it() {
+        // `last_argument_at` rests on this, and it is the one thing a
+        // multi-option entry could quietly break.
+        for name in ["bash", "python3", "node", "bb", "clojure", "clj"] {
+            let found = Interpreter::named(name).unwrap_or_else(|| panic!("{name}"));
+            let argv = found.argv("<the program>");
+            assert_eq!(argv.last().map(String::as_str), Some("<the program>"), "{name}");
+            assert_eq!(argv[found.source_at()], "<the program>", "{name}");
+            assert_eq!(argv.len(), found.source_at() + 1, "{name}");
+        }
     }
 
     #[test]
@@ -165,8 +207,9 @@ mod tests {
 
     #[test]
     fn the_source_is_where_both_halves_say_it_is() {
-        let argv = Interpreter::named("node").unwrap().argv("console.log(1)");
-        assert_eq!(argv[Interpreter::SOURCE_AT], "console.log(1)");
-        assert_eq!(argv.len(), Interpreter::SOURCE_AT + 1);
+        let node = Interpreter::named("node").unwrap();
+        let argv = node.argv("console.log(1)");
+        assert_eq!(argv[node.source_at()], "console.log(1)");
+        assert_eq!(argv.len(), node.source_at() + 1);
     }
 }

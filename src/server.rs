@@ -1106,7 +1106,8 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          another interruption.\n\
          \n\
          To run a program that is not shell, name what should read it in `run_with` — \
-         `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`, `zsh` — and put the program \
+         `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`, `clj`, `bash`, `sh`, `zsh` \
+         — and put the program \
          itself in `command`. It travels as a single argument, so nothing in it is quoted, \
          split or expanded on the way, and the person sees it drawn as a program rather than \
          as one long string. Prefer this to wrapping a here-document in a shell command: \

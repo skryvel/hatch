@@ -181,15 +181,18 @@ nobody is interrupted.
 
 Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 — never as a string handed to a second shell. A request can name something
-else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`,
-`zsh` — and then `command` is a program for that interpreter, handed to it as
-one argument. The window draws the invocation with the program under it,
+else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`,
+`clj`, `bash`, `sh`, `zsh` — and then `command` is a program for that
+interpreter, handed to it as one argument. The window draws the invocation with the program under it,
 names the language, and says the quotes are hatch's. A shell program is read
 again as shell; hatch has no reader for the others and does not pretend to —
 they are drawn exactly as they were sent. A name that is not on the list is
 refused with the list, because hatch has to know how a given interpreter takes
-a program (`-c` here, `-e` there) and a guessed flag builds an argv that fails
-after somebody has approved it. With `root: true` the argv
+a program (`-c` here, `-e` there, `-M -e` for `clojure`) and a guessed flag
+builds an argv that fails after somebody has approved it. Every one of those
+was spawned as the argv hatch builds — no shell in between, stdin closed — and
+checked for a clean exit and an empty standard error before it was written
+down. With `root: true` the argv
 becomes `run0 --pipe --setenv=… -- bash -c '<command>'`, and the window shows
 that whole line, wrapper and `--setenv` pairs included. The command inside
 those quotes is one word to `bash -c` and is drawn as the shell it is about to

@@ -56,6 +56,7 @@ pub enum Language {
     Shell,
     Sql,
     R,
+    Clojure,
 }
 
 impl Language {
@@ -71,6 +72,7 @@ impl Language {
             Self::Shell => "shell",
             Self::Sql => "SQL",
             Self::R => "R",
+            Self::Clojure => "Clojure",
         }
     }
 
@@ -93,12 +95,15 @@ impl Language {
             "sh" | "bash" | "zsh" | "dash" | "ksh" => Language::Shell,
             "psql" | "sqlite" | "mysql" => Language::Sql,
             "Rscript" => Language::R,
+            // `bb` is babashka and `clj` is the `clojure` launcher's own
+            // wrapper; all three read the same language.
+            "bb" | "clojure" | "clj" => Language::Clojure,
             _ => return None,
         })
     }
 
     /// The language a file of this name holds, if the extension says so.
-    fn of_filename(word: &str) -> Option<Language> {
+    pub(crate) fn of_filename(word: &str) -> Option<Language> {
         let name = word.rsplit('/').next()?;
         let extension = name.rsplit_once('.')?.1;
         Some(match extension {
@@ -111,6 +116,7 @@ impl Language {
             "sh" | "bash" => Language::Shell,
             "sql" => Language::Sql,
             "R" => Language::R,
+            "clj" | "cljs" | "cljc" | "bb" => Language::Clojure,
             _ => return None,
         })
     }
@@ -331,4 +337,27 @@ mod tests {
         assert!(text.contains("print(1)"), "{text:?}");
         assert!(!text.contains("PY"), "the delimiter is not data: {text:?}");
     }
+
+#[cfg(test)]
+mod clojure_tests {
+    use super::*;
+
+    #[test]
+    fn a_clojure_runner_names_its_language() {
+        // `bb` is babashka, `clj` is the `clojure` launcher's wrapper, and
+        // all three read the same language -- so a here-document given to any
+        // of them is named the same way.
+        for name in ["bb", "clojure", "clj", "/usr/bin/bb"] {
+            assert_eq!(Language::of_program(name), Some(Language::Clojure), "{name}");
+        }
+        assert_eq!(Language::Clojure.name(), "Clojure");
+    }
+
+    #[test]
+    fn a_clojure_file_is_named_by_its_extension() {
+        for path in ["/tmp/x.clj", "deps.cljs", "a/b.cljc", "task.bb"] {
+            assert_eq!(Language::of_filename(path), Some(Language::Clojure), "{path}");
+        }
+    }
+}
 }
