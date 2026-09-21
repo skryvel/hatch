@@ -47,6 +47,14 @@ toml = "1.1.5"
 unicode-normalization = "0.1.25"
 uuid = { version = "1.26.0", features = ["v4"] }
 
+# macOS only, and only to name one constant. `open_window` states the
+# application's activation policy rather than letting winit infer it from
+# whether this process is bundled. Adds nothing to the build anywhere else,
+# and nothing to the macOS build either: eframe already depends on this exact
+# winit, and cargo resolves both to one copy of it.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30.13"
+
 [dev-dependencies]
 proptest = "1.11.0"
 reqwest = "0.13.4"

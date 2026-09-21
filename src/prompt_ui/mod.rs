@@ -1544,6 +1544,29 @@ pub(crate) fn open_window(
             // hands it back once the window is only watching a command it
             // was given permission to run.
             .with_always_on_top(),
+        // Say what kind of application this is, on the one platform where it
+        // is a question. A `Regular` application is one that appears in the
+        // Dock and in Cmd-Tab and can be brought to the front; the two other
+        // policies are for programs that live in the menu bar or have no
+        // windows at all, and a window nobody can bring forward is no use to
+        // anybody being asked to decide something.
+        //
+        // **This is probably not needed.** winit sets `Regular` by itself
+        // when the process is not bundled, and hatch is a bare executable
+        // that never is. What it buys is that the answer stops depending on
+        // an inference: winit asks the system whether this process has a
+        // bundle identifier, and hatch's own requirement is not "whatever
+        // that answers" but "this window can be brought to the front".
+        //
+        // It is one call rather than a fallback for a diagnosed fault. The
+        // one report that prompted it turned out to be the macOS window
+        // server refusing new windows across the whole session, which no
+        // program can fix from inside.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Regular);
+        })),
         ..Default::default()
     };
 
