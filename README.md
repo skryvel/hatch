@@ -1150,6 +1150,23 @@ there because a command that stops to page its output is a command that hangs
 until the execution timeout kills it. If you spell `PATH` out here it wins over
 `exec_path`.
 
+**`exec_path` is the whole of where a command's names are looked up**, and it
+is the one setting most likely to surprise you: a program you run in your own
+shell every day is not on it unless this key says so. The default is
+`/usr/local/bin:/usr/bin:/bin` on Linux, and on macOS the same with both
+Homebrew prefixes in front — `/opt/homebrew/bin` for Apple silicon,
+`/usr/local/bin` for Intel — since macOS ships almost nothing you install
+yourself. A version manager, `~/.local/bin` or a language toolchain is yours
+to add.
+
+Nothing is silent about it: the window resolves every name in the command
+against this exact value and says *"Nothing on the command's PATH answers to
+…"* above the panes, before you approve anything.
+
+Note that the whole config is written out on first run, so **an installation
+made before a default changed keeps the old value in its file**. Changing it
+is one line in `config.toml`; nothing re-derives it for you.
+
 `denylist_extra` entries must be absolute literal path prefixes. `~` is not
 expanded and a relative entry can never match, so either one silently protects
 nothing — and nothing warns you, because there is no channel to warn on from
@@ -1189,7 +1206,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `timeout_secs` | `600` | How long a window waits for a decision, and how long a review of a command's output waits before nothing is sent |
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
-| `exec_path` | `/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands |
+| `exec_path` | `/usr/local/bin:/usr/bin:/bin`; on macOS `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands. Nothing is inherited, so a program not on this list is not found |
 | `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
 | `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |

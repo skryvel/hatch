@@ -94,6 +94,17 @@ pub struct Config {
     /// Cap on captured command output.
     pub output_cap_bytes: usize,
     /// `PATH` handed to approved commands.
+    ///
+    /// hatch **constructs** the child environment rather than inheriting one
+    /// — see [`crate::exec::env`] for why — so this is the whole of where an
+    /// approved command's names are looked up. A program the person can run
+    /// in their own shell is not on this `PATH` unless this key says so, and
+    /// the window says as much before anybody approves anything: the roster
+    /// resolves every name against exactly this value and reports the ones
+    /// nothing answers to.
+    ///
+    /// The default is per-platform for that reason, and per-platform is still
+    /// only a starting point: see [`default_exec_path`].
     pub exec_path: String,
     /// The terminal an interactive run opens, as argv with the program first.
     ///
@@ -164,6 +175,39 @@ pub struct Config {
     pub exec_env: BTreeMap<String, String>,
 }
 
+/// The `PATH` an approved command is given, on the platform this build is for.
+///
+/// Linux gets the three directories a distribution puts programs in. macOS
+/// gets those and both Homebrew prefixes in front — `/opt/homebrew/bin` on
+/// Apple silicon, `/usr/local/bin` on Intel — because on macOS the system
+/// ships almost nothing a person installs for themselves, and a `PATH`
+/// without Homebrew on it is one where a name the person types every day
+/// resolves to nothing.
+///
+/// Both prefixes unconditionally rather than whichever exists. Nothing is
+/// probed and no architecture is guessed: a directory that is not there costs
+/// a failed `stat` per lookup and changes no answer, and a default that
+/// depended on what was installed at the moment the config was written would
+/// be a default that silently meant different things on two machines.
+///
+/// Still a starting point rather than an answer. Nothing here can know where
+/// somebody keeps their own tools — a version manager, `~/.local/bin`, a
+/// language toolchain — and the window is what makes the gap visible: the
+/// roster resolves against this value and names what it could not find.
+pub fn default_exec_path() -> String {
+    exec_path_for_os(std::env::consts::OS)
+}
+
+/// The whole of [`default_exec_path`] except for asking which platform this
+/// is, so the arm that is not selected here is still covered by tests here.
+/// See [`terminal_for_os`], which is split for the same reason.
+fn exec_path_for_os(os: &str) -> String {
+    match os {
+        "macos" => "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        _ => "/usr/local/bin:/usr/bin:/bin".to_string(),
+    }
+}
+
 /// The terminal an interactive run opens, on the platform this build is for.
 ///
 /// Linux gets konsole; every other platform gets nothing, and nothing is the
@@ -207,7 +251,7 @@ impl Default for Config {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             exec_timeout_secs: DEFAULT_EXEC_TIMEOUT_SECS,
             output_cap_bytes: 262144,
-            exec_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
+            exec_path: default_exec_path(),
             terminal: default_terminal(),
             denylist_extra: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
@@ -880,6 +924,46 @@ mod tests {
         for dir in made {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "{} must be 0700", dir.display());
+        }
+    }
+
+    #[test]
+    fn the_default_path_carries_homebrew_on_the_platform_that_needs_it() {
+        // The system ships almost nothing a person installs for themselves,
+        // so a macOS `PATH` without Homebrew on it is one where a name the
+        // person types every day resolves to nothing -- `fish`, `rg`, `jq`,
+        // anything. Both prefixes, because which one is right is an
+        // architecture question this has deliberately not asked.
+        let mac = exec_path_for_os("macos");
+        assert!(mac.starts_with("/opt/homebrew/bin:"), "{mac}");
+        assert!(mac.contains(":/usr/local/bin:"), "{mac}");
+
+        // And the system directories are still on it, after them.
+        for directory in ["/usr/bin", "/bin"] {
+            assert!(mac.split(':').any(|entry| entry == directory), "{directory} is not on {mac}");
+        }
+    }
+
+    #[test]
+    fn the_default_path_is_unchanged_where_there_is_no_homebrew_to_add() {
+        // Linux distributions put programs in these three and a person's own
+        // tools are their own business, so there is nothing to add and adding
+        // something would be this default guessing.
+        assert_eq!(exec_path_for_os("linux"), "/usr/local/bin:/usr/bin:/bin");
+        assert_eq!(exec_path_for_os("freebsd"), "/usr/local/bin:/usr/bin:/bin");
+        assert_eq!(Config::default().exec_path, exec_path_for_os(std::env::consts::OS));
+    }
+
+    #[test]
+    fn every_default_path_entry_is_absolute() {
+        // An empty or relative entry on a `PATH` is the one lookup nobody
+        // wants: `exec::lookup` skips empty entries rather than reading them
+        // as `.`, and a relative directory would resolve a program out of
+        // whatever directory a request happened to name.
+        for os in ["linux", "macos"] {
+            for entry in exec_path_for_os(os).split(':') {
+                assert!(entry.starts_with('/'), "{entry:?} on {os} is not absolute");
+            }
         }
     }
 
