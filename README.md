@@ -1172,6 +1172,16 @@ Note that the whole config is written out on first run, so **an installation
 made before a default changed keeps the old value in its file**. Changing it
 is one line in `config.toml`; nothing re-derives it for you.
 
+**`tools = "batch"`** offers `batch` and nothing else. The two tools overlap
+rather than divide the work — `run_command` is a batch of exactly one command,
+and a test of that name keeps it so — and only `batch` can write a file. An
+agent offered both reaches for the simpler one, and then writes files through
+it with a here-document, which hatch renders as the command it is rather than
+as a diff of the bytes that will land. Withdrawing the smaller spelling closes
+that route and takes nothing away: every `run_command` call has an exact
+`batch` one. A client that calls the hidden tool anyway is refused and told
+how to spell it.
+
 `denylist_extra` entries must be absolute literal path prefixes. `~` is not
 expanded and a relative entry can never match, so either one silently protects
 nothing — and nothing warns you, because there is no channel to warn on from
@@ -1213,6 +1223,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin`; on macOS `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands. Nothing is inherited, so a program not on this list is not found |
 | `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
+| `tools` | `both` | Which tools an agent is offered: `both`, or `batch` alone |
 | `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |
 | `theme` | `"dark"` | `"dark"` or `"light"` |

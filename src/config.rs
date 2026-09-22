@@ -160,6 +160,8 @@ pub struct Config {
     /// Read through [`Config::font_size_points`], never directly: it is the
     /// clamp, and an unclamped 0 is a window with no text in it.
     pub font_size: u32,
+    /// Which tools an agent is offered: `both` or `batch`. See [`Tools`].
+    pub tools: Tools,
     /// Which palette the approval window draws in: `dark` or `light`.
     ///
     /// A preference on exactly the same terms as `font_size`, and here for
@@ -173,6 +175,36 @@ pub struct Config {
     pub theme: Theme,
     /// The complete child environment, on top of `exec_path` as `PATH`.
     pub exec_env: BTreeMap<String, String>,
+}
+
+/// Which tools the server offers an agent.
+///
+/// `batch` is the whole surface: a file write or a command, and `run_command`
+/// is a batch of exactly one command and nothing else — the test of that name
+/// is what keeps it so. The two therefore overlap rather than divide the
+/// work, and `run_command` is the strictly smaller one.
+///
+/// That overlap has a cost worth a setting. An agent offered both reaches for
+/// the simpler tool, and the simpler tool cannot write a file — so a file
+/// gets written by `run_command` with a here-document instead, which hatch
+/// renders as what it is, a command, rather than as a diff of the bytes that
+/// will land. The reviewable write path is the one an agent routes around.
+///
+/// [`Tools::Batch`] closes that route by not advertising the smaller tool.
+/// Nothing is lost: every `run_command` call has an exact `batch` spelling,
+/// and the description says so.
+///
+/// A word rather than a boolean, for the reason [`crate::prompt_ui::theme::Theme`]
+/// is one: the file says what it means, and a third arrangement would be a
+/// value rather than a schema change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tools {
+    /// `batch` and `run_command`, which is what hatch has always offered.
+    #[default]
+    Both,
+    /// `batch` alone.
+    Batch,
 }
 
 /// The `PATH` an approved command is given, on the platform this build is for.
@@ -254,6 +286,7 @@ impl Default for Config {
             exec_path: default_exec_path(),
             terminal: default_terminal(),
             denylist_extra: Vec::new(),
+            tools: Tools::default(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),
             exec_env,

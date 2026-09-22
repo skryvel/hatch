@@ -1264,9 +1264,18 @@ impl Hatch {
     /// that fallback is never actually taken.
     fn described_tools(&self) -> Vec<Tool> {
         let descriptions = tool_descriptions(self.daemon.config());
+        let offered = self.daemon.config().tools;
         self.tool_router
             .list_all()
             .into_iter()
+            // The one place a client learns what exists. A tool filtered out
+            // here is still refused if a client calls it anyway -- see
+            // `Daemon::run_command` -- because a list is what an agent is
+            // told and not what it is held to.
+            .filter(|declared| match offered {
+                crate::config::Tools::Both => true,
+                crate::config::Tools::Batch => declared.name != "run_command",
+            })
             .map(|mut declared| {
                 if let Some(text) = descriptions.for_tool(&declared.name) {
                     declared.description = Some(text.to_string().into());
@@ -1763,6 +1772,21 @@ impl Daemon {
     /// this call goes through, because it is one. See the `From` conversion
     /// on [`BatchParams`].
     pub async fn run_command(&self, params: RunCommandParams, caller: Caller) -> CallToolResult {
+        // Refused here rather than only hidden from the list, because a list
+        // is advertising and this is the rule. A client with a stale list, or
+        // one that never read it, gets an answer that says what to send
+        // instead -- every `run_command` call has an exact `batch` spelling,
+        // so nothing it wanted is unavailable.
+        //
+        // Not an audit line, for the reason the other boundary refusals are
+        // not: nothing was rendered and nobody was asked.
+        if self.config().tools == crate::config::Tools::Batch {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "This hatch offers `batch` only. Send the same command as a batch of one \
+                 operation: {\"title\": …, \"reason\": …, \"operations\": [{\"command\": …}]}. \
+                 Nothing was rendered, nobody was asked and nothing ran.",
+            )]);
+        }
         self.batch(BatchParams::from(params), caller).await
     }
 
@@ -5285,6 +5309,28 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_only_hatch_offers_one_tool_and_it_is_the_larger_one() {
+        // The one that can write a file. `run_command` is a batch of exactly
+        // one command -- the test of that name says so -- so hiding it takes
+        // nothing away, and leaving it visible is what lets an agent reach
+        // for the tool that cannot write and then write with a here-document
+        // instead.
+        let mut config = test_config();
+        config.tools = crate::config::Tools::Batch;
+        let names: Vec<String> = Hatch::new(bare_daemon(config))
+            .described_tools()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(names, ["batch"]);
+    }
+
+    #[test]
+    fn both_tools_are_offered_unless_the_config_says_otherwise() {
+        assert_eq!(Config::default().tools, crate::config::Tools::Both);
+    }
+
+    #[test]
     fn every_tool_has_a_runtime_description() {
         let config = test_config();
         let descriptions = tool_descriptions(&config);
@@ -6213,6 +6259,43 @@ later"), "");
                 serde_json::json!(true),
                 "the log is where anyone asks later which kind of run this was"
             );
+        }
+
+        #[tokio::test]
+        async fn the_tool_that_is_not_offered_is_also_refused() {
+            // A list is what an agent is told; this is what it is held to. A
+            // client with a stale list, or one that never asked for one, must
+            // not get a window out of a tool this hatch does not offer.
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.tools = crate::config::Tools::Batch;
+            });
+            let result =
+                within(harness.daemon.run_command(run_of("echo never"), Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true), "{text}");
+            // And it says what to send instead, because nothing the agent
+            // wanted is actually unavailable -- every `run_command` call has
+            // an exact `batch` spelling.
+            assert!(text.contains("batch"), "{text}");
+            assert!(text.contains("operations"), "the spelling is not shown: {text}");
+            assert!(text.contains("nothing ran"), "{text}");
+            assert!(harness.prompter.seen().is_empty(), "a window was opened for it anyway");
+        }
+
+        #[tokio::test]
+        async fn a_batch_is_still_served_where_run_command_is_not() {
+            // The flag withdraws a spelling, not the work. The same command
+            // sent the other way has to reach a window and run.
+            let harness = Harness::configured(vec![approve()], |config| {
+                config.tools = crate::config::Tools::Batch;
+            });
+            let params = BatchParams::from(run_of("echo through the batch"));
+            let result = within(harness.daemon.batch(params, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(false), "{text}");
+            assert!(text.contains("through the batch"), "{text}");
         }
 
         #[tokio::test]
