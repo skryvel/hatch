@@ -246,6 +246,27 @@ pub const MAX_PATCH_BYTES: usize = MAX_CONTENT_BYTES;
 /// it moves both, and neither can be left behind saying the old number.
 pub const MAX_OPERATIONS: usize = 1;
 
+/// The longest batch over [`MAX_OPERATIONS`] that is recorded before it is
+/// refused.
+///
+/// # Why an over-long batch is recorded at all
+///
+/// Whether agents would group operations if they could is the question the
+/// multi-operation window waits on, and a batch refused at the boundary left
+/// no trace to answer it with. So one within this bound is validated,
+/// prepared exactly like any other request, and refused with one `refused`
+/// line per operation -- `hatch log` then shows what an agent tried to put
+/// together. Nobody is asked and nothing runs, as before.
+///
+/// # Why a bound
+///
+/// Preparing is where the per-byte work is, and the caps bound it per field
+/// and not per list. Past this the call is refused at the boundary and not
+/// recorded, as every longer list was before: thirty-two operations is more
+/// than anyone could read in one window, so a longer list says nothing about
+/// grouping that a shorter one would not.
+pub const MAX_OPERATIONS_RECORDED: usize = 32;
+
 /// How many unanswered windows are remembered for the next one to mention.
 ///
 /// Eight, which is more than a person will have missed in a sitting and few
@@ -433,10 +454,18 @@ pub struct Batch {
     /// Why this is needed now.
     pub reason: String,
     /// The operations, in the order they will run. Never empty, and never
-    /// longer than [`MAX_OPERATIONS`].
+    /// longer than [`MAX_OPERATIONS`] unless `over_cap` says so.
     pub operations: Vec<Operation>,
     /// Whether to stop at the first operation that fails.
     pub stop_on_failure: bool,
+    /// Longer than this build takes, and here only to be recorded and then
+    /// refused -- see [`MAX_OPERATIONS_RECORDED`].
+    ///
+    /// Said by the boundary rather than worked out from the length later,
+    /// because the daemon behind it is built for a list and its own tests
+    /// hand it one: what is capped is what an agent may ask for, not what the
+    /// daemon can carry out.
+    pub over_cap: bool,
 }
 
 /// One operation, once the boundary has had it: exactly one kind, carrying
@@ -511,7 +540,10 @@ impl Batch {
                  command, with `command`.",
             ));
         }
-        if count > MAX_OPERATIONS {
+        // Over the cap but within the recorded bound goes on, to be validated
+        // here and refused in `decide` with a line per operation. See
+        // `MAX_OPERATIONS_RECORDED`.
+        if count > MAX_OPERATIONS_RECORDED {
             return Err(over_the_operation_cap(count));
         }
         let operations = params
@@ -530,12 +562,20 @@ impl Batch {
                 };
                 Operation::of(operation, &field)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, String>>()
+            // An over-long batch that is malformed as well hears about the
+            // length, which is what stands between it and running at all.
+            // Malformed, it has nothing a log line could record either.
+            .map_err(|problem| match count > MAX_OPERATIONS {
+                true => over_the_operation_cap(count),
+                false => problem,
+            })?;
         Ok(Batch {
             title: params.title,
             reason: params.reason,
             operations,
             stop_on_failure: params.stop_on_failure,
+            over_cap: count > MAX_OPERATIONS,
         })
     }
 }
@@ -1082,10 +1122,6 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
     let review = config.review_timeout_secs();
     let one = config.blocking_bound_secs(1);
     let total = config.client_timeout_secs();
-    let cap = match MAX_OPERATIONS {
-        1 => "One operation per batch for now; more later.".to_string(),
-        n => format!("Up to {n} operations per batch for now; more later."),
-    };
 
     let run_command = format!(
         "Run one shell command on the host machine, outside your sandbox.\n\
@@ -1167,9 +1203,10 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
         "Write files and run commands on the host machine, outside your sandbox: a list of \
          operations that one person reads and approves at once.\n\
          \n\
-         **{cap}** The list is the tool's real shape, but this version of hatch takes a batch \
-         of one operation, and a longer list comes back unrun with a message saying so. Until \
-         then, send each operation as a batch of its own.\n\
+         **Put operations that belong together in one batch.** A file and the command that \
+         puts it to use — write the unit, then reload it — are one decision to the person \
+         reading them, and sent together they are approved together, with the write shown as a \
+         diff rather than hidden inside a shell line.\n\
          \n\
          Use this only when the work has to happen on the host: a config under /etc, a dotfile \
          in the person's home directory, a service unit, a command that has to run outside your \
@@ -1234,7 +1271,7 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          person reads, so write \"Point the editor at the new font\", not the path and the \
          bytes. The point, not the syntax.\n\
          - reason: why this is needed now, in a sentence or two.\n\
-         - operations: the list, in the order to carry it out. {cap}\n\
+         - operations: the list, in the order to carry it out.\n\
          - stop_on_failure: true stops at the first operation that fails. Optional; false by \
          default."
     );
@@ -1883,12 +1920,31 @@ impl Daemon {
         number: &mut Option<u64>,
         window_ms: &mut Option<u64>,
     ) -> Outcome {
-        let Batch { operations, stop_on_failure, .. } = batch;
+        let Batch { operations, stop_on_failure, over_cap, .. } = batch;
 
         // Step 1. Validate and render, every operation of it. A refusal never
         // reaches a person: prompting for something that is going to be
         // refused spends the scarcest resource in the design on nothing.
-        let jobs = match self.prepare(operations) {
+        let count = operations.len();
+        let prepared = self.prepare(operations);
+        // A batch longer than this build takes is refused whatever preparing
+        // it found. It was prepared only so that the log can say what each
+        // operation was -- see `MAX_OPERATIONS_RECORDED`.
+        if over_cap {
+            let details = match prepared {
+                Prepared::Ready(jobs) => jobs.into_iter().map(|job| job.detail).collect(),
+                Prepared::Refused(refused) => {
+                    refused.effects.into_iter().map(|effect| effect.detail).collect()
+                }
+            };
+            return Outcome::refusing(
+                LogVerdict::Refused,
+                None,
+                details,
+                over_the_operation_cap(count),
+            );
+        }
+        let jobs = match prepared {
             Prepared::Ready(jobs) => jobs,
             Prepared::Refused(refused) => return refused,
         };
@@ -5076,6 +5132,7 @@ mod tests {
                     root: true,
                 }],
                 stop_on_failure: false,
+                over_cap: false,
             }
         );
 
@@ -5163,10 +5220,10 @@ mod tests {
         // temporary, nobody judged anything, and what to send instead -- and
         // it must not open with the word every other boundary refusal opens
         // with.
-        let over = MAX_OPERATIONS + 2;
+        let over = MAX_OPERATIONS_RECORDED + 1;
         let mut params = write_params("content", "c".to_string());
         params.operations = vec![params.operations[0].clone(); over];
-        let message = Batch::of(params).expect_err("over the cap does not pass");
+        let message = Batch::of(params).expect_err("over the recorded bound does not pass");
 
         assert!(message.contains(&over.to_string()), "the count it carried is not named: {message}");
         for claim in ["temporary", "nothing ran", "nobody decided anything", "batches of one"] {
@@ -5179,13 +5236,22 @@ mod tests {
             "the one wrong way round the limit is not named: {message}"
         );
 
-        // Checked before anything inside the operations: an over-cap batch
-        // whose operations are also malformed hears about the cap, because
-        // that is the thing standing between it and running at all.
-        let mut malformed = write_params("content", "c".to_string());
-        malformed.operations = vec![a_write(); over];
-        let message = Batch::of(malformed).expect_err("still over the cap");
-        assert!(message.contains("temporary"), "{message}");
+        // An over-cap batch whose operations are also malformed hears about
+        // the cap, because that is the thing standing between it and running
+        // at all -- on either side of the recorded bound.
+        for length in [MAX_OPERATIONS + 1, over] {
+            let mut malformed = write_params("content", "c".to_string());
+            malformed.operations = vec![a_write(); length];
+            let message = Batch::of(malformed).expect_err("still over the cap");
+            assert!(message.contains("temporary"), "{length}: {message}");
+        }
+
+        // And within the bound it passes, marked, to be recorded and refused
+        // further in. Only the boundary marks it.
+        let mut within = write_params("content", "c".to_string());
+        within.operations = vec![within.operations[0].clone(); MAX_OPERATIONS + 1];
+        assert!(Batch::of(within).expect("within the recorded bound").over_cap);
+        assert!(!Batch::of(write_params("content", "c".to_string())).unwrap().over_cap);
 
         // And an empty list is not the cap: it is a call with nothing in it.
         let mut empty = write_params("content", "c".to_string());
@@ -5396,21 +5462,24 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_description_says_the_cap_is_temporary_and_what_follows_a_failure() {
+    fn the_batch_description_asks_for_grouping_and_says_what_follows_a_failure() {
         // Two things an agent can only learn from this text before it costs
-        // a round trip. The cap, in the words the brief for this tool fixed:
-        // one operation for now, more later -- so a list that comes back
-        // unrun reads as the limit it is, not as a tool that is broken. And
-        // the execution contract: order, the three outcomes, the default, the
-        // option that changes it, the failures no option runs past, and that
-        // nothing is undone.
+        // a round trip. That related operations go in one batch -- and *not*
+        // the cap: this text used to say "one operation per batch for now",
+        // agents did exactly that, and a list nobody sends measures nothing.
+        // The cap is said by the refusal instead, which is recorded; see
+        // `MAX_OPERATIONS_RECORDED`. And the execution contract: order, the
+        // three outcomes, the default, the option that changes it, the
+        // failures no option runs past, and that nothing is undone.
         let batch = tool_descriptions(&test_config())
             .for_tool("batch")
             .expect("batch is described")
             .to_string();
 
-        assert_eq!(MAX_OPERATIONS, 1, "the wording below is the wording for a cap of one");
-        assert!(batch.contains("One operation per batch for now; more later."), "{batch}");
+        assert!(batch.contains("in one batch"), "{batch}");
+        for discouraging in ["per batch", "for now", "as a batch of its own", "batch of one"] {
+            assert!(!batch.contains(discouraging), "it still says {discouraging:?}: {batch}");
+        }
         for claim in [
             "in the order you list them",
             "done, failed, or not attempted",
@@ -6861,6 +6930,7 @@ later"), "");
                 reason: "because a test asked".to_string(),
                 operations,
                 stop_on_failure,
+                over_cap: false,
             }
         }
 
@@ -8239,6 +8309,44 @@ later"), "");
         /// A batch of one command, for `several`.
         fn command_of(command: &str) -> BatchParams {
             BatchParams::from(run_of(command))
+        }
+
+        #[tokio::test]
+        async fn a_batch_over_the_cap_is_recorded_line_by_line_and_nothing_else_happens() {
+            // The probe: whether agents would group operations if they could.
+            // Nobody is asked and nothing runs, exactly as when a long list
+            // was turned away at the boundary -- but the log now says what the
+            // agent tried to put together, one line per operation.
+            let harness = Harness::new(vec![approve()]);
+            let elsewhere = tempfile::tempdir().unwrap();
+            let marker = elsewhere.path().join("ran");
+            let target = elsewhere.path().join("unit.conf");
+            let mut params = command_of(&format!("touch {}", marker.display()));
+            params.operations.extend(swap_of(&target, "after\n", false).operations);
+            params.operations.extend(command_of("true").operations);
+
+            let result = within(harness.daemon.batch(params, Caller::quiet())).await;
+
+            let text = result_text(&result);
+            assert_eq!(result.is_error, Some(true));
+            assert!(text.contains("carries 3 operations"), "{text}");
+            assert!(text.contains("temporary"), "{text}");
+            assert!(harness.prompter.seen().is_empty(), "somebody was asked");
+            assert!(!marked(&marker), "an operation over the cap ran");
+            assert!(!target.exists(), "a write over the cap landed");
+
+            let records = harness.logged();
+            assert_eq!(records.len(), 3, "{records:?}");
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record["verdict"], "refused", "{records:?}");
+                assert_eq!(record["operation"], index + 1, "{records:?}");
+                assert_eq!(record["operations"], 3, "{records:?}");
+                assert!(record.get("number").is_none_or(|n| n.is_null()), "{records:?}");
+            }
+            // What was tried is on the line, which is the point of writing it.
+            let logged = serde_json::to_string(&records).unwrap();
+            assert!(logged.contains("touch"), "{logged}");
+            assert!(logged.contains("unit.conf"), "{logged}");
         }
 
         #[tokio::test]

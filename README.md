@@ -143,9 +143,14 @@ person reads, so the tool descriptions ask the agent for the intent, not the
 syntax.
 
 **A batch is one approval over several operations** — or it will be: this
-version takes one operation per batch, and says so in the tool description in
-as many words, so that a longer list coming back unrun reads as a temporary
-limit rather than a broken tool. The point of the shape is the incentive it
+version's window draws one operation, so a longer list comes back unrun, with
+a message that calls it a temporary limit rather than a refusal. The tool
+description does *not* say so. It used to, agents sent one operation per batch
+as told, and that left no way to learn whether they would group work if they
+could. So the description asks for related operations in one batch, and a list
+of up to 32 that comes back unrun is written to the log first — one `refused`
+line per operation, with no `number`, since no window opened — so `hatch log`
+shows what an agent tried to put together. The point of the shape is the incentive it
 removes. Three file writes used to cost three interruptions and one shell
 command with a here-document cost one, so an agent was pushed towards the form
 that shows the person a wall of shell instead of a diff, and skips the symlink
