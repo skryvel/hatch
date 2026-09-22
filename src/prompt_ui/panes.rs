@@ -2248,6 +2248,16 @@ fn program_note(language: Language) -> &'static str {
              exactly what the shell receives. The annotated pane reads it as the shell it will \
              be run as."
         }
+        // A language this build has a grammar for. The marks are a reading
+        // by a set of regular expressions that cannot know when it is wrong,
+        // and the sentence says so in as many words, because a string drawn
+        // as a string looks exactly as sure of itself either way.
+        other if crate::render::grammar::reads(other) => {
+            "The program is one argument to the interpreter named in front of it, drawn unquoted \
+             — what is on screen is exactly what the interpreter receives. Its strings and \
+             comments are marked from a grammar of the language, which can be wrong; nothing \
+             else in it is read."
+        }
         // Everything else. hatch has no reader for these and does not pretend
         // to: the program is drawn as the data it is, every byte as itself,
         // which is what the pane does with anything it has nothing to say
@@ -5511,13 +5521,19 @@ mod tests {
         // An ordinary command says nothing: there is no wrapper and no region.
         let frame = frames_of(&a_command("cat a"), a_window(), 3, false).pop().expect("a frame");
         assert!(!frame.iter().any(|(line, _)| line.contains("one argument")), "{frame:?}");
-        // And a program hatch cannot read says the other half of it.
-        let python = an_invocation("print(1)", Language::Python);
-        let frame = frames_of(&python, a_window(), 3, false).pop().expect("a frame");
-        assert!(
-            frame.iter().any(|(line, _)| line.contains("hatch does not read it")),
-            "{frame:?}"
-        );
+        // And a program hatch cannot read says the other half of it. Python
+        // is one it reads with the `highlight` feature, and then the sentence
+        // says what is read and that it can be wrong; Lua it never reads.
+        let said = |language: Language, words: &str| {
+            let program = an_invocation("print(1)", language);
+            let frame = frames_of(&program, a_window(), 3, false).pop().expect("a frame");
+            assert!(frame.iter().any(|(line, _)| line.contains(words)), "{words}: {frame:?}");
+        };
+        said(Language::Lua, "hatch does not read it");
+        match crate::render::grammar::reads(Language::Python) {
+            true => said(Language::Python, "which can be wrong"),
+            false => said(Language::Python, "hatch does not read it"),
+        }
     }
 
     /// The out-of-sight line a window drew, if it drew one.

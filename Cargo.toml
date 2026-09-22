@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "development-tools"]
 [features]
 default = []
 test-stub-prompter = []
+# Marks strings and comments inside a Python or Clojure program handed to an
+# interpreter. Off by default: an experiment, to see on real windows whether a
+# TextMate grammar's reading is worth drawing. See `src/render/grammar.rs`.
+highlight = ["dep:syntaxmate"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -39,6 +43,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 similar = "3.2.0"
+# Only with `highlight`. Pure Rust, no unsafe, its own bounded regex engine
+# rather than oniguruma -- the reason every other TextMate crate was out.
+# Pinned exactly: it reads bytes an agent chose, and a new release of a 0.1
+# crate by one author is not something to take unread. `bundled-grammars` is
+# the whole catalogue (about 2 MB); hatch asks it for two of them.
+syntaxmate = { version = "=0.1.3", optional = true, default-features = false, features = ["bundled-grammars"] }
 strip-ansi-escapes = "0.2.1"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["full"] }

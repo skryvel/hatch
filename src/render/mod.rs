@@ -13,6 +13,7 @@ pub mod blocks;
 pub mod command;
 pub mod danger;
 pub mod diff;
+pub mod grammar;
 pub mod language;
 pub mod roster;
 mod span;
@@ -250,15 +251,17 @@ fn reinterpret(
         // Shell, and about to be run as shell by the program named on the
         // line: reading it as shell is the honest rendering.
         language::Language::Shell => render_command(text, env),
-        // Anything else is classified and no more -- every byte drawn as
-        // itself, the unsafe ones chipped, which is exactly what the raw pane
-        // does with everything. It is *not* enough to leave the outer
-        // rendering alone here: the passes above have already read the whole
-        // line as shell, so Python's `import` would be marked as the word
-        // that names what runs and its `#` as a comment. The program is not
-        // in quotes any more -- see `crate::exec::invocation_line` -- so
-        // there is nothing else holding those readings off it.
-        _ => unicode::classify(text),
+        // Anything else is classified -- every byte drawn as itself, the
+        // unsafe ones chipped, which is exactly what the raw pane does with
+        // everything -- and, with the `highlight` feature, has its strings and
+        // comments marked where its own grammar is sure of them. It is *not*
+        // enough to leave the outer rendering alone here: the passes above
+        // have already read the whole line as shell, so Python's `import`
+        // would be marked as the word that names what runs and its `#` as a
+        // comment. The program is not in quotes any more -- see
+        // `crate::exec::invocation_line` -- so there is nothing else holding
+        // those readings off it.
+        other => grammar::read(text, other),
     };
     match spliced(&source, &spans, &inner, script.start) {
         Some(merged) => merged,

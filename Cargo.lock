@@ -2003,6 +2003,7 @@ dependencies = [
  "sha2",
  "similar 3.2.0",
  "strip-ansi-escapes",
+ "syntaxmate",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4491,6 +4492,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "syntaxmate"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fb77e3890e461eb54808dea95842afc88ff6efcdfea71adeead6d09c5ec8f1"
+dependencies = [
+ "memchr",
+ "miniz_oxide 0.9.1",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "unicode-script",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4899,6 +4915,12 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
 
 [[package]]
 name = "unicode-segmentation"

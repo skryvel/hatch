@@ -279,6 +279,22 @@ install -m755 target/release/hatch ~/.local/bin/hatch
 to GNU install and *set DESTDIR* to the BSD one macOS ships, so the one line
 that looked portable was the line that was not.
 
+**`--features highlight`** is an experiment, off by default. A Python or
+Clojure program handed to an interpreter (`run_with`, or a here-document hatch
+names) has its strings and comments marked, read by a TextMate grammar from
+[syntaxmate](https://crates.io/crates/syntaxmate) — pure Rust, its own regex
+engine, pinned to one version. Nothing else in the program is marked; keywords
+and names are an editor's taste, not a claim a reader needs. A grammar cannot
+tell when it is wrong, so the window says so in the sentence above the
+program, and every mark is dropped when the grammar reports that it stopped
+short, when its tokens fail to cover a line exactly, or — per string — when a
+string's closing delimiter never comes. Without the feature the program is
+drawn as it always was: every byte as itself, nothing read.
+
+```sh
+cargo build --release --features highlight
+```
+
 Start the daemon **outside** the sandbox, as your ordinary user:
 
 ```sh
