@@ -139,6 +139,7 @@
 pub mod guard;
 pub mod panes;
 pub mod reviewing;
+pub mod sound;
 pub mod theme;
 pub mod visibility;
 
@@ -339,6 +340,13 @@ const STREAM_DEAD: &str = "It runs in a terminal of its own.";
 /// cover. This one is a promise about the whole row of buttons, and all six of
 /// them keep it.
 const CLOSE_LABEL: &str = "Close when I decide";
+/// The box that asks for a noise when a window opens.
+///
+/// "a window" and not "this window", because that is what it does: the sound
+/// belongs to a window appearing, and this window has appeared by the time
+/// anybody can read its label. A label saying "this" would be describing
+/// something that already did not happen.
+const SOUND_LABEL: &str = "Sound when a window opens";
 
 /// What ticking it gives up, said where it is ticked.
 ///
@@ -1596,7 +1604,14 @@ pub fn run_prompt() -> anyhow::Result<()> {
     // and owns nothing, so a missing or unreadable config is a window at the
     // default size rather than a request that never opens one -- which the
     // daemon would resolve as a denial.
-    let (font_size, theme) = crate::config::display_style();
+    let config = crate::config::display_config();
+    let (font_size, theme) = (config.font_size_points(), config.theme);
+    // Asked once, here, rather than on the frame that would play it: the
+    // lookup touches the filesystem and the frame it would run on is the
+    // first frame of a window somebody is waiting for.
+    let sound_argv = config.sound.clone();
+    let sound_unavailable =
+        sound::unavailable(&sound_argv, &crate::exec::env::build_child_env(&config));
     // The one file this process owns, held to the same rule: see
     // `crate::prefs`. A window that would not open over a preference it could
     // not read would be a denial of a request nobody was ever shown.
@@ -1614,7 +1629,8 @@ pub fn run_prompt() -> anyhow::Result<()> {
             // the daemon's first write fits in the pipe.
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = cc.egui_ctx.clone();
-            let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal), prefs);
+            let app = PromptApp::new(rx, Box::new(io::stdout()), Arc::clone(&app_fatal), prefs)
+                .with_sound(sound_argv, sound_unavailable);
             let kept = app.kept();
             std::thread::spawn(move || {
                 read_frames(io::stdin().lock(), &tx, |noticed| {
@@ -1642,6 +1658,34 @@ pub fn run_prompt() -> anyhow::Result<()> {
     match fatal.get() {
         Some(why) => Err(anyhow::anyhow!("{why}")),
         None => Ok(()),
+    }
+}
+
+impl PromptApp {
+    /// Whether a window opening should make a noise.
+    ///
+    /// The reader's remembered answer, minus the machine being unable to act
+    /// on it — the same shape as [`PromptApp::streams`], and stored nowhere,
+    /// so a machine with no player never rewrites a preference the reader set
+    /// on one that has one.
+    fn wants_sound(&self) -> bool {
+        self.sound && self.sound_unavailable.is_none()
+    }
+
+    /// The window, knowing what this machine can make a noise with.
+    ///
+    /// Separate from [`PromptApp::new`] for [`crate::protocol::Payload::with_caveat`]'s
+    /// reason: the one caller that has a config to read is the one caller
+    /// that says anything, and every window under test stays silent by
+    /// construction rather than by each test remembering to ask for silence.
+    pub(crate) fn with_sound(
+        mut self,
+        argv: Vec<String>,
+        unavailable: Option<String>,
+    ) -> PromptApp {
+        self.sound_argv = argv;
+        self.sound_unavailable = unavailable;
+        self
     }
 }
 
@@ -1687,6 +1731,13 @@ pub(crate) struct PromptApp {
     /// [`PromptApp::closes_on_decide`] is the only thing that should be asked
     /// what will actually happen.
     close_on_decide: bool,
+    /// Whether a sound is played when a window opens. See [`crate::prefs::Prefs::sound`].
+    sound: bool,
+    /// What to spawn to make that noise, from the config. Empty plays nothing.
+    sound_argv: Vec<String>,
+    /// Why this machine cannot make a noise, or `None` when it can. See
+    /// [`sound::unavailable`].
+    sound_unavailable: Option<String>,
     /// Where the preference above is remembered between windows.
     ///
     /// Held rather than reached for at the moment of writing, so a test and a
@@ -1795,6 +1846,12 @@ impl PromptApp {
             draft: reviewing::Draft::default(),
             note: String::new(),
             guard: Guard::new(Instant::now()),
+            sound: remembered.sound,
+            // Empty until `with_sound` says otherwise, which is the shape
+            // every test wants: a window under test makes no noise and starts
+            // no process, without any of them having to say so.
+            sound_argv: Vec::new(),
+            sound_unavailable: None,
             guard_open: false,
             kept: Arc::new(AtomicBool::new(false)),
             copied: None,
@@ -2110,6 +2167,18 @@ impl eframe::App for PromptApp {
         // exists, and the state machine's latch is what keeps it to once.
         if let Some(title) = self.state.take_title() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+            // The same latch, and the same "once": this is the frame on which
+            // the window stops being an empty frame and becomes about a
+            // request, which is the moment a person who is not looking at the
+            // screen needs to be told about. Anything later would be a noise
+            // about a window they have already seen.
+            //
+            // The effective answer, so a machine that cannot play anything
+            // does not try on every window. Nothing is reported if it fails:
+            // see `sound::play`.
+            if self.wants_sound() {
+                sound::play(&self.sound_argv);
+            }
         }
         // And whenever the window stops asking or starts again. Nothing is
         // sent while it is what it already is, so an ordinary window says
@@ -3155,6 +3224,7 @@ impl PromptApp {
                 Some(why) => ui.label(egui::RichText::new(why).small().color(quiet)),
                 None => ui.label(egui::RichText::new(TERMINAL_CAPTURE).small().color(warn)),
             };
+
             if beside {
                 ui.add_space(PRIMARY_GAP);
             }
@@ -3204,6 +3274,7 @@ impl PromptApp {
         if review_changed {
             self.set_review(reviewing_now);
         }
+
     }
 
     /// The stream checkbox, and the reason it is dead when it is.
@@ -3339,6 +3410,35 @@ impl PromptApp {
             false => ui.visuals().weak_text_color(),
         };
         ui.label(egui::RichText::new(said).small().color(colour));
+        // Under the close box, because the two are the same kind of thing:
+        // what this window does of its own accord, remembered, and decided by
+        // nothing in the request. It is here rather than on the row of boxes
+        // about the command because that row is measured to fit beside the
+        // verdict buttons at the size a window opens at, and a fourth control
+        // on it stacks the row -- there is a test that says so.
+        //
+        // On every window, a write included: a write opens a window too, and
+        // a person who is not looking at the screen is not looking at it for
+        // either kind.
+        let mut wants_sound = self.sound;
+        let sound_changed = ui
+            .add_enabled(
+                self.sound_unavailable.is_none(),
+                egui::Checkbox::new(&mut wants_sound, SOUND_LABEL),
+            )
+            .changed();
+        if sound_changed {
+            self.sound = wants_sound;
+            // Written down for good, unlike the review box: whether somebody
+            // is at their desk is not a fact about one command.
+            self.prefs.update(|prefs| prefs.sound = wants_sound);
+        }
+        // Only where it is dead. A row that explained a control that is
+        // simply working would be a sentence nobody needs, under the two
+        // buttons that decide.
+        if let Some(why) = &self.sound_unavailable {
+            ui.label(egui::RichText::new(why).small().color(ui.visuals().weak_text_color()));
+        }
     }
 
     /// Take the reader's answer about reviewing, and write it down.
@@ -3376,7 +3476,16 @@ impl PromptApp {
             .max(text_width(ui, CLOSE_WATCHING, egui::TextStyle::Small))
             .max(text_width(ui, CLOSE_WATCHING_ALWAYS, egui::TextStyle::Small))
             .max(text_width(ui, CLOSE_REVIEWING, egui::TextStyle::Small));
-        label.max(said) + 2.0 * ui.spacing().item_spacing.x
+        // The sound box sits under the same flank, so the flank has to be
+        // wide enough for the wider of the two labels -- and for the sentence
+        // under it where there is one, which is the case where this control
+        // is widest rather than narrowest.
+        let sound = box_ + text_width(ui, SOUND_LABEL, egui::TextStyle::Button);
+        let sound_said = match &self.sound_unavailable {
+            Some(why) => text_width(ui, why, egui::TextStyle::Small),
+            None => 0.0,
+        };
+        label.max(said).max(sound).max(sound_said) + 2.0 * ui.spacing().item_spacing.x
     }
 
     /// How tall the close control is: its box, and the sentence under it.
@@ -3386,7 +3495,14 @@ impl PromptApp {
             .interact_size
             .y
             .max(ui.text_style_height(&egui::TextStyle::Button));
-        box_ + ui.spacing().item_spacing.y + ui.text_style_height(&egui::TextStyle::Small)
+        let small = ui.text_style_height(&egui::TextStyle::Small);
+        let sound = ui.spacing().item_spacing.y
+            + box_
+            + match self.sound_unavailable {
+                Some(_) => ui.spacing().item_spacing.y + small,
+                None => 0.0,
+            };
+        box_ + ui.spacing().item_spacing.y + small + sound
     }
 
     /// One row: the two buttons that decide, the four that do not, and the one
@@ -7951,6 +8067,7 @@ mod tests {
             terminal: false,
             show_original: false,
             review: false,
+            sound: false,
         });
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
@@ -7996,6 +8113,71 @@ mod tests {
         let said = window_text_sized(&mut app, opening_size());
         assert!(said.contains(TERMINAL_LABEL), "the control is not on screen: {said}");
         assert!(said.contains(TERMINAL_CAPTURE), "what it costs is not said: {said}");
+    }
+
+    #[test]
+    fn a_remembered_sound_is_read_at_the_next_window_and_the_box_says_so() {
+        // The one preference that does nothing to the window it is ticked on.
+        // The label has to say "a window" rather than "this window", because
+        // by the time anybody reads it this window has already opened.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { sound: true, ..Prefs::default() });
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(
+            rx,
+            Box::new(Vec::new()),
+            Arc::new(OnceLock::new()),
+            PrefsFile::at(&paths),
+        )
+        .with_sound(vec!["sh".to_string()], None);
+        let mut request = a_request(90);
+        request.operations = vec![Payload::command(
+            &render_command("ls", &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        )];
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+
+        assert!(app.wants_sound(), "the next window opened having forgotten");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains(SOUND_LABEL), "the control is not on screen: {said}");
+        assert!(!SOUND_LABEL.contains("this window"), "the label claims to be about this one");
+    }
+
+    #[test]
+    fn a_machine_that_cannot_make_a_noise_says_why_and_plays_nothing() {
+        // Dead with a reason, like every other control this window greys: a
+        // box that simply did nothing would read as a sound that failed.
+        let (_root, paths) = a_prefs_file();
+        PrefsFile::at(&paths).write(&Prefs { sound: true, ..Prefs::default() });
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app = PromptApp::new(
+            rx,
+            Box::new(Vec::new()),
+            Arc::new(OnceLock::new()),
+            PrefsFile::at(&paths),
+        )
+        .with_sound(Vec::new(), Some(
+            sound::unavailable(&[], &BTreeMap::new()).expect("nothing is configured"),
+        ));
+        let mut request = a_request(90);
+        request.operations = vec![Payload::command(
+            &render_command("ls", &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        )];
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+
+        assert!(!app.wants_sound(), "it would have tried to play nothing");
+        let said = window_text_sized(&mut app, opening_size());
+        assert!(said.contains("No sound is configured"), "the reason is not on screen: {said}");
+        // And the remembered tick is still there: a machine that cannot act
+        // on a preference must not clear it.
+        assert!(PrefsFile::at(&paths).read().sound, "a dead box cleared a standing preference");
     }
 
     #[test]
@@ -8137,6 +8319,7 @@ mod tests {
                 terminal: true,
                 show_original: false,
                 review: false,
+                sound: false,
             },
             "this window trampled what the one beside it saved"
         );
@@ -8210,6 +8393,7 @@ mod tests {
             terminal: false,
             show_original: false,
             review: false,
+            sound: false,
         };
         PrefsFile::at(&paths).write(&stored);
         let (mut app, sink) = a_write_window_remembering(PrefsFile::at(&paths));
@@ -8757,6 +8941,7 @@ mod tests {
             terminal: false,
             show_original: false,
             review: false,
+            sound: false,
         };
         PrefsFile::at(&paths).write(&stored);
         let (app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));

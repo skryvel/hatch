@@ -1172,6 +1172,19 @@ Note that the whole config is written out on first run, so **an installation
 made before a default changed keeps the old value in its file**. Changing it
 is one line in `config.toml`; nothing re-derives it for you.
 
+**Sound when a window opens** is a checkbox under *Close when I decide*, and
+it is remembered: it is for the person who is not looking at the screen, so
+nothing drawn on the screen could tell them to look. It does nothing to the
+window it is ticked on — by the time the box is readable, that window has
+already opened — and everything to the next one.
+
+`sound` is argv, like `terminal`: hatch spawns a program that can already make
+a noise rather than opening an audio device itself, because every Rust crate
+that opens one links C, and this is the process that draws agent-chosen bytes.
+Where the program named is not installed, the box is dead and says so, exactly
+as the terminal box does. A sound that does not play costs you the prompt and
+nothing else — the window, the deadline and every control are unaffected.
+
 **`tools = "batch"`** offers `batch` and nothing else. The two tools overlap
 rather than divide the work — `run_command` is a batch of exactly one command,
 and a test of that name keeps it so — and only `batch` can write a file. An
@@ -1223,6 +1236,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `output_cap_bytes` | `262144` | Cap on captured output |
 | `exec_path` | `/usr/local/bin:/usr/bin:/bin`; on macOS `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands. Nothing is inherited, so a program not on this list is not found |
 | `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
+| `sound` | `afplay …` on macOS, `paplay …` on Linux, `[]` elsewhere | Played when a window opens, as argv. Off until the box is ticked |
 | `tools` | `both` | Which tools an agent is offered: `both`, or `batch` alone |
 | `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |

@@ -160,6 +160,9 @@ pub struct Config {
     /// Read through [`Config::font_size_points`], never directly: it is the
     /// clamp, and an unclamped 0 is a window with no text in it.
     pub font_size: u32,
+    /// What is run to make a sound when a window opens, as argv with the
+    /// program first. Empty plays nothing. See [`default_sound`].
+    pub sound: Vec<String>,
     /// Which tools an agent is offered: `both` or `batch`. See [`Tools`].
     pub tools: Tools,
     /// Which palette the approval window draws in: `dark` or `light`.
@@ -205,6 +208,39 @@ pub enum Tools {
     Both,
     /// `batch` alone.
     Batch,
+}
+
+/// What is run to make a sound when a window opens, on the platform this
+/// build is for.
+///
+/// A program to spawn rather than audio hatch plays itself, and that is the
+/// dependency rule rather than laziness: every Rust crate that opens an audio
+/// device links C to do it — ALSA on Linux, CoreAudio on macOS — and a sound
+/// is not worth putting a C library on the path that an agent's bytes reach.
+/// Spawning something that already exists costs nothing and links nothing.
+///
+/// The defaults are chosen to be there already. `afplay` ships with macOS and
+/// so does the file it is given. `paplay` comes with the PulseAudio and
+/// PipeWire tools that a desktop Linux install has, and the sound is the
+/// freedesktop theme's. Neither is a certainty, which is why nothing depends
+/// on it working: a machine with no such program draws the window exactly as
+/// it always did, and the checkbox says why it is dead rather than ticking
+/// for a sound nobody will hear.
+pub fn default_sound() -> Vec<String> {
+    sound_for_os(std::env::consts::OS)
+}
+
+/// The whole of [`default_sound`] except for asking which platform this is,
+/// so the arm that is not selected here is still covered by tests here. See
+/// [`terminal_for_os`], which is split for the same reason.
+fn sound_for_os(os: &str) -> Vec<String> {
+    match os {
+        "macos" => ["afplay", "/System/Library/Sounds/Submarine.aiff"],
+        "linux" => ["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"],
+        _ => return Vec::new(),
+    }
+    .map(str::to_string)
+    .to_vec()
 }
 
 /// The `PATH` an approved command is given, on the platform this build is for.
@@ -286,6 +322,7 @@ impl Default for Config {
             exec_path: default_exec_path(),
             terminal: default_terminal(),
             denylist_extra: Vec::new(),
+            sound: default_sound(),
             tools: Tools::default(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),

@@ -195,6 +195,23 @@ pub struct Prefs {
     /// choice** — see this struct's own documentation, which is where the
     /// difference is set out and where anyone changing this should start.
     pub terminal: bool,
+    /// Whether a sound is played when a window opens.
+    ///
+    /// Written by the "Play a sound when a window opens" checkbox. The one
+    /// preference here that does nothing to the window it is ticked on: the
+    /// sound belongs to a window *appearing*, and by the time this box is on
+    /// screen its window has appeared. So it is read at the next one, which
+    /// is the whole of what it is for -- somebody who is not looking at the
+    /// screen cannot be told to look at it by anything drawn on it.
+    ///
+    /// Remembered for `show_original`'s reason and more plainly: whether a
+    /// person is at their desk is not a fact about one command.
+    ///
+    /// It decides nothing about the request. A sound that fails to play, or a
+    /// machine with nothing to play it with, costs the reader the prompt and
+    /// nothing else -- the window is drawn either way, and the deadline runs
+    /// either way.
+    pub sound: bool,
 }
 
 /// The file [`Prefs`] are kept in, and the only thing that writes it.
@@ -493,6 +510,7 @@ mod tests {
                 terminal: false,
                 show_original: false,
                 review: false,
+                sound: false,
             }
         );
 
@@ -502,6 +520,7 @@ mod tests {
             terminal: true,
             show_original: true,
             review: true,
+            sound: true,
         };
         file.write(&every);
         assert_eq!(
@@ -524,6 +543,7 @@ mod tests {
             terminal: false,
             show_original: false,
             review: true,
+            sound: false,
         });
 
         // A second window that opened before any of that and knows nothing
@@ -538,6 +558,7 @@ mod tests {
                 terminal: true,
                 show_original: false,
                 review: true,
+                sound: false,
             },
             "a window writing one box trampled the others"
         );
@@ -559,6 +580,7 @@ mod tests {
                 terminal: false,
                 show_original: false,
                 review: false,
+                sound: false,
             }
         );
     }
