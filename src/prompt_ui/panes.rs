@@ -651,17 +651,6 @@ pub enum DiffView {
     Unified,
 }
 
-/// How the two command panes are being drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandView {
-    /// Two columns: the exact text on the left, hatch's annotated form on the
-    /// right, each with the whole height of the window.
-    SideBySide,
-    /// The annotated pane under the raw one. What the panes fall back to when
-    /// two columns cannot hold them.
-    Stacked,
-}
-
 /// One drawn line's width in characters, notes included.
 ///
 /// Characters and not pixels, and the count is exact rather than an estimate.

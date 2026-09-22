@@ -18,22 +18,24 @@ HTTP on loopback, and a short-lived egui window spawned once per request.
 without an agent asking for anything.
 
 ![The hatch approval window. The agent's title and reason are at the top,
-marked as the agent's own words; below them a three-line shell command appears
-twice, raw on the left and annotated on the right. Along the bottom: a
-countdown, a terminal checkbox carrying a warning that a transcript captures
-what is typed into it, a note field, a stream checkbox, a box that closes the
-window once a decision is made, Approve and Deny with their keyboard shortcuts,
-and four narrower buttons.](media/approval-command.png)
+marked as the agent's own words; below them a line saying where each program
+the command names was found, and a three-line shell command, annotated, with a
+bracket down its left edge. Along the bottom: a countdown, a terminal checkbox
+carrying a warning that a transcript captures what is typed into it, a box to
+read the output before it is sent, a note field, a stream checkbox, a box that
+closes the window once a decision is made, a sound checkbox, Approve and Deny
+with their keyboard shortcuts, and four narrower buttons.](media/approval-command.png)
 
 *One request, waiting. The header is the agent's own words, marked as such: a
-rule down the side and "The agent says" in front of them. The left pane is
-exactly the text being approved — no reflow, no colour. The right is the same
-text annotated: numbered segments, `$HOME` shown with the value the command
-will actually receive, the `&&` that ends each segment still on screen with the
-line break it is followed by drawn as a quiet `↵` rather than silently
-swallowed. The header counts what it found, the countdown says how long is left
-before the window denies on its own, and the buttons name the keys that do the
-same thing.*
+rule down the side and "The agent says" in front of them. Under it, where each
+program the command names was found, looked up on the `PATH` the command will
+actually get. The pane is the command annotated: `$HOME` shown with the value
+the command will receive, the `&&` joining the three steps still on screen
+with the line break after it drawn as a quiet `↵` rather than silently
+swallowed, and a bracket and indentation showing that the three lines are one
+statement. **Show the original text** swaps it for the bytes exactly as sent.
+The countdown says how long is left before the window denies on its own, and
+every control with a key prints that key on itself.*
 
 <sub>`hatch preview command --shot media/approval-command.png` — see
 [Look at it yourself](#look-at-it-yourself-hatch-preview).</sub>
@@ -194,7 +196,7 @@ the program: `shell_quote` rewrites every `'` as `'\''`, and a Clojure program
 — where `'` is the quote form — comes out riddled with four-character
 sequences that are not in it. A reader cannot check text like that, and
 checking it is the whole of what the window is for. So the boundary is shown
-instead by a frame down the gutter and a line above the panes saying the run
+instead by a frame down the gutter and a line above the pane saying the run
 is one argument. Nothing about what runs changes either way: an argv is a list
 and `execve` takes a list, so quoting never reached it. **Copy command** quotes
 the program back, because that is the one control that hands the line to
@@ -417,9 +419,10 @@ ran as root.
 ![A root approval window. The whole window is enclosed in a red frame; in the
 header the word ROOT is reversed out of a filled red block, and above the panes
 a warning explains that a root command may be given a terminal where an
-ordinary one gets a pipe. The command is the run0 line, with the approved
-command beginning on its own line below run0's own options and drawn as shell
-inside the quotes hatch wrapped it in.](media/approval-root.png)
+ordinary one gets a pipe. The command is the run0 line: run0's own options,
+then `bash -c`, then the approved script on lines of its own, unquoted, framed
+down the left edge and drawn as shell — commands underlined, the loop
+bracketed and indented.](media/approval-root.png)
 
 <sub>`hatch preview root --shot media/approval-root.png`</sub>
 
@@ -604,8 +607,9 @@ marked.](media/approval-swap.png)
 *The metadata panel is the part a diff cannot show: which file, create or
 replace, at what mode, owned by whom, and how much larger. A replacement
 inherits the existing mode and owner, and the write either matches what the
-window said or does not happen. The tinted cell on the left is a row that side
-has no line for, which is not the same as a blank line.*
+window said or does not happen. The blank rows here are blank lines in both
+files; a row one side has no line for is tinted instead, which the line above
+the diff says.*
 
 <sub>`hatch preview swap --shot media/approval-swap.png`</sub>
 
@@ -627,11 +631,10 @@ I decide** and **Show me the output before it is sent**. Chords rather than
 bare letters, because the note field has the keyboard and a window where `s`
 means something other than the letter `s` eats what you type into it. They
 wait out the same guard as Approve does, which is not because a checkbox is
-dangerous but because the first two are remembered: what they write outlives
-the window, and the undo for a file is a box in a request nobody has made yet.
-Alt+R waits the same guard and writes nothing down, because that box is never
-remembered — see [Reviewing the output](#reviewing-the-output-before-it-goes).
-Aimed at a box that is dead — Alt+S on a command that is getting a terminal of
+dangerous but because all three are remembered: what they write outlives the
+window, and the undo for a file is a box in a request nobody has made yet. A
+chord writes down exactly what a click on the same box would — see
+[Reviewing the output](#reviewing-the-output-before-it-goes). Aimed at a box that is dead — Alt+S on a command that is getting a terminal of
 its own, Alt+R on a write, which prints nothing — they tick nothing and flash
 the sentence saying why instead.
 
@@ -768,7 +771,9 @@ in a viewer.
 
 **When the command finishes, the window shows its output as it will go.**
 stdout and stderr are two panes, side by side, each captioned with how many of
-its lines will be sent; a terminal run's transcript is one pane, and is
+its lines will be sent. A stream the command printed nothing on gets no pane —
+one quiet line says so, and the other takes the width. A terminal run's
+transcript is one pane, and is
 reviewed like any other output — it can hold what you typed into the terminal,
 which is the strongest case there is for reading it first. Two filters sit
 above them:
@@ -849,9 +854,10 @@ hatch preview --theme light       # the other palette, for this window only
 window on a sample request, reading the same config `hatch prompt` reads. It is
 how you see what your `font_size`, `theme` and `terminal` settings actually
 render as without having to get an agent to knock on the door. The `long` sample is
-the one that does not fit: it is there so the stacked panes, the strip that
-scrolls sideways and the line that says how many rows are out of sight are
-something you can look at rather than read about. The `comment` sample puts an
+the one that does not fit: it is there so the line that says how many rows are
+out of sight, and — under **Show the original text**, which does not reflow —
+a line that runs off to the right, are something you can look at rather than
+read about. The `comment` sample puts an
 `&&` inside a comment two rows above an `&&` that really is a boundary, so the
 difference is something you can see rather than take on trust. The `redirect`
 sample does the same for a `>|`, which is one operator, and the `|` three rows
@@ -1252,7 +1258,7 @@ to see what a `font_size` or a `theme` actually looks like before an agent
 does. `theme = "light"` is the same window as the one at the top of this page:
 
 ![The same approval window in the light palette: dark text on a pale ground,
-with the same two panes, the same annotations and the same
+with the same pane, the same annotations and the same
 buttons.](media/approval-command-light.png)
 
 <sub>`hatch preview command --theme light --shot media/approval-command-light.png`</sub>
@@ -1265,29 +1271,31 @@ request is drawn in whatever that is.
 
 `$XDG_STATE_HOME/hatch/prefs.toml`, by default
 `~/.local/state/hatch/prefs.toml`. One file, one job: the choices the window
-writes down because you ticked them in it. Three keys —
+writes down because you ticked them in it. Six keys —
 
 | Key | What ticking it remembers |
 |---|---|
 | `close_on_decide` | A command's window goes as soon as you answer, instead of staying to show the run |
 | `stream` | The window shows the output as it arrives |
+| `review` | You read a command's output before any of it is sent |
 | `terminal` | The command gets a terminal of its own |
+| `show_original` | The window opens on the original text instead of the annotated one |
+| `sound` | A window opening plays a sound |
 
 — and there is nothing to hand-edit: ticking the box in the window is how each
-one is set, and Alt+C and Alt+S are how the first two are set without the
-mouse. Every default is off, so a first run and a file hatch cannot read are
+one is set, and Alt+C, Alt+S and Alt+R are how the first three are set without
+the mouse. Every default is off, so a first run and a file hatch cannot read are
 the same window.
 
-The first two change what you see. `terminal` does not: it changes how the
-command runs, and everything in that terminal — including what you type into
-it — goes back to the agent. A tick made today therefore decides how a request
-next week executes. It is still one box, on screen, in the window that is
-asking, and the capture warning is drawn beside it whether or not it is
-ticked; it is worth knowing which of the three it is.
-
-The fourth box, **Show me the output before it is sent**, is deliberately not
-here: it is a choice about the command in front of you, and it opens unticked
-every time. See [Reviewing the output](#reviewing-the-output-before-it-goes).
+Most of them change what you see or hear. `review` changes what the agent is
+sent, and only ever in the direction of less: every run waits for you, and a
+window that ends without an answer sends nothing — see
+[Reviewing the output](#reviewing-the-output-before-it-goes). `terminal` is
+the one to know about: it changes how the command runs, and everything in that
+terminal — including what you type into it — goes back to the agent. A tick
+made today therefore decides how a request next week executes. It is still one
+box, on screen, in the window that is asking, and the capture warning is drawn
+beside it whether or not it is ticked.
 
 `stream` beats `close_on_decide` when both are on, because a window that has
 gone shows nothing. The close box is then greyed with *You stream every run.*

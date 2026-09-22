@@ -94,9 +94,9 @@ use crate::swap;
 /// How many frames are drawn after the request lands before the viewport is
 /// photographed.
 ///
-/// Not decoration. The two command panes decide between side by side and
-/// stacked from measurements they leave in egui's temporary memory for the
-/// next frame to read — see [`crate::prompt_ui::panes`] — a scroll area needs
+/// Not decoration. A diff decides between side by side and unified from
+/// measurements it leaves in egui's temporary memory for the next frame to
+/// read — see [`crate::prompt_ui::panes`] — a scroll area needs
 /// a frame to learn how tall its contents are, and the font atlas is built
 /// lazily on first use. A picture taken on the first frame is a picture of a
 /// window mid-thought. Eight is several times more than any of those need and
@@ -175,8 +175,8 @@ pub enum Scenario {
     Swap,
     /// A command that runs as root: the `ROOT` block and the danger frame.
     Root,
-    /// A command longer and wider than the window: the stacked panes, and the
-    /// line that says how much of it is out of sight.
+    /// A command longer and wider than the window: the line that says how much
+    /// of it is out of sight, and an original text wider than the pane.
     Long,
     /// A command with comments in it, including one that contains every
     /// separator hatch knows.
@@ -846,16 +846,16 @@ systemctl status service";
 /// The command behind [`Scenario::Long`].
 ///
 /// This scenario exists because the ones above it all fit. A sample that fits
-/// its panes exercises nothing about the window's account of what is off the
-/// end of them — the stacked arrangement, the strip that scrolls sideways,
-/// and the line under the caption that says how many rows are out of sight —
-/// and those are the parts a reader most needs to be able to look at, because
-/// they are the parts that exist for a command written to hide something.
+/// its pane exercises nothing about the window's account of what is off the
+/// end of it — the line under the caption that says how many rows are out of
+/// sight, and the original text running off to the right — and those are the
+/// parts a reader most needs to be able to look at, because they are the
+/// parts that exist for a command written to hide something.
 ///
 /// So it is long in both directions on purpose. More lines than a window of
 /// any ordinary height can show, and one line — the `rsync` — far wider than
-/// a full-width pane, which is what sends the panes into the stacked
-/// arrangement and runs the raw strip off its right edge.
+/// a full-width pane: the annotated rendering wraps it, and the original text,
+/// which never reflows, runs it off the pane's right edge.
 ///
 /// It is still a command somebody might really write. A sample of padding
 /// would demonstrate the same rectangles and teach nobody what the window is
@@ -1378,10 +1378,10 @@ mod tests {
 
     #[test]
     fn the_long_sample_really_is_longer_and_wider_than_a_pane() {
-        // The point of the scenario. A sample that fitted its panes would
-        // exercise none of what it is there for -- the stacked arrangement,
-        // a strip with text off to the right of it, and the line that says
-        // how many rows are out of sight -- and it would go on looking like
+        // The point of the scenario. A sample that fitted its pane would
+        // exercise none of what it is there for -- an original text running
+        // off to the right, and the line that says how many rows are out of
+        // sight -- and it would go on looking like
         // a perfectly good sample while doing so.
         let staging = tempfile::tempdir().unwrap();
         let sample = build(Scenario::Long, &a_config(), platform().as_ref(), staging.path())
