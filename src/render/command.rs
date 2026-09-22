@@ -2127,6 +2127,10 @@ fn assignments(command: &str, env: &BTreeMap<String, String>) -> Vec<Assignment>
             continue;
         }
         let words: Vec<&str> = command[segment.clone()].split_ascii_whitespace().collect();
+        if let Some(name) = loop_name(&words) {
+            out.push(Assignment { at: segment.end, name: name.to_string(), value: None });
+            continue;
+        }
         if words.is_empty() || !words.iter().all(|word| assigned_name(word).is_some()) {
             continue;
         }
@@ -2141,6 +2145,37 @@ fn assignments(command: &str, env: &BTreeMap<String, String>) -> Vec<Assignment>
         }
     }
     out
+}
+
+/// The name a `for` or `select` header sets, or `None` if `words` is not one.
+///
+/// `for unit in a b; do systemctl restart $unit; done` drew `$unit` as
+/// **unset**, because `unit` is not in the environment the child starts with.
+/// It is set, once per pass, by the loop itself -- so the claim was false in
+/// exactly the way [`assignments`] exists to stop.
+///
+/// What it is set to is not drawn. The body runs once per word, so a `$unit`
+/// in it is several values at once, and a chip can hold one; the list may
+/// also need a shell to work out (`in $(ls)`, `in *.txt`). So the name counts
+/// as *set, and hatch is not going to guess* -- nothing on it at all.
+///
+/// The header's segment is where it takes effect, which is also the shell's
+/// answer: `for x in $x` reads the old `x` in its list, and a loop leaves the
+/// name holding its last value once it is done, so a `$x` after `done` is
+/// still not unset.
+///
+/// `for ((i = 0; …))` is not this form -- the word after `for` is not a name
+/// -- and is not handled: its `$i` is still drawn as unset, which is the same
+/// false claim. Which names an arithmetic header sets needs the arithmetic
+/// read, and that is a second parser rather than one more keyword.
+fn loop_name<'a>(words: &[&'a str]) -> Option<&'a str> {
+    let [keyword, name, ..] = words else {
+        return None;
+    };
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    let named = (first.is_ascii_alphabetic() || first == '_') && chars.all(is_name_char);
+    (matches!(*keyword, "for" | "select") && named).then_some(*name)
 }
 
 /// The name a word assigns to, or `None` if it does not assign at all.
@@ -4481,6 +4516,54 @@ mod tests {
         // a `;` in one from being a separator stops this.
         let spans = rendered("cat <<'EOF' > f\nA=1\nEOF\necho $A", &env(&[]));
         assert_eq!(variables(&spans), vec![("$A", None)], "a config file set a variable");
+    }
+
+    #[test]
+    fn a_loop_variable_is_not_claimed_either_way() {
+        // The shape the README's root shot showed: `$unit -> unset` inside
+        // the loop that sets it. It is set, to several values in turn, so
+        // neither `unset` nor any one value is true -- nothing is drawn.
+        for command in [
+            "for unit in a b; do systemctl restart $unit; done",
+            "for unit in a b\ndo\n  echo $unit\ndone",
+            "for unit; do echo $unit; done",
+            "select unit in a b; do echo $unit; done",
+            // Once the loop is over the name holds its last value.
+            "for unit in a b; do :; done; echo $unit",
+        ] {
+            let spans = rendered(command, &env(&[]));
+            let said = variables(&spans);
+            assert!(said.is_empty(), "{command:?} claimed something about $unit: {said:?}");
+        }
+        // Not even when the environment happens to hold the name: the loop
+        // sets it second, so the environment's value is not the one used.
+        let spans = rendered("for unit in a; do echo $unit; done", &env(&[("unit", "x")]));
+        assert_eq!(variables(&spans), vec![]);
+    }
+
+    #[test]
+    fn a_loop_list_still_reads_the_name_as_it_was_before_the_loop() {
+        // The list is expanded before the first pass sets anything.
+        let spans = rendered("for x in $x; do :; done", &env(&[("x", "/old")]));
+        assert_eq!(variables(&spans), vec![("$x", Some("/old"))]);
+    }
+
+    #[test]
+    fn only_a_loop_header_sets_a_loop_name() {
+        // `for` as an argument, a quoted `for`, and a `for` in a
+        // here-document body set nothing.
+        for command in [
+            "echo for unit; echo $unit",
+            "\"for\" unit in a; echo $unit",
+            "cat <<'EOF' > f\nfor unit in a\nEOF\necho $unit",
+        ] {
+            let spans = rendered(command, &env(&[]));
+            assert!(
+                variables(&spans).contains(&("$unit", None)),
+                "{command:?} was read as setting unit: {:?}",
+                variables(&spans)
+            );
+        }
     }
 
     #[test]

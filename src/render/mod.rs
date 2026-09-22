@@ -394,10 +394,9 @@ mod tests {
             resolved,
             vec![
                 ("$HOME", &SpanKind::Variable { resolved: Some("/home/x".to_string()) }),
-                // The loop variable is the child's own and hatch does not set
-                // it, which `None` says and is right to say: see
-                // `SpanKind::Variable`.
-                ("$f", &SpanKind::Variable { resolved: None }),
+                // No `$f`: the loop sets it, to each word in turn, so it is
+                // neither unset nor any one value and nothing is drawn on it.
+                // See `command::loop_name`.
             ],
             "{resolved:?}"
         );
