@@ -252,6 +252,17 @@ fn sound_for_os(os: &str) -> Vec<String> {
 /// without Homebrew on it is one where a name the person types every day
 /// resolves to nothing.
 ///
+/// And macOS gets `/usr/sbin` and `/sbin` after them, where Linux does not.
+/// That is not a system-administration convenience: macOS keeps ordinary
+/// tools there -- `lsof`, `sysctl`, `diskutil`, `system_profiler` in one,
+/// `ifconfig` and `ping` in the other -- and its own `/etc/paths` puts both on
+/// every login shell's `PATH`, so a command that works in the person's
+/// terminal failed here with nothing on the command's `PATH` answering to it.
+/// Same order as `/etc/paths`, `bin` before `sbin`, with Homebrew's own
+/// `sbin` beside its `bin`. Linux is left alone: the distributions this has
+/// run on merged `sbin` into `bin`, and adding directories there would be
+/// this default guessing.
+///
 /// Both prefixes unconditionally rather than whichever exists. Nothing is
 /// probed and no architecture is guessed: a directory that is not there costs
 /// a failed `stat` per lookup and changes no answer, and a default that
@@ -271,7 +282,8 @@ pub fn default_exec_path() -> String {
 /// See [`terminal_for_os`], which is split for the same reason.
 fn exec_path_for_os(os: &str) -> String {
     match os {
-        "macos" => "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        "macos" => "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            .to_string(),
         _ => "/usr/local/bin:/usr/bin:/bin".to_string(),
     }
 }
@@ -1008,10 +1020,17 @@ mod tests {
         assert!(mac.starts_with("/opt/homebrew/bin:"), "{mac}");
         assert!(mac.contains(":/usr/local/bin:"), "{mac}");
 
-        // And the system directories are still on it, after them.
-        for directory in ["/usr/bin", "/bin"] {
-            assert!(mac.split(':').any(|entry| entry == directory), "{directory} is not on {mac}");
+        // And the system directories are still on it, after them -- the two
+        // `sbin` ones included, because macOS keeps `lsof` in `/usr/sbin` and
+        // `ifconfig` in `/sbin` and puts both on every login shell's `PATH`.
+        // Without them a command that works in the person's terminal was not
+        // found here.
+        let entries: Vec<&str> = mac.split(':').collect();
+        for directory in ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/sbin"] {
+            assert!(entries.contains(&directory), "{directory} is not on {mac}");
         }
+        let at = |directory: &str| entries.iter().position(|entry| *entry == directory);
+        assert!(at("/usr/bin") < at("/usr/sbin"), "sbin is ahead of bin, unlike /etc/paths: {mac}");
     }
 
     #[test]

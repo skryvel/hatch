@@ -1193,7 +1193,9 @@ shell every day is not on it unless this key says so. The default is
 `/usr/local/bin:/usr/bin:/bin` on Linux, and on macOS the same with both
 Homebrew prefixes in front — `/opt/homebrew/bin` for Apple silicon,
 `/usr/local/bin` for Intel — since macOS ships almost nothing you install
-yourself. A version manager, `~/.local/bin` or a language toolchain is yours
+yourself, and with `/usr/sbin` and `/sbin` after them, because macOS keeps
+everyday tools there (`lsof`, `sysctl`, `diskutil`, `ifconfig`, `ping`) and
+puts both on every login shell's `PATH`. A version manager, `~/.local/bin` or a language toolchain is yours
 to add.
 
 Nothing is silent about it: the window resolves every name in the command
@@ -1266,7 +1268,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `timeout_secs` | `600` | How long a window waits for a decision, and how long a review of a command's output waits before nothing is sent |
 | `exec_timeout_secs` | `300` | How long an approved command may run |
 | `output_cap_bytes` | `262144` | Cap on captured output |
-| `exec_path` | `/usr/local/bin:/usr/bin:/bin`; on macOS `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` | `PATH` handed to approved commands. Nothing is inherited, so a program not on this list is not found |
+| `exec_path` | `/usr/local/bin:/usr/bin:/bin`; on macOS `/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` | `PATH` handed to approved commands. Nothing is inherited, so a program not on this list is not found |
 | `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
 | `sound` | `afplay …` on macOS, `paplay …` on Linux, `[]` elsewhere | Played when a window opens, as argv. Off until the box is ticked |
 | `tools` | `both` | Which tools an agent is offered: `both`, or `batch` alone |
