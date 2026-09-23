@@ -191,9 +191,10 @@ Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`,
 `clj`, `bash`, `sh`, `zsh` — and then `command` is a program for that
 interpreter, handed to it as one argument. The window draws the invocation with the program under it,
-names the language, and frames the program down the gutter. A shell program is read
-again as shell; hatch has no reader for the others and does not pretend to —
-they are drawn exactly as they were sent.
+names the language, and draws a box around the program. A shell program is read
+again as shell; the others are drawn exactly as they were sent, with nothing
+read — except that a build with `--features highlight` marks the strings and
+comments of a Python or Clojure program (see [Install and run](#install-and-run)).
 
 The program is drawn **unquoted**, so what is on screen is byte for byte what
 the interpreter receives. Quoting it would buy the argument boundary and cost
@@ -201,8 +202,12 @@ the program: `shell_quote` rewrites every `'` as `'\''`, and a Clojure program
 — where `'` is the quote form — comes out riddled with four-character
 sequences that are not in it. A reader cannot check text like that, and
 checking it is the whole of what the window is for. So the boundary is shown
-instead by a frame down the gutter and a line above the pane saying the run
-is one argument. Nothing about what runs changes either way: an argv is a list
+instead by a box around the program and a line above the pane saying the run
+is one argument. The box is closed on all four sides, not a rule down the
+gutter like the brackets inside it: it says *this is one argument, in another
+language*, so the colours inside it read as being about that language, and it
+does the job quotes would do without drawing a character the command does not
+contain. Nothing about what runs changes either way: an argv is a list
 and `execve` takes a list, so quoting never reached it. **Copy command** quotes
 the program back, because that is the one control that hands the line to
 something other than a reader. A name that is not on the list is

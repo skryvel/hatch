@@ -3181,6 +3181,10 @@ fn paint_brackets(ui: &Ui, rows: &[egui::Rect], gutter: &Gutter, step: f32, ink:
         // One step further left for the frame, which has the outer column to
         // itself. See `Bracket::frames`.
         let x = first.left() - step * (1 + usize::from(bracket.frames)) as f32;
+        if bracket.frames {
+            paint_frame(ui, &rows[bracket.first..=bracket.last], x, step, stroke);
+            continue;
+        }
         let top = first.top() + BRACKET_INSET;
         let bottom = last.bottom() - BRACKET_INSET;
         if bottom <= top {
@@ -3190,6 +3194,40 @@ fn paint_brackets(ui: &Ui, rows: &[egui::Rect], gutter: &Gutter, step: f32, ink:
         painter.line_segment([egui::pos2(x, top), egui::pos2(x + tick, top)], stroke);
         painter.line_segment([egui::pos2(x, bottom), egui::pos2(x + tick, bottom)], stroke);
     }
+}
+
+/// The frame around a program: a box, where every other bracket is a rule.
+///
+/// A rule down the gutter says *these lines belong together*, and for a
+/// construct inside a shell script that is all there is to say. A program is
+/// a different claim -- *all of this is one argument, in another language* --
+/// and a rule on the left alone did not carry it: the colours inside read as
+/// a highlighter that had given up halfway, and a string's blue read as the
+/// same blue the shell's quoted words wear a few lines up. Closed on all four
+/// sides, the region reads as a thing of its own, and what is drawn inside it
+/// reads as being about it.
+///
+/// It is also what stands in for the quotes the program does not have. hatch
+/// hands it to the interpreter as one argument with no shell in between, so
+/// there is no quote character anywhere in what runs, and drawing one would
+/// be putting a byte on screen that is not in the command. The box says where
+/// the argument begins and ends without adding anything to it.
+///
+/// The left edge is where the frame's rule always was. The top and bottom sit
+/// in the gap between rows rather than inside a row, so no edge crosses a
+/// glyph, and the right edge is half a step past the widest line in it: a box
+/// sized to the pane would say the argument runs on into empty space.
+fn paint_frame(ui: &Ui, rows: &[egui::Rect], x: f32, step: f32, stroke: egui::Stroke) {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return;
+    };
+    let gap = ui.spacing().item_spacing.y / 2.0;
+    let right = rows.iter().map(egui::Rect::right).fold(first.right(), f32::max);
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(x, first.top() - gap),
+        egui::pos2(right + step / 2.0, last.bottom() + gap),
+    );
+    ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Middle);
 }
 
 /// The same, with [`ATTRIBUTION`] in front of the first line.
@@ -4409,6 +4447,69 @@ mod tests {
             walk(&clipped.shape, &mut into);
         }
         into
+    }
+
+    #[test]
+    fn a_program_is_framed_by_a_box_around_its_lines_and_nothing_else() {
+        // A rule on the left alone did not say "this is one argument, in
+        // another language": the colours inside read as a highlighter that
+        // gave up halfway. So the frame is closed on four sides, and it has
+        // to enclose every line of the program and not the invocation above
+        // it -- the box stands in for quotes the program does not have, and a
+        // box that took in `python3 -c` would say the argument starts there.
+        let program = "import os\nprint('a')\nprint(os.getcwd())";
+        let line = format!("python3 -c {program}");
+        let at = "python3 -c ".len();
+        let range = at..at + program.len();
+        let snippet = Snippet::declared(range.clone(), Language::Python);
+        let spans = crate::render::render_command_reinterpreting(
+            &line,
+            &BTreeMap::new(),
+            Some(at),
+            Some(&snippet),
+        );
+        let drawn = gutter(&lines(&spans), &program_blocks(&line, &range, false));
+
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label("something above it");
+            draw_spans_bracketed(ui, &spans, Weight::Mono, &drawn);
+        });
+
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) => into.push(rect.clone()),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        let galleys = drawn_galleys(&out);
+        out.textures_delta.clear();
+
+        let boxes: Vec<_> = rects.iter().filter(|rect| rect.stroke.width > 0.0).collect();
+        assert_eq!(boxes.len(), 1, "the program is framed by {} boxes", boxes.len());
+        let frame = boxes[0];
+        assert_eq!(frame.fill.a(), 0, "the frame is tinted, and tint read worst");
+        assert_eq!(frame.stroke.color, theme::DARK.quiet, "the frame is not in hatch's voice");
+        for text in program.lines() {
+            let (_, at, _) = galleys
+                .iter()
+                .find(|(drawn, _, _)| drawn.contains(text))
+                .unwrap_or_else(|| panic!("{text:?} was not drawn: {galleys:?}"));
+            assert!(frame.rect.contains_rect(*at), "{text:?} at {at:?} is outside {:?}", frame.rect);
+        }
+        let (_, invocation, _) =
+            galleys.iter().find(|(drawn, _, _)| drawn.starts_with("python3")).unwrap();
+        assert!(
+            invocation.bottom() <= frame.rect.top(),
+            "the box takes in the invocation: {invocation:?} against {:?}",
+            frame.rect
+        );
     }
 
     #[test]
