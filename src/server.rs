@@ -1122,6 +1122,21 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
     let review = config.review_timeout_secs();
     let one = config.blocking_bound_secs(1);
     let total = config.client_timeout_secs();
+    // From the table rather than written out, so the list an agent is shown
+    // is the list the boundary accepts.
+    let interpreters = Interpreter::known()
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Only where `run_command` is offered. An agent told about a tool it
+    // cannot see does the reasonable thing with the description it has: it
+    // builds each operation in that tool's shape -- `title`, `reason` and
+    // `command` together -- and every call fails validation.
+    let shortcut = match config.tools {
+        crate::config::Tools::Both => " For a single command, `run_command` is the shortcut.",
+        crate::config::Tools::Batch => "",
+    };
 
     let run_command = format!(
         "Run one shell command on the host machine, outside your sandbox.\n\
@@ -1143,8 +1158,7 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          another interruption.\n\
          \n\
          To run a program that is not shell, name what should read it in `run_with` — \
-         `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`, `clj`, `bash`, `sh`, `zsh` \
-         — and put the program \
+         {interpreters} — and put the program \
          itself in `command`. It travels as a single argument, so nothing in it is quoted, \
          split or expanded on the way, and the person sees it drawn as a program rather than \
          as one long string. Prefer this to wrapping a here-document in a shell command: \
@@ -1200,8 +1214,20 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
     );
 
     let batch = format!(
-        "Write files and run commands on the host machine, outside your sandbox: a list of \
-         operations that one person reads and approves at once.\n\
+        "hatch's `batch` tool. Write files and run commands on the host machine, outside your \
+         sandbox: a list of operations that one person reads and approves at once.\n\
+         \n\
+         A call looks like this — `title` and `reason` once, at the top, for the whole batch, \
+         and each operation carrying only its own fields, never a title or a reason:\n\
+         \n\
+         {{\"title\": \"Point the terminal at the new font\",\n \
+         \"reason\": \"The old font was removed by the last update, so it falls back to a bitmap one.\",\n \
+         \"operations\": [\n  \
+         {{\"path\": \"/home/me/.config/foot/foot.ini\", \"content\": \"font=Iosevka:size=11\\n\"}},\n  \
+         {{\"command\": \"fc-cache -f\"}}\n \
+         ]}}\n\
+         \n\
+         One command alone is `\"operations\": [{{\"command\": \"…\"}}]`.\n\
          \n\
          **Put operations that belong together in one batch.** A file and the command that \
          puts it to use — write the unit, then reload it — are one decision to the person \
@@ -1215,12 +1241,12 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          \n\
          **This is the tool for anything that touches a file.** Whenever what you want is \"this \
          file should now say X\" — a unit, a dotfile, something under /etc — send a write here, \
-         and not a `run_command` with a redirect, a `tee`, a here-document or a `sed -i`. A write \
+         and not a command with a redirect, a `tee`, a here-document or a `sed -i`. A write \
          is the form a person can actually check: they read a diff rather than reconstructing \
          what a shell line would do, they see the mode and owner the file will land at, and the \
          write is refused outright if the target is a symlink or the file changed between \
          hatch reading it and writing it, so an edit someone else makes in the meantime is \
-         reported to you instead of being overwritten. For a single command, `run_command` is the shortcut.\n\
+         reported to you instead of being overwritten.{shortcut}\n\
          \n\
          Every call opens a window on a person's screen and waits for them to read it and \
          decide. One call can block for up to {total} seconds: up to {approval}s waiting for \
@@ -1236,16 +1262,23 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          or `content`. **Editing a file that is already there? Send `patch`**: a unified diff \
          against the file as it is now, which costs you the lines you touch instead of the \
          whole file. Send `content` — the complete new contents — to create a file or to \
-         replace one wholesale. Both is an error, and so is neither. Read the file first — \
-         `run_command` with `cat` — so that what you send is an edit of what is really there. \
+         replace one wholesale. Both is an error, and so is neither. Read the file first — a \
+         command running `cat` — so that what you send is an edit of what is really there. \
          hatch applies a patch itself before anybody is asked, and what the person approves is \
          the bytes it produces, exactly as with `content`. A patch applies only where its hunk \
          headers say it does, and hatch never searches nearby for a better fit: a hunk whose \
          context does not match is refused, naming the line and what was found there, and \
          nothing is written and nobody is interrupted.\n\
-         - A command has `command`, and optionally `cwd` and `interactive`, which mean what they \
-         mean in `run_command` — including that the person may trim its output before you \
-         receive it, which its headings then say, or withhold it.\n\
+         - A command has `command`, the exact command, run through a shell. Optionally: `cwd`, \
+         an absolute working directory; `interactive`, true if it needs a terminal — a prompt, a \
+         pager, a full-screen program — in which case you get back one `transcript` of \
+         everything that appeared in the terminal instead of `stdout` and `stderr`; and \
+         `run_with`, to hand a program that is not shell to what should read it — \
+         {interpreters} — with the program itself in `command`, as one argument, nothing \
+         quoted or expanded. Prefer that to a here-document inside a shell command. The person \
+         may read a command's output before you receive it and send only part of it, which its \
+         headings then say, or none of it: then do not run it again to see the output, ask them \
+         for what you need.\n\
          - Either kind takes `root`: true carries that operation out as root, and costs the \
          person a password dialog of its own after they approve; dismissing it means that \
          operation does not happen. A root write keeps the file's existing owner and mode, or \
@@ -5492,6 +5525,58 @@ mod tests {
             "Nothing is ever rolled back",
         ] {
             assert!(batch.contains(claim), "the description does not say {claim:?}: {batch}");
+        }
+    }
+
+    #[test]
+    fn the_example_call_in_the_batch_description_is_one_hatch_accepts() {
+        // Agents in a client that wraps hatch as one tool kept putting
+        // `title` and `reason` inside each operation. The example is what
+        // shows where they go, so it has to be a call the boundary takes as
+        // it stands -- an example that fails validation teaches the failure.
+        let batch = tool_descriptions(&test_config())
+            .for_tool("batch")
+            .expect("batch is described")
+            .to_string();
+        let start = batch.find("{\"title\"").expect("the description carries an example call");
+        let end = start + batch[start..].find("]}").expect("the example closes") + 2;
+        let example: serde_json::Value = serde_json::from_str(&batch[start..end])
+            .unwrap_or_else(|e| panic!("the example is not JSON ({e}): {}", &batch[start..end]));
+
+        for operation in example["operations"].as_array().expect("operations is a list") {
+            for field in ["title", "reason"] {
+                assert!(operation.get(field).is_none(), "an operation carries {field}: {operation}");
+            }
+        }
+        let params: BatchParams = serde_json::from_value(example).expect("the example deserialises");
+        let accepted = Batch::of(params).expect("the example passes the boundary");
+        assert_eq!(accepted.operations.len(), 2, "the example shows a write and a command");
+    }
+
+    #[test]
+    fn a_batch_only_hatch_never_mentions_the_tool_it_hides() {
+        // Told that a command's fields "mean what they mean in `run_command`"
+        // by a hatch that does not offer `run_command`, agents built every
+        // operation in that tool's shape and every call failed validation.
+        let only = Config { tools: crate::config::Tools::Batch, ..test_config() };
+        let batch = tool_descriptions(&only).for_tool("batch").expect("described").to_string();
+        assert!(!batch.contains("run_command"), "{batch}");
+        // Where it is offered, the shortcut is still named.
+        let both = Config { tools: crate::config::Tools::Both, ..test_config() };
+        let batch = tool_descriptions(&both).for_tool("batch").expect("described").to_string();
+        assert!(batch.contains("`run_command` is the shortcut"), "{batch}");
+    }
+
+    #[test]
+    fn both_descriptions_name_every_interpreter_the_boundary_accepts() {
+        // The list is the table's, so neither description can offer a name
+        // the boundary refuses or leave out one it takes.
+        let descriptions = tool_descriptions(&test_config());
+        for tool in ["batch", "run_command"] {
+            let text = descriptions.for_tool(tool).expect("described");
+            for name in Interpreter::known() {
+                assert!(text.contains(&format!("`{name}`")), "{tool} does not name {name}");
+            }
         }
     }
 
