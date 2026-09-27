@@ -552,6 +552,17 @@ const DRAWN_GLYPHS: &[char] = &['\u{21B5}', '\u{21E5}', '\u{21E4}', '\u{2192}', 
 /// [`apply_font_size`], which sizes what this chooses.
 pub fn apply_faces(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    // No sub-pixel binning for the command face. Binning renders a glyph at
+    // up to four fractional offsets so proportional text kerns evenly, and
+    // egui's own docs say what it costs: blurrier text. A monospace face has
+    // nothing to kern -- every advance is the same, which is the property
+    // the fit rule measures by -- so it paid the blur and bought nothing, on
+    // the text a reader looks at hardest.
+    if let Some(face) = fonts.font_data.get_mut(MONOSPACE_FACE) {
+        let mut sharp = (**face).clone();
+        sharp.tweak.subpixel_binning = Some(false);
+        *face = std::sync::Arc::new(sharp);
+    }
     fonts.families.insert(egui::FontFamily::Monospace, vec![MONOSPACE_FACE.to_owned()]);
     fonts.families.insert(
         egui::FontFamily::Proportional,
@@ -4115,6 +4126,17 @@ mod tests {
             Some(PROPORTIONAL_FACE),
             "the prose face is not the one that was chosen"
         );
+    }
+
+    #[test]
+    fn the_command_face_is_not_binned_and_the_prose_face_is_left_alone() {
+        // Binning buys even kerning and costs sharpness; a monospace face has
+        // no kerning to buy. The prose face keeps egui's default, where the
+        // trade goes the other way.
+        let ctx = a_typeset_context();
+        let data = ctx.fonts(|fonts| fonts.definitions().font_data.clone());
+        assert_eq!(data[MONOSPACE_FACE].tweak.subpixel_binning, Some(false));
+        assert_eq!(data[PROPORTIONAL_FACE].tweak.subpixel_binning, None);
     }
 
     #[test]
