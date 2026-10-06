@@ -247,6 +247,10 @@ verdict's note is recorded in the log; this one deliberately is not, because it
 is written while reading output the person may be about to withhold, and a copy
 in the log would outlive the decision to keep it back.
 
+The review screen shows the verdict's note read-only above its own field,
+because it goes to the agent whichever button you press there. The field starts
+empty: filling it with the same words would send them twice.
+
 "Stop, let's sync" is the one answer that says nothing about the request. Deny
 is a judgement and invites a better version of the same idea; this says the
 person has something to talk about and the next move is theirs, so the agent is

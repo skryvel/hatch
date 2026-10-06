@@ -9226,6 +9226,33 @@ mod tests {
         assert!(note.is_empty(), "the verdict's note came back at the review: {note}");
     }
 
+    #[test]
+    fn the_note_sent_with_the_verdict_is_shown_at_the_review() {
+        // Found in use: the field at the review came up empty after a note
+        // had been typed beside Approve, and an empty field reads as the
+        // words having been lost. They go to the agent either way; the
+        // screen has to say so, and say what they were.
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let (mut app, _sink) = a_reviewing_window();
+        let shown = |app: &mut PromptApp| {
+            text_rects(&a_settled_frame(app, &ctx, now))
+                .into_iter()
+                .any(|(text, _)| text.starts_with(reviewing::APPROVAL_NOTE_LEAD))
+        };
+        assert!(!shown(&mut app), "a line about a note nobody typed");
+        app.note = "go on then".to_string();
+        let drawn = text_rects(&a_settled_frame(&mut app, &ctx, now));
+        assert!(
+            drawn.iter().any(|(text, _)| text.starts_with(reviewing::APPROVAL_NOTE_LEAD)
+                && text.contains("go on then")),
+            "the verdict's note is not on the review screen: {:?}",
+            drawn.iter().map(|(text, _)| text).collect::<Vec<_>>()
+        );
+    }
+
     /// A review of output long enough that a pane cannot show all of it.
     fn a_long_review() -> Review {
         let mut review = a_review();

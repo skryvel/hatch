@@ -155,6 +155,17 @@ pub const NOTE_LABEL: &str = "Note to the agent";
 /// nothing.
 pub const NOTE_HINT: &str = "Goes to the agent either way, including when you send nothing.";
 
+/// What introduces the note typed beside the verdict, shown read-only above
+/// this screen's own field.
+///
+/// Shown because a field that comes up empty after the reader typed into the
+/// one before it reads as their words having been lost. They were not: the
+/// daemon puts the verdict's note on the result whichever button is pressed
+/// here. Shown and not pre-filled into the field, because the field's text is
+/// a second note under a second label, and pre-filling would send the same
+/// sentence twice.
+pub const APPROVAL_NOTE_LEAD: &str = "Your note from the approval goes too:";
+
 /// The three fields' labels.
 pub const KEEP_LABEL: &str = "Keep only lines containing";
 pub const DROP_LABEL: &str = "Drop lines containing";
@@ -759,7 +770,13 @@ impl PromptApp {
         let quiet = ui.visuals().weak_text_color();
         let height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body));
         let width = cluster_width(ui);
+        let earlier = self.note.trim();
+        let earlier = (!earlier.is_empty()).then(|| format!("{APPROVAL_NOTE_LEAD} \u{201C}{earlier}\u{201D}"));
         ui.vertical_centered(|ui| {
+            // Above the field, so it is read before anything is typed into it.
+            if let Some(earlier) = earlier {
+                ui.label(egui::RichText::new(earlier).small().color(quiet));
+            }
             super::centred_row(ui, width, |ui| {
                 ui.label(egui::RichText::new(NOTE_LABEL).small().color(quiet));
                 // Never negative, however narrow the window has been dragged.
