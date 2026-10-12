@@ -2429,6 +2429,9 @@ impl PromptApp {
                 // output in front of them and a decision to make about it,
                 // which is the whole case for a key that moves it.
                 Action::Scroll(page) => self.page_output(page),
+                // The one box this screen draws. The others' chords mean
+                // nothing here, as there is no box for them to flip.
+                Action::Toggle(guard::Toggle::Review) => self.flip(guard::Toggle::Review),
                 Action::Toggle(_)
                 | Action::Keep
                 | Action::Copy
@@ -2539,8 +2542,11 @@ impl PromptApp {
         // Only while there is something to decide. In every later phase these
         // boxes are gone from the window along with the question they belonged
         // to, and a chord that changed a preference nobody could see change
-        // would be the invisible write this whole design is against.
-        if self.state.phase() != Phase::AwaitingVerdict {
+        // would be the invisible write this whole design is against. The
+        // review box is the exception because it is drawn again on the review
+        // screen, where it sets what the next window does.
+        let reviewing = self.state.phase() == Phase::Reviewing && toggle == guard::Toggle::Review;
+        if self.state.phase() != Phase::AwaitingVerdict && !reviewing {
             return;
         }
         match toggle {
@@ -3239,8 +3245,8 @@ impl PromptApp {
             if beside {
                 ui.add_space(PRIMARY_GAP);
             }
-            // Not written down when it changes, unlike the box before it: see
-            // `PromptApp::review` for why this one is never remembered.
+            // Written down below, through `set_review`, which the review
+            // screen's copy of this box and Alt+R also go through.
             review_changed = ui
                 .add(egui::Checkbox::new(
                     &mut reviewing_now,
@@ -5789,7 +5795,7 @@ mod tests {
             text_rects(&shapes).into_iter().map(|(text, _)| text + "\n").collect();
         // Paging has no button to print its key on, so the promise is kept
         // the only way it can be here: a line beside the output it moves.
-        for chord in [guard::APPROVE_CHORD, guard::DENY_CHORD, guard::PAGE_KEYS] {
+        for chord in [guard::APPROVE_CHORD, guard::DENY_CHORD, guard::PAGE_KEYS, guard::REVIEW_CHORD] {
             assert!(
                 reviewing.contains(chord),
                 "{chord:?} answers a review and is not on its screen: {reviewing}"
@@ -9251,6 +9257,41 @@ mod tests {
             "the verdict's note is not on the review screen: {:?}",
             drawn.iter().map(|(text, _)| text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_review_box_at_the_review_sets_the_next_window_and_answers_nothing() {
+        // Unticked here, by click and by chord, it is written down for the
+        // next window; this one stays a review, and nothing goes to the
+        // daemon, because the output in front of the reader is already held.
+        let (_root, paths) = a_prefs_file();
+        let stored = Prefs {
+            close_on_decide: false,
+            stream: false,
+            terminal: false,
+            show_original: false,
+            review: true,
+            sound: false,
+        };
+        PrefsFile::at(&paths).write(&stored);
+        let (mut app, sink) = a_reviewing_window();
+        app.prefs = PrefsFile::at(&paths);
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        let label = drawn_at(&mut app, &ctx, REVIEW_LABEL, now).expect("the review screen has no review box");
+        click_at(&mut app, &ctx, label.center(), now);
+        assert!(!app.review, "the click did not reach the box");
+        assert_eq!(PrefsFile::at(&paths).read(), Prefs { review: false, ..stored });
+
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::R, egui::Modifiers::ALT)], now);
+        assert!(app.review, "Alt+R did not reach the box on the review screen");
+        assert_eq!(PrefsFile::at(&paths).read(), stored);
+
+        assert_eq!(app.state.phase(), Phase::Reviewing, "the box ended the review");
+        assert!(sink.lock().unwrap().is_empty(), "the box answered the review");
     }
 
     /// A review of output long enough that a pane cannot show all of it.

@@ -793,6 +793,10 @@ run's output first, so every run waits for you.* — different words from the
 *You asked to see its output first.* you get when you ticked it here, because
 only one of those is true about a window you have not read yet.
 
+The same box, with the same Alt+R, is under the buttons on the review screen,
+so the setting can be changed while you are reading output. It changes nothing
+about that output, which is already held. It sets what the next window does.
+
 What a remembered tick cannot do is let anything out. It only ever puts more
 output in front of a person, and every ending that is not an answer — the
 review deadline included — sends nothing. It applies to commands only: a write

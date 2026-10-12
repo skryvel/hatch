@@ -61,8 +61,8 @@ use eframe::egui;
 use super::guard;
 use super::panes::{self, Shown};
 use super::{
-    Phase, PromptApp, answer, centred_row, cluster_width, paint_guard_notice, primary,
-    secondary, unfocusable,
+    Phase, PromptApp, REVIEW_LABEL, answer, centred_row, cluster_width, paint_guard_notice,
+    primary, secondary, unfocusable, with_chord,
 };
 use crate::protocol::{self, Release};
 use crate::render::unicode::{reveal, scan};
@@ -165,6 +165,16 @@ pub const NOTE_HINT: &str = "Goes to the agent either way, including when you se
 /// a second note under a second label, and pre-filling would send the same
 /// sentence twice.
 pub const APPROVAL_NOTE_LEAD: &str = "Your note from the approval goes too:";
+
+/// What the review box says about itself on this screen.
+///
+/// The box is the approval screen's own, label and chord included, because it
+/// is the same remembered answer: one preference should not have two names.
+/// What differs is when it acts. This output is already held, so ticking or
+/// unticking here changes nothing about it, only what the next window does.
+/// The sentence says that, so a reader who unticks it does not wonder why the
+/// output is still in front of them.
+pub const REVIEW_NEXT_HINT: &str = "From the next command on. This output is already held for you.";
 
 /// The three fields' labels.
 pub const KEEP_LABEL: &str = "Keep only lines containing";
@@ -847,6 +857,25 @@ impl PromptApp {
                 row
             })
             .inner;
+        // Outside the guard, like the note: it decides nothing about this
+        // output, and the approval screen's boxes are not guarded either.
+        ui.add_space(4.0);
+        let mut review_now = self.review;
+        let review_changed = ui
+            .vertical_centered(|ui| {
+                let changed = ui
+                    .add(egui::Checkbox::new(
+                        &mut review_now,
+                        with_chord(egui::RichText::new(REVIEW_LABEL), guard::REVIEW_CHORD),
+                    ))
+                    .changed();
+                ui.label(egui::RichText::new(REVIEW_NEXT_HINT).small().color(ui.visuals().weak_text_color()));
+                changed
+            })
+            .inner;
+        if review_changed {
+            self.set_review(review_now);
+        }
         if !guard_open {
             let over = egui::Rect::from_center_size(
                 egui::pos2(ui.max_rect().center().x, buttons.center().y),
