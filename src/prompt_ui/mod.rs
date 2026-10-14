@@ -2353,11 +2353,11 @@ impl PromptApp {
     /// What a finished streamed run shows: its command, named once, and all
     /// of the output it produced.
     ///
-    /// The command is the one-line display form and not the two panes: those
-    /// exist so a reader can tell what they are approving apart from what it
-    /// looks like, and nothing is being approved any more. It is here at all
-    /// because output with nothing naming it is output the reader has to
-    /// remember the provenance of.
+    /// The command is one row and not the two panes: those exist so a reader
+    /// can tell what they are approving apart from what it looks like, and
+    /// nothing is being approved any more. It is here at all because output
+    /// with nothing naming it is output the reader has to remember the
+    /// provenance of. See [`panes::draw_command_line`].
     fn viewer(&self, ui: &mut egui::Ui, title: &str) {
         // The headline and its corner are gone with the question they
         // belonged to, so this row is the only place left that can say what
@@ -2371,9 +2371,7 @@ impl PromptApp {
             ui.label(egui::RichText::new(title).strong());
         });
         if let Some(Shown::Command { raw, .. }) = self.state.shown() {
-            ui.label(
-                egui::RichText::new(protocol::display_line(raw)).monospace().small().weak(),
-            );
+            panes::draw_command_line(ui, raw);
         }
         if self.state.output_dropped() {
             ui.label(
@@ -9075,6 +9073,14 @@ mod tests {
     /// A window on the review screen, with the daemon's review delivered the
     /// way a real one is: down the channel, through `take_arrivals`.
     fn a_reviewing_window_of(review: Review) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        a_reviewing_window_on(a_request(90), review)
+    }
+
+    /// The same, for the run `request` asked for.
+    fn a_reviewing_window_on(
+        request: Request,
+        review: Review,
+    ) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app =
@@ -9084,7 +9090,7 @@ mod tests {
         // the only kind it ever arrives at.
         let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).expect("a minute of uptime");
         app.guard = Guard::new(long_ago);
-        tx.send(Incoming::Frame(DaemonMsg::Request(Box::new(a_request(90))))).unwrap();
+        tx.send(Incoming::Frame(DaemonMsg::Request(Box::new(request)))).unwrap();
         app.take_arrivals();
         app.review = true;
         let frame = app.state.decide(app.approval());
@@ -9099,6 +9105,87 @@ mod tests {
 
     fn a_reviewing_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
         a_reviewing_window_of(a_review())
+    }
+
+    /// A request whose one operation is `command`.
+    fn a_request_running(command: &str) -> Request {
+        let mut request = a_request(90);
+        request.operations = vec![Payload::command(
+            &render_command(command, &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        )];
+        request
+    }
+
+    /// A program fed to an interpreter, 42 lines in all, the way agents send
+    /// them.
+    fn a_long_program() -> String {
+        let body: Vec<String> = (0..40).map(|n| format!("print('step {n}')")).collect();
+        format!("cd /srv/app && python3 - <<'EOF'\n{}\nEOF", body.join("\n"))
+    }
+
+    /// Where `text` is drawn on a settled frame of `app`, at the size the
+    /// window opens at.
+    fn where_drawn(app: &mut PromptApp, text: &str) -> egui::Rect {
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        drawn_at(app, &ctx, text, past_the_guard())
+            .unwrap_or_else(|| panic!("{text:?} is not on screen"))
+    }
+
+    #[test]
+    fn a_long_command_takes_no_more_of_the_screens_after_the_question_than_a_short_one() {
+        // The bug: the review and the finished window drew the command whole,
+        // as one wrapped paragraph above the output, and a forty-line program
+        // left a review two rows of stdout. The output starts where it would
+        // under a one-line command, on both.
+        let review_starts = |command: &str| {
+            let (mut app, _sink) = a_reviewing_window_on(a_request_running(command), a_review());
+            where_drawn(&mut app, "ok: one").top()
+        };
+        let viewer_starts = |command: &str| {
+            let mut app = a_finished_window_showing(command, "a line it printed");
+            where_drawn(&mut app, "a line it printed").top()
+        };
+        let long = a_long_program();
+        assert_eq!(review_starts(&long), review_starts("cargo build"), "the command took rows from the review");
+        assert_eq!(
+            viewer_starts(&long),
+            viewer_starts("cargo build"),
+            "the command took rows from the finished window"
+        );
+    }
+
+    #[test]
+    fn a_long_command_is_named_by_its_first_line_and_the_rest_is_on_hover() {
+        let (mut app, _sink) = a_reviewing_window_on(a_request_running(&a_long_program()), a_review());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        let shown = shapes_text(&a_settled_frame(&mut app, &ctx, now));
+        assert!(shown.contains("cd /srv/app && python3 - <<'EOF'"), "the first line is not drawn: {shown}");
+        assert!(!shown.contains("step 20"), "the command is still drawn whole: {shown}");
+        let more = drawn_at(&mut app, &ctx, "and 41 more lines", now)
+            .expect("the row does not say how much of the command it leaves out");
+
+        a_live_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(more.center())], now);
+        // A second of frames, each a sixtieth of one: past egui's tooltip
+        // delay, which counts from when the pointer stopped.
+        let mut hovered = Vec::new();
+        for _ in 0..60 {
+            hovered = a_live_frame(&mut app, &ctx, Vec::new(), now);
+        }
+        let hovered = shapes_text(&hovered);
+        assert!(hovered.contains("print('step 20')"), "hovering did not show the rest: {hovered}");
+        // 42 lines do not fit a window 700 points tall, and the ones that
+        // are left out are counted rather than dropped in silence.
+        assert!(hovered.contains("do not fit here"), "the hover dropped lines without saying so: {hovered}");
     }
 
     /// What the window wrote back, as the one frame it should be.

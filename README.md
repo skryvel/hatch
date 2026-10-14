@@ -817,8 +817,12 @@ its lines will be sent. A stream the command printed nothing on gets no pane —
 one quiet line says so, and the other takes the width. A terminal run's
 transcript is one pane, and is
 reviewed like any other output — it can hold what you typed into the terminal,
-which is the strongest case there is for reading it first. Two filters sit
-above them:
+which is the strongest case there is for reading it first. The command that ran
+is named at the top in one row: its first line, cut at the window's edge, and
+how many lines it has after that. Hover over the row to see the rest. A forty-line
+program used to take most of the screen there, and leave stdout a row or two.
+The finished window of a streamed run names its command the same way. Two
+filters sit above the panes:
 
 - **Keep only lines containing** — only lines that contain one of these stay.
 - **Drop lines containing** — lines that contain one of these go.

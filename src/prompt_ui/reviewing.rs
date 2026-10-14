@@ -64,7 +64,7 @@ use super::{
     Phase, PromptApp, REVIEW_LABEL, answer, centred_row, cluster_width, paint_guard_notice,
     primary, secondary, unfocusable, with_chord,
 };
-use crate::protocol::{self, Release};
+use crate::protocol::Release;
 use crate::render::unicode::{reveal, scan};
 use crate::review::{self, Captured, Matcher, PatternError, Redactor, Section, Sections};
 
@@ -469,7 +469,9 @@ impl PromptApp {
 
         // What ran, named once, as the viewer names it: the question is about
         // this command's output, and output nobody can place is output the
-        // reader has to remember the provenance of.
+        // reader has to remember the provenance of. One row of it, so a long
+        // command cannot take the rows the output needs: see
+        // `panes::draw_command_line`.
         ui.horizontal_wrapped(|ui| {
             if self.state.runs_as_root() {
                 panes::draw_root_mark(ui);
@@ -477,7 +479,7 @@ impl PromptApp {
             ui.label(egui::RichText::new(title).strong());
         });
         if let Some(Shown::Command { raw, .. }) = self.state.shown() {
-            ui.label(egui::RichText::new(protocol::display_line(raw)).monospace().small().color(quiet));
+            panes::draw_command_line(ui, raw);
         }
         ui.label(egui::RichText::new(NOTHING_SENT_YET).strong());
         ui.separator();

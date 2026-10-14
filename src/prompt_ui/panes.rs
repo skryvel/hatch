@@ -1373,6 +1373,84 @@ pub fn draw_root_mark(ui: &mut Ui) {
     ui.painter().galley(rect.min + ROOT_MARK_PAD, galley, ink);
 }
 
+/// The command that ran, named in one row, for the screens after the
+/// question: the review and the finished window.
+///
+/// One row because the command is not what is being read any more; its
+/// output is. Drawn whole, as it used to be, a long command was one wrapped
+/// paragraph above the output, and a forty-line program left a review two
+/// rows of stdout. Its first line is what names it -- the program, or the
+/// interpreter a script is fed to -- so that is the line shown, cut at the
+/// edge of the window, and the row says how many lines it is not showing.
+///
+/// The rest is on hover, line for line, as many lines as the screen holds,
+/// with the count of any it cannot. Hover and not a control: every line of it
+/// was on the approval screen, and this is for telling which command it was,
+/// not for reading it again.
+pub fn draw_command_line(ui: &mut Ui, raw: &Spans) {
+    let quiet = ui.visuals().weak_text_color();
+    let text = |line: &[Span]| line.iter().map(Span::display_text).collect::<String>();
+    let drawn: Vec<String> = lines(raw).into_iter().map(text).collect();
+    let Some(first) = drawn.first() else { return };
+    let rest = match drawn.len() - 1 {
+        0 => None,
+        1 => Some("and 1 more line".to_string()),
+        more => Some(format!("and {more} more lines")),
+    };
+    let row = ui.horizontal(|ui| {
+        let room = ui.available_width()
+            - rest.as_deref().map_or(0.0, |rest| {
+                super::text_width(ui, rest, egui::TextStyle::Small) + ui.spacing().item_spacing.x
+            });
+        let galley = egui::WidgetText::from(RichText::new(first).monospace().small().color(quiet))
+            .into_galley(ui, Some(egui::TextWrapMode::Truncate), room, egui::TextStyle::Small);
+        let elided = galley.elided;
+        // Not selectable, so the row has one thing to do under the pointer.
+        let mut hovered = ui.add(egui::Label::new(galley).selectable(false));
+        if let Some(rest) = &rest {
+            hovered |= ui.add(
+                egui::Label::new(RichText::new(rest).small().color(quiet)).selectable(false),
+            );
+        }
+        (hovered, elided)
+    });
+    let (hovered, elided) = row.inner;
+    if !elided && rest.is_none() {
+        return;
+    }
+    hovered.on_hover_ui(|ui| {
+        let screen = ui.ctx().content_rect();
+        let width = screen.width() * 0.9;
+        ui.set_max_width(width);
+        let mut room = screen.height() * 0.8;
+        let mut shown = 0;
+        for line in &drawn {
+            let galley = egui::WidgetText::from(RichText::new(line).monospace()).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Wrap),
+                width,
+                egui::TextStyle::Monospace,
+            );
+            room -= galley.size().y + ui.spacing().item_spacing.y;
+            if room < 0.0 {
+                break;
+            }
+            ui.add(egui::Label::new(galley));
+            shown += 1;
+        }
+        let left = drawn.len() - shown;
+        if left > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "{left} more line(s) do not fit here; all of them were on the approval screen."
+                ))
+                .small()
+                .color(quiet),
+            );
+        }
+    });
+}
+
 /// "Runs as you in /some/path", as three labels — or as two and a mark, when
 /// the answer to *as who* is root.
 fn draw_run_context(ui: &mut Ui, aside: &RunContext) {
