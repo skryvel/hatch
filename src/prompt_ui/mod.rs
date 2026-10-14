@@ -2065,10 +2065,11 @@ impl PromptApp {
             return Keyboard::Composing;
         }
         // Nothing on this window has the keyboard, so Space is not going
-        // into a field or onto a checkbox and is free to page the output.
-        // The review screen only: it is the phase with output on it and a
-        // decision to make about it.
-        if self.state.phase() == Phase::Reviewing
+        // into a field or onto a checkbox and is free to page what is being
+        // decided about: the output at a review, the command or the diff at
+        // an approval. Those two phases only. A running or finished window
+        // is watching, and Space keeps it there.
+        if matches!(self.state.phase(), Phase::Reviewing | Phase::AwaitingVerdict)
             && ctx.memory(|memory| memory.focused()).is_none()
         {
             return Keyboard::Reading;
@@ -2325,7 +2326,11 @@ impl PromptApp {
                 // Applied after the panel closes: `shown` borrows the state
                 // for as long as it is drawn, and writing the preference
                 // takes the window.
-                swapped = panes::draw_payload(ui, shown, self.show_original);
+                let paging = panes::Paging {
+                    offered: self.state.phase() == Phase::AwaitingVerdict,
+                    asked: self.paging,
+                };
+                swapped = panes::draw_payload(ui, shown, self.show_original, paging);
             }
         });
         if let Some(original) = swapped {
@@ -2488,15 +2493,15 @@ impl PromptApp {
             Action::Approve => self.approval(),
             Action::Deny => Verdict::Deny { note: self.note.clone() },
             Action::Toggle(toggle) => return self.flip(toggle),
+            // The command pane, or the diff, by a screenful. It decides
+            // nothing, and no verdict button can hold the focus Space would
+            // activate: see `egui_will_not_give_a_verdict_button_the_focus_that_space_activates`.
+            Action::Scroll(page) => return self.page_output(page),
             // Neither is produced outside the phases above -- see
             // [`Keyboard`] -- and a window that is still asking has neither a
             // countdown to stop nor any output to take.
-            // Scroll is not produced here: `keyboard` only reports
-            // `Reading` for the phase that has output to move. See
-            // [`Keyboard::Reading`].
             Action::Keep
             | Action::Copy
-            | Action::Scroll(_)
             | Action::Ignored
             | Action::Passthrough => return,
         };
@@ -9390,6 +9395,154 @@ mod tests {
         a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], just_now);
         let after = lines_on_screen(&a_settled_frame(&mut app, &ctx, just_now));
         assert_eq!(after.first(), first.first(), "a keystroke in flight paged the output");
+    }
+
+    /// A window awaiting a verdict on `request`, with what it writes back
+    /// kept where a test can read it.
+    fn an_awaiting_window_on(request: Request) -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut app =
+            PromptApp::new(rx, Box::new(Sink(Arc::clone(&sink))), Arc::new(OnceLock::new()), PrefsFile::none());
+        app.state.handle(DaemonMsg::Request(Box::new(request)));
+        assert_eq!(app.state.phase(), Phase::AwaitingVerdict);
+        (app, sink)
+    }
+
+    /// A command of 200 lines, each carrying a marker `rows_on_screen` finds.
+    fn a_long_command_request() -> Request {
+        let command: String =
+            (0..200).map(|n| format!("echo row{n:03}")).collect::<Vec<_>>().join("\n");
+        let mut request = a_request(90);
+        request.operations = vec![Payload::command(
+            &render_command(&command, &BTreeMap::new()),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            false,
+            false,
+        )];
+        request
+    }
+
+    /// A write of a file whose 200 lines all change, so no row is collapsed.
+    fn a_long_write_request() -> Request {
+        let old: String = (0..200).map(|n| format!("row{n:03} = old\n")).collect();
+        let new: String = (0..200).map(|n| format!("row{n:03} = new\n")).collect();
+        let mut request = a_write_request();
+        let crate::protocol::Payload::Swap { plan, .. } = &request.operations[0] else {
+            panic!("a write request that is not a write")
+        };
+        let plan = plan.clone();
+        request.operations = vec![Payload::swap(
+            PathBuf::from("/tmp/conf.toml"),
+            plan,
+            &crate::render::diff::side_by_side(&old, &new),
+        )];
+        request
+    }
+
+    /// The `rowNNN` markers drawn in this frame, in the order drawn, once each.
+    fn rows_on_screen(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (text, _) in text_rects(shapes) {
+            for (at, _) in text.match_indices("row") {
+                let marker = text.get(at..at + 6).unwrap_or("");
+                if marker.len() == 6
+                    && marker[3..].bytes().all(|b| b.is_ascii_digit())
+                    && !out.iter().any(|seen| seen == marker)
+                {
+                    out.push(marker.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn space_pages_the_command_and_the_diff_at_an_approval() {
+        // The approval window has the same keys as the review: Space a
+        // screenful down, Shift+Space back, and neither of them a verdict.
+        for (what, request) in [("command", a_long_command_request()), ("diff", a_long_write_request())] {
+            let (mut app, sink) = an_awaiting_window_on(request);
+            let ctx = egui::Context::default();
+            apply_faces(&ctx);
+            apply_font_size(&ctx, 16.0);
+            let now = past_the_guard();
+
+            let drawn = a_settled_frame(&mut app, &ctx, now);
+            let first = rows_on_screen(&drawn);
+            assert!(first.len() > 3, "the {what} does not fill its pane: {first:?}");
+            assert_eq!(first.first().map(String::as_str), Some("row000"), "{what}");
+            // Printed where the reader is told there is more, which is the
+            // only case the keys do anything in.
+            assert!(
+                text_rects(&drawn).iter().any(|(text, _)| text.contains("out of sight")
+                    && text.contains(guard::PAGE_KEYS)),
+                "the {what}'s out-of-sight line does not say Space pages it"
+            );
+
+            a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], now);
+            let paged = rows_on_screen(&a_settled_frame(&mut app, &ctx, now));
+            assert_ne!(paged.first(), first.first(), "Space did not move the {what}");
+            let overlap = first.iter().filter(|row| paged.contains(row)).count();
+            assert!(
+                (1..=4).contains(&overlap),
+                "a page of the {what} kept {overlap} of the old screen: {first:?} then {paged:?}"
+            );
+
+            a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::SHIFT)], now);
+            let back = rows_on_screen(&a_settled_frame(&mut app, &ctx, now));
+            assert_eq!(back.first(), first.first(), "Shift+Space did not bring the {what} back");
+
+            assert!(sink.lock().unwrap().is_empty(), "paging the {what} answered the request");
+            assert_eq!(app.state.phase(), Phase::AwaitingVerdict);
+        }
+    }
+
+    #[test]
+    fn space_typed_into_the_approval_note_is_a_space_and_pages_nothing() {
+        let (mut app, _sink) = an_awaiting_window_on(a_long_command_request());
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+
+        click_into_the_note_field(&mut app, &ctx, now);
+        let before = rows_on_screen(&a_settled_frame(&mut app, &ctx, now));
+        a_live_frame(&mut app, &ctx, vec![chord(egui::Key::Space, egui::Modifiers::NONE)], now);
+        a_live_frame(&mut app, &ctx, vec![egui::Event::Text(" ".to_string())], now);
+        let after = rows_on_screen(&a_settled_frame(&mut app, &ctx, now));
+
+        assert_eq!(after.first(), before.first(), "Space paged out of the note it was typed into");
+        assert_eq!(app.note, " ", "the space never reached the note");
+    }
+
+    #[test]
+    fn a_running_window_does_not_offer_the_page_keys() {
+        // On a window that is watching rather than asking, Space keeps the
+        // window. The command pane is still drawn there, out-of-sight line
+        // and all, and it must not promise a key that means something else.
+        let (mut app, _sink) = an_awaiting_window_on(a_long_command_request());
+        app.state.decide(Verdict::Approve {
+            stream: false,
+            terminal: false,
+            closing: false,
+            review: false,
+            note: String::new(),
+        });
+        assert_eq!(app.state.phase(), Phase::Running);
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let drawn = a_settled_frame(&mut app, &ctx, past_the_guard());
+        assert!(
+            text_rects(&drawn).iter().any(|(text, _)| text.contains("out of sight")),
+            "the running window does not draw the out-of-sight line, so this proves nothing"
+        );
+        assert!(
+            !text_rects(&drawn).iter().any(|(text, _)| text.contains(guard::PAGE_KEYS)),
+            "a running window says Space pages it"
+        );
     }
 
     #[test]

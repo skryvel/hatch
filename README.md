@@ -573,6 +573,14 @@ affordance alone: they survive a reader who has never learned what a scroll bar
 means, and a screenshot printed in black and white. `hatch preview long` is a
 sample that does not fit, so this is something you can look at.
 
+While the window is asking, the same line ends with *"Space pages down,
+Shift+Space back up."*, and those keys page the command, or the diff of a file
+write, a screenful at a time. They work only when nothing on the window has
+the keyboard, so a space typed into the note is still a space. Neither can
+approve anything: the verdict buttons never take the focus that Space would
+press. On a running or finished window Space keeps the window open, so the
+keys are not offered there.
+
 **The face is part of the argument.** The panes are set in Hack, chosen rather
 than inherited, for three reasons that are requirements and not preferences: it
 has **no ligatures**, so `&&` is never drawn as one glyph and `!=` never as

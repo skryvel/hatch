@@ -55,6 +55,7 @@ use crate::render::language::{Evidence, Language, Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
+use crate::prompt_ui::guard;
 use crate::prompt_ui::theme::{self, Palette};
 use crate::render::{Span, SpanKind, Spans};
 use crate::swap::{PlanKind, SwapPlan};
@@ -1415,7 +1416,7 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 /// Returns the reader's new answer to "show the original text", on the frame
 /// they change it and on no other. The window writes it down; this function
 /// draws the box and has nowhere to keep anything.
-pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool) -> Option<bool> {
+pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool, paging: Paging) -> Option<bool> {
     match shown {
         Shown::Command {
             annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, program, ..
@@ -1429,13 +1430,27 @@ pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool) -> Option<bool> 
                 runs,
                 caveat.as_deref(),
             );
-            draw_command(ui, annotated, raw, *longest, blocks, original)
+            draw_command(ui, annotated, raw, *longest, blocks, original, paging)
         }
         Shown::Swap { path, plan, rows, longest } => {
-            draw_swap(ui, path, plan, rows, *longest);
+            draw_swap(ui, path, plan, rows, *longest, paging);
             None
         }
     }
+}
+
+/// Whether Space pages the command or diff pane on this window, and the page
+/// asked for this frame.
+///
+/// `offered` is true while the window is asking for a verdict and on no other
+/// window that draws a command or a diff: on a running or finished one, Space
+/// keeps the window. It decides whether the out-of-sight line names the keys.
+/// `asked` is the page pressed since the last frame, if one was. See
+/// [`page_by`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Paging {
+    pub offered: bool,
+    pub asked: Option<guard::Page>,
 }
 
 /// How odd the text is, and what it was marked for.
@@ -2034,15 +2049,23 @@ const ROW_EPSILON: f32 = 0.05;
 /// and no others — which is the register the rest of this window already
 /// works in. That is a better use of the reader's attention than a rule
 /// applied to every request they ever answer.
-fn rows_out_of_sight(rows: Rows, of: &str, pane: &str) -> Option<String> {
+///
+/// `pages` adds the keys that page the pane, on a window where they do: this
+/// line is shown exactly when there is something to page to, which makes it
+/// the place they are printed.
+fn rows_out_of_sight(rows: Rows, of: &str, pane: &str, pages: bool) -> Option<String> {
     (!rows.whole()).then(|| {
-        format!(
+        let said = format!(
             "Only {} of {of}'s {} rows fit {pane}, so {} of them are out of sight; scroll \
              for the rest.",
             rows.shown,
             rows.of,
             rows.hidden(),
-        )
+        );
+        match pages {
+            true => format!("{said} {}", guard::PAGE_KEYS),
+            false => said,
+        }
     })
 }
 
@@ -2075,6 +2098,49 @@ fn width_out_of_sight(longest: usize, across: usize, pane: &str) -> Option<Strin
 fn out_of_sight(rows: Option<String>, width: Option<String>) -> String {
     [rows, width].into_iter().flatten().collect::<Vec<_>>().join(" ")
 }
+
+/// Move this pane by a screenful, if the keyboard asked for one.
+///
+/// # Why a screenful and not a fixed number of lines
+///
+/// The unit a reader thinks in is the thing in front of them. A pane two
+/// lines tall and a pane forty lines tall are the same gesture to the person
+/// pressing the key, and a constant number of rows would be a crawl in one
+/// and a leap in the other.
+///
+/// `KEPT_ROWS` of the old screenful stay, which is what every pager does and
+/// for the reason every pager does it: a page that moved by exactly its own
+/// height leaves the reader with no line in common between the two screens,
+/// and nothing to place the new one against.
+///
+/// Called inside the scroll area, which is what `scroll_with_delta` is
+/// documented against, and once per pane -- so a review with two panes moves
+/// both, which is the honest answer when the reader has not said which one
+/// they mean and both are part of the same decision. The approval window has
+/// one pane, the command or the diff, and it is called there too.
+pub fn page_by(ui: &egui::Ui, paging: Option<guard::Page>, row: f32) {
+    let Some(page) = paging else { return };
+    // The visible height, not the content height: what is clipped is what is
+    // on the screen.
+    let screenful = (ui.clip_rect().height() - KEPT_ROWS * row).max(row);
+    // Negative moves the content up, which is what "down" means to a reader:
+    // further into the output. See `egui::Ui::scroll_with_delta`.
+    let delta = match page {
+        guard::Page::Down => -screenful,
+        guard::Page::Up => screenful,
+    };
+    // Instantly, not over egui's scroll animation. A reader paging through a
+    // long capture presses this repeatedly, and a third of a second of glide
+    // per press is both sluggish and a moving target for the next one. The
+    // two kept rows are what supplies the continuity an animation would.
+    ui.scroll_with_delta_animation(egui::vec2(0.0, delta), egui::style::ScrollAnimation::none());
+}
+
+/// How much of the old screenful a page keeps.
+///
+/// Two lines: enough to place the new screen against the old, few enough
+/// that paging through a long capture is not mostly re-reading.
+const KEPT_ROWS: f32 = 2.0;
 
 /// Draw the out-of-sight line, if there is one.
 ///
@@ -2310,6 +2376,7 @@ fn draw_command(
     longest: usize,
     blocks: &[Block],
     original: bool,
+    paging: Paging,
 ) -> Option<bool> {
     let palette = palette(ui);
     let gutter = gutter(&lines(annotated), blocks);
@@ -2332,7 +2399,7 @@ fn draw_command(
     draw_out_of_sight(
         ui,
         &out_of_sight(
-            rows_out_of_sight(seen, "the command", "the pane"),
+            rows_out_of_sight(seen, "the command", "the pane", paging.offered),
             match original {
                 true => width_out_of_sight(longest, across, "the pane"),
                 // The annotated pane wraps, so nothing of it is off to the
@@ -2360,8 +2427,20 @@ fn draw_command(
 
     let height = ui.available_height();
     let shown = match original {
-        true => draw_command_pane(ui, raw, PaneBox::raw(height, false, want), &Gutter::default()),
-        false => draw_command_pane(ui, annotated, PaneBox::annotated(height, want), &gutter),
+        true => draw_command_pane(
+            ui,
+            raw,
+            PaneBox::raw(height, false, want),
+            &Gutter::default(),
+            paging.asked,
+        ),
+        false => draw_command_pane(
+            ui,
+            annotated,
+            PaneBox::annotated(height, want),
+            &gutter,
+            paging.asked,
+        ),
     };
     ui.data_mut(|data| {
         data.insert_temp(pane_rows_id(), shown.rows);
@@ -2388,7 +2467,13 @@ fn draw_command(
 /// both of those from a pane that simply ran out of command. See [`PaneAt`].
 /// The same two numbers, in rows rather than in pixels, are what the caption
 /// says out loud on the next frame: see [`Rows`].
-fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox, gutter: &Gutter) -> PaneShown {
+fn draw_command_pane(
+    ui: &mut Ui,
+    spans: &Spans,
+    pane: PaneBox,
+    gutter: &Gutter,
+    paging: Option<guard::Page>,
+) -> PaneShown {
     // A pane that cannot wrap needs somewhere to scroll a long line to; one
     // that wraps has nothing to the side and a horizontal bar would only be
     // furniture.
@@ -2405,7 +2490,10 @@ fn draw_command_pane(ui: &mut Ui, spans: &Spans, pane: PaneBox, gutter: &Gutter)
     let row = row_height(ui);
     pane_frame(ui)
         .show(ui, |ui| {
-            let drawn = scroll.show(ui, |ui| draw_spans_bracketed(ui, spans, pane.weight, gutter));
+            let drawn = scroll.show(ui, |ui| {
+                page_by(ui, paging, row);
+                draw_spans_bracketed(ui, spans, pane.weight, gutter)
+            });
             PaneShown {
                 at: PaneAt {
                     offset: drawn.state.offset.y,
@@ -2520,7 +2608,14 @@ impl PaneBox {
 /// of them is much less of an imposition. It is not gone: a chip on every
 /// line is still a mark on every line, and the rule costs a reader nothing,
 /// because the case it hides is exactly the case where both sides agree.
-fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: usize) {
+fn draw_swap(
+    ui: &mut Ui,
+    path: &str,
+    plan: &SwapPlan,
+    rows: &[Row],
+    longest: usize,
+    paging: Paging,
+) {
     let palette = palette(ui);
     ui.horizontal_wrapped(|ui| {
         ui.label("Writes");
@@ -2580,7 +2675,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
     draw_out_of_sight(
         ui,
         &out_of_sight(
-            rows_out_of_sight(seen, "the diff", "the pane"),
+            rows_out_of_sight(seen, "the diff", "the pane", paging.offered),
             match view {
                 DiffView::SideBySide => None,
                 DiffView::Unified => width_out_of_sight(
@@ -2631,6 +2726,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
                         .max_height(ui.available_height())
                         .auto_shrink([false, false])
                         .show_rows(ui, row_height, items.len(), |ui, range| {
+                            page_by(ui, paging.asked, row_height);
                             for item in &items[range] {
                                 match item {
                                     Item::Drawn(row) => draw_row(ui, row, &palette, size),
@@ -2646,6 +2742,7 @@ fn draw_swap(ui: &mut Ui, path: &str, plan: &SwapPlan, rows: &[Row], longest: us
                         .max_height(ui.available_height())
                         .auto_shrink([false, false])
                         .show_rows(ui, row_height, items.len(), |ui, range| {
+                            page_by(ui, paging.asked, row_height);
                             for item in &items[range] {
                                 match item {
                                     Item::Drawn(line) => {
@@ -5595,7 +5692,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut out = ctx.run_ui(input, |ui| {
-                    draw_payload(ui, &shown, original);
+                    draw_payload(ui, &shown, original, Paging { offered: true, asked: None });
                 });
                 let text = drawn_text(&out);
                 out.textures_delta.clear();
@@ -5678,7 +5775,7 @@ mod tests {
 
     #[test]
     fn the_words_say_how_much_is_out_of_sight_and_what_to_do_about_it() {
-        let note = rows_out_of_sight(Rows { of: 63, shown: 24 }, "the command", "the pane below")
+        let note = rows_out_of_sight(Rows { of: 63, shown: 24 }, "the command", "the pane below", false)
             .expect("a pane showing 24 of 63 rows has something to say");
         assert!(note.contains("63"), "the sentence does not say how much there is: {note}");
         assert!(note.contains("24"), "nor how much is on screen: {note}");
@@ -5690,8 +5787,8 @@ mod tests {
         // Nothing at all when the reader has been shown all of it. The
         // measurement is a frame old, and "all of it is on screen" is the one
         // sentence a reader would stop reading on, so this never says it.
-        assert_eq!(rows_out_of_sight(Rows { of: 24, shown: 24 }, "the command", "the pane"), None);
-        assert_eq!(rows_out_of_sight(Rows::default(), "the command", "the pane"), None);
+        assert_eq!(rows_out_of_sight(Rows { of: 24, shown: 24 }, "the command", "the pane", true), None);
+        assert_eq!(rows_out_of_sight(Rows::default(), "the command", "the pane", true), None);
 
         // And the same sideways, which is the axis the raw pane loses text
         // off: it does not reflow, so a long line stops at the right edge.

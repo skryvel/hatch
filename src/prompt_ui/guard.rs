@@ -245,12 +245,15 @@ pub const KEEP_KEYS: &str = "E, O\nSpace";
 /// buttons names it.
 pub const COPY_CHORD: &str = "Alt+C";
 
-/// What pages the output under review, printed where that output is.
+/// What pages the output under review, or the command or diff being
+/// approved, printed where that text is.
 ///
 /// Not on a button, because there is no button: paging is the one thing this
 /// window does that has no control to hang a label off. So it is a line of
 /// its own beside the panes, which is the same promise kept the only way it
 /// can be kept here -- a shortcut nobody can see is a shortcut nobody has.
+/// At an approval it ends the line that says rows are out of sight, which is
+/// shown exactly when there is something to page to.
 ///
 /// Space is what every pager in the world uses, and Shift+Space is what every
 /// one of them uses to go back. Neither collides with the bare letters of a
@@ -323,7 +326,8 @@ pub enum Keyboard {
     /// A window that is asking with *nothing* on it holding the keyboard.
     ///
     /// Everything [`Keyboard::Asking`] means, and one key more: Space pages
-    /// the output down and Shift+Space pages it back up. It is a separate
+    /// the text being decided about down -- the output at a review, the
+    /// command or the diff at an approval -- and Shift+Space pages it back up. It is a separate
     /// state and not a rule inside `Asking` because the difference is the
     /// whole safety of it — this window has text fields and checkboxes on it,
     /// and Space belongs to whichever of them has the keyboard whenever one
