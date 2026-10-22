@@ -157,20 +157,27 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// the mouse -- which is most of them, most of the time, because that is
 /// where the buttons are -- has no keyboard approval at all, and the whole
 /// point of putting these on the button was that answering should not cost a
-/// trip across the desk. `Ctrl+Shift+A` is reachable by the left hand alone.
+/// trip across the desk. `Alt+Shift+A` is reachable by the left hand alone,
+/// with the thumb on Alt rather than a little finger stretched to Control.
 ///
 /// It was `Ctrl+Alt+A`, and on KDE Plasma that never reached the window:
 /// KWin binds it by default (Activate Window Demanding Attention) and takes
 /// the key before any application sees it. `Ctrl+Alt` is the combination
-/// desktops claim, which is why [`toggle_chord`] refuses it too; `Ctrl+Shift`
-/// is one they mostly leave to applications. A desktop that does grab it means
-/// the chord does not work and nothing else happens either. It cannot
-/// misfire, only fail to fire, and the two Enter chords are still there.
+/// desktops claim, which is why [`toggle_chord`] refuses it too. A desktop
+/// that does grab this one means the chord does not work and nothing else
+/// happens either. It cannot misfire, only fail to fire, and the two Enter
+/// chords are still there.
 ///
-/// It is also why the letter may not be carried by one modifier alone. `Alt+A` with
-/// nothing else held is one keystroke away from the box chords beside it, and
-/// on a window with a text field on it a bare-ish letter approving a command
-/// is the burst-of-keystrokes hazard this whole module exists for.
+/// Not `Alt+A`, although the typing guard would hold it as long as any other
+/// chord. The guard stops keys that were in flight when the window appeared;
+/// it does nothing about a slip by somebody already using the window, and A
+/// is the key beside S, whose `Alt+S` is a box. A finger that lands one key
+/// over on its way to that box presses `Alt+A`, which does nothing.
+///
+/// The cost is macOS, where Option is how a layout types a second letter:
+/// `Option+Shift+A` is `Å` on a US layout, and this chord takes it before the
+/// note field does. The box chords already take `Option+S`, `Option+C` and
+/// `Option+R` the same way.
 ///
 /// One line was tried first and does not fit. The hint may not widen the
 /// button — the two buttons that decide are centred in a rect measured from
@@ -188,7 +195,7 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// `the_buttons_name_exactly_the_chords_the_guard_takes` reads it the way a
 /// user does — every line — and holds the rule to it, so the two cannot drift
 /// apart.
-pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nCtrl+Shift+A";
+pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nAlt+Shift+A";
 
 /// What the Deny button says the keyboard shortcut is.
 ///
@@ -520,7 +527,7 @@ impl Guard {
             Some(Key::Enter) if !open => Action::Ignored,
             // Every approval, whichever key carries it. Judged after the
             // shut-guard arm above for Enter, and with its own shut check
-            // for the rest: `Ctrl+Shift+A` is as much a decision as
+            // for the rest: `Alt+Shift+A` is as much a decision as
             // `Ctrl+Enter` and waits exactly as long.
             Some(key) if approves(key, modifiers) => match (open, keyboard) {
                 (false, _) => Action::Ignored,
@@ -634,15 +641,17 @@ fn approves(key: Key, m: Modifiers) -> bool {
     let control = m.ctrl || m.command || m.mac_cmd;
     match key {
         Key::Enter => (control && !m.alt && !m.shift) || (m.shift && !m.alt && !control),
-        // The left hand's. Control *and* Shift, and neither on its own:
-        // `Shift+A` is a capital letter typed into the note field this window
-        // has on it, and `Ctrl+A` is select-all in that field.
+        // The left hand's. Alt *and* Shift, and neither on its own: `Shift+A`
+        // is a capital letter typed into the note field this window has on
+        // it, and `Alt+A` is one key from the box chords.
         //
-        // Not reachable by a keyboard producing a character: typing a letter
-        // never holds Control. Alt is refused rather than ignored, so the old
-        // `Ctrl+Alt+A` does nothing, and on Windows -- where AltGr is
-        // Ctrl+Alt -- `AltGr+Shift+A` cannot approve either.
-        Key::A => control && m.shift && !m.alt,
+        // Control is refused rather than ignored, so the old `Ctrl+Alt+A`
+        // does nothing. On X11 and Wayland AltGr is a level shift that
+        // arrives as `AltGraph`, off the `Alt` modifier entirely, so no
+        // layout types a letter with it; on Windows, where AltGr is Ctrl+Alt,
+        // the Control it carries refuses it. macOS is the exception, and is
+        // said at `APPROVE_CHORD`.
+        Key::A => m.alt && m.shift && !control,
         _ => false,
     }
 }
@@ -1255,7 +1264,7 @@ mod tests {
             // Every key the label mentions, against every modifier
             // combination there is -- so a label naming two keys is held to
             // the rule on both, and a chord that works on the wrong one of
-            // them fails here. `Ctrl+Shift+A` approving while `Ctrl+A` does
+            // them fails here. `Alt+Shift+A` approving while `Alt+A` does
             // not is exactly this check.
             let mut keys: Vec<Key> = chords.iter().map(|(key, _)| *key).collect();
             keys.dedup();
@@ -1295,13 +1304,13 @@ mod tests {
         // Lines naming different keys, and a line naming two modifiers:
         // both are what the third approval chord needs read correctly, and
         // neither was possible to write before it existed.
-        let ctrl_shift = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+        let alt_shift = Modifiers { alt: true, shift: true, ..Modifiers::NONE };
         assert_eq!(
             named(APPROVE_CHORD),
             vec![
                 (Key::Enter, Modifiers::CTRL),
                 (Key::Enter, Modifiers::SHIFT),
-                (Key::A, ctrl_shift),
+                (Key::A, alt_shift),
             ],
             "the label on the Approve button is not the three chords it looks like"
         );
