@@ -6261,6 +6261,7 @@ mod tests {
             raw,
             danger,
             runs,
+            files: Default::default(),
             cwd,
             root,
             interactive,

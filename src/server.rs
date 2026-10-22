@@ -190,6 +190,7 @@ use crate::protocol::{
 };
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_naming;
+use crate::render::files::named_files;
 use crate::render::roster::roster;
 use crate::render::unicode::defang;
 use crate::queue::ApprovalQueue;
@@ -2759,6 +2760,9 @@ impl Daemon {
         // filesystem, which is why it is here and not in the window: the
         // child `PATH` is this process's config.
         let runs = roster(&roster_line, &render_env, &cwd);
+        // The files it names, on the roster's terms and for its reasons:
+        // the same line, the same environment, the same directory.
+        let files = named_files(&roster_line, &render_env, &cwd);
         // Danger markers are display-only and land with the marker heuristics;
         // an empty list has never been a claim that a command is safe.
         let payload =
@@ -2766,6 +2770,7 @@ impl Daemon {
                 .with_caveat(caveat)
                 .with_program(program)
                 .with_runs(runs)
+                .with_files(files)
                 .with_no_terminal(no_terminal.as_ref().map(NoTerminal::sentence));
         Rendered::Ready(Box::new(Job {
             detail: detail(&cwd),

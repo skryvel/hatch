@@ -776,6 +776,14 @@ pub enum Payload {
         /// command runs nothing — see [`Payload::with_runs`] for why it is
         /// filled in by a separate call.
         runs: Vec<crate::render::roster::Entry>,
+        /// The regular files the command names, which the window offers to
+        /// show: [`crate::render::files::named_files`], built against the
+        /// same environment and directory as `runs`, for the same reason.
+        ///
+        /// Display only. An empty list is not a claim that the command reads
+        /// no file -- `make` reads a `Makefile` it never names -- and a listed
+        /// file may change between being shown and being run.
+        files: crate::render::files::Named,
         /// The working directory it will run in.
         ///
         /// A `PathBuf` rather than a `String`: JSON cannot carry a non-UTF-8
@@ -868,6 +876,7 @@ impl Payload {
             raw: spans.source().to_string(),
             danger,
             runs: Vec::new(),
+            files: crate::render::files::Named::default(),
             cwd,
             root,
             interactive,
@@ -895,6 +904,7 @@ impl Payload {
                 raw,
                 danger,
                 runs,
+                files,
                 cwd,
                 root,
                 interactive,
@@ -907,6 +917,7 @@ impl Payload {
                 raw,
                 danger,
                 runs,
+                files,
                 cwd,
                 root,
                 interactive,
@@ -930,7 +941,7 @@ impl Payload {
     /// caveat to attach to one.
     pub fn with_caveat(self, caveat: Option<&str>) -> Payload {
         match self {
-            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, cwd, root, interactive, program, no_terminal } => {
+            Payload::Command { caveat: _, display_line, spans, raw, danger, runs, files, cwd, root, interactive, program, no_terminal } => {
                 Payload::Command {
                     caveat: caveat.map(str::to_string),
                     display_line,
@@ -938,6 +949,7 @@ impl Payload {
                     raw,
                     danger,
                     runs,
+                    files,
                     cwd,
                     root,
                     interactive,
@@ -966,6 +978,7 @@ impl Payload {
                 raw,
                 danger,
                 runs,
+                files,
                 cwd,
                 root,
                 interactive,
@@ -978,6 +991,7 @@ impl Payload {
                 raw,
                 danger,
                 runs,
+                files,
                 cwd,
                 root,
                 interactive,
@@ -986,6 +1000,21 @@ impl Payload {
             },
             swap => swap,
         }
+    }
+
+    /// The same payload, carrying the files the command names. See
+    /// [`Payload::Command::files`].
+    ///
+    /// Separate from [`Payload::command`] for [`Payload::with_runs`]'s reason:
+    /// the places with a working directory and a child environment to resolve
+    /// against are the places that set it.
+    ///
+    /// A no-op on a swap payload, which shows its file already.
+    pub fn with_files(mut self, named: crate::render::files::Named) -> Payload {
+        if let Payload::Command { files, .. } = &mut self {
+            *files = named;
+        }
+        self
     }
 
     /// The same payload, carrying the roster of what the command will run.
@@ -1000,9 +1029,10 @@ impl Payload {
     /// A no-op on a swap payload: a swap runs no command.
     pub fn with_runs(self, runs: Vec<crate::render::roster::Entry>) -> Payload {
         match self {
-            Payload::Command { runs: _, display_line, spans, raw, danger, cwd, root, interactive, caveat, program, no_terminal } => {
+            Payload::Command { runs: _, display_line, spans, raw, danger, files, cwd, root, interactive, caveat, program, no_terminal } => {
                 Payload::Command {
                     runs,
+                    files,
                     display_line,
                     spans,
                     raw,
@@ -1837,6 +1867,7 @@ mod tests {
                 "cwd",
                 "danger",
                 "display_line",
+                "files",
                 "interactive",
                 "kind",
                 "no_terminal",

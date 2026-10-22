@@ -13,6 +13,7 @@ pub mod blocks;
 pub mod command;
 pub mod danger;
 pub mod diff;
+pub mod files;
 pub mod grammar;
 pub mod language;
 pub mod roster;

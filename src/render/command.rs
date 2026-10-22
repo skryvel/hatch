@@ -3230,6 +3230,216 @@ fn literal_word(word: &str) -> Option<String> {
     Some(out)
 }
 
+// ---- paths a command names -------------------------------------------------
+
+/// The values of the words in `command` that hatch can state exactly, for
+/// the window to offer as files to look at.
+///
+/// `python script.py` is approved on a line that says nothing about what
+/// `script.py` does. This finds the `script.py`; which of these values are
+/// files, and what is in them, is [`super::files`]'s business.
+///
+/// # Which words
+///
+/// Every word of every segment from the one that names what runs onwards,
+/// that word included only when it is a path (`./deploy.sh`), never a name
+/// looked up on `PATH`. The file a `<` reads from is one too. Options are
+/// not (`-f`'s argument is its own word and is), nor are assignments, words
+/// in a here-document body or a comment, or the inside of a substitution.
+///
+/// # Only a value that is already what it will be
+///
+/// Quoting is removed the way [`literal_word`] removes it. A `$NAME` or
+/// `${NAME}` is replaced with the value the window already draws beside it:
+/// what the command set it to, or the environment it starts in, under the
+/// same rule as [`annotate_variables`]. That is how `F=/srv/x.py; python
+/// "$F"` names `/srv/x.py`. `~/` is read through `HOME` as [`assigned_value`]
+/// reads it. Anything else that expands -- a substitution, a glob, a brace,
+/// `$1`, `${F:-x}` -- makes the word name nothing, and so does an unquoted
+/// `$NAME` whose value the shell would split or match.
+///
+/// # Only from where it will be resolved
+///
+/// A relative value is resolved against the request's working directory by
+/// whoever uses this, so one is only offered while that is still the working
+/// directory. After a segment that may change it -- `cd`, `pushd`, `popd`,
+/// `source`, `.`, `eval`, a subshell, or a command whose name hatch cannot
+/// read -- relative values are dropped for the rest of the command, and a
+/// segment with an option that moves one program elsewhere (`-C`,
+/// `--directory`) drops its own. Absolute values are kept throughout. Missing
+/// a file is the direction this may be wrong in; showing the wrong one is not.
+pub fn named_paths(command: &str, env: &BTreeMap<String, String>) -> Vec<String> {
+    let scanned: Vec<Scanned> = scan(command).collect();
+    let set_here = assignments(command, env);
+    let inputs: Vec<Range<usize>> = read_from(command);
+    let mut at = 0;
+    let mut moved = false;
+    let mut out: Vec<String> = Vec::new();
+    for segment in segments(command) {
+        let words = words(&scanned, &mut at, &segment);
+        let Some(mut first) = command_at(command, &words) else {
+            continue;
+        };
+        let texts: Vec<&str> = words.iter().map(|word| &command[word.clone()]).collect();
+        // `then python3 x.py` runs `python3`, not `then`.
+        let keyword = |text: &str| readable_name(text).is_some_and(|name| is_keyword(&name));
+        while first + 1 < texts.len() && keyword(texts[first]) {
+            first += 1;
+        }
+        let elsewhere = texts.iter().any(|text| moves_one_program(text));
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for (index, word) in words.iter().enumerate().skip(first) {
+            let text = texts[index];
+            let path_only = index == first;
+            let declined = text.starts_with('-') || text.contains(STRUCTURE);
+            if declined || (path_only && !text.contains('/')) {
+                continue;
+            }
+            if let Some(value) = expanded(text, word.start, &set_here, env) {
+                found.push((word.start, value));
+            }
+        }
+        for input in inputs.iter().filter(|input| segment.contains(&input.start)) {
+            if let Some(value) = expanded(&command[input.clone()], input.start, &set_here, env) {
+                found.push((input.start, value));
+            }
+        }
+        found.sort_by_key(|(at, _)| *at);
+        for (_, value) in found {
+            let relative = !value.starts_with('/');
+            if value.is_empty() || (relative && (moved || elsewhere)) || out.contains(&value) {
+                continue;
+            }
+            out.push(value);
+        }
+        let name = readable_name(texts[first]);
+        let leaves = matches!(
+            name.as_deref(),
+            None | Some("cd" | "pushd" | "popd" | "source" | "." | "eval")
+        );
+        if leaves || texts.iter().any(|text| text.contains(STRUCTURE)) {
+            moved = true;
+        }
+    }
+    out
+}
+
+/// Whether a word is an option that runs its program somewhere other than the
+/// working directory: `git -C dir`, `make --directory=dir`, `env --chdir`.
+///
+/// A list and not a grammar, so it is incomplete, and what it misses is a
+/// relative path offered from the wrong directory. It covers the spellings
+/// common enough to be worth the check; see [`named_paths`].
+fn moves_one_program(word: &str) -> bool {
+    word == "-C"
+        || ["--directory", "--chdir", "--cwd", "--work-tree", "--git-dir"]
+            .iter()
+            .any(|long| word == *long || word.starts_with(&format!("{long}=")))
+}
+
+/// The targets of the `<` redirections in `command`: the files it reads its
+/// input from. Not `<<`, `<<<`, `<&` or `<>`, which are a here-document, a
+/// string, a descriptor and a file opened for writing as well.
+fn read_from(command: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut operator: Option<&str> = None;
+    for (range, half) in redirections(command) {
+        match half {
+            Redirect::Operator => operator = Some(&command[range]),
+            Redirect::Target => {
+                let reads = |op: &str| op.trim_start_matches(|c: char| c.is_ascii_digit()) == "<";
+                if operator.is_some_and(reads) {
+                    out.push(range);
+                }
+                operator = None;
+            }
+        }
+    }
+    out
+}
+
+/// What a word is worth once quoting is removed and the variables in it
+/// that hatch can state are replaced, or `None` when hatch will not say.
+///
+/// `at` is where the word starts, which decides which of the command's own
+/// assignments it sees. See [`named_paths`] for the rules.
+fn expanded(
+    word: &str,
+    at: usize,
+    set_here: &[Assignment],
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    let value_of = |name: &str| match assigned_at(set_here, name, at) {
+        Some(held) => held.value.clone(),
+        None => env.get(name).cloned(),
+    };
+    let mut out = String::new();
+    let mut rest = word;
+    if let Some(after) = word.strip_prefix("~/") {
+        out = format!("{}/", env.get("HOME")?);
+        rest = after;
+    }
+    let mut chars = rest.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !quoted => {
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    out.push(c);
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '"' => quoted = !quoted,
+            // Inside double quotes a backslash only escapes what would
+            // otherwise mean something there, and stays itself elsewhere.
+            '\\' if quoted => match chars.next()? {
+                '\n' => {}
+                escaped @ ('$' | '`' | '"' | '\\') => out.push(escaped),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            },
+            '\\' => match chars.next()? {
+                '\n' => {}
+                escaped => out.push(escaped),
+            },
+            '$' => {
+                let braced = chars.next_if_eq(&'{').is_some();
+                let mut name = String::new();
+                while let Some(c) = chars.next_if(|c| is_name_char(*c)) {
+                    name.push(c);
+                }
+                if braced && chars.next() != Some('}') {
+                    return None;
+                }
+                if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    return None;
+                }
+                let value = value_of(&name)?;
+                // Unquoted, the shell splits the value on blanks and matches
+                // it as a pattern, and the word may become several or none.
+                let splits = |c: char| c.is_whitespace() || matches!(c, '*' | '?' | '[');
+                if !quoted && value.contains(splits) {
+                    return None;
+                }
+                out.push_str(&value);
+            }
+            '`' => return None,
+            '*' | '?' | '[' | '{' | '}' | '~' if !quoted => return None,
+            _ => out.push(c),
+        }
+    }
+    (!quoted).then_some(out)
+}
+
 // ---- wrappers --------------------------------------------------------------
 
 /// One program whose own arguments end in another program's name.
@@ -6413,5 +6623,65 @@ mod tests {
         assert_eq!(dollar_extent("${A"), 2, "unterminated: claim nothing past the brace");
         assert_eq!(dollar_extent("$(id)"), 2);
         assert_eq!(dollar_extent("$é"), 3, "a multibyte sigil is stepped over whole");
+    }
+
+    // ---- paths a command names --------------------------------------------
+
+    fn paths(command: &str) -> Vec<String> {
+        named_paths(command, &BTreeMap::new())
+    }
+
+    #[test]
+    fn the_words_after_what_runs_are_named_and_a_program_only_when_it_is_a_path() {
+        assert_eq!(paths("python3 script.py --fast -o out.txt"), ["script.py", "out.txt"]);
+        assert_eq!(paths("./deploy.sh prod"), ["./deploy.sh", "prod"]);
+        assert_eq!(paths("bash 'my script.sh'"), ["my script.sh"]);
+        assert_eq!(paths("FOO=1 ls"), Vec::<String>::new());
+        assert_eq!(paths("if true; then python3 x.py; fi"), ["x.py"]);
+        assert_eq!(paths("bash < deploy.sh; cat <<< x.txt"), ["deploy.sh"]);
+    }
+
+    #[test]
+    fn a_variable_names_what_the_window_already_says_it_holds() {
+        assert_eq!(paths("F=/srv/x.py; python3 \"$F\""), ["/srv/x.py"]);
+        assert_eq!(paths("D=/srv; python3 ${D}/run.py"), ["/srv/run.py"]);
+        let env = BTreeMap::from([
+            ("SCRIPT".to_string(), "/opt/a b.py".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+        ]);
+        assert_eq!(named_paths("python3 \"$SCRIPT\"", &env), ["/opt/a b.py"]);
+        // Unquoted, the shell would split it into two words.
+        assert!(named_paths("python3 $SCRIPT", &env).is_empty());
+        assert_eq!(named_paths("python3 ~/bin/x.py", &env), ["/home/u/bin/x.py"]);
+    }
+
+    #[test]
+    fn a_word_that_needs_a_shell_to_work_out_names_nothing() {
+        for command in [
+            "python3 $(which x)",
+            "python3 *.py",
+            "python3 ${F:-x.py}",
+            "python3 $1",
+            "python3 $UNSET",
+            "python3 {a,b}.py",
+            "for f in a; do python3 $f; done",
+            "ls # notes.txt",
+            "python3 - <<'EOF'\nopen('x.py')\nEOF",
+        ] {
+            let found = paths(command);
+            assert!(
+                !found.iter().any(|path| path.ends_with(".py") || path.contains("notes")),
+                "{command:?} named {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_not_offered_once_the_directory_may_have_moved() {
+        assert_eq!(paths("cd /srv && python3 run.py /etc/x.conf"), ["/srv", "/etc/x.conf"]);
+        assert_eq!(paths("$CD x; python3 run.py"), ["x"]);
+        assert_eq!(paths("(cd x; python3 run.py)"), ["x"]);
+        assert_eq!(paths("git -C repo apply fix.patch /tmp/p"), ["/tmp/p"]);
+        assert_eq!(paths("make --directory=sub test.mk; cat notes"), ["notes"]);
     }
 }
