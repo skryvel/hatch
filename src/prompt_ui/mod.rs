@@ -8017,11 +8017,11 @@ mod tests {
         //
         // The note field is where the left-hand chord has most to prove: it
         // is carried by a letter, and a letter is what that field is for.
-        let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..egui::Modifiers::NONE };
         for (key, held) in [
             (egui::Key::Enter, egui::Modifiers::CTRL),
             (egui::Key::Enter, egui::Modifiers::SHIFT),
-            (egui::Key::A, ctrl_alt),
+            (egui::Key::A, ctrl_shift),
         ] {
             let (mut app, sink) = an_awaiting_window();
             let ctx = egui::Context::default();
@@ -8046,16 +8046,20 @@ mod tests {
 
     #[test]
     fn a_letter_that_carries_an_approval_is_still_a_letter_without_its_chord() {
-        // `A` approves only with Control *and* Alt. The window has a text
+        // `A` approves only with Control *and* Shift. The window has a text
         // field on it, so every other way of pressing that key has to reach
         // the field -- including the near misses, which is where a rule
         // matched loosely would show up as a window that eats what you type.
+        // `Ctrl+Alt+A` among them: it was the chord once, and is inert now.
+        let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
         let ctrl_alt_shift =
             egui::Modifiers { ctrl: true, alt: true, shift: true, ..egui::Modifiers::NONE };
         for held in [
             egui::Modifiers::NONE,
             egui::Modifiers::ALT,
             egui::Modifiers::SHIFT,
+            egui::Modifiers::CTRL,
+            ctrl_alt,
             ctrl_alt_shift,
         ] {
             let (mut app, sink) = an_awaiting_window();

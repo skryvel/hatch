@@ -157,16 +157,17 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// the mouse -- which is most of them, most of the time, because that is
 /// where the buttons are -- has no keyboard approval at all, and the whole
 /// point of putting these on the button was that answering should not cost a
-/// trip across the desk. `Ctrl+Alt+A` is reachable by the left hand alone.
+/// trip across the desk. `Ctrl+Shift+A` is reachable by the left hand alone.
 ///
-/// `Ctrl+Alt` is the one combination [`toggle_chord`] refuses on the grounds
-/// that a desktop may have claimed it. That argument still holds and is the
-/// accepted cost here: a compositor that grabs `Ctrl+Alt+A` means hatch never
-/// sees the event, so the chord does not work and nothing else happens
-/// either. It cannot misfire, only fail to fire, and the two Enter chords are
-/// still there.
+/// It was `Ctrl+Alt+A`, and on KDE Plasma that never reached the window:
+/// KWin binds it by default (Activate Window Demanding Attention) and takes
+/// the key before any application sees it. `Ctrl+Alt` is the combination
+/// desktops claim, which is why [`toggle_chord`] refuses it too; `Ctrl+Shift`
+/// is one they mostly leave to applications. A desktop that does grab it means
+/// the chord does not work and nothing else happens either. It cannot
+/// misfire, only fail to fire, and the two Enter chords are still there.
 ///
-/// It is also why the letter may not be carried by `Alt` alone. `Alt+A` with
+/// It is also why the letter may not be carried by one modifier alone. `Alt+A` with
 /// nothing else held is one keystroke away from the box chords beside it, and
 /// on a window with a text field on it a bare-ish letter approving a command
 /// is the burst-of-keystrokes hazard this whole module exists for.
@@ -187,7 +188,7 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// `the_buttons_name_exactly_the_chords_the_guard_takes` reads it the way a
 /// user does — every line — and holds the rule to it, so the two cannot drift
 /// apart.
-pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nCtrl+Alt+A";
+pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nCtrl+Shift+A";
 
 /// What the Deny button says the keyboard shortcut is.
 ///
@@ -519,7 +520,7 @@ impl Guard {
             Some(Key::Enter) if !open => Action::Ignored,
             // Every approval, whichever key carries it. Judged after the
             // shut-guard arm above for Enter, and with its own shut check
-            // for the rest: `Ctrl+Alt+A` is as much a decision as
+            // for the rest: `Ctrl+Shift+A` is as much a decision as
             // `Ctrl+Enter` and waits exactly as long.
             Some(key) if approves(key, modifiers) => match (open, keyboard) {
                 (false, _) => Action::Ignored,
@@ -633,17 +634,15 @@ fn approves(key: Key, m: Modifiers) -> bool {
     let control = m.ctrl || m.command || m.mac_cmd;
     match key {
         Key::Enter => (control && !m.alt && !m.shift) || (m.shift && !m.alt && !control),
-        // The left hand's. Control *and* Alt, and neither on its own: `Alt+A`
-        // sits one keystroke from the box chords, and `Ctrl+A` is select-all
-        // in the field this window has on it.
+        // The left hand's. Control *and* Shift, and neither on its own:
+        // `Shift+A` is a capital letter typed into the note field this window
+        // has on it, and `Ctrl+A` is select-all in that field.
         //
-        // Not reachable by a keyboard producing a character. AltGr is a level
-        // shift rather than Alt on X11 and Wayland -- it arrives as
-        // `AltGraph`, off the `Alt` modifier entirely -- and on Windows,
-        // where AltGr really is Ctrl+Alt, winit drops the synthetic Control
-        // for layouts that have one. So no layout can approve a command by
-        // typing a letter into the note field.
-        Key::A => control && m.alt && !m.shift,
+        // Not reachable by a keyboard producing a character: typing a letter
+        // never holds Control. Alt is refused rather than ignored, so the old
+        // `Ctrl+Alt+A` does nothing, and on Windows -- where AltGr is
+        // Ctrl+Alt -- `AltGr+Shift+A` cannot approve either.
+        Key::A => control && m.shift && !m.alt,
         _ => false,
     }
 }
@@ -1256,7 +1255,7 @@ mod tests {
             // Every key the label mentions, against every modifier
             // combination there is -- so a label naming two keys is held to
             // the rule on both, and a chord that works on the wrong one of
-            // them fails here. `Ctrl+Alt+A` approving while `Ctrl+A` does
+            // them fails here. `Ctrl+Shift+A` approving while `Ctrl+A` does
             // not is exactly this check.
             let mut keys: Vec<Key> = chords.iter().map(|(key, _)| *key).collect();
             keys.dedup();
@@ -1296,13 +1295,13 @@ mod tests {
         // Lines naming different keys, and a line naming two modifiers:
         // both are what the third approval chord needs read correctly, and
         // neither was possible to write before it existed.
-        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
         assert_eq!(
             named(APPROVE_CHORD),
             vec![
                 (Key::Enter, Modifiers::CTRL),
                 (Key::Enter, Modifiers::SHIFT),
-                (Key::A, ctrl_alt),
+                (Key::A, ctrl_shift),
             ],
             "the label on the Approve button is not the three chords it looks like"
         );
