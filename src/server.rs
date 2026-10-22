@@ -953,6 +953,26 @@ impl Drop for StreamEnd {
     }
 }
 
+/// How long a client's MCP session may go without a message before it is
+/// dropped.
+///
+/// rmcp's default is five minutes, and five minutes is shorter than an
+/// ordinary gap between two calls from one agent: a build, a long read, a
+/// person away from the desk. A call on a dropped session is answered 404,
+/// and Claude Code, at the time of writing, does not pass that on. It opens a
+/// new session and sends the same call again by itself, and that second send
+/// is a window on somebody's screen. About a second later it gives up on that
+/// one too, tells the agent the session expired, and the agent asks a third
+/// time. From the chair that is a window that appears, vanishes and comes
+/// back; in the audit log it is `disconnected` after about a second, and it
+/// came after five quiet minutes or more every time it was looked for.
+///
+/// A day is longer than any gap between two calls that was looked at,
+/// overnight included. It is not forever, because a client that goes away
+/// without ending its session leaves it behind, and a session that never
+/// expires is never freed.
+const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// [`LocalSessionManager`], plus the one fact it does not pass on.
 ///
 /// Every method but two is a straight delegation. `create_stream` mints a
@@ -971,9 +991,12 @@ pub struct WatchedSessions {
 }
 
 impl WatchedSessions {
-    /// A session manager that reports its disconnects into `calls`.
+    /// A session manager that reports its disconnects into `calls`, and
+    /// keeps a quiet session for [`SESSION_IDLE`].
     pub fn new(calls: Arc<Calls>) -> WatchedSessions {
-        WatchedSessions { inner: LocalSessionManager::default(), calls }
+        let mut inner = LocalSessionManager::default();
+        inner.session_config.keep_alive = Some(SESSION_IDLE);
+        WatchedSessions { inner, calls }
     }
 }
 
@@ -5680,6 +5703,87 @@ mod tests {
             .or(if text.starts_with('{') { Some(text.as_str()) } else { None })
             .map(|json| serde_json::from_str(json).unwrap());
         (headers, decoded)
+    }
+
+    /// [`rpc`] without the socket: the router called directly, in memory.
+    ///
+    /// For the tests on a paused clock. A paused clock skips ahead whenever
+    /// every task is waiting, and waiting on a socket counts, so over a real
+    /// connection it would skip past a timeout nobody had reached. The status
+    /// is returned rather than asserted, because what these tests ask about is
+    /// sometimes a 404.
+    async fn rpc_in_memory(
+        app: &Router,
+        session: Option<&str>,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Option<serde_json::Value>) {
+        use tower::ServiceExt as _;
+        let mut request = axum::http::Request::post("/mcp")
+            .header("Host", "127.0.0.1")
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(id) = session {
+            request = request.header("Mcp-Session-Id", id);
+        }
+        let request = request.body(axum::body::Body::from(body.to_string())).unwrap();
+        let (parts, body) = app.clone().oneshot(request).await.unwrap().into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let decoded = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|payload| payload.starts_with('{'))
+            .and_then(|json| serde_json::from_str(json).ok());
+        (parts.status, parts.headers, decoded)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_left_quiet_overnight_is_still_there() {
+        // The window that appears and vanishes within a second. A session
+        // dropped for being quiet answers the next call with a 404, and the
+        // client's own retry of that call is the window -- which the client
+        // then abandons. So a session has to outlast the quiet between two
+        // calls, and a night is the longest of those there is.
+        let app = app(bare_daemon(test_config()));
+        let (status, headers, _) = rpc_in_memory(
+            &app,
+            None,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" },
+                },
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+        let session = headers.get("mcp-session-id").map(|v| v.to_str().unwrap().to_string());
+        assert!(session.is_some(), "the handshake handed out no session");
+        rpc_in_memory(
+            &app,
+            session.as_deref(),
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+        let list = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+
+        tokio::time::sleep(Duration::from_secs(12 * 60 * 60)).await;
+        let (status, _, listed) = rpc_in_memory(&app, session.as_deref(), list.clone()).await;
+        assert_eq!(status, 200, "a session quiet for a night was dropped");
+        assert!(
+            listed.is_some_and(|listed| listed["result"]["tools"].is_array()),
+            "the session answered, but not with the tools"
+        );
+
+        // And it does end, a day after its last message: a client that left
+        // without ending its session does not leave it here for good.
+        tokio::time::sleep(SESSION_IDLE + Duration::from_secs(60)).await;
+        let (status, _, _) = rpc_in_memory(&app, session.as_deref(), list).await;
+        assert_eq!(status, 404, "a session nobody has used for over a day is still held");
     }
 
     #[tokio::test]

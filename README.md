@@ -1418,6 +1418,13 @@ refused before anybody was asked never reached a screen, so the key is absent
 rather than zero — a zero would say the window was there and was answered at
 once, which is the exact reading this is here to make possible.
 
+A `disconnected` at about a second, with the same request asked again soon
+after, is the client giving up rather than anything you did. The usual cause
+was the MCP session: one quiet for five minutes used to be dropped, and Claude
+Code answers a dropped session by sending the call again on a new one, then
+abandoning that send about a second later. hatch now keeps a quiet session for
+a day. If the pattern comes back, look at the gap before it.
+
 A batch of several operations is several lines, not one line holding a list,
 because the questions this file is for — what wrote to this file, what ran as
 root — are asked a line at a time, and a line carrying three operations would

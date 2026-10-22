@@ -68,3 +68,9 @@ winit = "0.30.13"
 [dev-dependencies]
 proptest = "1.11.0"
 reqwest = "0.13.4"
+# A paused clock, for the tests that have to outwait a timer measured in
+# hours. The crate is the one already built; this adds a feature.
+tokio = { version = "1.53.1", features = ["test-util"] }
+# `oneshot`, to call the router in memory, where a paused clock is safe.
+# Already in the tree under axum, with this feature on.
+tower = { version = "0.5.3", features = ["util"] }
