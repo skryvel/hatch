@@ -435,6 +435,17 @@ be searched for. It counts the windows of the *running* daemon: restart hatch
 and the next window is `#1` again, which is why the log keeps the timestamp
 beside the number rather than instead of it.
 
+**A call sent twice says so.** When Claude Code loses the connection a call
+went out on, it sends the same call again on a new one. That is a second window
+for something the agent asked for once, and approving both runs it twice. The
+second window says so under the header — *Sent again: window 31 showed this
+same call, and you approved it.* — naming the earlier window and how it ended:
+approved, not approved, or ended with nobody deciding. A call counts as the
+same only when both the client's ID for it and everything it asks for match,
+so a client cannot pass a new command off as one you already approved. Claude
+Code sends that ID as `claudecode/toolUseId` in the call's `_meta`; a client
+that sends none gets no line.
+
 **A root request is a differently shaped window.** When the command will run as
 root the header says `ROOT` reversed out of a filled block, and the whole window
 is framed in the same colour. Both are shapes and not only colours — a block
@@ -1424,6 +1435,11 @@ was the MCP session: one quiet for five minutes used to be dropped, and Claude
 Code answers a dropped session by sending the call again on a new one, then
 abandoning that send about a second later. hatch now keeps a quiet session for
 a day. If the pattern comes back, look at the gap before it.
+
+A call the client sent a second time is marked on the second send's lines:
+`same_call_as` holds the number of the window that showed it first, and the
+readable line says `same call as #31`. Two lines with the same command and
+that key are one request sent twice, not two requests.
 
 A batch of several operations is several lines, not one line holding a list,
 because the questions this file is for — what wrote to this file, what ran as

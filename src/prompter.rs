@@ -1256,6 +1256,7 @@ mod tests {
             queue_depth: 0,
             number: Some(1),
             unanswered: Vec::new(),
+            resent: None,
             operations: vec![Payload::command(
                 &render_command("true", &BTreeMap::new()),
                 Vec::new(),

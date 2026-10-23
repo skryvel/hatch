@@ -49,7 +49,7 @@ use chrono::Local;
 use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
-use crate::protocol::{Outcome, Payload, ProtocolError, Unanswered, Unheard};
+use crate::protocol::{EarlierEnd, Outcome, Payload, ProtocolError, Resent, Unanswered, Unheard};
 use crate::render::blocks::{Block, BlockKind, blocks, program_blocks};
 use crate::render::language::{Evidence, Language, Snippet, snippets};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
@@ -584,6 +584,32 @@ pub fn draw_unanswered(ui: &mut Ui, items: &[Unanswered]) {
     let Some(note) = unanswered_note(items) else { return };
     let palette = palette(ui);
     ui.label(RichText::new(note).small().color(palette.warn));
+}
+
+/// The line that says this call was on screen before, in an earlier window.
+///
+/// It names that window and says how it ended, and stops there. What the
+/// reader needs is the fact they would otherwise lack: that they have seen
+/// this call already, and what they did with it. Whether a second approval
+/// runs it twice follows from "you approved it", and a sentence that said so
+/// would be wrong for the approval whose run never started.
+///
+/// "Sent again" and not "asked again", because it was the client that sent
+/// it: the agent asked once, and may not know the first send reached anyone.
+pub fn resent_note(resent: &Resent) -> String {
+    let how = match resent.ended {
+        EarlierEnd::Approved => "and you approved it",
+        EarlierEnd::Declined => "and you did not approve it",
+        EarlierEnd::Undecided => "and it ended with nobody deciding",
+    };
+    format!("Sent again: window {} showed this same call, {how}.", resent.number)
+}
+
+/// Draw that line, if there is one.
+pub fn draw_resent(ui: &mut Ui, resent: Option<&Resent>) {
+    let Some(resent) = resent else { return };
+    let palette = palette(ui);
+    ui.label(RichText::new(resent_note(resent)).small().color(palette.warn));
 }
 
 /// What to say about the programs a command carries, or `None` when it

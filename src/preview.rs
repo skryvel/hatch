@@ -313,6 +313,7 @@ impl Sample {
             // watched other windows end, so there is nothing it could
             // honestly report having missed.
             unanswered: Vec::new(),
+            resent: None,
         }
     }
 }

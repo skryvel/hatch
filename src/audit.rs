@@ -230,6 +230,15 @@ pub struct AuditRecord {
     /// something.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_ms: Option<u64>,
+    /// The earlier window that showed this same call, when the client sent
+    /// the call again.
+    ///
+    /// Absent on every other line. A client can send one call twice without
+    /// the agent asking twice, and both sends are windows; this is what says
+    /// that two lines with the same command are one request and not two.
+    /// See [`crate::protocol::Request::resent`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_call_as: Option<u64>,
     /// What the user typed into the prompt window, if anything.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -583,6 +592,9 @@ impl AuditRecord {
         if let Some(ms) = self.window_ms {
             line.push_str(&format!("  |  window {}", on_screen(ms)));
         }
+        if let Some(earlier) = self.same_call_as {
+            line.push_str(&format!("  |  same call as #{earlier}"));
+        }
         if let Some(note) = &self.note {
             line.push_str(&format!("  |  note: {}", visible(note)));
         }
@@ -720,6 +732,7 @@ mod tests {
             operation: 1,
             operations: 1,
             window_ms: Some(4_200),
+            same_call_as: None,
             stop_on_failure: false,
             verdict,
             note: None,
@@ -760,6 +773,27 @@ mod tests {
         // would read as answered-instantly.
         record.window_ms = None;
         assert!(!record.summary().contains("window"), "{}", record.summary());
+    }
+
+    #[test]
+    fn a_call_sent_again_names_the_earlier_window_on_both_lines() {
+        // Two lines with the same command read as two requests unless the
+        // second says otherwise, on the readable line and in the JSON.
+        let mut record = sample_record(LogVerdict::Deny);
+        assert!(!record.summary().contains("same call"), "{}", record.summary());
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("same_call_as").is_none(), "{json}");
+
+        record.same_call_as = Some(31);
+        assert!(record.summary().contains("same call as #31"), "{}", record.summary());
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["same_call_as"], 31, "{json}");
+
+        // A line written before the key existed reads back without it.
+        let mut older = json;
+        older.as_object_mut().unwrap().remove("same_call_as");
+        let read: AuditRecord = serde_json::from_value(older).unwrap();
+        assert_eq!(read.same_call_as, None);
     }
 
     #[test]
@@ -842,6 +876,7 @@ mod tests {
             operation: 1,
             operations: 1,
             window_ms: Some(4_200),
+            same_call_as: None,
             stop_on_failure: false,
             verdict: LogVerdict::Deny,
             note: Some("wrong IP, it's .12 not .21".to_string()),
@@ -1205,6 +1240,7 @@ mod tests {
             operation: 1,
             operations: 1,
             window_ms: Some(4_200),
+            same_call_as: None,
             stop_on_failure: false,
             verdict: LogVerdict::Approve,
             note: None,

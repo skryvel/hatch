@@ -698,6 +698,50 @@ pub struct Request {
     /// Empty on almost every request, and an empty list draws nothing. It is
     /// required on the wire like every other field.
     pub unanswered: Vec<Unanswered>,
+    /// The earlier window that showed this same call, when the client has
+    /// sent the call again.
+    ///
+    /// A client can send one call twice without the agent asking twice.
+    /// Claude Code does when the connection it sent a call on closes before
+    /// the answer arrives: it opens another and sends the call again. That
+    /// is a second window for one thing the agent asked for once, and
+    /// approving both runs it twice. Told nothing, the reader sees a request
+    /// they have just answered come back, and cannot tell a client's retry
+    /// from an agent that is asking again.
+    ///
+    /// `None` on almost every request, and on every request from a client
+    /// that does not name its calls. See `SameCall` in [`crate::server`] for
+    /// what counts as the same call. Required on the wire like every other
+    /// field.
+    pub resent: Option<Resent>,
+}
+
+/// An earlier window that showed the same call as this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resent {
+    /// The number the earlier window wore in its title bar.
+    pub number: u64,
+    /// How that window ended.
+    pub ended: EarlierEnd,
+}
+
+/// How an earlier window for the same call ended.
+///
+/// Three, because what approving the call again does turns on these three
+/// and on nothing finer: after an approval it runs the call a second time,
+/// after any other answer it runs a call the reader chose not to run, and
+/// after no answer it runs it for the first time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EarlierEnd {
+    /// The reader approved it.
+    Approved,
+    /// The reader answered it and did not approve it: they denied it, sent
+    /// it back, or kept it to do themselves. It did not run.
+    Declined,
+    /// Nobody answered it: it expired, the call went away, or the window
+    /// died. It did not run.
+    Undecided,
 }
 
 /// One window that ended without the reader deciding anything.
@@ -1613,6 +1657,7 @@ mod tests {
             queue_depth: 0,
             number: Some(47),
             unanswered: Vec::new(),
+            resent: None,
             operations: vec![Payload::command(
                 &rendering("rm -rf /tmp/build"),
                 vec!["rm -rf".to_string()],
@@ -1846,6 +1891,7 @@ mod tests {
                 "operations",
                 "queue_depth",
                 "reason",
+                "resent",
                 "stop_on_failure",
                 "title",
                 "type",

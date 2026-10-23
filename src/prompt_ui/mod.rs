@@ -158,7 +158,8 @@ use crate::prefs::PrefsFile;
 use crate::prompt_ui::guard::{Action, Guard, Keyboard, intercept};
 use crate::prompt_ui::panes::{Shown, Urgency, countdown_text, urgency};
 use crate::protocol::{
-    self, DaemonMsg, Outcome, PromptMsg, Release, Request, Review, ReviseKind, Unanswered, Verdict,
+    self, DaemonMsg, Outcome, PromptMsg, Release, Request, Resent, Review, ReviseKind, Unanswered,
+    Verdict,
 };
 
 /// The window's application id.
@@ -863,6 +864,12 @@ impl PromptState {
     /// would be a second thing to keep in step with it.
     pub fn unanswered(&self) -> &[Unanswered] {
         self.request.as_ref().map_or(&[], |request| request.unanswered.as_slice())
+    }
+
+    /// The earlier window that showed this same call, if the client sent it
+    /// again. Read off the request, as [`PromptState::unanswered`] is.
+    pub fn resent(&self) -> Option<&Resent> {
+        self.request.as_ref().and_then(|request| request.resent.as_ref())
     }
 
     /// The last depth the daemon published, whether or not it is drawn.
@@ -2317,6 +2324,9 @@ impl PromptApp {
             // could not be rebuilt closed the window instead of becoming one.
             let aside = self.state.shown().and_then(panes::RunContext::of);
             panes::draw_headline(ui, &title, &reason, aside.as_ref());
+            // Straight under the headline, because it is about what the
+            // headline names: this call, which an earlier window showed.
+            panes::draw_resent(ui, self.state.resent());
             // Above the separator, with the headline rather than with the
             // request: it is news about a window that is gone, not a fact
             // about the one being asked about now.
@@ -4332,6 +4342,7 @@ mod tests {
             queue_depth: 0,
             number: Some(47),
             unanswered: Vec::new(),
+            resent: None,
             operations: vec![Payload::command(
                 &render_command("rm -rf target", &BTreeMap::new()),
                 Vec::new(),
@@ -5838,6 +5849,33 @@ mod tests {
         // It is news about a window that is gone, so it does not claim to be
         // about the one being asked about now.
         assert!(drawn.contains("rm -rf") || drawn.contains("delete"), "{drawn}");
+    }
+
+    #[test]
+    fn a_call_sent_again_says_which_window_showed_it_and_how_that_ended() {
+        let mut quiet = a_window_showing("rm -rf target");
+        let drawn = window_text_sized(&mut quiet, opening_size());
+        assert!(!drawn.contains("Sent again"), "an ordinary window claimed a resend: {drawn}");
+
+        for (ended, says) in [
+            (protocol::EarlierEnd::Approved, "and you approved it."),
+            (protocol::EarlierEnd::Declined, "and you did not approve it."),
+            (protocol::EarlierEnd::Undecided, "and it ended with nobody deciding."),
+        ] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let mut app = PromptApp::new(
+                rx,
+                Box::new(Vec::new()),
+                Arc::new(OnceLock::new()),
+                PrefsFile::none(),
+            );
+            let mut request = a_request(90);
+            request.resent = Some(Resent { number: 31, ended });
+            app.state.handle(DaemonMsg::Request(Box::new(request)));
+            let drawn = window_text_sized(&mut app, opening_size());
+            assert!(drawn.contains("Sent again: window 31 showed this same call"), "{drawn}");
+            assert!(drawn.contains(says), "{ended:?} read wrong: {drawn}");
+        }
     }
 
     /// The same window once its streamed command has finished, with `printed`

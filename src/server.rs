@@ -132,7 +132,7 @@
 //! non-decision: a denial names the user, a timeout says nobody answered, a
 //! size cap and an unsupported request both say plainly that nobody was asked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -154,8 +154,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     ProtocolVersion,
     CallToolResult, ClientJsonRpcMessage, ClientNotification, ContentBlock, GetExtensions,
-    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, RequestId,
-    ServerJsonRpcMessage, Tool,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, RequestId, ServerJsonRpcMessage, Tool,
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -164,7 +164,7 @@ use rmcp::transport::streamable_http_server::session::{
 };
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -186,7 +186,8 @@ use crate::exec::{Chunk, Env, Output, RunOpts};
 use crate::paths::Paths;
 use crate::prompter::{Outbox, ProcessPrompter, PromptSession, Prompter};
 use crate::protocol::{
-    Payload, Release, Request as PromptRequest, ReviseKind, Unanswered, Unheard, Verdict,
+    EarlierEnd, Payload, Release, Request as PromptRequest, Resent, ReviseKind, Unanswered,
+    Unheard, Verdict,
 };
 use crate::render::diff::{FileDiff, diff_files};
 use crate::render::render_command_naming;
@@ -276,6 +277,15 @@ pub const MAX_OPERATIONS_RECORDED: usize = 32;
 /// all night and leave a list as long as the night was.
 const MAX_UNANSWERED: usize = 8;
 
+/// How many calls recent windows showed are remembered, so that one the
+/// client sends again can name the window it was.
+///
+/// A client sends a call again seconds after the first send, not hours, so
+/// only the last few windows are ever the one it was. Sixty-four is a few
+/// with room to spare, and a bound on memory against a client that sends a
+/// new ID with every call.
+const MAX_EARLIER_CALLS: usize = 64;
+
 /// Parameters of `run_command`.
 ///
 /// Every field is agent-controlled and every one of them except `root` and
@@ -353,7 +363,7 @@ impl From<RunCommandParams> for BatchParams {
 
 /// Parameters of `batch`. See [`RunCommandParams`] on why every string in
 /// here is length-checked before anything renders it.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
     /// The one-line intent of the whole batch, as the user should read it.
     pub title: String,
@@ -387,7 +397,7 @@ pub struct BatchParams {
 /// Every field is optional here, which is the only place in hatch where an
 /// operation can be both kinds or neither: see [`Batch::of`] for why the wire
 /// type is allowed to be wrong and why nothing past it can be.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OperationParams {
     /// A file write: absolute path of the file to write.
     #[serde(default)]
@@ -1476,6 +1486,48 @@ pub struct Daemon {
     /// into a thing that can be consumed by the wrong reader. Draining it is
     /// what stops a notice being shown twice.
     unanswered: Mutex<Vec<Unanswered>>,
+    /// The calls recent windows showed, oldest first, for a call sent again
+    /// to look itself up in.
+    ///
+    /// A `Mutex` for the reason `unanswered` is one, and not drained: a call
+    /// can be sent a third time, and the window that answers that send has
+    /// to find the second.
+    earlier_calls: Mutex<VecDeque<EarlierCall>>,
+}
+
+/// One call, as far as telling whether it was sent before needs.
+///
+/// Two things, and a call is the same only if both match: the client's ID
+/// for it, and a digest of what it asked for, taken from the arguments
+/// before hatch reads anything out of them. The ID alone would let a
+/// client name a new command after a call the reader has already approved,
+/// and the window would then tell them they had approved it. The digest is
+/// SHA-256 and not the standard library's hasher: whoever writes the
+/// command can also search for a collision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SameCall {
+    id: String,
+    sent: [u8; 32],
+}
+
+impl SameCall {
+    /// The call `id` names, asking for `params`.
+    fn of(id: String, params: &BatchParams) -> SameCall {
+        // JSON because it already spells every field of the parameters
+        // unambiguously, which a digest over strings put end to end would
+        // not. It cannot fail on a struct of strings, numbers and booleans;
+        // if it did, every call would digest the same empty input, and the
+        // ID would still have to match.
+        let bytes = serde_json::to_vec(params).unwrap_or_default();
+        SameCall { id, sent: Sha256::digest(bytes).into() }
+    }
+}
+
+/// A call an earlier window showed, and how that window ended.
+struct EarlierCall {
+    call: SameCall,
+    number: u64,
+    ended: EarlierEnd,
 }
 
 impl Daemon {
@@ -1503,6 +1555,7 @@ impl Daemon {
             elevation: Arc::from(crate::exec::elevate::platform()),
             stage_dir,
             unanswered: Mutex::new(Vec::new()),
+            earlier_calls: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1543,6 +1596,32 @@ impl Daemon {
         self.unanswered.lock().map(|mut held| std::mem::take(&mut *held)).unwrap_or_default()
     }
 
+    /// Remember that window `number` showed `call` and ended as `ended`.
+    ///
+    /// Called once per window, when it stops asking. A poisoned lock is
+    /// stepped over, as in [`Daemon::remember_unanswered`]: what is lost is a
+    /// line that is not shown.
+    fn remember_shown(&self, call: SameCall, number: u64, ended: EarlierEnd) {
+        if let Ok(mut held) = self.earlier_calls.lock() {
+            held.push_back(EarlierCall { call, number, ended });
+            if held.len() > MAX_EARLIER_CALLS {
+                held.pop_front();
+            }
+        }
+    }
+
+    /// The latest window that showed `call`, if one did.
+    ///
+    /// Asked when a request becomes a window, and by then every earlier
+    /// window for the same call has ended: the approval lock opens windows
+    /// one at a time and in arrival order, and a client sends a call again
+    /// only after sending it once.
+    fn shown_before(&self, call: &SameCall) -> Option<Resent> {
+        let held = self.earlier_calls.lock().ok()?;
+        let earlier = held.iter().rev().find(|shown| shown.call == *call)?;
+        Some(Resent { number: earlier.number, ended: earlier.ended })
+    }
+
     /// The running config, for the tool descriptions.
     pub fn config(&self) -> &Arc<Config> {
         &self.config
@@ -1566,6 +1645,33 @@ pub struct Caller {
     /// notification with no token from the request's `_meta` is one no client
     /// can associate with anything.
     progress: Option<(Peer<RoleServer>, ProgressToken)>,
+    /// The client's own name for this call, when it gives one: see
+    /// [`call_id`]. It is how a call the client sends twice is known to be one
+    /// call, and nothing else reads it.
+    call_id: Option<String>,
+}
+
+/// The `_meta` key Claude Code puts its name for a call under.
+///
+/// The ID of the `tool_use` block the call came from. One block is one call
+/// however many times the client sends it, and a new block, even for the
+/// same command, is a new one. No other client is known to send it, and a
+/// client that sends nothing here gets no notice, which is the right side to
+/// fail on.
+const CALL_ID_KEY: &str = "claudecode/toolUseId";
+
+/// The longest call ID hatch keeps.
+///
+/// Claude Code's are about thirty bytes. The cap is there because the daemon
+/// keeps recent ones in memory, and a client is free to send any string it
+/// likes; a longer one is ignored rather than cut, since a cut one could
+/// match a different call.
+const MAX_CALL_ID_BYTES: usize = 128;
+
+/// The call ID in a request's `_meta`, if there is a usable one.
+fn call_id(meta: &JsonObject) -> Option<String> {
+    let id = meta.get(CALL_ID_KEY)?.as_str()?;
+    (!id.is_empty() && id.len() <= MAX_CALL_ID_BYTES).then(|| id.to_string())
 }
 
 impl Caller {
@@ -1578,13 +1684,20 @@ impl Caller {
                 .meta
                 .get_progress_token()
                 .map(|token| (context.peer.clone(), token)),
+            call_id: call_id(&context.meta),
         }
     }
 
     /// A caller that never cancels, never hangs up and wants no progress.
     #[cfg(test)]
     fn quiet() -> Caller {
-        Caller { cancelled: CancellationToken::new(), hangup: None, progress: None }
+        Caller { cancelled: CancellationToken::new(), hangup: None, progress: None, call_id: None }
+    }
+
+    /// The same caller, naming its call `id`.
+    #[cfg(test)]
+    fn calling(self, id: &str) -> Caller {
+        Caller { call_id: Some(id.to_string()), ..self }
     }
 
     /// Resolves when the client's connection ends.
@@ -1896,35 +2009,28 @@ impl Daemon {
         // became a request: nothing was rendered, no window was opened, and
         // the record would have to carry the very field that is too large or
         // too malformed to handle in the first place.
+        //
+        // What the call is, for knowing it again, is taken first: `Batch::of`
+        // takes the parameters apart, and a call sent twice is the same in
+        // what was sent, not in what hatch made of it.
+        let same = caller.call_id.clone().map(|id| SameCall::of(id, &params));
         match Batch::of(params) {
-            Ok(batch) => self.serve(batch, caller).await,
+            Ok(batch) => self.serve(batch, same, caller).await,
             Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal)]),
         }
     }
 
     /// One request, and the one place its audit records are written.
-    async fn serve(&self, batch: Batch, caller: Caller) -> CallToolResult {
+    async fn serve(&self, batch: Batch, same: Option<SameCall>, caller: Caller) -> CallToolResult {
         // The two agent-written lines every window and every log record
         // carries, defanged: the agent chooses this text and it frames the
         // whole decision, so a bidi override in it would reorder everything
         // the reader sees.
         let (title, reason) = (defang(&batch.title), defang(&batch.reason));
         let stop_on_failure = batch.stop_on_failure;
-        // An out-parameter rather than a field on `Outcome`, and that is the
-        // point of it: the number is drawn in one place, half way through
-        // `decide`, and every one of the eight ways out of that function
-        // after it would otherwise have to remember to carry it. Written
-        // where it is drawn and read here, no exit path is involved at all.
-        // A request refused before the queue never opens a window, never
-        // draws a number, and leaves this `None`.
-        let mut number = None;
-        // Beside the number, and an out-parameter for the same reason: it is
-        // known half way through `decide`, at the one moment the window stops
-        // being on screen, and every exit path after that would otherwise
-        // have to carry it out.
-        let mut window_ms = None;
-        let outcome =
-            self.decide(batch, caller, &title, &reason, &mut number, &mut window_ms).await;
+        let mut shown = Shown::default();
+        let outcome = self.decide(batch, same, caller, &title, &reason, &mut shown).await;
+        let Shown { number, window_ms, same_call_as } = shown;
 
         // The only `append` in the crate's request path. See `Outcome`.
         //
@@ -1944,6 +2050,7 @@ impl Daemon {
                 stop_on_failure,
                 verdict,
                 window_ms,
+                same_call_as,
                 note: outcome.note.clone(),
                 detail,
             };
@@ -1965,17 +2072,17 @@ impl Daemon {
     /// prompting, start the clock at the window and not at the queue, and stop
     /// applying the deny rule the moment a verdict arrives.
     ///
-    /// `number` is written the moment this request becomes a window and is
-    /// left alone otherwise -- see [`Daemon::serve`], which reads it however
-    /// this function returns.
+    /// `shown` is written as this request becomes a window and as the window
+    /// stops asking, and is left alone otherwise -- see [`Shown`], and
+    /// [`Daemon::serve`], which reads it however this function returns.
     async fn decide(
         &self,
         batch: Batch,
+        same: Option<SameCall>,
         caller: Caller,
         title: &str,
         reason: &str,
-        number: &mut Option<u64>,
-        window_ms: &mut Option<u64>,
+        shown: &mut Shown,
     ) -> Outcome {
         let Batch { operations, stop_on_failure, over_cap, .. } = batch;
 
@@ -2039,7 +2146,13 @@ impl Daemon {
         // number: the same one the title bar wears and the audit records
         // carry. See `queue::Admission::number` for why the counter is the
         // queue's and why it starts again at one on every run.
-        *number = Some(admission.number());
+        let number = admission.number();
+        shown.number = Some(number);
+        // And whether this call has been on screen before, asked now and not
+        // on arrival: an earlier window for it may still have been open then,
+        // and by now it has ended. See `Daemon::shown_before`.
+        let resent = same.as_ref().and_then(|call| self.shown_before(call));
+        shown.same_call_as = resent.map(|resent| resent.number);
         let (permit, depths) = admission.into_parts();
 
         // Step 3. The window, and only now the clock. The deadline is computed
@@ -2054,7 +2167,7 @@ impl Daemon {
             reason: reason.to_string(),
             deadline: Utc::now() + chrono::Duration::seconds(self.config.timeout_secs as i64),
             queue_depth: badge,
-            number: *number,
+            number: Some(number),
             operations: payloads,
             stop_on_failure,
             // Drained, so a notice is shown once. This window is the first
@@ -2063,6 +2176,7 @@ impl Daemon {
             // something they have already been told about, which is how a
             // line that only appears when it is true stops being read.
             unanswered: self.take_unanswered(),
+            resent,
         };
         let mut session = match self.prompter.prompt(request, depths).await {
             Ok(session) => session,
@@ -2097,12 +2211,17 @@ impl Daemon {
         };
         // One place, after every one of the five endings and before any of
         // them is acted on, so no path can forget it.
-        *window_ms = Some(opened_at.elapsed().as_millis() as u64);
+        shown.window_ms = Some(opened_at.elapsed().as_millis() as u64);
+        // Here for the same reason, and before the approval lock opens below:
+        // a send of this call waiting behind it must find it.
+        if let Some(call) = same {
+            self.remember_shown(call, number, ending.earlier());
+        }
 
         let verdict = match ending {
             Ending::Decided(Ok(verdict)) => verdict,
             Ending::Decided(Err(gone)) => {
-                self.remember_unanswered(*number, Unheard::WindowDied);
+                self.remember_unanswered(Some(number), Unheard::WindowDied);
                 session.close().await;
                 return Outcome::refusing(
                     LogVerdict::PromptDied,
@@ -2116,7 +2235,7 @@ impl Daemon {
                 );
             }
             Ending::Expired => {
-                self.remember_unanswered(*number, Unheard::Expired);
+                self.remember_unanswered(Some(number), Unheard::Expired);
                 session.close().await;
                 return Outcome::refusing(
                     LogVerdict::Timeout,
@@ -2131,12 +2250,12 @@ impl Daemon {
                 );
             }
             Ending::Cancelled => {
-                self.remember_unanswered(*number, Unheard::AgentLeft);
+                self.remember_unanswered(Some(number), Unheard::AgentLeft);
                 session.close().await;
                 return abandoned(LogVerdict::Cancelled, details);
             }
             Ending::HungUp => {
-                self.remember_unanswered(*number, Unheard::AgentLeft);
+                self.remember_unanswered(Some(number), Unheard::AgentLeft);
                 session.close().await;
                 return abandoned(caller.abandonment(), details);
             }
@@ -2506,12 +2625,46 @@ enum Windup {
     Detach,
 }
 
+/// What the log keeps about the window a request became.
+///
+/// Out-parameters of [`Daemon::decide`] rather than fields on `Outcome`, and
+/// that is the point of them: each is learnt in one place half way through
+/// `decide`, and every one of the eight ways out of that function after it
+/// would otherwise have to remember to carry it. Written where each is
+/// learnt and read by [`Daemon::serve`], no exit path is involved at all.
+#[derive(Default)]
+struct Shown {
+    /// The window's number, drawn when the request leaves the queue. A
+    /// request refused before the queue never opens a window, never draws a
+    /// number, and leaves this `None`.
+    number: Option<u64>,
+    /// How long the window was on screen, known at the one moment it stops
+    /// being on screen.
+    window_ms: Option<u64>,
+    /// The earlier window that showed this same call, when the client sent
+    /// it again. Known with the number.
+    same_call_as: Option<u64>,
+}
+
 /// Which of the four things happened while the window was open.
 enum Ending {
     Decided(Result<Verdict, crate::prompter::PromptGone>),
     Expired,
     Cancelled,
     HungUp,
+}
+
+impl Ending {
+    /// How this ending reads to a later window for the same call.
+    fn earlier(&self) -> EarlierEnd {
+        match self {
+            Ending::Decided(Ok(Verdict::Approve { .. })) => EarlierEnd::Approved,
+            Ending::Decided(Ok(_)) => EarlierEnd::Declined,
+            Ending::Decided(Err(_)) | Ending::Expired | Ending::Cancelled | Ending::HungUp => {
+                EarlierEnd::Undecided
+            }
+        }
+    }
 }
 
 // ---- step 1: validate and render, before anybody is interrupted ------------
@@ -6388,6 +6541,7 @@ later"), "");
                 cancelled: CancellationToken::new(),
                 hangup: Some(dropped.clone()),
                 progress: None,
+                call_id: None,
             };
             // The drop has to land *after* the window is up, and the wait is
             // not politeness: a request whose caller is already gone is
@@ -6421,6 +6575,162 @@ later"), "");
             let first = &harness.logged()[0];
             assert_eq!(first["verdict"], "disconnected");
             assert!(first["window_ms"].is_u64(), "{first}");
+        }
+
+        #[tokio::test]
+        async fn a_call_the_client_sends_again_names_the_window_that_showed_it() {
+            // The shape read off a real log: window 31 approved and running,
+            // and window 32 the same command half a second before 31
+            // finished, for one call in the agent's transcript. The client
+            // had sent the call again on a new connection, so the reader was
+            // asked twice for one thing, and approving both runs it twice.
+            let harness = Harness::new(vec![approve(), Reply::verdict(Verdict::Deny {
+                note: String::new(),
+            })]);
+            for _ in 0..2 {
+                let caller = Caller::quiet().calling("toolu_01");
+                let _ = within(harness.daemon.run_command(run_of("true"), caller)).await;
+            }
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), 2, "two windows were opened");
+            assert_eq!(seen[0].resent, None, "the first send named an earlier window");
+            let first = seen[0].number.expect("a numbered window");
+            assert_eq!(seen[1].resent, Some(Resent { number: first, ended: EarlierEnd::Approved }));
+
+            // And the log ties the two together, so the same command on two
+            // lines reads as one request sent twice.
+            let records = harness.logged();
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert!(records[0].get("same_call_as").is_none(), "{}", records[0]);
+            assert_eq!(records[1]["same_call_as"], first, "{}", records[1]);
+        }
+
+        #[tokio::test]
+        async fn only_the_same_id_with_the_same_arguments_is_the_same_call() {
+            // The ID is the client's word, and a client can send any. Matched
+            // alone, it would let a new command borrow an old one's window:
+            // the reader would be told they had approved a call they have
+            // never seen.
+            let deny = || Reply::verdict(Verdict::Deny { note: String::new() });
+            let harness =
+                Harness::new(vec![Reply::silent(), deny(), deny(), deny(), deny(), deny()]);
+            let sends = [
+                (Some("toolu_01"), "true"),
+                // The same ID for another command.
+                (Some("toolu_01"), "false"),
+                // Another ID for the same command.
+                (Some("toolu_02"), "true"),
+                // No ID at all.
+                (None, "true"),
+                // The first call, sent again, and then once more.
+                (Some("toolu_01"), "true"),
+                (Some("toolu_01"), "true"),
+            ];
+            for (id, command) in sends {
+                let caller = match id {
+                    Some(id) => Caller::quiet().calling(id),
+                    None => Caller::quiet(),
+                };
+                let _ = within(harness.daemon.run_command(run_of(command), caller)).await;
+            }
+
+            let seen = harness.prompter.seen();
+            assert_eq!(seen.len(), sends.len());
+            let numbers: Vec<u64> = seen.iter().map(|request| request.number.unwrap()).collect();
+            for (index, request) in seen.iter().enumerate().take(4) {
+                assert_eq!(request.resent, None, "send {index} was taken for another call");
+            }
+            // Nobody answered the first window, and a send of it says so.
+            assert_eq!(
+                seen[4].resent,
+                Some(Resent { number: numbers[0], ended: EarlierEnd::Undecided })
+            );
+            // A third send names the latest window, and how that one ended.
+            assert_eq!(
+                seen[5].resent,
+                Some(Resent { number: numbers[4], ended: EarlierEnd::Declined })
+            );
+        }
+
+        #[tokio::test]
+        async fn the_call_id_is_read_from_meta_on_a_new_session() {
+            // The other tests name the call by hand. This one sends the key
+            // where Claude Code puts it, in the call's `_meta`, and sends it
+            // again on a second session, as the client does once it has given
+            // up on the first. A change in what rmcp passes on from `_meta`
+            // fails here, and not as a line that quietly stops appearing.
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::scratch(dir.path());
+            let mut config = quick(&paths);
+            config.token = "test-token".to_string();
+            let deny = || Reply::verdict(Verdict::Deny { note: String::new() });
+            let prompter = Arc::new(StubPrompter::new(vec![deny(), deny()]));
+            let daemon =
+                Arc::new(Daemon::new(&paths, config, Arc::clone(&prompter) as Arc<_>));
+            let app = app(daemon);
+
+            for session in 0..2 {
+                let (_, headers, _) = rpc_in_memory(
+                    &app,
+                    None,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": { "name": "test", "version": "0" },
+                        },
+                    }),
+                )
+                .await;
+                let id = headers.get("mcp-session-id").expect("a session").to_str().unwrap();
+                rpc_in_memory(
+                    &app,
+                    Some(id),
+                    serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                )
+                .await;
+                let (_, _, answered) = rpc_in_memory(
+                    &app,
+                    Some(id),
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {
+                            "name": "run_command",
+                            "arguments": {
+                                "title": "a test", "command": "true",
+                                "reason": "because a test asked"
+                            },
+                            "_meta": { "claudecode/toolUseId": "toolu_01Taildrop" },
+                        },
+                    }),
+                )
+                .await;
+                assert!(answered.is_some(), "session {session} got no answer");
+            }
+
+            let seen = prompter.seen();
+            assert_eq!(seen.len(), 2, "two windows were opened");
+            assert_eq!(seen[0].resent, None);
+            assert_eq!(
+                seen[1].resent,
+                Some(Resent { number: seen[0].number.unwrap(), ended: EarlierEnd::Declined })
+            );
+        }
+
+        #[test]
+        fn a_call_id_is_kept_only_when_it_is_a_short_string() {
+            let meta = |value: serde_json::Value| {
+                JsonObject::from_iter([(CALL_ID_KEY.to_string(), value)])
+            };
+            assert_eq!(call_id(&meta("toolu_01".into())), Some("toolu_01".to_string()));
+            assert_eq!(call_id(&JsonObject::new()), None);
+            assert_eq!(call_id(&meta("".into())), None);
+            assert_eq!(call_id(&meta(7.into())), None);
+            // Ignored rather than cut: a cut ID could be another call's.
+            let long = "x".repeat(MAX_CALL_ID_BYTES + 1);
+            assert_eq!(call_id(&meta(long.into())), None);
         }
 
         #[tokio::test]
@@ -6882,6 +7192,7 @@ later"), "");
                 cancelled: cancelled.clone(),
                 hangup: None,
                 progress: None,
+                call_id: None,
             };
             let call = {
                 let daemon = Arc::clone(&daemon);
@@ -6922,8 +7233,12 @@ later"), "");
             }
 
             let cancelled = CancellationToken::new();
-            let caller =
-                Caller { cancelled: cancelled.clone(), hangup: None, progress: None };
+            let caller = Caller {
+                cancelled: cancelled.clone(),
+                hangup: None,
+                progress: None,
+                call_id: None,
+            };
             let queued = {
                 let daemon = Arc::clone(&harness.daemon);
                 tokio::spawn(async move { daemon.run_command(run_of("second"), caller).await })
@@ -6954,6 +7269,7 @@ later"), "");
                 cancelled: CancellationToken::new(),
                 hangup: Some(hangup.clone()),
                 progress: None,
+                call_id: None,
             };
             let call = {
                 let daemon = Arc::clone(&harness.daemon);
@@ -6979,6 +7295,7 @@ later"), "");
                 cancelled: CancellationToken::new(),
                 hangup: Some(hangup.clone()),
                 progress: None,
+                call_id: None,
             };
             let call = {
                 let daemon = Arc::clone(&harness.daemon);
@@ -8561,7 +8878,7 @@ later"), "");
                     command_of(&format!("cat {} >> {}", target.display(), journal.display())),
                 ],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert_ne!(result.is_error, Some(true), "{text}");
@@ -8614,7 +8931,7 @@ later"), "");
                 false,
                 vec![command_of("exit 1"), command_of(&format!("touch {}", marker.display()))],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert!(marked(&marker), "the operation after a failure did not run: {text}");
@@ -8634,7 +8951,7 @@ later"), "");
                 true,
                 vec![command_of("exit 1"), command_of(&format!("touch {}", marker.display()))],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert!(!marked(&marker), "an operation ran past a failure it was told to stop at");
@@ -8681,7 +8998,7 @@ later"), "");
                         command_of(&format!("touch {}", marker.display())),
                     ],
                 );
-                let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+                let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
                 let text = result_text(&result);
                 assert!(text.contains("a write to") && text.contains(": failed"), "{text}");
@@ -8710,7 +9027,7 @@ later"), "");
                 false,
                 vec![command_of("sleep 30"), command_of(&format!("touch {}", marker.display()))],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert!(!marked(&marker), "an operation ran past a Kill: {text}");
@@ -8733,7 +9050,7 @@ later"), "");
                 false,
                 vec![command_of("sleep 5"), command_of(&format!("touch {}", marker.display()))],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert!(!marked(&marker), "an operation ran past a timed-out one: {text}");
@@ -8764,7 +9081,7 @@ later"), "");
                 first.operations[0].root = true;
                 let batch =
                     several(false, vec![first, command_of(&format!("touch {}", marker.display()))]);
-                let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+                let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
                 let text = result_text(&result);
                 assert_eq!(marked(&marker), carries_on, "{outcome:?}: {text}");
@@ -8787,7 +9104,7 @@ later"), "");
                     command_of(&format!("touch {}", two.display())),
                 ],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             assert!(marked(&one) && marked(&two), "{}", result_text(&result));
             let records = harness.logged();
@@ -8808,7 +9125,7 @@ later"), "");
                 false,
                 vec![swap_of(&protected, "x", false), command_of("true"), elsewhere],
             );
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert_eq!(result.is_error, Some(true), "{text}");
@@ -8831,7 +9148,7 @@ later"), "");
             std::fs::write(&target, b"before\n").unwrap();
             let batch =
                 several(true, vec![swap_of(&target, "after\n", false), command_of("true")]);
-            let result = within(harness.daemon.serve(batch, Caller::quiet())).await;
+            let result = within(harness.daemon.serve(batch, None, Caller::quiet())).await;
 
             let text = result_text(&result);
             assert!(text.contains("denied by user: not both"), "{text}");
@@ -9516,8 +9833,12 @@ later"), "");
 
             let arrived = Utc::now();
             let cancelled = CancellationToken::new();
-            let caller =
-                Caller { cancelled: cancelled.clone(), hangup: None, progress: None };
+            let caller = Caller {
+                cancelled: cancelled.clone(),
+                hangup: None,
+                progress: None,
+                call_id: None,
+            };
             let queued = {
                 let daemon = Arc::clone(&daemon);
                 tokio::spawn(async move { daemon.run_command(run_of("true"), caller).await })
@@ -10336,6 +10657,7 @@ later"), "");
             cancelled: CancellationToken::new(),
             hangup: Some(Hangup::new()),
             progress: None,
+            call_id: None,
         };
         assert_eq!(caller.abandonment(), LogVerdict::Disconnected);
 
@@ -10345,12 +10667,13 @@ later"), "");
             cancelled: CancellationToken::new(),
             hangup: Some(hangup),
             progress: None,
+            call_id: None,
         };
         assert_eq!(flagged.abandonment(), LogVerdict::Cancelled);
 
         let token = CancellationToken::new();
         token.cancel();
-        let told = Caller { cancelled: token, hangup: None, progress: None };
+        let told = Caller { cancelled: token, hangup: None, progress: None, call_id: None };
         assert_eq!(told.abandonment(), LogVerdict::Cancelled);
     }
 
