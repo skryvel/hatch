@@ -324,6 +324,9 @@ const TERMINAL_ASKED: &str = "The agent asked for one.";
 /// The label on the control that shows the output as it arrives.
 const STREAM_LABEL: &str = "Stream output to this window";
 
+/// The box over a watched run's output.
+const WRAP_LABEL: &str = "Wrap long lines";
+
 /// Why that control is dead when it is.
 ///
 /// A terminal is a stream of its own and the reader is about to be looking at
@@ -1723,6 +1726,9 @@ pub(crate) struct PromptApp {
     /// Whether the command area shows the exact text instead of the
     /// annotated rendering. Remembered; see [`crate::prefs::Prefs`].
     show_original: bool,
+    /// Whether a watched run's output wraps at the window's edge.
+    /// Remembered; see [`crate::prefs::Prefs::wrap`].
+    wrap: bool,
     /// Whether the tick above came out of the file rather than out of this
     /// window.
     ///
@@ -1847,6 +1853,7 @@ impl PromptApp {
             out,
             stream: remembered.stream,
             show_original: remembered.show_original,
+            wrap: remembered.wrap,
             stream_is_remembered: remembered.stream,
             review_is_remembered: remembered.review,
             close_on_decide: remembered.close_on_decide,
@@ -2365,7 +2372,7 @@ impl PromptApp {
     /// nothing is being approved any more. It is here at all because output
     /// with nothing naming it is output the reader has to remember the
     /// provenance of. See [`panes::draw_command_line`].
-    fn viewer(&self, ui: &mut egui::Ui, title: &str) {
+    fn viewer(&mut self, ui: &mut egui::Ui, title: &str) {
         // The headline and its corner are gone with the question they
         // belonged to, so this row is the only place left that can say what
         // just ran, and what just ran was root. Wrapped rather than
@@ -2403,6 +2410,18 @@ impl PromptApp {
             ui.label(egui::RichText::new(went).weak());
             return;
         }
+        // Above the output and drawn before there is any, so the output does
+        // not move down a row when its first line arrives.
+        let mut wrap = self.wrap;
+        let flipped = ui
+            .add(egui::Checkbox::new(
+                &mut wrap,
+                with_chord(egui::RichText::new(WRAP_LABEL).small(), guard::WRAP_CHORD),
+            ))
+            .changed();
+        if flipped {
+            self.set_wrap(wrap);
+        }
         if self.state.output().iter().all(|(_, chunk)| chunk.is_empty()) {
             let said = match self.state.outcome() {
                 Some(_) => "It printed nothing.",
@@ -2411,14 +2430,21 @@ impl PromptApp {
             ui.label(egui::RichText::new(said).weak());
             return;
         }
-        egui::ScrollArea::vertical()
+        // Unwrapped, a long line runs on past the edge, so the area scrolls
+        // across as well as down.
+        let (scroll, mode) = match self.wrap {
+            true => (egui::ScrollArea::vertical(), egui::TextWrapMode::Wrap),
+            false => (egui::ScrollArea::both(), egui::TextWrapMode::Extend),
+        };
+        scroll
             .id_salt("hatch-viewer-output")
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 // Already decoded by the daemon; drawn, never decoded again.
                 // See `crate::protocol`.
-                ui.add(egui::Label::new(panes::output_job(ui, self.state.output())));
+                let job = panes::output_job(ui, self.state.output());
+                ui.add(egui::Label::new(job).wrap_mode(mode));
             });
     }
 
@@ -2469,6 +2495,11 @@ impl PromptApp {
                 // it would be a window claiming to have handed something over.
                 Action::Copy if self.state.streaming() => self.copy_output(ctx),
                 Action::Copy => {}
+                // Inert where there is no output, as Copy is, and for its
+                // reason: there is no box on the window to have pressed.
+                Action::Toggle(guard::Toggle::Wrap) if self.state.streaming() => {
+                    self.set_wrap(!self.wrap)
+                }
                 Action::Approve
                 | Action::Scroll(_)
                 | Action::Toggle(_)
@@ -2489,8 +2520,12 @@ impl PromptApp {
         // chords already have on a payload that offers no box. A window
         // cannot flash a sentence it is not drawing.
         if self.state.phase() == Phase::Running {
-            if action == Action::Keep {
-                self.keep_window();
+            match action {
+                Action::Keep => self.keep_window(),
+                Action::Toggle(guard::Toggle::Wrap) if self.state.streaming() => {
+                    self.set_wrap(!self.wrap)
+                }
+                _ => {}
             }
             return;
         }
@@ -2579,6 +2614,10 @@ impl PromptApp {
             // Through the same setter the click goes through, so the
             // keyboard and the mouse cannot end up remembering different
             // things -- which is this method's whole claim.
+            // Never produced while there is a question: its box is over the
+            // output, and a window that is asking has none. See
+            // `guard::watching`.
+            guard::Toggle::Wrap => {}
             guard::Toggle::Review => match self.runs() {
                 true => self.set_review(!self.review),
                 // A write prints nothing, so there is no output to hold back
@@ -3336,6 +3375,14 @@ impl PromptApp {
     fn set_show_original(&mut self, ticked: bool) {
         self.show_original = ticked;
         self.prefs.update(|prefs| prefs.show_original = ticked);
+    }
+
+    /// Wrap the output, or let it run on, and write it down.
+    ///
+    /// [`PromptApp::set_show_original`]'s reasons, for the output.
+    fn set_wrap(&mut self, ticked: bool) {
+        self.wrap = ticked;
+        self.prefs.update(|prefs| prefs.wrap = ticked);
     }
 
     fn set_stream(&mut self, ticked: bool) {
@@ -5899,6 +5946,24 @@ mod tests {
     }
 
     #[test]
+    fn the_wrap_box_is_over_the_output_and_its_chord_writes_it_down() {
+        let (_root, paths) = a_prefs_file();
+        let mut app = a_finished_window_showing("make test", "a line it printed\n");
+        app.prefs = PrefsFile::at(&paths);
+        assert!(app.wrap, "output wraps until somebody says otherwise, as it always did");
+
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains(WRAP_LABEL), "{drawn}");
+        assert!(drawn.contains(guard::WRAP_CHORD), "the chord is not on the screen: {drawn}");
+
+        app.act(&egui::Context::default(), Action::Toggle(guard::Toggle::Wrap));
+        assert!(!app.wrap, "Alt+W did not unwrap the output");
+        assert!(!PrefsFile::at(&paths).read().wrap, "and the next window would wrap again");
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains("a line it printed"), "unwrapped output went missing: {drawn}");
+    }
+
+    #[test]
     fn a_lingering_window_shows_the_output_the_outcome_and_how_long_it_is_staying() {
         let mut app = a_finished_window_showing("echo marker", "a line it printed\n");
 
@@ -8154,6 +8219,7 @@ mod tests {
             show_original: false,
             review: false,
             sound: false,
+            wrap: true,
         });
         let (mut app, _sink) = an_awaiting_window_remembering(PrefsFile::at(&paths));
         assert!(!app.closes_on_decide(), "it would have closed over the output it was asked for");
@@ -8406,6 +8472,7 @@ mod tests {
                 show_original: false,
                 review: false,
                 sound: false,
+                wrap: true,
             },
             "this window trampled what the one beside it saved"
         );
@@ -8480,6 +8547,7 @@ mod tests {
             show_original: false,
             review: false,
             sound: false,
+            wrap: true,
         };
         PrefsFile::at(&paths).write(&stored);
         let (mut app, sink) = a_write_window_remembering(PrefsFile::at(&paths));
@@ -9028,6 +9096,7 @@ mod tests {
             show_original: false,
             review: false,
             sound: false,
+            wrap: true,
         };
         PrefsFile::at(&paths).write(&stored);
         let (app, _sink) = a_window_whose_review_box_was_clicked(PrefsFile::at(&paths));
@@ -9419,6 +9488,7 @@ mod tests {
             show_original: false,
             review: true,
             sound: false,
+            wrap: true,
         };
         PrefsFile::at(&paths).write(&stored);
         let (mut app, sink) = a_reviewing_window();

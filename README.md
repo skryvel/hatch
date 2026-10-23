@@ -693,7 +693,9 @@ place of the command panes, from the moment you approve: the command shrinks to
 one row under the title, as it does once the run ends, so nothing moves when it
 does. stdout and stderr are one block in the order they arrived. Once there is
 stderr, each of its lines starts with `err` and each stdout line with four
-blanks, so the output still starts in one column. Kill
+blanks, so the output still starts in one column. **Wrap long lines** (Alt+W)
+over the output turns wrapping off, so a long line runs on and the output
+scrolls sideways; it is remembered. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops. **Keep this window** is beside it while you are
 streaming, and what it does is below. A file write has no Kill button, because
@@ -1335,7 +1337,7 @@ request is drawn in whatever that is.
 
 `$XDG_STATE_HOME/hatch/prefs.toml`, by default
 `~/.local/state/hatch/prefs.toml`. One file, one job: the choices the window
-writes down because you ticked them in it. Six keys —
+writes down because you ticked them in it. Seven keys —
 
 | Key | What ticking it remembers |
 |---|---|
@@ -1345,11 +1347,13 @@ writes down because you ticked them in it. Six keys —
 | `terminal` | The command gets a terminal of its own |
 | `show_original` | The window opens on the original text instead of the annotated one |
 | `sound` | A window opening plays a sound |
+| `wrap` | A watched run's output wraps at the window's edge instead of scrolling sideways |
 
 — and there is nothing to hand-edit: ticking the box in the window is how each
-one is set, and Alt+C, Alt+S and Alt+R are how the first three are set without
-the mouse. Every default is off, so a first run and a file hatch cannot read are
-the same window.
+one is set, and Alt+C, Alt+S, Alt+R and Alt+W are how four of them are set
+without the mouse. Every default but `wrap` is off, and `wrap` is on because
+output wrapped before there was a box for it, so a first run and a file hatch
+cannot read are the same window.
 
 Most of them change what you see or hear. `review` changes what the agent is
 sent, and only ever in the direction of less: every run waits for you, and a

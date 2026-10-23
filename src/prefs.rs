@@ -124,7 +124,7 @@ use crate::paths::Paths;
 /// preference in this file that a person can set once and then be surprised
 /// by. Treat any change to how it is drawn as a change to a security control,
 /// not to a checkbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
     /// Whether the window should close as soon as a verdict is given, rather
@@ -212,6 +212,28 @@ pub struct Prefs {
     /// nothing else -- the window is drawn either way, and the deadline runs
     /// either way.
     pub sound: bool,
+    /// Whether a command's output wraps at the edge of the window, rather
+    /// than running on past it with a bar to scroll it across.
+    ///
+    /// Written by the "Wrap long lines" checkbox above the output. A view
+    /// choice like `show_original`, and remembered for its reason. `true`
+    /// when nothing has been written, which is how output was drawn before
+    /// there was a box: a file from before it reads back as it looked.
+    pub wrap: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Prefs {
+        Prefs {
+            close_on_decide: false,
+            stream: false,
+            show_original: false,
+            review: false,
+            terminal: false,
+            sound: false,
+            wrap: true,
+        }
+    }
 }
 
 /// The file [`Prefs`] are kept in, and the only thing that writes it.
@@ -511,6 +533,7 @@ mod tests {
                 show_original: false,
                 review: false,
                 sound: false,
+                wrap: true,
             }
         );
 
@@ -521,6 +544,9 @@ mod tests {
             show_original: true,
             review: true,
             sound: true,
+            // The one box that starts ticked, so it is written unticked here:
+            // written ticked it would read back the same from no file at all.
+            wrap: false,
         };
         file.write(&every);
         assert_eq!(
@@ -544,6 +570,7 @@ mod tests {
             show_original: false,
             review: true,
             sound: false,
+            wrap: true,
         });
 
         // A second window that opened before any of that and knows nothing
@@ -559,6 +586,7 @@ mod tests {
                 show_original: false,
                 review: true,
                 sound: false,
+                wrap: true,
             },
             "a window writing one box trampled the others"
         );
@@ -581,6 +609,7 @@ mod tests {
                 show_original: false,
                 review: false,
                 sound: false,
+                wrap: true,
             }
         );
     }

@@ -221,6 +221,13 @@ pub const CLOSE_CHORD: &str = "Alt+C";
 /// taken, by the stream box here and by Keep in the watching phase.
 pub const REVIEW_CHORD: &str = "Alt+R";
 
+/// What toggles "wrap long lines" over a command's output.
+///
+/// Alt, for [`STREAM_CHORD`]'s reasons, though the box is only on windows
+/// with no field to type in: the same chord on every box keeps one rule for
+/// all of them. `W` for *wrap*; nothing else on those windows uses it.
+pub const WRAP_CHORD: &str = "Alt+W";
+
 /// What keeps the window, printed on the button that does the same thing.
 ///
 /// Three keys for one action, which is more than anything else here gets, and
@@ -363,6 +370,8 @@ pub enum Toggle {
     Close,
     /// "Show me the output before it is sent".
     Review,
+    /// "Wrap long lines", over the output of a watched run.
+    Wrap,
 }
 
 /// The window's guard against input it did not mean.
@@ -722,6 +731,7 @@ fn watching(key: Key, m: Modifiers) -> Option<Action> {
     match key {
         Key::E | Key::O | Key::Space if m.is_none() => Some(Action::Keep),
         Key::C if m.alt && !m.shift && !control => Some(Action::Copy),
+        Key::W if m.alt && !m.shift && !control => Some(Action::Toggle(Toggle::Wrap)),
         _ => None,
     }
 }
@@ -791,6 +801,14 @@ pub fn intercept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_w_wraps_on_a_watched_window_and_nowhere_else() {
+        assert_eq!(watching(Key::W, Modifiers::ALT), Some(Action::Toggle(Toggle::Wrap)));
+        assert_eq!(watching(Key::W, Modifiers::NONE), None, "a bare W is not ours");
+        // A window that is asking has no output to wrap, and no box for it.
+        assert_eq!(toggle_chord(Key::W, Modifiers::ALT), None);
+    }
 
     /// A clock the test drives by hand, so nothing here sleeps.
     struct Clock(Instant);
