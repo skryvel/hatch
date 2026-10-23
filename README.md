@@ -558,6 +558,14 @@ described above. The language comes from the same evidence the sentence above
 the panes names — a `#!` line, the program it is given to, the file it is
 written to — and a body in a language nothing here reads is left plain.
 
+A body read this way wears the box a `run_with` program wears, around its
+lines and not the opening line or the delimiter, because inside it the colours
+are another language's. A shell body's loops, `if`s and groups are bracketed
+and indented like the line's own. Bodies inside bodies are read four deep;
+past that a body is drawn plain and unboxed, because each level is read by
+drawing its body again, and a sixteen-kilobyte command can nest eight hundred
+deep.
+
 **One line says what the command runs.** Ten `grep`s in a pipeline means
 reading the whole command to learn what it invokes, and asking "what does this
 run" of `sudo foo` used to get the answer `sudo`. So above the panes, before

@@ -4773,17 +4773,7 @@ mod tests {
             draw_spans_bracketed(ui, &spans, Weight::Mono, &drawn);
         });
 
-        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<egui::epaint::RectShape>) {
-            match shape {
-                egui::epaint::Shape::Rect(rect) => into.push(rect.clone()),
-                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, into)),
-                _ => {}
-            }
-        }
-        let mut rects = Vec::new();
-        for clipped in &out.shapes {
-            walk(&clipped.shape, &mut rects);
-        }
+        let rects = painted_rects(&out);
         let galleys = drawn_galleys(&out);
         out.textures_delta.clear();
 
@@ -4806,6 +4796,64 @@ mod tests {
             "the box takes in the invocation: {invocation:?} against {:?}",
             frame.rect
         );
+    }
+
+    /// Every rectangle a frame painted, however deep in the shape tree.
+    fn painted_rects(out: &egui::FullOutput) -> Vec<egui::epaint::RectShape> {
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::epaint::Shape::Rect(rect) => into.push(rect.clone()),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    #[test]
+    fn a_here_document_read_as_a_program_is_boxed_and_its_delimiters_are_not() {
+        // The same box a declared program wears, for the same reason: inside
+        // it the colours are another language's. The line that opens the
+        // body and the line that ends it stay outside, because they are the
+        // shell's, and the box is what says where the language changes.
+        // Shell, so the test does not depend on `--features highlight`; a
+        // Python body is framed by the same rule when the feature is on.
+        let body = "cd /tmp\nls -l\nrm -f x\n";
+        let line = format!("bash <<'SH'\n{body}SH\necho after");
+        let spans = crate::render::render_command(&line, &BTreeMap::new());
+        let drawn = gutter(&lines(&spans), &blocks(&line));
+
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            draw_spans_bracketed(ui, &spans, Weight::Mono, &drawn);
+        });
+        let rects = painted_rects(&out);
+        let galleys = drawn_galleys(&out);
+        out.textures_delta.clear();
+
+        let boxes: Vec<_> = rects.iter().filter(|rect| rect.stroke.width > 0.0).collect();
+        assert_eq!(boxes.len(), 1, "the body is framed by {} boxes", boxes.len());
+        let frame = boxes[0];
+        assert_eq!(frame.fill.a(), 0, "the frame is tinted");
+        for text in body.lines() {
+            let (_, at, _) = galleys
+                .iter()
+                .find(|(drawn, _, _)| drawn.contains(text))
+                .unwrap_or_else(|| panic!("{text:?} was not drawn: {galleys:?}"));
+            assert!(frame.rect.contains_rect(*at), "{text:?} at {at:?} is outside {:?}", frame.rect);
+        }
+        for outside in ["bash", "SH", "echo"] {
+            let (_, at, _) = galleys
+                .iter()
+                .find(|(drawn, _, _)| drawn.starts_with(outside))
+                .unwrap_or_else(|| panic!("{outside:?} was not drawn: {galleys:?}"));
+            assert!(!frame.rect.intersects(*at), "{outside:?} at {at:?} is inside {:?}", frame.rect);
+        }
     }
 
     #[test]

@@ -166,6 +166,18 @@ pub fn render_command_reinterpreting(
     at: Option<usize>,
     program: Option<&language::Snippet>,
 ) -> Spans {
+    render_nested(command, env, at, program, 0)
+}
+
+/// [`render_command_reinterpreting`] for a source `depth` here-documents or
+/// programs deep: zero for the request's own line.
+fn render_nested(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    at: Option<usize>,
+    program: Option<&language::Snippet>,
+    depth: usize,
+) -> Spans {
     let segmented = command::segment_breaking_at(command, at);
     let outer = command::highlight(command::annotate_variables(segmented, env));
     // The language decides, here and not at the two call sites. Splicing a
@@ -178,10 +190,10 @@ pub fn render_command_reinterpreting(
     // two passes below has to carry the same four checks.
     let named = program.filter(|program| is_a_run_of(command, &program.range()));
     let spans = match named {
-        Some(program) => reinterpret(outer, env, program.range(), program.language()),
+        Some(program) => reinterpret(outer, env, program.range(), program.language(), depth),
         None => outer,
     };
-    let spans = here_documents(spans, env, at, named);
+    let spans = here_documents(spans, env, at, named, depth);
     if let Some(at) = at {
         assert!(
             spans.iter().any(|span| span.range().start == at && span.break_before()),
@@ -256,27 +268,54 @@ fn here_documents(
     env: &BTreeMap<String, String>,
     at: Option<usize>,
     program: Option<&language::Snippet>,
+    depth: usize,
 ) -> Spans {
     let source = spans.source().to_string();
-    let literal = command::literal_here_bodies(&source);
-    for body in language::snippets(&source) {
+    for body in read_here_bodies(&source, depth) {
         let range = body.range();
-        let read = body.language() == language::Language::Shell || grammar::reads(body.language());
         let inside_program = program.is_some_and(|program| {
             let outer = program.range();
             outer.start <= range.start && range.end <= outer.end
         });
         let across_break = at.is_some_and(|at| range.start <= at && at < range.end);
-        if read
-            && literal.contains(&range)
-            && !inside_program
-            && !across_break
-            && is_a_run_of(&source, &range)
-        {
-            spans = reinterpret(spans, env, range, body.language());
+        if !inside_program && !across_break && is_a_run_of(&source, &range) {
+            spans = reinterpret(spans, env, range, body.language(), depth);
         }
     }
     spans
+}
+
+/// How deep here-documents inside here-documents are still read as programs.
+///
+/// Real commands go two deep, a shell body that hands a Python body to
+/// `python3 -`, and four is twice that. Past it a body is drawn as the outer
+/// reading drew it, which is every byte as itself. The bound is there because
+/// each level is read by rendering its body again, and a command can be
+/// written to nest eight hundred deep in sixteen kilobytes: that took over a
+/// second to draw.
+pub(crate) const MAX_HERE_NESTING: usize = 4;
+
+/// The here-document bodies of `source` that are read as programs, for a
+/// source `depth` levels down.
+///
+/// One answer for the two places that need it: the rendering, which reads
+/// these bodies, and [`blocks::blocks`], which frames them. Two copies of the
+/// rule would be how a body comes to be framed and not read, or read and not
+/// framed. A body qualifies when its delimiter was quoted, so its bytes are
+/// what the program receives, and when its language is one something here
+/// reads: shell, which hatch reads itself, or one with a grammar.
+pub(crate) fn read_here_bodies(source: &str, depth: usize) -> Vec<language::Snippet> {
+    if depth >= MAX_HERE_NESTING {
+        return Vec::new();
+    }
+    let literal = command::literal_here_bodies(source);
+    language::snippets(source)
+        .into_iter()
+        .filter(|body| literal.contains(&body.range()))
+        .filter(|body| {
+            body.language() == language::Language::Shell || grammar::reads(body.language())
+        })
+        .collect()
 }
 
 /// Render `spans.source()[script]` as a command of its own and put the result
@@ -291,6 +330,7 @@ fn reinterpret(
     env: &BTreeMap<String, String>,
     script: Range<usize>,
     language: language::Language,
+    depth: usize,
 ) -> Spans {
     let source = spans.source().to_string();
     debug_assert!(is_a_run_of(&source, &script));
@@ -298,7 +338,7 @@ fn reinterpret(
     let inner = match language {
         // Shell, and about to be run as shell by the program named on the
         // line: reading it as shell is the honest rendering.
-        language::Language::Shell => render_command(text, env),
+        language::Language::Shell => render_nested(text, env, None, None, depth + 1),
         // Anything else is classified -- every byte drawn as itself, the
         // unsafe ones chipped, which is exactly what the raw pane does with
         // everything -- and, with the `highlight` feature, has its strings and
@@ -449,6 +489,27 @@ mod tests {
         assert!(inside.contains(&(";", &SpanKind::Separator)), "{inside:?}");
         assert_eq!(unrender(&spans), line);
         assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn here_documents_inside_here_documents_are_read_only_so_deep() {
+        // Each level is read by rendering its body again, and sixteen
+        // kilobytes holds eight hundred levels: that took over a second to
+        // draw. Past the cap a body is drawn as the outer reading drew it.
+        let mut source = "rm -rf x\n".to_string();
+        for level in (0..MAX_HERE_NESTING + 1).rev() {
+            source = format!("bash <<'L{level}'\n{source}L{level}\n");
+        }
+        let spans = render_command(&source);
+        let commands: Vec<&str> = spans
+            .iter()
+            .filter(|span| matches!(span.kind(), SpanKind::Command))
+            .map(Span::text)
+            .collect();
+        // The outer `bash`, and one `bash` per level read. The innermost
+        // body, past the cap, is not read, so its `rm` is not a command.
+        assert_eq!(commands, vec!["bash"; MAX_HERE_NESTING + 1], "{commands:?}");
+        assert_eq!(unrender(&spans), source);
     }
 
     #[test]

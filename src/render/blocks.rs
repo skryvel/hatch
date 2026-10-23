@@ -233,11 +233,13 @@ impl Block {
     }
 }
 
-/// The constructs in `source`, outermost first, or nothing at all.
+/// The constructs in `source`, outermost first, and a frame around each
+/// here-document body the rendering reads as a program -- see
+/// [`blocks_nested`].
 ///
-/// Empty is the answer for every kind of doubt, and the cases are worth
-/// naming because they are not failures of this function — they are what it
-/// is for:
+/// For the constructs, empty is the answer for every kind of doubt, and the
+/// cases are worth naming because they are not failures of this function —
+/// they are what it is for:
 ///
 /// * the tokenizer or the parser refuses the input, which is roughly the
 ///   input `bash -c` would refuse too;
@@ -252,6 +254,52 @@ impl Block {
 /// cost is a comparison per block, and what it buys is that a wrong offset
 /// draws nothing rather than drawing a bracket around the wrong lines.
 pub fn blocks(source: &str) -> Vec<Block> {
+    blocks_nested(source, 0)
+}
+
+/// [`blocks`] for a source `depth` here-documents deep, with a frame around
+/// every here-document body the rendering reads as a program.
+///
+/// The frame is [`BlockKind::Program`]'s, for that kind's reason: the colours
+/// inside a body read in another language need a border saying the region is
+/// a thing of its own, or they read as the shell's colours gone wrong. A
+/// shell body is parsed for its own constructs too, so a loop in it is
+/// bracketed and indented like a loop on the line. Which bodies is decided
+/// once, in [`super::read_here_bodies`], so a body cannot be framed and not
+/// read, or read and not framed.
+///
+/// The frames come from hatch's own scanner and not from the parse, so they
+/// are drawn even when the parse refuses the line. If a frame would cross a
+/// construct instead of nesting with it, which no input known today does, the
+/// frames are dropped and the constructs drawn as they always were.
+fn blocks_nested(source: &str, depth: usize) -> Vec<Block> {
+    let constructs = constructs(source);
+    let mut out = constructs.clone();
+    for body in super::read_here_bodies(source, depth) {
+        let range = body.range();
+        if range.start >= range.end {
+            continue;
+        }
+        out.push(Block { range: range.clone(), kind: BlockKind::Program, depth: 0 });
+        if body.language() == super::language::Language::Shell {
+            out.extend(blocks_nested(&source[range.clone()], depth + 1).into_iter().map(
+                |block| Block {
+                    range: block.range.start + range.start..block.range.end + range.start,
+                    ..block
+                },
+            ));
+        }
+    }
+    out.sort_by_key(|block| (block.range.start, std::cmp::Reverse(block.range.end)));
+    if !properly_nested(&out) {
+        return constructs;
+    }
+    set_depths(&mut out);
+    out
+}
+
+/// The shell constructs in `source`, outermost first, or nothing at all.
+fn constructs(source: &str) -> Vec<Block> {
     if source.is_empty() || nesting_beyond(source, MAX_NESTING) {
         return Vec::new();
     }
@@ -317,7 +365,9 @@ pub fn program_blocks(line: &str, program: &Range<usize>, shell: bool) -> Vec<Bl
     }
     let mut out = vec![Block { range: program.clone(), kind: BlockKind::Program, depth: 0 }];
     if shell {
-        out.extend(blocks(&line[program.clone()]).into_iter().map(|block| Block {
+        // One level down, as the rendering reads it: a here-document inside
+        // the program is as deep as one inside a body.
+        out.extend(blocks_nested(&line[program.clone()], 1).into_iter().map(|block| Block {
             range: block.range.start + program.start..block.range.end + program.start,
             // One deeper than the parse reported: everything inside the
             // program is inside the program.
@@ -596,6 +646,50 @@ mod tests {
             .into_iter()
             .map(|block| (block.kind().name(), &source[block.range()], block.depth()))
             .collect()
+    }
+
+    #[test]
+    fn a_here_document_read_as_a_program_is_framed_and_a_shell_one_parsed() {
+        // The screenshot that asked for it: a Python body and a shell body,
+        // each drawn in its own language's colours with nothing saying where
+        // the language changes, and the shell body's loop flush left.
+        let python = "import subprocess\nprint(subprocess.run(['uname']))\n";
+        let shell = "cd /tmp\nfor f in a b; do echo \"$f\";\ndone\n";
+        let source = format!("python3 - <<'PY'\n{python}PY\nbash <<'SH'\n{shell}SH\n");
+        let found = drawn(&source);
+        // Python is read only with `--features highlight`, and framed exactly
+        // when it is read.
+        let python_read = super::super::grammar::reads(super::super::language::Language::Python);
+        assert_eq!(found.contains(&("program", python, 0)), python_read, "{found:?}");
+        assert!(found.contains(&("program", shell, 0)), "{found:?}");
+        let looped = found.iter().find(|(kind, _, _)| *kind == "loop").expect("the loop");
+        assert!(looped.1.starts_with("for f") && looped.1.ends_with("done"), "{found:?}");
+        assert_eq!(looped.2, 1, "the loop is inside the body's frame");
+    }
+
+    #[test]
+    fn a_here_document_nothing_reads_is_not_framed() {
+        // Expanding, so the shell substitutes before anything reads it; and
+        // in a language with no reader. Neither is drawn in another
+        // language's colours, so neither needs a border saying so.
+        let expanding = "bash <<SH\ncd /tmp\necho $HOME\nSH\n";
+        assert!(drawn(expanding).iter().all(|(kind, _, _)| *kind != "program"), "{expanding}");
+        let unread = "lua - <<'EOF'\nprint(1)\nprint(2)\nEOF\n";
+        assert!(drawn(unread).iter().all(|(kind, _, _)| *kind != "program"), "{unread}");
+    }
+
+    #[test]
+    fn here_documents_are_framed_only_as_deep_as_they_are_read() {
+        // Each level is read by rendering its body again, so the depth is
+        // capped; a frame past the cap would surround a body drawn as plain
+        // text, which is the frame saying something the colours do not.
+        let levels = super::super::MAX_HERE_NESTING + 2;
+        let mut source = "echo deepest\necho again\n".to_string();
+        for level in (0..levels).rev() {
+            source = format!("bash <<'L{level}'\n{source}L{level}\n");
+        }
+        let frames = drawn(&source).iter().filter(|(kind, _, _)| *kind == "program").count();
+        assert_eq!(frames, super::super::MAX_HERE_NESTING);
     }
 
     #[test]
