@@ -290,15 +290,26 @@ that looked portable was the line that was not.
 
 **`--features highlight`** is an experiment, off by default. A Python or
 Clojure program handed to an interpreter (`run_with`, or a here-document with a
-quoted delimiter whose language hatch names) has its strings and comments marked, read by a TextMate grammar from
-[syntaxmate](https://crates.io/crates/syntaxmate) — pure Rust, its own regex
-engine, pinned to one version. Nothing else in the program is marked; keywords
-and names are an editor's taste, not a claim a reader needs. A grammar cannot
-tell when it is wrong, so the window says so in the sentence above the
-program, and every mark is dropped when the grammar reports that it stopped
-short, when its tokens fail to cover a line exactly, or — per string — when a
-string's closing delimiter never comes. Without the feature the program is
-drawn as it always was: every byte as itself, nothing read.
+quoted delimiter whose language hatch names) has its strings and comments
+marked. Nothing else in the program is marked yet. Both readers are pure Rust
+and pinned to one version:
+
+- **Python** is parsed by tree-sitter's Python grammar through
+  [mesquite](https://crates.io/crates/mesquite), a port of tree-sitter to
+  Rust with no C, no build script and `forbid(unsafe_code)` in every crate.
+  A program whose parse tree has any error in it gets no marks at all, and
+  neither does one the parser gives up on within 100 ms or panics on. A
+  panic is caught and drawn as a plain program.
+- **Clojure** is read by a TextMate grammar from
+  [syntaxmate](https://crates.io/crates/syntaxmate), which has its own regex
+  engine. A TextMate grammar cannot tell when it is wrong, so every mark is
+  dropped when it reports that it stopped short or when its tokens fail to
+  cover a line exactly, and a string whose closing delimiter never comes is
+  not marked.
+
+Either can be wrong, and the window says so in the sentence above the
+program. Without the feature the program is drawn as it always was: every
+byte as itself, nothing read.
 
 ```sh
 cargo build --release --features highlight
@@ -1523,6 +1534,20 @@ than `#[cfg(test)]`, because integration tests link the library compiled
 no environment-variable bypass: a build that does not enable the feature does
 not contain the stub, so an ordinary `cargo build --release` cannot be talked
 into skipping the window.
+
+One more run is left out of the default set, because its input is yours: it
+takes the commands in a hatch audit log, mangles each a few times — quotes and
+brackets that do not close, here-document operators, characters that must be
+chipped — and checks that every rendering keeps every byte, draws each one as
+itself, and does not panic. It is the closest thing to what agents actually
+send, and it covers the program readers on the way:
+
+```sh
+HATCH_FUZZ_CORPUS=~/.local/state/hatch/log/hatch-2026-10.jsonl \
+  cargo test --release --features test-stub-prompter,highlight --test fidelity -- --ignored mangled
+```
+
+`HATCH_FUZZ_ROUNDS` sets how many mangled commands, 20 000 by default.
 
 Two checks cannot be automated and are worth running by hand after any change
 near them: the polkit re-authentication check above, and holding Enter down

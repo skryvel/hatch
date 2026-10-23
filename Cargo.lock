@@ -1990,6 +1990,8 @@ dependencies = [
  "dirs",
  "eframe",
  "futures-core",
+ "mesquite",
+ "mesquite_python",
  "nix",
  "png",
  "proptest",
@@ -2577,6 +2579,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mesquite"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2e6d8781f488b0ef3eab29dd945c6fbf9b68507f6412f3e60ad13a900ae3cbb"
+dependencies = [
+ "mesquite_language",
+ "regex",
+ "streaming-iterator",
+]
+
+[[package]]
+name = "mesquite_language"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44fe057271f7722874dac9a4141d1d953daff176a55b210c3cc56d0a3d1745d4"
+
+[[package]]
+name = "mesquite_python"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f759f7cf0c069db021f97abf2807890207cc596e27d67b79fdb9bec7cc28f7"
+dependencies = [
+ "mesquite_language",
 ]
 
 [[package]]
@@ -4422,6 +4450,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "strict-num"

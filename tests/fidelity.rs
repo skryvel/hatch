@@ -141,6 +141,67 @@ proptest! {
     }
 }
 
+/// A here-document handed to a program, its body built from the pieces the
+/// readings of programs turn on.
+///
+/// The generators above put `<<'EOF'` on a line with nothing in front of it,
+/// so no body there is ever handed to a program, and the readings of
+/// programs -- hatch's own of a shell body, and with `highlight` a grammar's
+/// of a Python or Clojure one -- were never under these properties. Here every
+/// body is: quotes and brackets that open and do not close, an f-string's
+/// braces, comment and statement markers, a delimiter in the middle of a
+/// line, and characters that must stay chips inside a string.
+fn program_heredoc() -> impl Strategy<Value = String> {
+    let head = prop_oneof![
+        Just("python3 - <<'EOF'\n".to_string()),
+        Just("python3 - <<EOF\n".to_string()),
+        Just("bash <<'EOF'\n".to_string()),
+        Just("bb <<'EOF'\n".to_string()),
+        Just("cat > x.py <<'EOF'\n".to_string()),
+    ];
+    let body = prop::collection::vec(
+        prop_oneof![
+            "[a-z_ =.]{1,8}",
+            Just("'".to_string()),
+            Just("\"".to_string()),
+            Just("'''".to_string()),
+            Just("f\"".to_string()),
+            Just("{".to_string()),
+            Just("}".to_string()),
+            Just("(".to_string()),
+            Just(")".to_string()),
+            Just("[".to_string()),
+            Just("]".to_string()),
+            Just("#".to_string()),
+            Just(";".to_string()),
+            Just("\\".to_string()),
+            Just("\n".to_string()),
+            Just("    ".to_string()),
+            Just("$(x)".to_string()),
+            Just("$HOME".to_string()),
+            Just("\u{202E}".to_string()),   // bidi override
+            Just("\u{200B}".to_string()),   // zero-width space
+            Just("\u{00A0}".to_string()),   // non-breaking space
+            Just("EOF".to_string()),        // a delimiter in the middle of a line
+            Just("\nEOF\n".to_string()),    // and one that ends the body early
+        ],
+        0..40,
+    );
+    (head, body, any::<bool>()).prop_map(|(head, body, closed)| {
+        let end = if closed { "\nEOF\n" } else { "" };
+        format!("{head}{}{end}", body.concat())
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #[test]
+    fn a_program_in_a_here_document_round_trips_and_hides_nothing(cmd in program_heredoc()) {
+        prop_assert_eq!(unrender(&render_command(&cmd)), cmd.clone());
+        every_span_is_shown_as_what_it_is(&cmd)?;
+    }
+}
+
 #[test]
 fn a_chip_cannot_cover_the_rest_of_the_command() {
     // The hazard invariant 1b exists for, spelled out: a renderer that chips
@@ -363,4 +424,74 @@ fn a_row_cannot_cover_the_rest_of_the_file() {
         .map(|s| s.display_text())
         .collect();
     assert!(shown.contains("rm -rf /"), "the added line must be readable, not just present");
+}
+
+/// Both invariants over real commands, mangled.
+///
+/// Ignored, because the corpus is not in the repository: it is the audit log
+/// of whoever runs it, which is the best record there is of what agents
+/// actually send, and nobody else's to publish. Point it at a month's file
+/// and run it by name:
+///
+/// ```sh
+/// HATCH_FUZZ_CORPUS=~/.local/state/hatch/log/hatch-2026-10.jsonl \
+///   cargo test --release --features highlight --test fidelity -- --ignored mangled
+/// ```
+///
+/// Each round takes one logged command and inserts, deletes or repeats a few
+/// pieces of it -- quotes, brackets, here-document operators and delimiters,
+/// characters that must be chipped -- and renders the result. A panic fails
+/// it as surely as a broken invariant does: in the daemon a panic is a request
+/// that never answers.
+#[test]
+#[ignore = "needs HATCH_FUZZ_CORPUS, a hatch audit log"]
+fn mangled_logged_commands_round_trip_and_hide_nothing() {
+    const PIECES: &[&str] = &[
+        "'", "\"", "'''", "(", ")", "[", "]", "{", "}", "\\", "\n", "#", ";", "$(", "`", "<<'EOF'\n",
+        "<<EOF\n", "\nEOF\n", "f\"", "\u{202E}", "\u{200B}", "\u{00A0}", "\r", "\t", "é",
+    ];
+    let path = std::env::var("HATCH_FUZZ_CORPUS").expect("HATCH_FUZZ_CORPUS");
+    let rounds: usize = std::env::var("HATCH_FUZZ_ROUNDS").map_or(20_000, |n| n.parse().unwrap());
+    let corpus: Vec<String> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record["command"].as_str().map(str::to_string))
+        .collect();
+    assert!(!corpus.is_empty(), "no commands in the corpus");
+
+    // xorshift: the same rounds on every run, without a dependency for it.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move |below: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % below.max(1) as u64) as usize
+    };
+    for round in 0..rounds {
+        let mut cmd: Vec<char> = corpus[round % corpus.len()].chars().collect();
+        for _ in 0..1 + next(6) {
+            let at = next(cmd.len() + 1);
+            match next(3) {
+                0 => {
+                    let piece = PIECES[next(PIECES.len())];
+                    cmd.splice(at..at, piece.chars());
+                }
+                1 => {
+                    let end = (at + 1 + next(20)).min(cmd.len());
+                    cmd.drain(at.min(end)..end);
+                }
+                _ => {
+                    let from = next(cmd.len() + 1);
+                    let to = (from + next(200)).min(cmd.len());
+                    let copy: Vec<char> = cmd[from..to].to_vec();
+                    cmd.splice(at..at, copy);
+                }
+            }
+        }
+        let cmd: String = cmd.into_iter().collect();
+        assert_eq!(unrender(&render_command(&cmd)), cmd, "round {round}");
+        every_span_is_shown_as_what_it_is(&cmd)
+            .unwrap_or_else(|error| panic!("round {round}: {error}\n{cmd:?}"));
+    }
 }

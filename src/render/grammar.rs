@@ -1,6 +1,7 @@
-//! Strings and comments in a program that is not shell, read by a TextMate
-//! grammar. Only with the `highlight` feature; without it, [`read`] is
-//! [`super::unicode::classify`] and nothing else.
+//! Strings and comments in a program that is not shell, read by a grammar of
+//! its language: tree-sitter's for Python, through mesquite, and a TextMate
+//! one for Clojure, through syntaxmate. Only with the `highlight` feature;
+//! without it, [`read`] is [`super::unicode::classify`] and nothing else.
 //!
 //! # What it may say
 //!
@@ -19,13 +20,22 @@
 //! existed, and marks are laid over its `Plain` runs only: a chip stays a
 //! chip, a newline still starts a line, and the text under a mark is the text.
 //!
-//! # When it says nothing
+//! # When it says nothing: Python
 //!
-//! A grammar is a set of regular expressions with no notion of being unsure,
-//! so a confidently wrong reading cannot be caught here. What can be caught is
-//! the grammar knowing it struggled, and every one of those drops *every*
-//! mark rather than keeping the ones that look fine -- a reading that went
-//! wrong once has no standing anywhere else in the same program:
+//! tree-sitter builds a whole parse tree and knows where it failed to, so
+//! the rule is the simplest one there is: a program whose tree has any error
+//! in it gets no marks at all, and neither does one the parser gave up on
+//! within its time budget, or one it panicked on. The parser is safe Rust, so
+//! a panic is the worst a hostile program can make of it, and it is caught
+//! here and turned into a plain drawing.
+//!
+//! # When it says nothing: Clojure
+//!
+//! A TextMate grammar is a set of regular expressions with no notion of being
+//! unsure, so a confidently wrong reading cannot be caught here. What can be
+//! caught is the grammar knowing it struggled, and every one of those drops
+//! *every* mark rather than keeping the ones that look fine -- a reading that
+//! went wrong once has no standing anywhere else in the same program:
 //!
 //! * the tokenizer reports a line [`HighlightStatus::Degraded`] -- its own
 //!   budgets stopped it short;
@@ -33,11 +43,11 @@
 //! * the grammar will not load, or refuses a line.
 //!
 //! One more is caught per string rather than per program: a string whose
-//! closing delimiter never comes is drawn plain. The grammars end a
-//! single-quoted Python string at the end of its line whether or not it was
-//! closed, and report that as a complete, well-formed reading -- so the pairing
-//! is done here, from the grammar's own begin and end punctuation, and an
-//! opening with no end marks nothing.
+//! closing delimiter never comes is drawn plain. TextMate grammars end a
+//! string at the end of its line whether or not it was closed, and report
+//! that as a complete, well-formed reading -- so the pairing is done here,
+//! from the grammar's own begin and end punctuation, and an opening with no
+//! end marks nothing.
 
 use super::language::Language;
 use super::span::{SpanBuilder, SpanKind, Spans};
@@ -93,7 +103,7 @@ fn overlay(plain: &Spans, marks: &[(Range<usize>, SpanKind)]) -> Spans {
 /// would be the window contradicting itself.
 pub fn reads(language: Language) -> bool {
     #[cfg(feature = "highlight")]
-    return grammar_of(language).is_some();
+    return language == Language::Python || grammar_of(language).is_some();
     #[cfg(not(feature = "highlight"))]
     return {
         let _ = language;
@@ -102,12 +112,12 @@ pub fn reads(language: Language) -> bool {
 }
 
 /// The grammar name syntaxmate knows `language` by, for the languages this
-/// was tried on. Every other one is left alone: a grammar nobody has looked
-/// at a real window of is not one to start drawing claims from.
+/// was tried on and tree-sitter is not used for. Every other one is left
+/// alone: a grammar nobody has looked at a real window of is not one to start
+/// drawing claims from.
 #[cfg(feature = "highlight")]
 fn grammar_of(language: Language) -> Option<&'static str> {
     match language {
-        Language::Python => Some("python"),
         Language::Clojure => Some("clojure"),
         _ => None,
     }
@@ -123,6 +133,83 @@ fn marks(_text: &str, _language: Language) -> Option<Vec<(Range<usize>, SpanKind
 /// for what counts.
 #[cfg(feature = "highlight")]
 fn marks(text: &str, language: Language) -> Option<Vec<(Range<usize>, SpanKind)>> {
+    match language {
+        Language::Python => python_marks(text),
+        other => textmate_marks(text, other),
+    }
+}
+
+/// How long the Python parser may take over one program before hatch draws
+/// it plain instead.
+///
+/// Ordinary programs take well under a millisecond and the worst seen, a
+/// hundred thousand nested brackets, took sixteen. This is the window not
+/// waiting on a parser rather than a figure anything is tuned to.
+#[cfg(feature = "highlight")]
+const PARSE_BUDGET_MICROS: u64 = 100_000;
+
+/// Python's strings and comments, from tree-sitter's parse of the program.
+///
+/// `None` for a tree with any error in it, a parse that ran out of budget,
+/// and a panic. Each string is marked whole, prefix and quotes included,
+/// except for an f-string's `{…}`: that part runs, and is drawn plain, with
+/// any string or comment inside it marked in turn.
+#[cfg(feature = "highlight")]
+fn python_marks(text: &str) -> Option<Vec<(Range<usize>, SpanKind)>> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let parsed = catch_unwind(AssertUnwindSafe(|| {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
+        parser.set_timeout_micros(PARSE_BUDGET_MICROS);
+        let tree = parser.parse(text, None)?;
+        let root = tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        // A stack and not recursion: the tree is as deep as the program's
+        // nesting, and the program is the agent's.
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "comment" => out.push((node.byte_range(), SpanKind::Comment)),
+                "string" => {
+                    let mut from = node.start_byte();
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "interpolation" {
+                            out.push((from..child.start_byte(), SpanKind::Quoted));
+                            from = child.end_byte();
+                            stack.push(child);
+                        }
+                    }
+                    out.push((from..node.end_byte(), SpanKind::Quoted));
+                }
+                _ => {
+                    let mut cursor = node.walk();
+                    stack.extend(node.children(&mut cursor));
+                }
+            }
+        }
+        Some(out)
+    }));
+    let mut out = parsed.ok()??;
+    out.retain(|(at, _)| !at.is_empty());
+    out.sort_by_key(|(at, _)| at.start);
+    // What the tree says has to be a set of separate runs of this text, on
+    // character boundaries, before anything is drawn from it.
+    let sound = out.windows(2).all(|pair| pair[0].0.end <= pair[1].0.start)
+        && out.iter().all(|(at, _)| {
+            at.end <= text.len() && text.is_char_boundary(at.start) && text.is_char_boundary(at.end)
+        });
+    sound.then(|| joined(out))
+}
+
+/// Clojure's strings and comments, from syntaxmate's TextMate grammar. See
+/// the module docs for when it says nothing.
+#[cfg(feature = "highlight")]
+fn textmate_marks(text: &str, language: Language) -> Option<Vec<(Range<usize>, SpanKind)>> {
     use syntaxmate::{HighlightStatus, Tokenizer, TokenizerOptions};
 
     let mut tokenizer =
@@ -256,15 +343,42 @@ mod tests {
     }
 
     #[test]
-    fn a_string_that_never_closes_is_not_marked() {
-        // The grammar calls this a string to the end of the line, and says
-        // it read the line completely.
+    fn a_python_program_with_any_error_in_it_is_not_marked_at_all() {
         assert_eq!(marked("s = 'open", Language::Python), vec![]);
         assert_eq!(marked("s = '''open\nstill", Language::Python), vec![]);
-        // And one that did close is still marked beside it.
+        // Not even the string that did close: a tree that went wrong once
+        // has no standing anywhere else in the same program.
+        assert_eq!(marked("a = 'shut'; s = 'open", Language::Python), vec![]);
+        assert_eq!(marked("def f(:\n    return 'x'  # c", Language::Python), vec![]);
+    }
+
+    #[test]
+    fn a_string_inside_an_f_strings_code_is_marked_as_a_string() {
         assert_eq!(
-            marked("a = 'shut'; s = 'open", Language::Python),
-            vec![("'shut'", SpanKind::Quoted)]
+            marked("x = f\"a{d['k']}b\"", Language::Python),
+            vec![("f\"a", SpanKind::Quoted), ("'k'", SpanKind::Quoted), ("b\"", SpanKind::Quoted)]
+        );
+    }
+
+    #[test]
+    fn deep_nesting_is_parsed_or_left_plain_and_never_kills_the_daemon() {
+        // A program is the agent's, and so is how deep it nests.
+        let deep = format!("x = {}'a'{}", "[".repeat(50_000), "]".repeat(50_000));
+        let spans = read(&deep, Language::Python);
+        assert!(spans.covers_source());
+        let open = "(".repeat(100_000);
+        assert_eq!(marked(&open, Language::Python), vec![]);
+    }
+
+    #[test]
+    fn a_comment_in_the_code_of_a_program_is_marked_and_one_in_a_string_is_not() {
+        assert_eq!(
+            marked("x = '# not a comment'\n# one\ny = 1  # two", Language::Python),
+            vec![
+                ("'# not a comment'", SpanKind::Quoted),
+                ("# one", SpanKind::Comment),
+                ("# two", SpanKind::Comment)
+            ]
         );
     }
 

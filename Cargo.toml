@@ -15,7 +15,7 @@ test-stub-prompter = []
 # Marks strings and comments inside a Python or Clojure program handed to an
 # interpreter. Off by default: an experiment, to see on real windows whether a
 # TextMate grammar's reading is worth drawing. See `src/render/grammar.rs`.
-highlight = ["dep:syntaxmate"]
+highlight = ["dep:syntaxmate", "dep:mesquite", "dep:mesquite_python"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -49,6 +49,13 @@ similar = "3.2.0"
 # crate by one author is not something to take unread. `bundled-grammars` is
 # the whole catalogue (about 2 MB); hatch asks it for two of them.
 syntaxmate = { version = "=0.1.3", optional = true, default-features = false, features = ["bundled-grammars"] }
+# Only with `highlight`, and only for Python. tree-sitter's runtime and its
+# Python grammar ported to Rust: no C, no build script, and
+# `forbid(unsafe_code)` in every crate, which is what makes a parser of bytes
+# an agent chose acceptable here. Pinned exactly for the reason syntaxmate is:
+# a weeks-old crate from one publisher is not something to update unread.
+mesquite = { version = "=0.25.10", optional = true }
+mesquite_python = { version = "=0.1.0", optional = true }
 strip-ansi-escapes = "0.2.1"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["full"] }
