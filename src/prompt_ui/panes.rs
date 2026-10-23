@@ -41,6 +41,7 @@
 //! they arrive defanged and are drawn as they arrive, per
 //! [`crate::protocol::Request`].
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::Path;
 
@@ -49,6 +50,7 @@ use chrono::Local;
 use eframe::egui::epaint::text::ByteRangeExt as _;
 use eframe::egui::{self, Color32, RichText, Ui};
 
+use crate::exec::Stream;
 use crate::protocol::{EarlierEnd, Outcome, Payload, ProtocolError, Resent, Unanswered, Unheard};
 use crate::render::blocks::{Block, BlockKind, blocks, program_blocks};
 use crate::render::language::{Evidence, Language, Snippet, snippets};
@@ -1397,6 +1399,59 @@ pub fn draw_root_mark(ui: &mut Ui) {
         ui.allocate_exact_size(galley.size() + 2.0 * ROOT_MARK_PAD, egui::Sense::hover());
     ui.painter().rect_filled(rect, ROOT_MARK_RADIUS, fill);
     ui.painter().galley(rect.min + ROOT_MARK_PAD, galley, ink);
+}
+
+/// What leads a line of output that came on stderr.
+///
+/// Text and not only colour, so it still reads to somebody who cannot tell
+/// the colours apart and in a screenshot printed in black and white. Every
+/// stdout line gets [`NO_MARK`], as wide, so the output itself starts in one
+/// column whichever stream a line came on.
+pub const STDERR_MARK: &str = "err ";
+
+/// What leads a stdout line once there is stderr beside it.
+const NO_MARK: &str = "    ";
+
+/// A command's streamed output, as one block in the order it arrived, with
+/// every line that came on stderr marked.
+///
+/// One block and not a pane per stream. Two panes side by side halve the
+/// width each stream gets, and split apart the error from the line it was
+/// about; in one, a warning sits where it was printed.
+///
+/// The marks are a gutter, and only when there is something to mark: output
+/// that is all stdout is drawn as it was printed, with no gutter at all. A
+/// line one stream left unfinished when the other spoke is drawn ending
+/// there, and the rest of it starts a line of its own when it arrives,
+/// because that is the order the bytes came in.
+///
+/// No wrapping is set here. The [`egui::Label`] it is drawn in decides that.
+pub fn output_job(ui: &Ui, chunks: &VecDeque<(Stream, String)>) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let text = egui::TextFormat::simple(font.clone(), ui.visuals().text_color());
+    let mark = egui::TextFormat::simple(font, ui.visuals().error_fg_color);
+    let gutter = chunks.iter().any(|(stream, _)| *stream == Stream::Stderr);
+    let mut job = egui::text::LayoutJob::default();
+    let mut line_start = true;
+    let mut last = None;
+    for (stream, chunk) in chunks.iter().filter(|(_, chunk)| !chunk.is_empty()) {
+        if !line_start && last != Some(*stream) {
+            job.append("\n", 0.0, text.clone());
+            line_start = true;
+        }
+        last = Some(*stream);
+        for piece in chunk.split_inclusive('\n') {
+            if line_start && gutter {
+                match stream {
+                    Stream::Stderr => job.append(STDERR_MARK, 0.0, mark.clone()),
+                    Stream::Stdout => job.append(NO_MARK, 0.0, text.clone()),
+                }
+            }
+            job.append(piece, 0.0, text.clone());
+            line_start = piece.ends_with('\n');
+        }
+    }
+    job
 }
 
 /// The command that ran, named in one row, for the screens after the
@@ -3690,6 +3745,44 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// The text of [`output_job`] over `chunks`, as it would be drawn.
+    fn output_drawn(chunks: &[(Stream, &str)]) -> String {
+        let chunks = chunks.iter().map(|(stream, text)| (*stream, text.to_string())).collect();
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| text = output_job(ui, &chunks).text);
+        out.textures_delta.clear();
+        text
+    }
+
+    #[test]
+    fn output_that_is_all_stdout_is_drawn_as_it_was_printed() {
+        let drawn = output_drawn(&[(Stream::Stdout, "one\ntw"), (Stream::Stdout, "o\n")]);
+        assert_eq!(drawn, "one\ntwo\n");
+    }
+
+    #[test]
+    fn stderr_is_marked_line_by_line_in_the_order_it_arrived() {
+        let drawn = output_drawn(&[
+            (Stream::Stdout, "one\n"),
+            (Stream::Stderr, "two\nthree\n"),
+            (Stream::Stdout, "four\n"),
+        ]);
+        assert_eq!(drawn, "    one\nerr two\nerr three\n    four\n");
+    }
+
+    #[test]
+    fn a_line_cut_into_by_the_other_stream_is_drawn_where_the_bytes_fell() {
+        // Joined, the halves would claim a line nobody printed, and the
+        // warning would sit under a line it interrupted.
+        let drawn = output_drawn(&[
+            (Stream::Stdout, "par"),
+            (Stream::Stderr, "warning\n"),
+            (Stream::Stdout, "tial\n"),
+        ]);
+        assert_eq!(drawn, "    par\nerr warning\n    tial\n");
+    }
     use crate::protocol::{WireSpan, display_line, wire_spans};
     use crate::render::render_command;
     use crate::render::unicode::classify;

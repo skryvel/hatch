@@ -461,14 +461,6 @@ const GUARD_NOTICE: &str =
 /// window looks.
 const REFUSAL_NOTICE: Duration = Duration::from_secs(2);
 
-/// The most of the window the live output takes while a command runs, in
-/// lines of the monospace font it is drawn in.
-///
-/// Lines and not points, for the reason [`PRIMARY_BUTTON_ROWS`] gives: the
-/// question is how much of the output a reader can see at once, and that is a
-/// number of lines whatever size they have chosen to read at.
-const RUNNING_OUTPUT_ROWS: f32 = 10.0;
-
 /// How much larger than body text the headline is drawn.
 ///
 /// The headline is two paragraphs of agent-written prose and should read as
@@ -2295,6 +2287,10 @@ impl PromptApp {
         egui::Panel::bottom("hatch-controls").show(ui, |ui| self.controls(ui, guard_open));
 
         let viewing = matches!(self.state.drawn_phase(), Phase::Lingering | Phase::Detached);
+        // A run the reader asked to watch is its output from the moment it
+        // is approved, not from the moment it ends: the command was the
+        // question, and the question has been answered.
+        let watching = self.state.drawn_phase() == Phase::Running && self.state.streaming();
         let reviewing = self.state.drawn_phase() == Phase::Reviewing;
         // Set inside the panel, applied outside it: see the call.
         let mut swapped = None;
@@ -2305,11 +2301,12 @@ impl PromptApp {
                 self.reviewer(ui, &title);
                 return;
             }
-            if viewing && self.runs() {
-                // The question has been answered and the command has run, so
-                // the two panes arguing about what the command says are of no
-                // further use. What is worth the window now is what it
-                // printed.
+            if (viewing || watching) && self.runs() {
+                // The question has been answered, so the two panes arguing
+                // about what the command says are of no further use. What is
+                // worth the window now is what it prints, and it is the same
+                // screen while it runs and after, so nothing moves when it
+                // ends.
                 self.viewer(ui, &title);
                 return;
             }
@@ -2360,8 +2357,8 @@ impl PromptApp {
         self.paging = None;
     }
 
-    /// What a finished streamed run shows: its command, named once, and all
-    /// of the output it produced.
+    /// What a streamed run shows, running and finished: its command, named
+    /// once, and all of the output it has produced.
     ///
     /// The command is one row and not the two panes: those exist so a reader
     /// can tell what they are approving apart from what it looks like, and
@@ -2406,9 +2403,12 @@ impl PromptApp {
             ui.label(egui::RichText::new(went).weak());
             return;
         }
-        let text = self.state.output_text();
-        if text.is_empty() {
-            ui.label(egui::RichText::new("It printed nothing.").weak());
+        if self.state.output().iter().all(|(_, chunk)| chunk.is_empty()) {
+            let said = match self.state.outcome() {
+                Some(_) => "It printed nothing.",
+                None => "It has printed nothing yet.",
+            };
+            ui.label(egui::RichText::new(said).weak());
             return;
         }
         egui::ScrollArea::vertical()
@@ -2418,7 +2418,7 @@ impl PromptApp {
             .show(ui, |ui| {
                 // Already decoded by the daemon; drawn, never decoded again.
                 // See `crate::protocol`.
-                ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
+                ui.add(egui::Label::new(panes::output_job(ui, self.state.output())));
             });
     }
 
@@ -2816,9 +2816,8 @@ impl PromptApp {
 
     /// What an approved command's window offers while it runs.
     ///
-    /// The output is here, in the same panel as Kill, and capped: the reason
-    /// to watch it is to decide whether to press that button, and a decision
-    /// is made from the last screenful.
+    /// The output it is streaming is not here: it has the window above, as
+    /// it will once the run ends. See [`PromptApp::viewer`].
     fn running_row(&mut self, ui: &mut egui::Ui) {
         // Two different sentences and not one with a suffix, because they say
         // opposite things about the only question the reader has: whether the
@@ -2880,31 +2879,16 @@ impl PromptApp {
         if !runs {
             return;
         }
-        if self.streams() {
-            let text = self.state.output_text();
-            egui::ScrollArea::vertical()
-                .id_salt("hatch-output")
-                .max_height(ui.text_style_height(&egui::TextStyle::Monospace) * RUNNING_OUTPUT_ROWS)
-                .auto_shrink([false, true])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    // Already decoded by the daemon; drawn, never decoded
-                    // again. See `crate::protocol`.
-                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
-                });
-        } else if self.in_a_terminal() {
-            ui.label(egui::RichText::new("It is running in a terminal of its own.").small());
-        } else if self.state.reviewing() {
-            ui.label(
-                egui::RichText::new(
-                    "Its output is held until it finishes, and you will see it before it is sent.",
-                )
-                .small(),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new("Its output is not being streamed to this window.").small(),
-            );
+        // Where the output is going, when it is not the window above.
+        if !self.streams() {
+            let went = if self.in_a_terminal() {
+                "It is running in a terminal of its own."
+            } else if self.state.reviewing() {
+                "Its output is held until it finishes, and you will see it before it is sent."
+            } else {
+                "Its output is not being streamed to this window."
+            };
+            ui.label(egui::RichText::new(went).small());
         }
         // Centred with the verdict buttons they replace. The output above
         // them is not: it is monospace text being read, and a column of it
@@ -5887,6 +5871,31 @@ mod tests {
             .handle(DaemonMsg::Output { stream: Stream::Stdout, text: printed.to_string() });
         app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 3 }));
         app
+    }
+
+    #[test]
+    fn a_watched_run_shows_its_output_and_not_the_command_panes_while_it_runs() {
+        // The command was the question, and it has been answered. Drawn as
+        // the two panes it took the room the output needs, while the output
+        // sat in ten rows of the bottom panel.
+        let mut app = a_window_showing("make test");
+        app.state.decide(approved(true));
+        app.state.handle(DaemonMsg::Output { stream: Stream::Stdout, text: "compiling\n".into() });
+        app.state.handle(DaemonMsg::Output { stream: Stream::Stderr, text: "warning: x\n".into() });
+        assert_eq!(app.state.phase(), Phase::Running);
+
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(!drawn.contains(panes::ATTRIBUTION), "the approval's panes are still up: {drawn}");
+        assert!(drawn.contains("    compiling"), "{drawn}");
+        assert!(drawn.contains(&format!("{}warning: x", panes::STDERR_MARK)), "{drawn}");
+        assert!(drawn.contains("Kill"), "the run can no longer be stopped: {drawn}");
+
+        // A run nobody is watching has no output here, and keeps the panes:
+        // they are the only thing on the window saying what is running.
+        let mut unwatched = a_window_showing("make test");
+        unwatched.state.decide(approved(false));
+        let drawn = window_text_sized(&mut unwatched, opening_size());
+        assert!(drawn.contains(panes::ATTRIBUTION), "{drawn}");
     }
 
     #[test]

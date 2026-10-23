@@ -688,7 +688,12 @@ its own, Alt+R on a write, which prints nothing — they tick nothing and flash
 the sentence saying why instead.
 
 **After Approve the window stays.** It becomes a running indicator with elapsed
-time and a Kill button, and the output pane if streaming was ticked. Kill
+time and a Kill button. If streaming was ticked, the output takes the window in
+place of the command panes, from the moment you approve: the command shrinks to
+one row under the title, as it does once the run ends, so nothing moves when it
+does. stdout and stderr are one block in the order they arrived. Once there is
+stderr, each of its lines starts with `err` and each stdout line with four
+blanks, so the output still starts in one column. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops. **Keep this window** is beside it while you are
 streaming, and what it does is below. A file write has no Kill button, because
