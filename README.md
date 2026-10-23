@@ -191,7 +191,8 @@ Commands run through a shell, spawned as a direct argv — `bash -c '<command>'`
 else in `run_with` — `python3`, `node`, `ruby`, `perl`, `lua`, `bb`, `clojure`,
 `clj`, `bash`, `sh`, `zsh` — and then `command` is a program for that
 interpreter, handed to it as one argument. The window draws the invocation with the program under it,
-names the language, and draws a box around the program. A shell program is read
+names the language, and draws a box around the program, one step in from the
+invocation. A shell program is read
 again as shell; the others are drawn exactly as they were sent, with nothing
 read — except that a build with `--features highlight` marks the strings and
 comments of a Python or Clojure program (see [Install and run](#install-and-run)).
@@ -560,7 +561,9 @@ written to — and a body in a language nothing here reads is left plain.
 
 A body read this way wears the box a `run_with` program wears, around its
 lines and not the opening line or the delimiter, because inside it the colours
-are another language's. A shell body's loops, `if`s and groups are bracketed
+are another language's. Like that program, it sits one step in from the line
+that hands it over; every line moves by the same step, so its own indentation
+is unchanged relative to itself. A shell body's loops, `if`s and groups are bracketed
 and indented like the line's own. Bodies inside bodies are read four deep;
 past that a body is drawn plain and unboxed, because each level is read by
 drawing its body again, and a sixteen-kilobyte command can nest eight hundred

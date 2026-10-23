@@ -188,17 +188,24 @@ impl BlockKind {
         !matches!(self, Self::Pipeline | Self::AndOr | Self::Program)
     }
 
-    /// Whether being inside this construct moves a line to the right.
+    /// Whether the construct's first drawn line is inside it, and so indented
+    /// with the rest.
     ///
-    /// Every shell construct: that is what the indentation is for. Not
-    /// [`BlockKind::Program`], and the difference is the point of the
-    /// distinction. A program brings its own indentation -- Python's is its
-    /// syntax -- and stepping all of it right by two would be hatch adding
-    /// structure to text it has already said it does not read. The bracket
-    /// still says where the program begins and ends, which is the one thing
-    /// a reader needs from it and the one thing indentation cannot say.
-    pub fn indents(self) -> bool {
-        !matches!(self, Self::Program)
+    /// Not for a shell construct: its first line is the word that opens it,
+    /// `for` or `case` or `(`, and that belongs at the level the construct
+    /// sits at. A [`BlockKind::Program`] has no opening word of its own. The
+    /// line that hands it over, `python3 - <<'PY'` or the interpreter's
+    /// invocation, is outside the block, so every line of the program is in
+    /// it and every line moves one step right, under the line that hands it
+    /// over.
+    ///
+    /// It used to not move at all, on the grounds that a program brings its
+    /// own indentation and Python's is its syntax. Moving every line by the
+    /// same step leaves that indentation exactly as it was relative to
+    /// itself, and a body flush with the line above it read as one more line
+    /// of shell with a box drawn round it.
+    pub fn first_line_inside(self) -> bool {
+        matches!(self, Self::Program)
     }
 }
 
@@ -775,14 +782,13 @@ mod tests {
     }
 
     #[test]
-    fn a_program_is_bracketed_but_does_not_indent_what_is_in_it() {
-        // The one kind that brackets without indenting: a program brings its
-        // own structure, and stepping all of it right by two would be hatch
-        // adding structure to text it has just said it does not read.
-        assert!(!BlockKind::Program.indents());
+    fn a_program_is_inside_its_block_from_its_first_line_to_its_last() {
+        // Nothing opens a program and nothing closes it: the line that hands
+        // it over is outside the block, so every line of it is inside.
+        assert!(BlockKind::Program.first_line_inside());
         assert!(!BlockKind::Program.closed_by_a_word());
         for shell in [BlockKind::Loop, BlockKind::If, BlockKind::Pipeline, BlockKind::AndOr] {
-            assert!(shell.indents(), "{shell:?}");
+            assert!(!shell.first_line_inside(), "{shell:?}");
         }
     }
 

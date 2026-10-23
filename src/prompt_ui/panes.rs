@@ -1783,15 +1783,10 @@ struct Bracket {
     /// terminator, and drawing it at the margin says the pipeline ended one
     /// line earlier than it did.
     closed_by_a_word: bool,
-    /// Whether the lines inside it are drawn one step further in.
-    ///
-    /// Every shell construct: nesting is what the indentation is for. Not the
-    /// program a request named an interpreter for, which is a bracket without
-    /// an indent -- it brings its own structure, and Python's indentation is
-    /// its syntax. Stepping all of it right by two would be hatch adding
-    /// structure to text it has just said it does not read. See
-    /// [`crate::render::blocks::BlockKind::indents`].
-    indents: bool,
+    /// Whether its first line is inside it and indented with the rest, as a
+    /// program's is, rather than the word that opens it. See
+    /// [`crate::render::blocks::BlockKind::first_line_inside`].
+    first_inside: bool,
     /// Whether this is the frame around the program rather than a bracket
     /// around a construct inside it.
     ///
@@ -1859,22 +1854,27 @@ impl Gutter {
     /// How many brackets enclose line `index` without starting or ending on
     /// it, which is how far that line is indented.
     ///
-    /// A block's own first line is never indented by it, and its last line is
-    /// indented only when nothing closes the block: `for` and `done` belong
-    /// to the construct rather than to its body, but the last stage of a
-    /// pipeline is a member of it. See [`Bracket::closed_by_a_word`].
+    /// A block's own first line is indented by it only when nothing opens
+    /// the block, which is a program's case, and its last line only when
+    /// nothing closes it: `for` and `done` belong to the construct rather
+    /// than to its body, but the last stage of a pipeline is a member of it.
+    /// See [`Bracket::first_inside`] and [`Bracket::closed_by_a_word`].
     fn indent(&self, index: usize) -> usize {
         self.brackets
             .iter()
-            .filter(|bracket| bracket.indents)
             .filter(|bracket| {
-                // The last line is inside the block when nothing closes it,
-                // and is the closing word itself when something does.
+                // The first line is inside the block when nothing opens it,
+                // and is the opening word itself when something does; the
+                // last likewise for what closes it.
+                let from = match bracket.first_inside {
+                    true => bracket.first,
+                    false => bracket.first + 1,
+                };
                 let past = match bracket.closed_by_a_word {
                     true => bracket.last,
                     false => bracket.last + 1,
                 };
-                bracket.first < index && index < past
+                from <= index && index < past
             })
             .count()
     }
@@ -1949,7 +1949,7 @@ fn gutter(lines: &[&[Span]], blocks: &[Block]) -> Gutter {
             first,
             last,
             closed_by_a_word: block.kind().closed_by_a_word(),
-            indents: block.kind().indents(),
+            first_inside: block.kind().first_line_inside(),
             frames: block.kind() == BlockKind::Program,
         });
     }
@@ -3903,6 +3903,30 @@ mod tests {
         let (brackets, indents) = bracketed("ls -l /tmp");
         assert_eq!(brackets, vec![]);
         assert!(indents.iter().all(|indent| *indent == 0), "{indents:?}");
+    }
+
+    #[test]
+    fn a_here_document_body_is_one_step_in_from_the_lines_around_it() {
+        // Flush with the line that opens it, a boxed body read as one more
+        // line of shell with a box drawn round it. Every line of it moves one
+        // step, the first and the last too, so its own indentation is what
+        // it was relative to itself; the opening line and the delimiter stay
+        // where they were. A loop inside a shell body is one step further.
+        let source = "bash <<'SH'\ncd /tmp\nfor f in a b; do\necho $f\ndone\nSH\necho after";
+        let shown = drawn_lines(source);
+        let (_, indents) = bracketed(source);
+        let at = |text: &str| {
+            shown.iter().position(|line| line.starts_with(text)).unwrap_or_else(|| {
+                panic!("{text:?} was not drawn: {shown:?}")
+            })
+        };
+        for outside in ["bash", "SH", "echo after"] {
+            assert_eq!(indents[at(outside)], 0, "{outside:?}: {indents:?}");
+        }
+        for inside in ["cd /tmp", "for f", "done"] {
+            assert_eq!(indents[at(inside)], 1, "{inside:?}: {indents:?}");
+        }
+        assert_eq!(indents[at("echo $f")], 2, "the loop's body: {indents:?}");
     }
 
     #[test]
