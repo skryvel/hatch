@@ -228,13 +228,23 @@ pub enum Scenario {
     /// -- the same characters, a row or two of scrolling away, drawn as the
     /// shell they are there.
     Program,
+    /// Two here-documents handed to programs, `python3 -` and `bash`: each
+    /// body boxed, set one step in, and read as the language it is in.
+    ///
+    /// Its own sample because the thing to look at is what [`Scenario::Heredoc`]
+    /// is not: a body hatch *does* read. The Python one has the argument list
+    /// a `subprocess.run` is handed and a comment beside it, which are what a
+    /// reader skims a program for, and the shell one a loop with a `;` in it.
+    /// A build without `--features highlight` draws the Python unmarked, and
+    /// the box is still there.
+    HeredocProgram,
 }
 
 impl Scenario {
     /// All of them, so a test that must cover every scenario cannot be
     /// written to cover three.
     #[cfg(test)]
-    pub(crate) fn all() -> [Scenario; 10] {
+    pub(crate) fn all() -> [Scenario; 11] {
         [
             Scenario::Command,
             Scenario::Chips,
@@ -246,6 +256,7 @@ impl Scenario {
             Scenario::Heredoc,
             Scenario::Blocks,
             Scenario::Program,
+            Scenario::HeredocProgram,
         ]
     }
 }
@@ -658,6 +669,24 @@ pub(crate) fn build(
                 asked,
             }
         }
+        Scenario::HeredocProgram => {
+            let asked = Asked::Command {
+                run_with: None,
+                command: HEREDOC_PROGRAM_SAMPLE.to_string(),
+                cwd,
+                root: false,
+                interactive: false,
+            };
+            Sample {
+                title: "List the three newest release tags and check each signature".to_string(),
+                reason: "The signing key was rotated last week, and the changelog names the \
+                         last three releases."
+                    .to_string(),
+                queue_depth: 0,
+                payload: command_payload(elevation, &env, &config.terminal, &asked)?,
+                asked,
+            }
+        }
         Scenario::Root => {
             let asked = Asked::Command {
                 run_with: None,
@@ -829,6 +858,28 @@ seen = {}
 for path in sorted(pathlib.Path(\".\").rglob(\"*.json\")):
     seen[path.name] = json.loads(path.read_text()).get(\"version\")
 print(json.dumps(seen, indent=2))";
+
+/// The command behind [`Scenario::HeredocProgram`].
+///
+/// The way agents write a program into a command: a here-document with a
+/// quoted delimiter, so the outer shell substitutes nothing in it. Each body
+/// has the things a reader looks for before approving one. The Python has
+/// the list `git` is run with, laid out as the list it is, and a comment that
+/// should read as one. The shell has a loop, a `;` and a `&&`.
+const HEREDOC_PROGRAM_SAMPLE: &str = "\
+python3 - <<'PY'
+import json, subprocess
+# Newest first; the list is exactly what git is handed.
+out = subprocess.run([\"git\", \"tag\", \"--sort=-creatordate\"],
+                     capture_output=True, text=True, check=True).stdout
+print(json.dumps(out.split()[:3]))
+PY
+bash <<'SH'
+cd $HOME/src/service
+for tag in $(git tag --sort=-creatordate | head -n 3); do
+  git verify-tag \"$tag\" && echo \"signed: $tag\"   # by the release key
+done
+SH";
 
 /// The command behind [`Scenario::Root`].
 ///

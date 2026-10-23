@@ -473,8 +473,8 @@ ran as root.
 header the word ROOT is reversed out of a filled red block, and above the panes
 a warning explains that a root command may be given a terminal where an
 ordinary one gets a pipe. The command is the run0 line: run0's own options,
-then `bash -c`, then the approved script on lines of its own, unquoted, framed
-down the left edge and drawn as shell — commands underlined, the loop
+then `bash -c`, then the approved script on lines of its own, unquoted, in a
+box one step in, and drawn as shell — commands underlined, the loop
 bracketed and indented.](media/approval-root.png)
 
 <sub>`hatch preview root --shot media/approval-root.png`</sub>
@@ -568,6 +568,18 @@ and indented like the line's own. Bodies inside bodies are read four deep;
 past that a body is drawn plain and unboxed, because each level is read by
 drawing its body again, and a sixteen-kilobyte command can nest eight hundred
 deep.
+
+![An approval window for two here-documents. The first line is
+`python3 - <<'PY'`, and under it, in a box one step in, a short Python
+program: its strings in blue, a comment in a dimmer green, and the list
+handed to subprocess.run with each argument a separate string. The `PY` that
+ends it is outside the box. Then `bash <<'SH'`, and a second box holding a
+shell script: a cd with $HOME's value shown beside it, and a for loop
+bracketed and indented, with its `;` boxed and the commands
+underlined.](media/approval-heredoc-program.png)
+
+<sub>`hatch preview heredoc-program --shot media/approval-heredoc-program.png`,
+from a build with `--features highlight`</sub>
 
 **One line says what the command runs.** Ten `grep`s in a pipeline means
 reading the whole command to learn what it invokes, and asking "what does this
@@ -943,10 +955,11 @@ hatch preview long                # a command taller and wider than the window
 hatch preview comment             # comments, beside the separators they are not
 hatch preview redirect            # redirections, and the two things that look like one
 hatch preview heredoc             # a here-document body, drawn as the data it is
+hatch preview heredoc-program     # here-documents handed to Python and to bash, read as each
 hatch preview --theme light       # the other palette, for this window only
 ```
 
-`hatch preview [command|chips|swap|root|long|comment|redirect|heredoc]` opens the real approval
+`hatch preview [command|chips|swap|root|long|comment|redirect|heredoc|blocks|program|heredoc-program]` opens the real approval
 window on a sample request, reading the same config `hatch prompt` reads. It is
 how you see what your `font_size`, `theme` and `terminal` settings actually
 render as without having to get an agent to knock on the door. The `long` sample is
