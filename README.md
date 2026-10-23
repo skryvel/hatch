@@ -289,8 +289,8 @@ to GNU install and *set DESTDIR* to the BSD one macOS ships, so the one line
 that looked portable was the line that was not.
 
 **`--features highlight`** is an experiment, off by default. A Python or
-Clojure program handed to an interpreter (`run_with`, or a here-document hatch
-names) has its strings and comments marked, read by a TextMate grammar from
+Clojure program handed to an interpreter (`run_with`, or a here-document with a
+quoted delimiter whose language hatch names) has its strings and comments marked, read by a TextMate grammar from
 [syntaxmate](https://crates.io/crates/syntaxmate) — pure Rust, its own regex
 engine, pinned to one version. Nothing else in the program is marked; keywords
 and names are an editor's taste, not a claim a reader needs. A grammar cannot
@@ -536,6 +536,16 @@ with it. The body itself is drawn plain, at full contrast and in no colour of
 its own: it is usually the whole point of the command, so it is the last text
 that should be dimmed, and the delimiter at each end is what says where it
 stops. `hatch preview heredoc` is the sample.
+
+A body handed to a program is read as that program, when its delimiter is
+quoted. `bash <<'EOF'` gets the same reading as the line it sits on: command
+names, separators, variables. `python3 - <<'EOF'` gets the marks a build with
+`--features highlight` puts on a Python program. Only a quoted delimiter
+qualifies, because only then are the body's bytes the bytes the program
+receives; a bare `<<EOF` body is substituted by the shell first, and stays as
+described above. The language comes from the same evidence the sentence above
+the panes names — a `#!` line, the program it is given to, the file it is
+written to — and a body in a language nothing here reads is left plain.
 
 **One line says what the command runs.** Ten `grep`s in a pipeline means
 reading the whole command to learn what it invokes, and asking "what does this

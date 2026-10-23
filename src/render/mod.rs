@@ -181,6 +181,7 @@ pub fn render_command_reinterpreting(
         Some(program) => reinterpret(outer, env, program.range(), program.language()),
         None => outer,
     };
+    let spans = here_documents(spans, env, at, named);
     if let Some(at) = at {
         assert!(
             spans.iter().any(|span| span.range().start == at && span.break_before()),
@@ -230,6 +231,52 @@ fn is_a_run_of(source: &str, at: &Range<usize>) -> bool {
         && at.end <= source.len()
         && source.is_char_boundary(at.start)
         && source.is_char_boundary(at.end)
+}
+
+/// Every here-document body that reads as a program, read as that program.
+///
+/// The same splice as a declared program's, once per body, and declined for
+/// the same doubts. Only these bodies:
+///
+/// * **Ones that expand nothing.** `<<'EOF'` hands the program its bytes
+///   untouched, so reading them as the program reads what runs. A bare
+///   `<<EOF` body has `$x` and `$(…)` substituted by the shell first, and the
+///   outer rendering already draws those as what they are.
+/// * **Ones in a language something here reads.** Shell is read by hatch's
+///   own passes, and a language with a grammar gets its marks. Any other is
+///   left exactly as the outer rendering drew it, which is every byte as
+///   itself.
+/// * **Not inside a declared program.** A shell program has already been
+///   read again, its bodies with it, and in any other language a `<<` is not
+///   a here-document at all.
+/// * **Not across the line break asked for.** The splice would take the
+///   break with it; the body stays as drawn rather than the line not breaking.
+fn here_documents(
+    mut spans: Spans,
+    env: &BTreeMap<String, String>,
+    at: Option<usize>,
+    program: Option<&language::Snippet>,
+) -> Spans {
+    let source = spans.source().to_string();
+    let literal = command::literal_here_bodies(&source);
+    for body in language::snippets(&source) {
+        let range = body.range();
+        let read = body.language() == language::Language::Shell || grammar::reads(body.language());
+        let inside_program = program.is_some_and(|program| {
+            let outer = program.range();
+            outer.start <= range.start && range.end <= outer.end
+        });
+        let across_break = at.is_some_and(|at| range.start <= at && at < range.end);
+        if read
+            && literal.contains(&range)
+            && !inside_program
+            && !across_break
+            && is_a_run_of(&source, &range)
+        {
+            spans = reinterpret(spans, env, range, body.language());
+        }
+    }
+    spans
 }
 
 /// Render `spans.source()[script]` as a command of its own and put the result
@@ -373,6 +420,79 @@ mod tests {
         assert_eq!(spans.first().map(Span::text), Some("run0"));
         assert_eq!(spans.last().map(Span::text), Some("'"));
         assert_eq!(spans.last().map(Span::kind), Some(&SpanKind::Quoted));
+        assert_eq!(unrender(&spans), line);
+    }
+
+    /// The kinds the spans inside `body` of `line` were drawn as.
+    fn kinds_in<'a>(spans: &'a Spans, line: &str, body: &str) -> Vec<(&'a str, &'a SpanKind)> {
+        let start = line.find(body).expect("the body is in the line");
+        let end = start + body.len();
+        spans
+            .iter()
+            .filter(|span| start <= span.range().start && span.range().end <= end)
+            .map(|span| (span.text(), span.kind()))
+            .collect()
+    }
+
+    #[test]
+    fn a_shell_here_document_that_expands_nothing_is_read_as_shell() {
+        // Agents hand a shell its program this way more often than any
+        // other, and the body was drawn as one flat run of text: no command
+        // names, no separators, nothing a reader skimming for `rm` could
+        // catch on.
+        let body = "cd /tmp; rm -rf x\n";
+        let line = format!("bash <<'EOF'\n{body}EOF\n");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, body);
+        assert!(inside.contains(&("cd", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&("rm", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&(";", &SpanKind::Separator)), "{inside:?}");
+        assert_eq!(unrender(&spans), line);
+        assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn a_here_document_that_expands_is_left_as_the_outer_reading_drew_it() {
+        // `<<EOF` substitutes before anything reads the body, so the reading
+        // that is true of `$(…)` in it is the outer one. Read again as a
+        // program it would be drawn as the program's, which it is not yet.
+        let body = "cd /tmp; rm -rf x\n";
+        let line = format!("bash <<EOF\n{body}EOF\n");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, body);
+        assert!(
+            inside.iter().all(|(_, kind)| !matches!(kind, SpanKind::Command)),
+            "an expanding body was read as a program: {inside:?}"
+        );
+        assert_eq!(unrender(&spans), line);
+    }
+
+    #[test]
+    fn a_here_document_in_a_language_nothing_reads_is_left_as_it_was() {
+        let body = "print(1)\n";
+        let line = format!("lua - <<'EOF'\n{body}EOF\n");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, body);
+        // Text and the line ends drawn as themselves, and nothing read.
+        assert!(
+            inside.iter().all(|(_, kind)| matches!(kind, SpanKind::Plain | SpanKind::Chip { .. })),
+            "{inside:?}"
+        );
+    }
+
+    #[cfg(feature = "highlight")]
+    #[test]
+    fn a_python_here_document_gets_the_marks_its_grammar_is_sure_of() {
+        // The case in the screenshot that asked for this: a Python program
+        // handed to `python3 -` with a quoted delimiter, drawn plain.
+        let body = "key = 'x'  # the key\nprint(key)\n";
+        let line = format!("python3 - <<'EOF'\n{body}EOF\n");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, body);
+        assert!(inside.contains(&("'x'", &SpanKind::Quoted)), "{inside:?}");
+        assert!(inside.contains(&("# the key", &SpanKind::Comment)), "{inside:?}");
+        // And the shell's reading of it is gone: `print` is not a command.
+        assert!(!inside.contains(&("print", &SpanKind::Command)), "{inside:?}");
         assert_eq!(unrender(&spans), line);
     }
 

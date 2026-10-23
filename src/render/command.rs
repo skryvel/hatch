@@ -2064,9 +2064,25 @@ struct Assignment {
 /// terminator line is not part of the range -- it is the delimiter, not the
 /// data.
 pub(crate) fn here_bodies(command: &str) -> Vec<Range<usize>> {
+    bodies_where(command, |_| true)
+}
+
+/// Where each here-document body that expands nothing is: the ones whose
+/// delimiter was quoted, `<<'EOF'`, `<<"EOF"` or `<<\EOF`.
+///
+/// The bytes of such a body are the bytes the program reading it receives,
+/// so a reading of them in that program's language is a reading of what
+/// runs. A bare `<<EOF` body is not: the shell substitutes `$x` and `$(…)`
+/// in it first, and the reading of those that is true is the shell's.
+pub(crate) fn literal_here_bodies(command: &str) -> Vec<Range<usize>> {
+    bodies_where(command, |expands| !expands)
+}
+
+/// The bodies whose `expands` passes `keep`, each one range.
+fn bodies_where(command: &str, keep: impl Fn(bool) -> bool) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();
     for scanned in scan(command) {
-        if !matches!(scanned.here, Some(Here::Body { .. })) {
+        if !matches!(scanned.here, Some(Here::Body { expands }) if keep(expands)) {
             continue;
         }
         let end = scanned.offset + scanned.ch.len_utf8();
