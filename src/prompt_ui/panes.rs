@@ -1764,6 +1764,21 @@ const BRACKET_TICK: f32 = 0.6;
 /// do not meet and read as one unbroken rule through both.
 const BRACKET_INSET: f32 = 2.0;
 
+/// How much empty space a program's box adds above its first line and below
+/// its last, as a fraction of one row.
+///
+/// Without it the box's edges sat in the ordinary gap between two rows, a
+/// point or two from the underline on the executable in the line above and as
+/// close again to the program's own first line: the edge crowded the one
+/// mark a reader skims that line for. A third of a row clears both, and the
+/// box's edge stays in the middle of the space, so neither side gets more of
+/// it. Only above and below. Across, the box already stands one step clear.
+///
+/// A fraction of a row rather than points, so that it follows the font size
+/// and so that the pane's own arithmetic, which counts in rows, can count it.
+/// See [`PaneLine::top`].
+const FRAME_PADDING: f32 = 0.3;
+
 /// One bracket: the lines it spans, and how far into the gutter it sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Bracket {
@@ -1840,6 +1855,21 @@ impl Gutter {
     /// Steps of gutter in front of the text, before any indentation.
     fn columns(&self) -> usize {
         BRACKET_STEP_CHARS * (1 + usize::from(self.frames()))
+    }
+
+    /// How many boxes open on line `index`, and how many close on it: the
+    /// paddings drawn above that line and below it. See [`FRAME_PADDING`].
+    fn padded(&self, index: usize) -> (usize, usize) {
+        let framed = || self.brackets.iter().filter(|bracket| bracket.frames);
+        (
+            framed().filter(|bracket| bracket.first == index).count(),
+            framed().filter(|bracket| bracket.last == index).count(),
+        )
+    }
+
+    /// How many paddings the whole rendering is drawn with.
+    fn paddings(&self) -> usize {
+        2 * self.brackets.iter().filter(|bracket| bracket.frames).count()
     }
 
     /// The deepest any line is indented, for the caller that has to know how
@@ -1964,6 +1994,21 @@ struct PaneLine {
     /// The row it starts on, counting the extra rows any wrapped line above
     /// it took.
     row: usize,
+    /// How many paddings above or below a box are drawn above it.
+    pads: usize,
+}
+
+impl PaneLine {
+    /// How far down the pane it starts, in points, for rows `row` points
+    /// apart.
+    ///
+    /// Rows alone would put every line below a box too high by the box's
+    /// padding. Read back from a scroll offset, that is a line too far down,
+    /// and too far down is the direction [`pane_lines`] is written never to
+    /// go in.
+    fn top(self, row: f32) -> f32 {
+        (self.row as f32 + self.pads as f32 * FRAME_PADDING) * row
+    }
 }
 
 /// One pane's lines, and how many rows they take altogether.
@@ -1993,12 +2038,22 @@ struct PaneRows {
 /// The follower therefore lands at the linked line or a little above it,
 /// showing context before it — never past it, which is the answer that would
 /// hide the line the reader was looking for.
-fn pane_lines(spans: &Spans, wrap: Option<usize>) -> PaneRows {
+///
+/// `gutter` is the one the pane is drawn with, for the space it puts around
+/// each box. See [`FRAME_PADDING`].
+fn pane_lines(spans: &Spans, wrap: Option<usize>, gutter: &Gutter) -> PaneRows {
     let mut lines_out = Vec::new();
     let mut rows = 0;
-    for line in lines(spans) {
-        let Some(first) = line.first() else { continue };
-        lines_out.push(PaneLine { at: first.range().start, row: rows });
+    let mut pads = 0;
+    for (index, line) in lines(spans).into_iter().enumerate() {
+        let (above, below) = gutter.padded(index);
+        pads += above;
+        let Some(first) = line.first() else {
+            pads += below;
+            continue;
+        };
+        lines_out.push(PaneLine { at: first.range().start, row: rows, pads });
+        pads += below;
         rows += match wrap {
             Some(width) if width > 0 => line_chars(line).div_ceil(width).max(1),
             _ => 1,
@@ -2009,8 +2064,8 @@ fn pane_lines(spans: &Spans, wrap: Option<usize>) -> PaneRows {
 
 /// Which line a pane is showing at its top, from its offset in pixels.
 fn line_at(offset: f32, row: f32, lines: &[PaneLine]) -> usize {
-    let at = (offset / row).floor().max(0.0) as usize;
-    lines.partition_point(|line| line.row <= at).saturating_sub(1)
+    let at = offset.max(0.0);
+    lines.partition_point(|line| line.top(row) <= at).saturating_sub(1)
 }
 
 /// The line of `to` that holds the place line `line` of `from` begins at.
@@ -2573,15 +2628,16 @@ fn draw_command(
     let was = ui.data(|data| data.get_temp::<Showing>(showing_id()).unwrap_or_default());
     let want = (was.original != original).then(|| {
         let furniture = gutter.columns() + gutter.deepest() * INDENT_CHARS;
-        let annotated_lines = pane_lines(annotated, Some(across.saturating_sub(furniture)));
-        let raw_lines = pane_lines(raw, None);
+        let annotated_lines =
+            pane_lines(annotated, Some(across.saturating_sub(furniture)), &gutter);
+        let raw_lines = pane_lines(raw, None, &Gutter::default());
         let (from, to) = match original {
             true => (&annotated_lines, &raw_lines),
             false => (&raw_lines, &annotated_lines),
         };
         let line = line_at(was.offset, row, &from.lines);
         let landed = linked_line(&from.lines, &to.lines, line);
-        to.lines.get(landed).map_or(0.0, |line| line.row as f32 * row)
+        to.lines.get(landed).map_or(0.0, |line| line.top(row))
     });
 
     let height = ui.available_height();
@@ -2647,18 +2703,29 @@ fn draw_command_pane(
         scroll = scroll.vertical_scroll_offset(at);
     }
     let row = row_height(ui);
+    // Taken off both heights, so the count is of rows the command has and a
+    // pane its text fits says so, exactly as it did before boxes had space
+    // around them. What it costs is that space scrolled out of view is taken
+    // off the rows shown as well, which can say a row or so more is out of
+    // sight than is -- the direction that sends a reader to look.
+    let padding = frame_padding(ui) * gutter.paddings() as f32;
     pane_frame(ui)
         .show(ui, |ui| {
             let drawn = scroll.show(ui, |ui| {
                 page_by(ui, paging, row);
                 draw_spans_bracketed(ui, spans, pane.weight, gutter)
             });
+            let unpadded = |height: f32| (height - padding).max(0.0);
             PaneShown {
                 at: PaneAt {
                     offset: drawn.state.offset.y,
                     max: (drawn.content_size.y - drawn.inner_rect.height()).max(0.0),
                 },
-                rows: Rows::measured(drawn.content_size.y, drawn.inner_rect.height(), row),
+                rows: Rows::measured(
+                    unpadded(drawn.content_size.y),
+                    unpadded(drawn.inner_rect.height()),
+                    row,
+                ),
             }
         })
         .inner
@@ -3394,10 +3461,13 @@ fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gut
     let ink = palette(ui).quiet;
     let advance = advance(ui);
     let step = advance * BRACKET_STEP_CHARS as f32;
+    let pad = frame_padding(ui);
     let mut rows: Vec<egui::Rect> = Vec::new();
     for (index, line) in lines(spans).into_iter().enumerate() {
         let inset = advance * gutter.columns() as f32
             + advance * (gutter.indent(index) * INDENT_CHARS) as f32;
+        let (above, below) = gutter.padded(index);
+        ui.add_space(pad * above as f32);
         let drawn = ui
             .horizontal_top(|ui| {
                 // Otherwise the gap egui puts between two widgets in a row
@@ -3408,9 +3478,15 @@ fn draw_spans_bracketed(ui: &mut Ui, spans: &Spans, weight: Weight, gutter: &Gut
                 draw_line(ui, line, weight).rect
             })
             .inner;
+        ui.add_space(pad * below as f32);
         rows.push(drawn);
     }
     paint_brackets(ui, &rows, gutter, step, ink);
+}
+
+/// The space above and below a box, in points. See [`FRAME_PADDING`].
+fn frame_padding(ui: &Ui) -> f32 {
+    FRAME_PADDING * row_height(ui)
 }
 
 /// Paint one stroke per bracket, from the rows the lines landed on.
@@ -3470,14 +3546,15 @@ fn paint_brackets(ui: &Ui, rows: &[egui::Rect], gutter: &Gutter, step: f32, ink:
 /// the argument begins and ends without adding anything to it.
 ///
 /// The left edge is where the frame's rule always was. The top and bottom sit
-/// in the gap between rows rather than inside a row, so no edge crosses a
-/// glyph, and the right edge is half a step past the widest line in it: a box
-/// sized to the pane would say the argument runs on into empty space.
+/// in the middle of the gap between rows, widened by [`FRAME_PADDING`], so no
+/// edge crosses a glyph or crowds the underline above it, and the right edge
+/// is half a step past the widest line in it: a box sized to the pane would
+/// say the argument runs on into empty space.
 fn paint_frame(ui: &Ui, rows: &[egui::Rect], x: f32, step: f32, stroke: egui::Stroke) {
     let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
         return;
     };
-    let gap = ui.spacing().item_spacing.y / 2.0;
+    let gap = (ui.spacing().item_spacing.y + frame_padding(ui)) / 2.0;
     let right = rows.iter().map(egui::Rect::right).fold(first.right(), f32::max);
     let rect = egui::Rect::from_min_max(
         egui::pos2(x, first.top() - gap),
@@ -4880,6 +4957,87 @@ mod tests {
         }
     }
 
+    /// `bash <<'SH'`, a body, and the lines after it, drawn: the box, every
+    /// galley, and the row pitch the pane counts in.
+    fn a_drawn_box() -> (egui::Rect, Vec<(String, egui::Rect, Color32)>, f32) {
+        let line = "bash <<'SH'\ncd /tmp\nls -l\nSH\necho after";
+        let spans = crate::render::render_command(line, &BTreeMap::new());
+        let drawn = gutter(&lines(&spans), &blocks(line));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        let mut row = 0.0;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            row = row_height(ui);
+            draw_spans_bracketed(ui, &spans, Weight::Mono, &drawn);
+        });
+        let rects = painted_rects(&out);
+        let galleys = drawn_galleys(&out);
+        out.textures_delta.clear();
+        let boxes: Vec<_> = rects.iter().filter(|rect| rect.stroke.width > 0.0).collect();
+        assert_eq!(boxes.len(), 1, "the body is framed by {} boxes", boxes.len());
+        (boxes[0].rect, galleys, row)
+    }
+
+    #[test]
+    fn a_box_stands_clear_of_the_lines_above_and_below_it_and_of_its_own() {
+        // Its edges used to sit in the ordinary gap between two rows, a point
+        // or two under the executable's underline on the line that opens the
+        // body. Now there is padding on both sides of each edge, and the
+        // edge is in the middle of it.
+        let (frame, galleys, row) = a_drawn_box();
+        let at = |start: &str| {
+            galleys
+                .iter()
+                .find(|(drawn, _, _)| drawn.starts_with(start))
+                .map(|(_, at, _)| *at)
+                .unwrap_or_else(|| panic!("{start:?} was not drawn: {galleys:?}"))
+        };
+        let clear = FRAME_PADDING * row / 2.0;
+        for (outside, inside) in [
+            (frame.top() - at("bash").bottom(), at("cd").top() - frame.top()),
+            (at("SH").top() - frame.bottom(), frame.bottom() - at("ls").bottom()),
+        ] {
+            assert!(outside >= clear && inside >= clear, "{outside} and {inside}, under {clear}");
+            assert!((outside - inside).abs() < 1.0, "off centre: {outside} against {inside}");
+        }
+    }
+
+    #[test]
+    fn the_rows_a_pane_counts_are_where_its_lines_are_drawn() {
+        // The pane turns a scroll offset into a line, and a line into an
+        // offset, by counting rows. A box's padding is not a row, and a count
+        // that left it out would put every line below the box too high --
+        // read back, a line too far down, which hides the one the reader was
+        // on when the other rendering is asked for.
+        let line = "bash <<'SH'\ncd /tmp\nls -l\nSH\necho after";
+        let spans = crate::render::render_command(line, &BTreeMap::new());
+        let counted = pane_lines(&spans, None, &gutter(&lines(&spans), &blocks(line))).lines;
+        let (_, galleys, row) = a_drawn_box();
+        let tops: Vec<f32> = ["bash", "cd", "ls", "SH", "echo"]
+            .iter()
+            .map(|start| {
+                let (_, at, _) =
+                    galleys.iter().find(|(drawn, _, _)| drawn.starts_with(start)).unwrap();
+                at.top()
+            })
+            .collect();
+        assert_eq!(counted.len(), tops.len(), "{counted:?}");
+        assert_eq!(counted.iter().map(|line| line.pads).collect::<Vec<_>>(), [0, 1, 1, 2, 2]);
+        for (line, top) in counted.iter().zip(&tops) {
+            assert!(
+                (line.top(row) - (top - tops[0])).abs() < 1.0,
+                "counted at {}, drawn at {}: {counted:?}",
+                line.top(row),
+                top - tops[0],
+            );
+            // And read back: the offset a line is scrolled to is that line,
+            // and a point above it is the line before.
+            let index = counted.iter().position(|other| other == line).unwrap();
+            assert_eq!(line_at(line.top(row), row, &counted), index);
+            assert_eq!(line_at(line.top(row) - 1.0, row, &counted), index.saturating_sub(1));
+        }
+    }
+
     #[test]
     fn root_is_a_filled_block_with_the_word_knocked_out_of_it() {
         // The old treatment was the same word tinted red, and red is a
@@ -5788,8 +5946,8 @@ mod tests {
         // same string -- which is exactly why a line number is not a shared
         // coordinate and a byte offset is.
         let source = "ls; rm\ncat";
-        let raw = pane_lines(&classify(source), None);
-        let annotated = pane_lines(&render_command(source, &BTreeMap::new()), None);
+        let raw = unboxed(&classify(source), None);
+        let annotated = unboxed(&render_command(source, &BTreeMap::new()), None);
 
         assert_eq!(rows_of(&raw), vec![(0, 0), (7, 1)], "the raw pane breaks only at the newline");
         assert_eq!(
@@ -5808,22 +5966,27 @@ mod tests {
         let spans = classify("aaaaaaaaaa\nbb\ncc");
 
         assert_eq!(
-            rows_of(&pane_lines(&spans, None)),
+            rows_of(&unboxed(&spans, None)),
             vec![(0, 0), (11, 1), (14, 2)],
             "a pane that does not reflow gives every line one row"
         );
         // Eleven characters -- ten and the `↵` -- across a four-character
         // pane is three rows, so the lines below start three rows down.
-        let wrapped = pane_lines(&spans, Some(4));
+        let wrapped = unboxed(&spans, Some(4));
         assert_eq!(rows_of(&wrapped), vec![(0, 0), (11, 3), (14, 4)]);
         assert_eq!(wrapped.rows, 5);
 
         // A width of nothing is not a division by zero and not an infinite
         // number of rows: it is a pane that cannot be measured, and one row
         // per line is the answer that never scrolls past anything.
-        assert_eq!(rows_of(&pane_lines(&spans, Some(0))), vec![(0, 0), (11, 1), (14, 2)]);
+        assert_eq!(rows_of(&unboxed(&spans, Some(0))), vec![(0, 0), (11, 1), (14, 2)]);
         // An empty rendering has no lines and no rows, not one blank row.
-        assert_eq!(pane_lines(&classify(""), None), PaneRows { lines: Vec::new(), rows: 0 });
+        assert_eq!(unboxed(&classify(""), None), PaneRows { lines: Vec::new(), rows: 0 });
+    }
+
+    /// A pane's lines when it has no box to make room around.
+    fn unboxed(spans: &Spans, wrap: Option<usize>) -> PaneRows {
+        pane_lines(spans, wrap, &Gutter::default())
     }
 
     /// The two panes of `ls; rm\ncat`, which is the shape the link is for:
@@ -5831,8 +5994,8 @@ mod tests {
     fn linked_panes() -> (PaneRows, PaneRows) {
         let source = "ls; rm\ncat";
         (
-            pane_lines(&classify(source), None),
-            pane_lines(&render_command(source, &BTreeMap::new()), None),
+            unboxed(&classify(source), None),
+            unboxed(&render_command(source, &BTreeMap::new()), None),
         )
     }
 
@@ -5855,7 +6018,7 @@ mod tests {
 
     #[test]
     fn a_panes_offset_reads_as_the_line_it_is_showing() {
-        let lines = pane_lines(&classify("aaaaaaaaaa\nbb\ncc"), Some(4)).lines;
+        let lines = unboxed(&classify("aaaaaaaaaa\nbb\ncc"), Some(4)).lines;
 
         assert_eq!(line_at(0.0, 10.0, &lines), 0);
         assert_eq!(line_at(9.9, 10.0, &lines), 0, "part of a row is still that row");
