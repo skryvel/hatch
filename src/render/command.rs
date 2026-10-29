@@ -2080,6 +2080,56 @@ pub(crate) fn literal_here_bodies(command: &str) -> Vec<Range<usize>> {
     bodies_where(command, |expands| !expands)
 }
 
+/// The part of a body's operator line that hands the body to something: from
+/// the start of the command whose `<<` opened it to the end of its pipeline.
+///
+/// The body is that command's stdin, and what the command writes goes on down
+/// the pipe, so `cat <<'EOF' | python3 -` hands it to Python. A command before
+/// it in the pipeline never sees the body, and neither does one after a `;`
+/// or `&&`: in `python3 -c 'a'; bash <<'SH'` the body is bash's, and reading
+/// the whole line found the `python3` first.
+///
+/// The operator is the line's first. A body that follows a line directly is
+/// the first operator's, because bash takes bodies in the order their
+/// operators were written; a later operator's body starts after the line
+/// that ends the one before it, so it has no operator line and is `None`.
+pub(crate) fn here_reader(command: &str, body: &Range<usize>) -> Option<Range<usize>> {
+    let head = command.get(..body.start)?.trim_end_matches('\n');
+    let line = head.rfind('\n').map_or(0, |at| at + 1)..head.len();
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for c in scan(command) {
+        if c.offset >= line.end {
+            break;
+        }
+        if c.offset < line.start || c.redirect != Some(Redirect::Operator) {
+            continue;
+        }
+        let end = c.offset + c.ch.len_utf8();
+        match runs.last_mut() {
+            Some(run) if run.end == c.offset => run.end = end,
+            _ => runs.push(c.offset..end),
+        }
+    }
+    let operator = runs.into_iter().find(|run| {
+        let text = command[run.clone()].trim_start_matches(|ch: char| ch.is_ascii_digit());
+        text.starts_with("<<") && !text.starts_with("<<<")
+    })?;
+    let mut start = line.start;
+    let mut end = line.end;
+    for boundary in boundaries(command) {
+        let Boundary::Separator(token) = boundary else { continue };
+        if token.end <= operator.start && token.start >= line.start {
+            start = start.max(token.end);
+        } else if token.start >= operator.end
+            && token.end <= line.end
+            && &command[token.clone()] != "|"
+        {
+            end = end.min(token.start);
+        }
+    }
+    Some(start..end)
+}
+
 /// The bodies whose `expands` passes `keep`, each one range.
 fn bodies_where(command: &str, keep: impl Fn(bool) -> bool) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();

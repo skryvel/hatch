@@ -226,10 +226,10 @@ fn read(command: &str, body: &Range<usize>) -> Option<(Language, Evidence)> {
     if let Some(language) = shebang(&command[body.clone()]) {
         return Some((language, Evidence::Shebang));
     }
-    // The line the here-document operator is on: the body starts after the
-    // newline that ends it.
-    let head = command[..body.start].trim_end_matches('\n');
-    let line = &head[head.rfind('\n').map_or(0, |at| at + 1)..];
+    // The command the here-document operator belongs to, and the rest of its
+    // pipeline, on the line the body follows. Not the whole line: the body
+    // of `python3 -c 'a'; bash <<'SH'` is bash's.
+    let line = &command[super::command::here_reader(command, body)?];
 
     // The program before the filename, because a command that runs `python3`
     // has said what the body is more directly than a file it happens to also
@@ -277,6 +277,24 @@ mod tests {
             read_as("node -e x <<'JS'\nlet a = 1\nJS"),
             vec![("JavaScript", "from the program it is given to")]
         );
+    }
+
+    #[test]
+    fn a_body_is_read_by_the_command_that_owns_it_and_the_pipe_after_it() {
+        // Before the fix each of the first three read the first interpreter
+        // anywhere on the line.
+        let given = "from the program it is given to";
+        assert_eq!(
+            read_as("python3 -c 'a'; bash <<'SH'\nls\nSH"),
+            vec![("Python", "from the option in front of it"), ("shell", given)]
+        );
+        assert_eq!(read_as("python3 gen.py | bash <<'SH'\nls\nSH"), vec![("shell", given)]);
+        assert_eq!(read_as("cat <<'EOF' > config.json && python3 deploy.py\n{}\nEOF"), vec![]);
+        // What the owner writes goes on down the pipe.
+        assert_eq!(read_as("cat <<'EOF' | python3 -\nprint(1)\nEOF"), vec![("Python", given)]);
+        // And a body after another one's terminator has no line of its own
+        // to be read from; before, it was read from that terminator.
+        assert_eq!(read_as("cat <<'python3' <<'B'\nx\npython3\ny\nB"), vec![]);
     }
 
     #[test]
@@ -373,7 +391,7 @@ mod tests {
         );
         // One per segment, in source order, among here-documents.
         assert_eq!(
-            programs_in("cd /tmp && python3 -c 'a'\nbash <<'SH'\nb\nSH\nbash -c 'c'"),
+            programs_in("cd /tmp && python3 -c 'a'; bash <<'SH'\nb\nSH\nbash -c 'c'"),
             vec![("a", "Python"), ("b\n", "shell"), ("c", "shell")]
         );
     }
