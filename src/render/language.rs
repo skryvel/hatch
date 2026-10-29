@@ -143,6 +143,10 @@ pub enum Evidence {
     Interpreter,
     /// The name of the file it is written to.
     Filename,
+    /// The option it follows: the `-c` of `python3 -c '…'`. The program is
+    /// an argument rather than a here-document, which is the one thing the
+    /// window says differently about it.
+    Flag,
 }
 
 impl Evidence {
@@ -156,6 +160,7 @@ impl Evidence {
             Self::Shebang => "from its own `#!` line",
             Self::Interpreter => "from the program it is given to",
             Self::Filename => "from the name of the file it is written to",
+            Self::Flag => "from the option in front of it",
         }
     }
 }
@@ -198,11 +203,10 @@ impl Snippet {
 
 /// Every embedded program this command carries, in source order.
 ///
-/// Here-documents only, for now. They are where an agent puts a program most
-/// often and they are the region already known not to be shell, so a reading
-/// here changes nothing else about how the body is drawn. An interpreter's
-/// `-c` argument is the obvious next one and is not done: the body is the
-/// common case and this says nothing rather than half a thing.
+/// Here-documents, which are where an agent puts a program most often, and
+/// an interpreter's single-quoted `-c` or `-e` argument. Those are found by
+/// [`super::command::script_arguments`], which says which ones and why only
+/// those.
 pub fn snippets(command: &str) -> Vec<Snippet> {
     let mut out = Vec::new();
     for range in super::command::here_bodies(command) {
@@ -210,6 +214,10 @@ pub fn snippets(command: &str) -> Vec<Snippet> {
         let (language, evidence) = found;
         out.push(Snippet { range, language, evidence });
     }
+    for (range, language) in super::command::script_arguments(command) {
+        out.push(Snippet { range, language, evidence: Evidence::Flag });
+    }
+    out.sort_by_key(|found| found.range.start);
     out
 }
 
@@ -336,6 +344,73 @@ mod tests {
         let text = &command[found[0].range()];
         assert!(text.contains("print(1)"), "{text:?}");
         assert!(!text.contains("PY"), "the delimiter is not data: {text:?}");
+    }
+
+    /// Each program found in `command`, as its text and what it reads as.
+    fn programs_in(command: &str) -> Vec<(&str, &'static str)> {
+        snippets(command)
+            .iter()
+            .map(|found| (&command[found.range()], found.language().name()))
+            .collect()
+    }
+
+    #[test]
+    fn a_single_quoted_argument_to_an_interpreters_option_reads_as_its_language() {
+        assert_eq!(programs_in("python3 -c 'print(1)'"), vec![("print(1)", "Python")]);
+        assert_eq!(
+            read_as("python3 -c 'print(1)'"),
+            vec![("Python", "from the option in front of it")]
+        );
+        assert_eq!(programs_in("bb -e '(println 1)'"), vec![("(println 1)", "Clojure")]);
+        assert_eq!(programs_in("clojure -M -e '(println 1)'"), vec![("(println 1)", "Clojure")]);
+        assert_eq!(programs_in("bash -c 'cd /tmp; ls'"), vec![("cd /tmp; ls", "shell")]);
+        // The shells' own options are known, for the list of what runs.
+        assert_eq!(programs_in("bash -e -u -c 'ls'"), vec![("ls", "shell")]);
+        // Past assignments and wrappers, as that list is.
+        assert_eq!(
+            programs_in("A=1 env B=2 timeout 60 sudo /usr/bin/python3.12 -c 'x'"),
+            vec![("x", "Python")]
+        );
+        // One per segment, in source order, among here-documents.
+        assert_eq!(
+            programs_in("cd /tmp && python3 -c 'a'\nbash <<'SH'\nb\nSH\nbash -c 'c'"),
+            vec![("a", "Python"), ("b\n", "shell"), ("c", "shell")]
+        );
+    }
+
+    #[test]
+    fn a_newline_straight_after_the_quote_ends_the_line_above_and_is_not_the_programs() {
+        // So the program starts at the start of a line, where its box does.
+        assert_eq!(programs_in("python3 -c '\nprint(1)\n'"), vec![("print(1)\n", "Python")]);
+        // And a program that was nothing else is no program.
+        assert_eq!(programs_in("python3 -c '\n'"), vec![]);
+    }
+
+    #[test]
+    fn an_argument_whose_bytes_are_not_the_programs_or_whose_place_is_a_guess_is_not_read() {
+        for command in [
+            // The shell expands it first.
+            "python3 -c \"print(1)\"",
+            // Several strings joined, the usual way to put a quote in one.
+            "python3 -c 'print('\\''x'\\'')'",
+            "python3 -c print",
+            // An option in front of `-c` might take a value, and `-W` does.
+            "python3 -u -c 'print(1)'",
+            "python3 -W ignore -c 'print(1)'",
+            "python3 script.py 'print(1)'",
+            "python3 -c",
+            "python3 -c ''",
+            "python3 -c 'print(1)",
+            // Not what the segment runs.
+            "echo python3 -c 'x'",
+            // Not looked inside, not shell, not in the table.
+            "x=$(python3 -c 'x')",
+            "# python3 -c 'x'",
+            "cat <<'EOF'\npython3 -c 'x'\nEOF",
+            "php -r 'echo 1;'",
+        ] {
+            assert_eq!(programs_in(command), vec![], "{command}");
+        }
     }
 
 #[cfg(test)]

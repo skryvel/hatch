@@ -112,6 +112,11 @@ impl Interpreter {
         &self.program
     }
 
+    /// What goes between the program and the program text.
+    pub fn flags(&self) -> &'static [&'static str] {
+        self.flags
+    }
+
     /// `<program> <flags…> <source>` -- the argv that runs `source`.
     ///
     /// Separate arguments, never a concatenation: the program travels as a

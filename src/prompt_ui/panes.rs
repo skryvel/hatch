@@ -228,7 +228,17 @@ impl Shown {
                     snippets: program
                         .clone()
                         .into_iter()
-                        .chain(snippets(source))
+                        .chain(snippets(source).into_iter().filter(|found| {
+                            // A declared program is on the line as itself,
+                            // not shell-quoted, so an argument found by
+                            // reading that line as shell is not one.
+                            found.evidence() != Evidence::Flag
+                                || program.as_ref().is_none_or(|program| {
+                                    let outer = program.range();
+                                    let at = found.range();
+                                    at.end <= outer.start || outer.end <= at.start
+                                })
+                        }))
                         .collect(),
                     scan: scan(source),
                     danger: danger.iter().map(|label| defang(label)).collect(),
@@ -633,8 +643,11 @@ pub fn snippet_note(found: &[Snippet]) -> Option<String> {
     // here-document and must not be described as one -- and it is a fact
     // rather than a reading, so it says so without hedging. At most one of
     // them: a request names one interpreter.
-    let (declared, bodies): (Vec<&Snippet>, Vec<&Snippet>) =
+    let (declared, written): (Vec<&Snippet>, Vec<&Snippet>) =
         found.iter().partition(|found| found.evidence() == Evidence::Declared);
+    // An argument is not a here-document either, and is said apart from them.
+    let (arguments, bodies): (Vec<&Snippet>, Vec<&Snippet>) =
+        written.into_iter().partition(|found| found.evidence() == Evidence::Flag);
     let mut said: Vec<String> = declared
         .first()
         // A shell program says nothing here: `program_note` already says the
@@ -656,6 +669,22 @@ pub fn snippet_note(found: &[Snippet]) -> Option<String> {
             named.dedup();
             said.push(format!(
                 "Its here-documents read as {}.",
+                listed(named.into_iter().map(str::to_string))
+            ));
+        }
+    }
+    match arguments.as_slice() {
+        [] => {}
+        [only] => said.push(format!(
+            "Its quoted argument reads as {}, {}.",
+            only.language().name(),
+            only.evidence().because()
+        )),
+        several => {
+            let mut named: Vec<&str> = several.iter().map(|s| s.language().name()).collect();
+            named.dedup();
+            said.push(format!(
+                "Its quoted arguments read as {}.",
                 listed(named.into_iter().map(str::to_string))
             ));
         }
@@ -4471,6 +4500,25 @@ mod tests {
             panic!("not a command")
         };
         assert_eq!(blocks.len(), 2, "the shell half stopped finding constructs: {blocks:?}");
+    }
+
+    #[test]
+    fn a_quoted_argument_is_said_to_be_one_and_not_a_here_document() {
+        let found = snippets("python3 -c 'print(1)'");
+        let note = snippet_note(&found).expect("a program on the line said nothing about itself");
+        assert_eq!(note, "Its quoted argument reads as Python, from the option in front of it.");
+
+        // A declared program is on the line unquoted, so a string at its
+        // start is the program's own and not an argument of the wrapper's.
+        let payload = an_invocation("'/bin/ls' -l", Language::Shell);
+        let Shown::Command { snippets, .. } = Shown::of(&payload).expect("a real payload") else {
+            panic!("not a command")
+        };
+        assert_eq!(
+            snippets.iter().map(Snippet::evidence).collect::<Vec<_>>(),
+            vec![Evidence::Declared],
+            "{snippets:?}"
+        );
     }
 
     #[test]

@@ -265,15 +265,21 @@ pub fn blocks(source: &str) -> Vec<Block> {
 }
 
 /// [`blocks`] for a source `depth` here-documents deep, with a frame around
-/// every here-document body the rendering reads as a program.
+/// every here-document body and `-c` argument the rendering reads as a
+/// program.
 ///
 /// The frame is [`BlockKind::Program`]'s, for that kind's reason: the colours
 /// inside a body read in another language need a border saying the region is
 /// a thing of its own, or they read as the shell's colours gone wrong. A
 /// shell body is parsed for its own constructs too, so a loop in it is
-/// bracketed and indented like a loop on the line. Which bodies is decided
-/// once, in [`super::read_here_bodies`], so a body cannot be framed and not
+/// bracketed and indented like a loop on the line. Which programs is decided
+/// once, in [`super::read_programs`], so a body cannot be framed and not
 /// read, or read and not framed.
+///
+/// With one exception, which goes the safe way: an argument that is drawn on
+/// the line naming its interpreter is read and not framed. A frame is drawn
+/// around whole lines, and that line is not the program's. See
+/// [`super::begins_a_line`].
 ///
 /// The frames come from hatch's own scanner and not from the parse, so they
 /// are drawn even when the parse refuses the line. If a frame would cross a
@@ -282,12 +288,15 @@ pub fn blocks(source: &str) -> Vec<Block> {
 fn blocks_nested(source: &str, depth: usize) -> Vec<Block> {
     let constructs = constructs(source);
     let mut out = constructs.clone();
-    for body in super::read_here_bodies(source, depth) {
+    for body in super::read_programs(source, depth) {
         let range = body.range();
         if range.start >= range.end {
             continue;
         }
-        out.push(Block { range: range.clone(), kind: BlockKind::Program, depth: 0 });
+        let argument = body.evidence() == super::language::Evidence::Flag;
+        if !argument || super::begins_a_line(source, &range, body.language()) {
+            out.push(Block { range: range.clone(), kind: BlockKind::Program, depth: 0 });
+        }
         if body.language() == super::language::Language::Shell {
             out.extend(blocks_nested(&source[range.clone()], depth + 1).into_iter().map(
                 |block| Block {
@@ -672,6 +681,23 @@ mod tests {
         let looped = found.iter().find(|(kind, _, _)| *kind == "loop").expect("the loop");
         assert!(looped.1.starts_with("for f") && looped.1.ends_with("done"), "{found:?}");
         assert_eq!(looped.2, 1, "the loop is inside the body's frame");
+    }
+
+    #[test]
+    fn an_argument_on_lines_of_its_own_is_framed_and_one_beside_its_interpreter_is_not() {
+        let python = "import sys\nprint(sys.argv)\n";
+        let source = format!("python3 -c '\n{python}' a b");
+        let found = drawn(&source);
+        let python_read = super::super::grammar::reads(super::super::language::Language::Python);
+        assert_eq!(found.contains(&("program", python, 0)), python_read, "{found:?}");
+        // Shell is drawn broken at its separators, so this one is on lines
+        // of its own too.
+        assert!(drawn("bash -c 'cd /tmp; ls'").contains(&("program", "cd /tmp; ls", 0)));
+        // A frame goes round whole lines, and the only line here is the
+        // interpreter's.
+        for one in ["python3 -c 'print(1)'", "bash -c 'ls -l'"] {
+            assert!(drawn(one).iter().all(|(kind, _, _)| *kind != "program"), "{one}");
+        }
     }
 
     #[test]

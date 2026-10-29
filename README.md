@@ -290,8 +290,9 @@ to GNU install and *set DESTDIR* to the BSD one macOS ships, so the one line
 that looked portable was the line that was not.
 
 **`--features highlight`** is an experiment, off by default. A Python or
-Clojure program handed to an interpreter (`run_with`, or a here-document with a
-quoted delimiter whose language hatch names) has its strings and comments
+Clojure program handed to an interpreter (`run_with`, a here-document with a
+quoted delimiter whose language hatch names, or a single-quoted `-c` or `-e`
+argument) has its strings and comments
 marked. Nothing else in the program is marked yet. Both readers are pure Rust
 and pinned to one version:
 
@@ -568,6 +569,19 @@ and indented like the line's own. Bodies inside bodies are read four deep;
 past that a body is drawn plain and unboxed, because each level is read by
 drawing its body again, and a sixteen-kilobyte command can nest eight hundred
 deep.
+
+A program an agent writes straight into the command, `python3 -c '…'`, is
+read the same way, for the interpreters `run_with` takes and with the option
+`run_with` would use. It has to be one single-quoted string, since only then
+are its bytes the bytes the interpreter gets; `-c "…"` is expanded by the
+shell first and stays a string. The option has to follow the interpreter's
+name directly, because an option in front of it might take a value
+(`python3 -W ignore -c`); the shells' own options are known, so
+`bash -e -c '…'` is read. `env`, `sudo`, `timeout` and the other wrappers in
+front are looked past, as the list of what runs looks past them. A program
+drawn on lines of its own is boxed like a body. One that stays on the line
+naming its interpreter is read but not boxed, because a box goes round whole
+lines.
 
 ![An approval window for two here-documents. The first line is
 `python3 - <<'PY'`, and under it, in a box one step in, a short Python
@@ -1538,9 +1552,10 @@ Stated so you do not go looking:
 - **Drawing a nested command as a tree.** The roster above the panes reads
   through `bash -c '…'` and `sh -c '…'` to name what is inside, and reads
   through the fourteen other wrappers it knows; `ssh host '…'` and
-  `docker exec … '…'` it does not. Either way the payload is still *drawn* as
-  one inert string in the panes, correctly and unhelpfully — the panes have no
-  nesting in them.
+  `docker exec … '…'` it does not. The panes read a single-quoted `-c '…'`
+  as a program, as described above; anything else nested, `ssh host '…'` or
+  `-c "…"` among them, is still drawn as one inert string, correctly and
+  unhelpfully.
 - **macOS and anything else.** Elevation and the window hints sit behind a
   small platform seam with a refusing implementation for other systems, so a
   port is a port and not a rewrite. It has not been done.

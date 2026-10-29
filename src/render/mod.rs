@@ -245,7 +245,8 @@ fn is_a_run_of(source: &str, at: &Range<usize>) -> bool {
         && source.is_char_boundary(at.end)
 }
 
-/// Every here-document body that reads as a program, read as that program.
+/// Every here-document body and `-c` argument that reads as a program, read
+/// as that program.
 ///
 /// The same splice as a declared program's, once per body, and declined for
 /// the same doubts. Only these bodies:
@@ -253,7 +254,8 @@ fn is_a_run_of(source: &str, at: &Range<usize>) -> bool {
 /// * **Ones that expand nothing.** `<<'EOF'` hands the program its bytes
 ///   untouched, so reading them as the program reads what runs. A bare
 ///   `<<EOF` body has `$x` and `$(…)` substituted by the shell first, and the
-///   outer rendering already draws those as what they are.
+///   outer rendering already draws those as what they are. An argument is
+///   only ever found in single quotes, which expand nothing.
 /// * **Ones in a language something here reads.** Shell is read by hatch's
 ///   own passes, and a language with a grammar gets its marks. Any other is
 ///   left exactly as the outer rendering drew it, which is every byte as
@@ -271,7 +273,7 @@ fn here_documents(
     depth: usize,
 ) -> Spans {
     let source = spans.source().to_string();
-    for body in read_here_bodies(&source, depth) {
+    for body in read_programs(&source, depth) {
         let range = body.range();
         let inside_program = program.is_some_and(|program| {
             let outer = program.range();
@@ -295,23 +297,28 @@ fn here_documents(
 /// second to draw.
 pub(crate) const MAX_HERE_NESTING: usize = 4;
 
-/// The here-document bodies of `source` that are read as programs, for a
-/// source `depth` levels down.
+/// The programs written into `source` that are read as programs, for a
+/// source `depth` levels down: here-document bodies, and the single-quoted
+/// arguments of `python3 -c` and its kind.
 ///
 /// One answer for the two places that need it: the rendering, which reads
-/// these bodies, and [`blocks::blocks`], which frames them. Two copies of the
-/// rule would be how a body comes to be framed and not read, or read and not
-/// framed. A body qualifies when its delimiter was quoted, so its bytes are
-/// what the program receives, and when its language is one something here
-/// reads: shell, which hatch reads itself, or one with a grammar.
-pub(crate) fn read_here_bodies(source: &str, depth: usize) -> Vec<language::Snippet> {
+/// these, and [`blocks::blocks`], which frames them. Two copies of the rule
+/// would be how a body comes to be framed and not read, or read and not
+/// framed. A program qualifies when its bytes are what the interpreter
+/// receives -- a body whose delimiter was quoted, or an argument, which is
+/// only ever found in single quotes -- and when its language is one
+/// something here reads: shell, which hatch reads itself, or one with a
+/// grammar.
+pub(crate) fn read_programs(source: &str, depth: usize) -> Vec<language::Snippet> {
     if depth >= MAX_HERE_NESTING {
         return Vec::new();
     }
     let literal = command::literal_here_bodies(source);
     language::snippets(source)
         .into_iter()
-        .filter(|body| literal.contains(&body.range()))
+        .filter(|body| {
+            body.evidence() == language::Evidence::Flag || literal.contains(&body.range())
+        })
         .filter(|body| {
             body.language() == language::Language::Shell || grammar::reads(body.language())
         })
@@ -355,6 +362,27 @@ fn reinterpret(
         Some(merged) => merged,
         None => spans,
     }
+}
+
+/// Whether the program read from `source[range]` starts a drawn line of its
+/// own: [`spliced`]'s rule, said without rendering anything, for the frame
+/// that has to go round whole lines.
+///
+/// It does when a line already starts there, and when its own reading
+/// breaks a line anywhere, since then the splice starts it on one. Shell is
+/// broken at its separators as well as its newlines, by the same pass that
+/// will draw it; anything else only at its newlines.
+pub(crate) fn begins_a_line(
+    source: &str,
+    range: &Range<usize>,
+    language: language::Language,
+) -> bool {
+    let text = &source[range.clone()];
+    source[..range.start].ends_with('\n')
+        || match language {
+            language::Language::Shell => command::segment(text).iter().any(Span::break_before),
+            _ => text.contains('\n'),
+        }
 }
 
 /// The outer spans with `inner`'s spans in place of the run they cover,
@@ -507,6 +535,48 @@ mod tests {
         let spans = render_command(line);
         let first = spans.iter().find(|span| span.text() == "echo").expect("the body was read");
         assert!(first.break_before(), "the body shares a line with `bash <<'SH'`");
+        assert_eq!(unrender(&spans), line);
+    }
+
+    #[test]
+    fn a_shell_program_in_single_quotes_after_c_is_read_as_shell_and_keeps_its_quotes() {
+        let script = "cd /tmp; rm -rf x";
+        let line = format!("bash -c '{script}'");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, script);
+        assert!(inside.contains(&("cd", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&("rm", &SpanKind::Command)), "{inside:?}");
+        assert!(inside.contains(&(";", &SpanKind::Separator)), "{inside:?}");
+        // The quotes are still the string they open and close.
+        let quotes: Vec<&SpanKind> =
+            spans.iter().filter(|span| span.text() == "'").map(Span::kind).collect();
+        assert_eq!(quotes, vec![&SpanKind::Quoted; 2]);
+        assert_eq!(unrender(&spans), line);
+        assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn a_double_quoted_program_is_left_as_the_string_the_shell_expands_first() {
+        let script = "cd /tmp; rm -rf $X";
+        let line = format!("bash -c \"{script}\"");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, script);
+        assert!(
+            inside.iter().all(|(_, kind)| !matches!(kind, SpanKind::Command)),
+            "a program the shell expands first was read as one: {inside:?}"
+        );
+    }
+
+    #[cfg(feature = "highlight")]
+    #[test]
+    fn a_python_program_after_c_gets_the_marks_its_grammar_is_sure_of() {
+        let body = "key = \"x\"  # the key\nprint(key)\n";
+        let line = format!("python3 -c '\n{body}'");
+        let spans = render_command(&line);
+        let inside = kinds_in(&spans, &line, body);
+        assert!(inside.contains(&("\"x\"", &SpanKind::Quoted)), "{inside:?}");
+        assert!(inside.contains(&("# the key", &SpanKind::Comment)), "{inside:?}");
+        assert!(!inside.contains(&("print", &SpanKind::Command)), "{inside:?}");
         assert_eq!(unrender(&spans), line);
     }
 

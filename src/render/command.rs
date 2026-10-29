@@ -448,7 +448,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
+use super::language::Language;
 use super::{SpanBuilder, SpanKind, Spans, unicode, variable_name};
+use crate::exec::interpreter::Interpreter;
 
 /// The separator tokens, longest first.
 ///
@@ -3244,6 +3246,98 @@ fn literal_word(word: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+// ---- programs written into an argument -------------------------------------
+
+/// Where each program this command hands an interpreter as an argument is,
+/// and the language that interpreter reads it in: the `print(1)` of
+/// `python3 -c 'print(1)'`.
+///
+/// # Only one kind of word
+///
+/// The argument is read only when it is one single-quoted string and nothing
+/// else: a quote at each end and none between. Inside single quotes nothing
+/// expands and nothing is escaped, so those bytes are the bytes the
+/// interpreter receives, which is the rule a here-document body is held to
+/// too (see [`literal_here_bodies`]). A double-quoted program is not read:
+/// the shell substitutes its `$x` and `\` first, and a reading of the text on
+/// screen would be a reading of a program that does not run. `'a'\''b'`, the
+/// usual way to put a quote inside one, is several strings joined and is
+/// declined with them.
+///
+/// # Only an interpreter hatch knows how to hand a program to
+///
+/// The table is [`crate::exec::interpreter`]'s, the one a request's
+/// `run_with` is checked against, so the two ways of sending a program agree
+/// about which interpreters and which option. The option has to come
+/// straight after the name -- `python3 -c`, `bb -e`, `clojure -M -e` --
+/// because an option before it might take a value, and skipping it would
+/// read the wrong word as the program. The shells are the exception: their
+/// options are already modelled for the list of what runs, so
+/// `bash -e -c '…'` is found the way [`walk`] finds it.
+///
+/// The interpreter is found past the same wrappers that list looks past, so
+/// `env`, `timeout 60` or `sudo` in front of it changes nothing. Inside a
+/// command substitution is not looked at.
+///
+/// # The range
+///
+/// The string's contents, without its quotes. A newline straight after the
+/// opening quote is left out too: it ends the line the interpreter is named
+/// on, and the program starts on the line under it, which is where a box
+/// around it has to start.
+pub(crate) fn script_arguments(command: &str) -> Vec<(Range<usize>, Language)> {
+    let scanned: Vec<Scanned> = scan(command).collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for segment in segments(command) {
+        let words = words(&scanned, &mut at, &segment);
+        let Some((word, language)) = script_word(command, &words) else { continue };
+        let text = &command[word.clone()];
+        let single = text.len() >= 2
+            && text.starts_with('\'')
+            && text.ends_with('\'')
+            && !text[1..text.len() - 1].contains('\'');
+        if !single {
+            continue;
+        }
+        let mut range = word.start + 1..word.end - 1;
+        if command[range.clone()].starts_with('\n') {
+            range.start += 1;
+        }
+        if range.start < range.end {
+            out.push((range, language));
+        }
+    }
+    out
+}
+
+/// The word of a segment that an interpreter will run as a program, and the
+/// language it reads it in. See [`script_arguments`].
+///
+/// The index only ever moves forward, for [`walk`]'s reason.
+fn script_word(command: &str, words: &[Range<usize>]) -> Option<(Range<usize>, Language)> {
+    let text = |word: &Range<usize>| &command[word.clone()];
+    let mut index = command_at(command, words)?;
+    loop {
+        let name = readable_name(text(words.get(index)?))?;
+        let rest = &words[index + 1..];
+        if let Some(interpreter) = Interpreter::named(&name) {
+            let flags = interpreter.flags();
+            let given = rest.iter().map(text).take(flags.len());
+            if rest.len() > flags.len() && given.eq(flags.iter().copied()) {
+                return Some((rest[flags.len()].clone(), interpreter.language()));
+            }
+        }
+        let wrapper = WRAPPERS.iter().find(|wrapper| wrapper.name == name)?;
+        match past(command, wrapper, rest) {
+            Step::Command(ahead) => index += 1 + ahead,
+            // Only `bash` and `sh` have a script option, and both are shell.
+            Step::Script(ahead) => return Some((rest[ahead].clone(), Language::Shell)),
+            Step::Nothing | Step::Lost => return None,
+        }
+    }
 }
 
 // ---- paths a command names -------------------------------------------------

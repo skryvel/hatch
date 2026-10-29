@@ -141,8 +141,8 @@ proptest! {
     }
 }
 
-/// A here-document handed to a program, its body built from the pieces the
-/// readings of programs turn on.
+/// A here-document or a quoted `-c` argument handed to a program, its body
+/// built from the pieces the readings of programs turn on.
 ///
 /// The generators above put `<<'EOF'` on a line with nothing in front of it,
 /// so no body there is ever handed to a program, and the readings of
@@ -150,14 +150,21 @@ proptest! {
 /// of a Python or Clojure one -- were never under these properties. Here every
 /// body is: quotes and brackets that open and do not close, an f-string's
 /// braces, comment and statement markers, a delimiter in the middle of a
-/// line, and characters that must stay chips inside a string.
+/// line, and characters that must stay chips inside a string. An argument
+/// is ended by its closing quote rather than a delimiter line, and a `'` in
+/// the body ends it early, which is a shape worth having too.
 fn program_heredoc() -> impl Strategy<Value = String> {
+    let here = "\nEOF\n";
     let head = prop_oneof![
-        Just("python3 - <<'EOF'\n".to_string()),
-        Just("python3 - <<EOF\n".to_string()),
-        Just("bash <<'EOF'\n".to_string()),
-        Just("bb <<'EOF'\n".to_string()),
-        Just("cat > x.py <<'EOF'\n".to_string()),
+        Just(("python3 - <<'EOF'\n", here)),
+        Just(("python3 - <<EOF\n", here)),
+        Just(("bash <<'EOF'\n", here)),
+        Just(("bb <<'EOF'\n", here)),
+        Just(("cat > x.py <<'EOF'\n", here)),
+        Just(("python3 -c '", "'")),
+        Just(("python3 -c '\n", "'")),
+        Just(("bash -c '", "' x")),
+        Just(("bb -e '", "'")),
     ];
     let body = prop::collection::vec(
         prop_oneof![
@@ -187,8 +194,8 @@ fn program_heredoc() -> impl Strategy<Value = String> {
         ],
         0..40,
     );
-    (head, body, any::<bool>()).prop_map(|(head, body, closed)| {
-        let end = if closed { "\nEOF\n" } else { "" };
+    (head, body, any::<bool>()).prop_map(|((head, close), body, closed)| {
+        let end = if closed { close } else { "" };
         format!("{head}{}{end}", body.concat())
     })
 }
@@ -448,7 +455,8 @@ fn a_row_cannot_cover_the_rest_of_the_file() {
 fn mangled_logged_commands_round_trip_and_hide_nothing() {
     const PIECES: &[&str] = &[
         "'", "\"", "'''", "(", ")", "[", "]", "{", "}", "\\", "\n", "#", ";", "$(", "`", "<<'EOF'\n",
-        "<<EOF\n", "\nEOF\n", "f\"", "\u{202E}", "\u{200B}", "\u{00A0}", "\r", "\t", "é",
+        "<<EOF\n", "\nEOF\n", "python3 -c '", "bash -c '", "f\"", "\u{202E}", "\u{200B}",
+        "\u{00A0}", "\r", "\t", "é",
     ];
     let path = std::env::var("HATCH_FUZZ_CORPUS").expect("HATCH_FUZZ_CORPUS");
     let rounds: usize = std::env::var("HATCH_FUZZ_ROUNDS").map_or(20_000, |n| n.parse().unwrap());
