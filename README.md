@@ -1129,13 +1129,14 @@ the part of that which rests on you.
 
 All of these are real. They are stated here rather than discovered later.
 
-**Files a command reads are not shown.** `python script.py` is approved without
-the reader ever seeing `script.py`. The same goes for `bash deploy.sh`,
-`make install`, anything with `-f config`. hatch renders the *command* and then
-claims that nothing happens which you did not see — and for any file-reading
-command that claim is currently incomplete. This is the largest known gap. The
-second-order problem, that the file could change between approval and
-execution, is smaller than the first-order one that you never saw it at all.
+**Files a command reads are shown only when asked for, and only some of
+them.** Under the command, a row names the regular files its words name —
+`script.py` in `python script.py`, `deploy.sh` in `bash deploy.sh`, the file
+after a `<` — and clicking one shows it in the command's place until *Back to
+the command*. Nobody has to click, so a window can still be approved without
+the file having been read. And a file a program finds for itself is not named:
+`make install` reads a `Makefile` its words never mention. The file could also
+change between being shown and being run; nothing checks yet that it did not.
 
 **Segmentation models quoting and escaping only, and errs in both
 directions.** It splits on `;`, `&&`, `||`, `|` and newlines, outside quotes.

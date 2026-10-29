@@ -44,6 +44,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::Local;
 
@@ -54,7 +55,9 @@ use crate::exec::Stream;
 use crate::protocol::{EarlierEnd, Outcome, Payload, ProtocolError, Resent, Unanswered, Unheard};
 use crate::render::blocks::{Block, BlockKind, blocks, program_blocks};
 use crate::render::language::{Evidence, Language, Snippet, snippets};
+use crate::peek::{LIMIT, Peek, peek};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
+use crate::render::files::{Named, NamedFile};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::prompt_ui::guard;
@@ -158,6 +161,9 @@ pub enum Shown {
         /// program are hatch's, and a reader is owed a sentence saying who
         /// decided what those bytes are.
         program: Option<Snippet>,
+        /// The regular files the command names, which the window offers to
+        /// show in place of it. See [`Payload::Command::files`].
+        files: Named,
     },
     /// A file swap, drawn in whichever of the two views fits — see
     /// [`draw_swap`].
@@ -191,7 +197,9 @@ impl Shown {
     /// The window closes on it rather than drawing part of it.
     pub fn of(payload: &Payload) -> Result<Shown, ProtocolError> {
         match payload {
-            Payload::Command { danger, runs, cwd, root, interactive, caveat, no_terminal, .. } => {
+            Payload::Command {
+                danger, runs, cwd, root, interactive, caveat, no_terminal, files, ..
+            } => {
                 let annotated = payload.rendering()?;
                 // Checked against the rendering it names, before anything
                 // slices the source with it. See `Payload::program`.
@@ -260,6 +268,7 @@ impl Shown {
                     // nothing reaches the screen undefanged stops being one.
                     no_terminal: no_terminal.as_deref().map(defang),
                     program,
+                    files: files.clone(),
                     longest: widest_line(&annotated).max(widest_line(&raw)),
                     raw,
                     annotated,
@@ -1607,7 +1616,18 @@ fn run_context_width(ui: &Ui, aside: &RunContext) -> f32 {
 pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool, paging: Paging) -> Option<bool> {
     match shown {
         Shown::Command {
-            annotated, raw, scan, danger, runs, longest, caveat, blocks, snippets, program, ..
+            annotated,
+            raw,
+            scan,
+            danger,
+            runs,
+            longest,
+            caveat,
+            blocks,
+            snippets,
+            program,
+            files,
+            ..
         } => {
             draw_command_header(
                 ui,
@@ -1618,7 +1638,12 @@ pub fn draw_payload(ui: &mut Ui, shown: &Shown, original: bool, paging: Paging) 
                 runs,
                 caveat.as_deref(),
             );
-            draw_command(ui, annotated, raw, *longest, blocks, original, paging)
+            // A file the reader opened takes the command's place, under the
+            // row that opened it.
+            match draw_files(ui, files, raw.source(), paging) {
+                true => None,
+                false => draw_command(ui, annotated, raw, *longest, blocks, original, paging),
+            }
         }
         Shown::Swap { path, plan, rows, longest } => {
             draw_swap(ui, path, plan, rows, *longest, paging);
@@ -2612,6 +2637,158 @@ fn program_note(language: Language) -> &'static str {
 /// place this line starts at. It is the same machinery the two panes used to
 /// scroll together with, doing the same job one frame at a time instead of
 /// every frame.
+/// The row of files the command names, and the file the reader opened from
+/// it, drawn in the command's place. True when a file was drawn.
+///
+/// A row of names rather than words to click inside the command: the pane
+/// draws every byte of the command as itself, and a word that was also a
+/// button would be a second thing to read in each one.
+///
+/// The file is read on a thread of its own, because a file on a stalled
+/// network mount can hold a read up for as long as it likes and the window
+/// that draws it has a countdown to keep. Esc still denies while one is open;
+/// a file is something to look at, and looking does not change what is
+/// approved.
+fn draw_files(ui: &mut Ui, files: &Named, source: &str, paging: Paging) -> bool {
+    if files.files.is_empty() {
+        return false;
+    }
+    let palette = palette(ui);
+    // Only this request's: a window that moves on to the next request in the
+    // queue goes back to its command.
+    let mut opened = ui
+        .data(|data| data.get_temp::<Opened>(opened_id()))
+        .filter(|opened| &*opened.source == source);
+
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Files it names:").small().color(palette.quiet));
+        for (index, file) in files.files.iter().enumerate() {
+            let open = opened.as_ref().is_some_and(|opened| opened.index == index);
+            let name = RichText::new(defang(&file.named)).monospace();
+            if ui.selectable_label(open, name).clicked() {
+                clicked = Some(index);
+            }
+        }
+        if files.more > 0 {
+            let more = format!("and {} more", files.more);
+            ui.label(RichText::new(more).small().color(palette.quiet));
+        }
+    });
+    if let Some(index) = clicked {
+        opened = match opened.as_ref().is_some_and(|opened| opened.index == index) {
+            true => None,
+            false => files.files.get(index).map(|file| Opened::read(ui.ctx(), source, index, file)),
+        };
+    }
+    let Some((opened, file)) =
+        opened.and_then(|opened| files.files.get(opened.index).cloned().map(|file| (opened, file)))
+    else {
+        ui.data_mut(|data| data.remove::<Opened>(opened_id()));
+        return false;
+    };
+
+    let mut back = false;
+    ui.horizontal(|ui| {
+        back = ui.button("Back to the command").clicked();
+        let path = defang(&file.path.display().to_string());
+        ui.label(RichText::new(path).small().color(palette.quiet));
+    });
+    match back {
+        true => ui.data_mut(|data| data.remove::<Opened>(opened_id())),
+        false => ui.data_mut(|data| {
+            data.insert_temp(opened_id(), opened.clone());
+        }),
+    }
+    draw_opened(ui, &opened, paging);
+    true
+}
+
+/// The file itself, or why it is not shown.
+fn draw_opened(ui: &mut Ui, opened: &Opened, paging: Paging) {
+    let palette = palette(ui);
+    let note = |ui: &mut Ui, text: String| {
+        ui.label(RichText::new(text).small().color(palette.quiet));
+    };
+    let read = opened.read.lock().unwrap_or_else(PoisonError::into_inner);
+    match &*read {
+        None => note(ui, "Reading the file…".to_string()),
+        Some(Read::Text { spans, truncated, size }) => {
+            if *truncated {
+                note(ui, format!("The first {} of {}.", bytes(LIMIT as i64), bytes(*size as i64)));
+            }
+            let pane = PaneBox {
+                id: "hatch-file",
+                weight: Weight::Mono,
+                height: ui.available_height(),
+                shrink: false,
+                at: None,
+            };
+            draw_command_pane(ui, spans, pane, &Gutter::default(), paging.asked);
+        }
+        Some(Read::Other(peeked)) => note(ui, not_shown(peeked)),
+    }
+}
+
+/// Why a file that was asked for is not on screen.
+fn not_shown(peeked: &Peek) -> String {
+    match peeked {
+        // Read is only ever this for a file that was not text.
+        Peek::Text { .. } => "It is text, and was not drawn.".to_string(),
+        Peek::NotText { size } => format!("Not shown: {} that are not text.", bytes(*size as i64)),
+        Peek::NotAFile { what } => format!("Not shown: it is {what} now, not a file."),
+        Peek::Missing => "Not shown: nothing is there now.".to_string(),
+        Peek::Unreadable { why } => format!("Not shown: it could not be read. {}", defang(why)),
+    }
+}
+
+/// A file the reader opened from the row of named ones, being read or read.
+#[derive(Clone)]
+struct Opened {
+    /// The command it was opened from.
+    source: Arc<str>,
+    /// Which of the command's files.
+    index: usize,
+    /// `None` until the thread reading it is done.
+    read: Arc<Mutex<Option<Read>>>,
+}
+
+/// A file as the window draws it: its text classified once, rather than on
+/// every frame it is on screen.
+enum Read {
+    Text { spans: Spans, truncated: bool, size: u64 },
+    Other(Peek),
+}
+
+impl Opened {
+    /// Start reading `file` on a thread, and ask for a frame when it is read.
+    fn read(ctx: &egui::Context, source: &str, index: usize, file: &NamedFile) -> Opened {
+        let read = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&read);
+        let path = file.path.clone();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("hatch-peek".to_string()).spawn(move || {
+            let got = match peek(&path) {
+                Peek::Text { text, truncated, size } => {
+                    Read::Text { spans: classify(&text), truncated, size }
+                }
+                other => Read::Other(other),
+            };
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(got);
+            ctx.request_repaint();
+        });
+        if let Err(error) = spawned {
+            let why = Peek::Unreadable { why: error.to_string() };
+            *read.lock().unwrap_or_else(PoisonError::into_inner) = Some(Read::Other(why));
+        }
+        Opened { source: source.into(), index, read }
+    }
+}
+
+fn opened_id() -> egui::Id {
+    egui::Id::new("hatch-opened-file")
+}
+
 fn draw_command(
     ui: &mut Ui,
     annotated: &Spans,
@@ -6075,6 +6252,109 @@ mod tests {
         assert_eq!(line_at(1e9, 10.0, &lines), 2, "past the end is the last line, not a panic");
         assert_eq!(line_at(-5.0, 10.0, &lines), 0, "and above the top is the first");
         assert_eq!(line_at(50.0, 10.0, &[]), 0, "a pane with no lines is on line zero");
+    }
+
+    #[test]
+    fn a_named_file_opens_in_the_commands_place_and_back_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("script.py"), "print('from the file')\n").unwrap();
+        let command = "python3 script.py";
+        let files = crate::render::files::named_files(command, &BTreeMap::new(), dir.path());
+        let shown = Shown::of(&a_command(command).with_files(files)).expect("a real payload");
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::Theme::Dark);
+        let size = egui::vec2(900.0, 700.0);
+        let mut frames = 0u32;
+        let mut frame = |events: Vec<egui::Event>| {
+            frames += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(f64::from(frames) / 60.0),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                draw_payload(ui, &shown, false, Paging::default());
+            });
+            out.textures_delta.clear();
+            out
+        };
+        let click = |place: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: place,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            [vec![egui::Event::PointerMoved(place)], vec![button(true)], vec![button(false)]]
+        };
+        let texts = |out: &egui::FullOutput| -> Vec<String> {
+            drawn_text(out).into_iter().map(|(text, _)| text).collect()
+        };
+        // Where a frame drew exactly `text`.
+        fn place_of(out: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+            fn walk(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::epaint::Shape::Text(drawn) if drawn.galley.text() == text => {
+                        Some(egui::Rect::from_min_size(drawn.pos, drawn.galley.size()).center())
+                    }
+                    egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, text)),
+                    _ => None,
+                }
+            }
+            out.shapes.iter().find_map(|clipped| walk(&clipped.shape, text))
+        }
+
+        let first = frame(Vec::new());
+        assert!(texts(&first).iter().any(|text| text == "Files it names:"), "{:?}", texts(&first));
+        let name = place_of(&first, "script.py").expect("the file is not offered");
+        for events in click(name) {
+            frame(events);
+        }
+        let mut opened = frame(Vec::new());
+        for _ in 0..200 {
+            if texts(&opened).iter().any(|text| text.contains("from the file")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            opened = frame(Vec::new());
+        }
+        let drawn = texts(&opened);
+        assert!(drawn.iter().any(|text| text.contains("print('from the file')")), "{drawn:?}");
+        assert!(!drawn.iter().any(|text| text.contains("python3")), "the command is still drawn");
+
+        let back = place_of(&opened, "Back to the command").expect("no way back is drawn");
+        for events in click(back) {
+            frame(events);
+        }
+        let closed = texts(&frame(Vec::new()));
+        assert!(closed.iter().any(|text| text.contains("python3")), "{closed:?}");
+        assert!(!closed.iter().any(|text| text.contains("from the file")), "{closed:?}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_shown_says_why() {
+        assert_eq!(not_shown(&Peek::Missing), "Not shown: nothing is there now.");
+        assert_eq!(
+            not_shown(&Peek::NotText { size: 4 }),
+            "Not shown: 4 bytes that are not text."
+        );
+        // The system's words are the agent's reach too: a file name is in
+        // them.
+        let why = not_shown(&Peek::Unreadable { why: "no\u{202E}pe".to_string() });
+        assert!(!why.contains('\u{202E}'), "{why}");
+    }
+
+    #[test]
+    fn a_command_that_names_no_file_draws_no_row_for_them() {
+        let ctx = egui::Context::default();
+        let shown = Shown::of(&a_command("ls -l")).expect("a real payload");
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            draw_payload(ui, &shown, false, Paging::default());
+        });
+        let drawn = drawn_text(&out);
+        out.textures_delta.clear();
+        assert!(!drawn.iter().any(|(text, _)| text.contains("Files it names")), "{drawn:?}");
     }
 
     /// Every string a frame drew where its own pane could show it.
