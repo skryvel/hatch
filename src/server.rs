@@ -301,12 +301,12 @@ pub struct RunCommandParams {
     pub command: String,
     /// What reads `command`. The shell when absent.
     ///
-    /// `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`, `zsh`, with a
-    /// version suffix and a directory both allowed. The program travels as
-    /// one argument, so nothing in it is quoted, split or expanded on the way
-    /// — which is the point of saying it here rather than writing
-    /// `python3 - <<'PY'` into `command` and hoping the quoting survives two
-    /// readers.
+    /// `python3`, `node`, `ruby`, `perl`, `lua`, `bash`, `sh`, `zsh`, `bb`,
+    /// `clojure`, `clj`, with a version suffix and a directory both allowed.
+    /// The program travels as one argument, so nothing in it is quoted, split
+    /// or expanded on the way — which is the point of saying it here rather
+    /// than writing `python3 - <<'PY'` or `python3 -c '…'` into `command` and
+    /// hoping the quoting survives two readers.
     #[serde(default)]
     pub run_with: Option<String>,
     /// Why this is needed now.
@@ -1195,9 +1195,9 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          {interpreters} — and put the program \
          itself in `command`. It travels as a single argument, so nothing in it is quoted, \
          split or expanded on the way, and the person sees it drawn as a program rather than \
-         as one long string. Prefer this to wrapping a here-document in a shell command: \
-         `run_with: \"python3\"` says in one field what `python3 - <<'PY' … PY` says in two \
-         layers of quoting, and it cannot come apart on a quote character.\n\
+         as one long string. Prefer this to wrapping a here-document or a `-c` argument in a \
+         shell command: `run_with: \"python3\"` says in one field what `python3 - <<'PY' … PY` \
+         says in two layers of quoting, and it cannot come apart on a quote character.\n\
          \n\
          The person may refuse the command, ask you to explain it, ask for a form of it that \
          is easier to read, or decide to run it themselves. You get back what actually \
@@ -1309,7 +1309,8 @@ pub fn tool_descriptions(config: &Config) -> ToolDescriptions {
          everything that appeared in the terminal instead of `stdout` and `stderr`; and \
          `run_with`, to hand a program that is not shell to what should read it — \
          {interpreters} — with the program itself in `command`, as one argument, nothing \
-         quoted or expanded. Prefer that to a here-document inside a shell command. The person \
+         quoted or expanded. Prefer that to a here-document or a `python3 -c '…'` inside a \
+         shell command. The person \
          may read a command's output before you receive it and send only part of it, which its \
          headings then say, or none of it: then do not run it again to see the output, ask them \
          for what you need.\n\
