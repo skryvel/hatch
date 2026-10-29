@@ -405,7 +405,14 @@ fn spliced(source: &str, outer: &Spans, inner: &Spans, at: usize) -> Option<Span
             // being the one that shares a line with the wrapper. A script
             // that fits on one line stays where it is: a line of its own
             // would be a line spent saying nothing.
-            if inner.iter().any(Span::break_before) {
+            //
+            // Unless a line already starts there. A here-document body
+            // begins under its operator line, and the break the outer
+            // rendering put on the body's first span is on a span this
+            // replaces whole -- dropping it drew a one-line body on the
+            // operator's line, and the box around the body went round both.
+            let starts_a_line = range.start == at && span.break_before();
+            if starts_a_line || inner.iter().any(Span::break_before) {
                 builder.break_next();
             }
             for nested in inner.iter() {
@@ -489,6 +496,18 @@ mod tests {
         assert!(inside.contains(&(";", &SpanKind::Separator)), "{inside:?}");
         assert_eq!(unrender(&spans), line);
         assert!(spans.covers_source());
+    }
+
+    #[test]
+    fn a_body_of_one_line_starts_the_line_under_its_operator() {
+        // The splice replaced the body's first span whole and lost the line
+        // break on it, so a one-line body was drawn on the operator's line,
+        // and the box around the body took the operator in with it.
+        let line = "bash <<'SH'\necho hi\nSH\n";
+        let spans = render_command(line);
+        let first = spans.iter().find(|span| span.text() == "echo").expect("the body was read");
+        assert!(first.break_before(), "the body shares a line with `bash <<'SH'`");
+        assert_eq!(unrender(&spans), line);
     }
 
     #[test]
