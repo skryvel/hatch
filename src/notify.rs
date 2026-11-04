@@ -3,11 +3,23 @@
 //! # Why
 //!
 //! A window on the screen does nothing for a reader who is away from it, and
-//! a phone is usually nearer. The simple push services turn a POST to a URL
-//! into a notification on one: `https://ntfy.sh/<topic>` is the one this was
-//! written for. So with `notify_url` set, a window that is still asking when
-//! half its deadline has gone sends one message there. Half, so that a reader
-//! who gets it has as long to come back as the window has already waited.
+//! a phone is usually nearer. The push services turn a POST to a URL into a
+//! notification on one. So with `notify_url` set, a window that is still
+//! asking when half its deadline has gone sends one message there. Half, so
+//! that a reader who gets it has as long to come back as the window has
+//! already waited.
+//!
+//! # Two shapes of POST
+//!
+//! ntfy reads the body as the message, so with nothing else configured the
+//! body is the message. Pushover, and Gotify, read form fields, and want
+//! credentials among them: Pushover's `token` and `user`. So `notify_form`
+//! is a table of fields, and when it has any the body is those fields
+//! form-encoded with `title` and `message` added. See [`body`].
+//!
+//! The body reaches curl on its stdin, never in its arguments. Arguments are
+//! readable by every process on the machine for as long as curl runs, and a
+//! Pushover token is a credential.
 //!
 //! # Why curl and not an HTTP client
 //!
@@ -19,18 +31,20 @@
 //! # What it says
 //!
 //! Nothing of the request. The title, the reason and the command are the
-//! agent's words, and a public push service is a place they would be
-//! published: the topic in an ntfy.sh URL is its only password. So the
-//! message names the machine, the window's number and how long is left, and
-//! that is all anyone holding the topic learns.
+//! agent's words, and a push service is a third party: the topic in an
+//! ntfy.sh URL is its only password. So the message names the machine, the
+//! window's number and how long is left, and that is all it tells anyone.
 //!
 //! # It decides nothing
 //!
 //! It is sent at most once per window, nothing waits for it, and a failure is
 //! a line in the log. A window decided before the halfway mark sends nothing.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
+
+use tokio::io::AsyncWriteExt as _;
 
 /// What is run to send the message.
 pub const PROGRAM: &str = "curl";
@@ -67,34 +81,88 @@ pub fn host() -> String {
         .unwrap_or_else(|| "this machine".to_string())
 }
 
-/// The arguments that POST `message` to `url`.
+/// What is posted: the message itself, or with `form` the form's fields and
+/// the message, form-encoded.
 ///
-/// `--data-raw` rather than `--data`, which reads a file when its value
-/// starts with `@`. `--proto` keeps the URL, and any redirect it answers
-/// with, to HTTP and HTTPS: curl also speaks `file://` and a dozen others.
-/// The URL goes after `--url`, so nothing in it is read as an option.
-pub fn argv(url: &str, message: &str) -> Vec<String> {
-    let max = MAX_SECS.to_string();
-    [
-        "--silent", "--show-error", "--fail", "--max-time", &max, "--proto", "=http,https",
-        "--proto-redir", "=http,https", "--header", "Title: hatch", "--data-raw", message,
-        "--url", url,
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect()
+/// A `message` field in the form is left out, because the message is what
+/// this is for. A `title` field is kept, and `hatch` is the title when there
+/// is none.
+pub fn body(message: &str, form: &BTreeMap<String, String>) -> String {
+    if form.is_empty() {
+        return message.to_string();
+    }
+    let mut fields: Vec<(&str, &str)> = form
+        .iter()
+        .filter(|(name, _)| name.as_str() != "message")
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    if !form.contains_key("title") {
+        fields.push(("title", "hatch"));
+    }
+    fields.push(("message", message));
+    fields
+        .iter()
+        .map(|(name, value)| format!("{}={}", encoded(name), encoded(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
-/// Send `message` to `url`, and log what went wrong if anything did.
-pub async fn send(url: String, message: String) {
-    let ran = tokio::process::Command::new(PROGRAM)
-        .args(argv(&url, &message))
-        .stdin(Stdio::null())
+/// `text` percent-encoded for a form: every byte but the unreserved ones.
+fn encoded(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The arguments that POST curl's stdin to `url`.
+///
+/// `--data-binary @-` sends stdin as it is. `--proto` keeps the URL, and any
+/// redirect it answers with, to HTTP and HTTPS: curl also speaks `file://`
+/// and a dozen others. The URL goes after `--url`, so nothing in it is read
+/// as an option. A plain body gets its title as ntfy's header; a form carries
+/// its own.
+pub fn argv(url: &str, form: bool) -> Vec<String> {
+    let max = MAX_SECS.to_string();
+    let mut argv = vec![
+        "--silent", "--show-error", "--fail", "--max-time", &max, "--proto", "=http,https",
+        "--proto-redir", "=http,https", "--data-binary", "@-",
+    ];
+    if !form {
+        argv.extend(["--header", "Title: hatch"]);
+    }
+    argv.extend(["--url", url]);
+    argv.into_iter().map(str::to_string).collect()
+}
+
+/// Send `message` to `url`, as `form` says, and log what went wrong if
+/// anything did.
+pub async fn send(url: String, form: BTreeMap<String, String>, message: String) {
+    let spawned = tokio::process::Command::new(PROGRAM)
+        .args(argv(&url, !form.is_empty()))
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
-        .await;
-    match ran {
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("hatch could not run {PROGRAM} to send its notification: {error}");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // Dropped at the end of this block, which is the end of the body. A
+        // curl that exits without reading it says why below.
+        let _ = stdin.write_all(body(&message, &form).as_bytes()).await;
+    }
+    match child.wait_with_output().await {
         Ok(out) if out.status.success() => {}
         Ok(out) => eprintln!(
             "hatch could not send its notification: {PROGRAM} {}: {}",
@@ -127,13 +195,39 @@ mod tests {
     }
 
     #[test]
-    fn the_url_and_the_message_cannot_be_read_as_options_or_files() {
-        let argv = argv("-K/etc/passwd", "@/etc/passwd");
-        let at = |flag: &str| argv.iter().position(|arg| arg == flag).expect(flag);
-        assert_eq!(argv[at("--url") + 1], "-K/etc/passwd");
-        assert_eq!(argv[at("--data-raw") + 1], "@/etc/passwd");
-        assert!(!argv.iter().any(|arg| arg == "--data" || arg == "-d"), "{argv:?}");
-        assert_eq!(argv[at("--proto") + 1], "=http,https");
-        assert_eq!(argv[at("--proto-redir") + 1], "=http,https");
+    fn the_url_cannot_be_read_as_an_option_and_the_body_comes_from_stdin() {
+        for form in [false, true] {
+            let argv = argv("-K/etc/passwd", form);
+            let at = |flag: &str| argv.iter().position(|arg| arg == flag).expect(flag);
+            assert_eq!(argv[at("--url") + 1], "-K/etc/passwd");
+            assert_eq!(argv[at("--data-binary") + 1], "@-");
+            assert_eq!(argv[at("--proto") + 1], "=http,https");
+            assert_eq!(argv[at("--proto-redir") + 1], "=http,https");
+            assert_eq!(argv.contains(&"Title: hatch".to_string()), !form, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_body_is_the_message() {
+        assert_eq!(body("Window 1 is waiting.", &BTreeMap::new()), "Window 1 is waiting.");
+    }
+
+    #[test]
+    fn a_form_is_its_fields_then_a_title_then_the_message_encoded() {
+        // Pushover's shape: the two credentials, then what to say.
+        let form = BTreeMap::from([
+            ("token".to_string(), "a&b=c".to_string()),
+            ("user".to_string(), "u1".to_string()),
+        ]);
+        assert_eq!(
+            body("Window 1 on desk: é.", &form),
+            "token=a%26b%3Dc&user=u1&title=hatch&message=Window%201%20on%20desk%3A%20%C3%A9."
+        );
+        // A title of its own is kept; a message of its own is not.
+        let form = BTreeMap::from([
+            ("message".to_string(), "not this".to_string()),
+            ("title".to_string(), "desk".to_string()),
+        ]);
+        assert_eq!(body("this", &form), "title=desk&message=this");
     }
 }

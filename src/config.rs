@@ -168,6 +168,11 @@ pub struct Config {
     /// a notification on a phone. Empty sends nothing. See [`crate::notify`]
     /// for what the message says and what it leaves out.
     pub notify_url: String,
+    /// Form fields to POST to `notify_url` alongside the message, for a
+    /// service that reads a form rather than a body: Pushover's `token` and
+    /// `user`, for one. Empty posts the message as the whole body, which is
+    /// what ntfy reads. See [`crate::notify::body`].
+    pub notify_form: BTreeMap<String, String>,
     /// Which tools an agent is offered: `both` or `batch`. See [`Tools`].
     pub tools: Tools,
     /// Which palette the approval window draws in: `dark` or `light`.
@@ -341,6 +346,7 @@ impl Default for Config {
             denylist_extra: Vec::new(),
             sound: default_sound(),
             notify_url: String::new(),
+            notify_form: BTreeMap::new(),
             tools: Tools::default(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),

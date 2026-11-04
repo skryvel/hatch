@@ -2204,12 +2204,13 @@ impl Daemon {
         // message that has started going goes. See `crate::notify`.
         let nudge = (!self.config.notify_url.is_empty()).then(|| {
             let url = self.config.notify_url.clone();
+            let form = self.config.notify_form.clone();
             let left = window - crate::notify::after(window);
             let at = expires_at - left;
             let message = crate::notify::message(&crate::notify::host(), number, left);
             tokio::spawn(async move {
                 tokio::time::sleep_until(at).await;
-                tokio::spawn(crate::notify::send(url, message));
+                tokio::spawn(crate::notify::send(url, form, message));
             })
         });
 
@@ -6493,6 +6494,29 @@ later"), "");
             // Nothing of the request: not its title, not its command.
             assert!(!request.contains("a test"), "{request}");
             assert!(started.elapsed() >= Duration::from_secs(1), "sent before half the window");
+        }
+
+        #[tokio::test]
+        async fn a_notify_form_is_posted_as_a_form_with_the_message_in_it() {
+            // Pushover's shape, and the credentials are in the body only.
+            let (url, got) = a_listener(Duration::from_secs(10)).await;
+            let harness = Harness::configured(vec![Reply::silent()], |config| {
+                config.timeout_secs = 2;
+                config.notify_url = url;
+                config.notify_form = std::collections::BTreeMap::from([
+                    ("token".to_string(), "app-token".to_string()),
+                    ("user".to_string(), "user-key".to_string()),
+                ]);
+            });
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+
+            let request = got.await.unwrap().expect("nothing was posted");
+            assert!(request.contains("application/x-www-form-urlencoded"), "{request}");
+            assert!(!request.contains("Title: hatch"), "{request}");
+            let body = request.split("\r\n\r\n").nth(1).expect("a body");
+            let fields = "token=app-token&user=user-key&title=hatch&message=Window%20";
+            assert!(body.starts_with(fields), "{body}");
+            assert!(body.ends_with("%201%20second%20left%20to%20decide."), "{body}");
         }
 
         #[tokio::test]

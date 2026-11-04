@@ -1321,11 +1321,28 @@ nothing else — the window, the deadline and every control are unaffected.
 waited half of `timeout_secs` with nobody deciding POSTs one line to it, such as
 `Window 3 on desk is waiting for you: 5 minutes left to decide.` A window decided
 before then sends nothing. The line carries nothing of the request — not its
-title, reason or command — because those are the agent's words, and the topic
-in an ntfy.sh URL is the only thing keeping them private. hatch runs `curl` for
-it rather than linking an HTTP client, for the reason it runs a program for the
-sound. Only `http` and `https` URLs are followed. A message that fails is a
-line in hatch's log and changes nothing else.
+title, reason or command — because those are the agent's words, and a push
+service is a third party. hatch runs `curl` for it rather than linking an HTTP
+client, for the reason it runs a program for the sound. Only `http` and `https`
+URLs are followed. A message that fails is a line in hatch's log and changes
+nothing else.
+
+With `notify_url` alone, the line is the whole body, which is what
+`https://ntfy.sh/<topic>` reads. A service that reads form fields gets them
+from **`[notify_form]`**: the body is then those fields, form-encoded, with
+`title` and `message` added. Pushover is two fields:
+
+```toml
+notify_url = "https://api.pushover.net/1/messages.json"
+
+[notify_form]
+token = "<the application's API token>"
+user = "<your user key>"
+```
+
+Any other field Pushover takes, `priority` or `sound`, goes in the same table.
+The body reaches `curl` on its stdin and never in its arguments, which every
+process on the machine can read while it runs.
 
 **`tools = "batch"`** offers `batch` and nothing else. The two tools overlap
 rather than divide the work — `run_command` is a batch of exactly one command,
@@ -1380,6 +1397,7 @@ enforces. `hatch serve` prints that sum on startup — 1500 s with the defaults,
 | `terminal` | `["konsole", "--nofork", "-e"]` on Linux, `[]` elsewhere | Terminal for interactive runs; the runner's path is appended to it. kitty wants `["kitty"]` with no `-e`. Empty means interactive runs are refused, with a reason |
 | `sound` | `afplay …` on macOS, `paplay …` on Linux, `[]` elsewhere | Played when a window opens, as argv. Off until the box is ticked |
 | `notify_url` | `""` | Where a window still waiting at half of `timeout_secs` POSTs a short message, through `curl`: an `https://ntfy.sh/<topic>` puts it on a phone. Empty sends nothing |
+| `notify_form` | `{}` | Form fields posted with the message instead of a plain body: Pushover's `token` and `user` |
 | `tools` | `both` | Which tools an agent is offered: `both`, or `batch` alone |
 | `denylist_extra` | `[]` | Extra paths a file write must refuse |
 | `font_size` | `16` | Point size, clamped to 8–48 |
