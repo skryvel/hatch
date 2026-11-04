@@ -2199,6 +2199,20 @@ impl Daemon {
         // command then took, which is `duration_ms` and a different question.
         let opened_at = tokio::time::Instant::now();
 
+        // A window still asking at half its time tells the reader wherever
+        // `notify_url` says. Only the wait is cancelled with the window: a
+        // message that has started going goes. See `crate::notify`.
+        let nudge = (!self.config.notify_url.is_empty()).then(|| {
+            let url = self.config.notify_url.clone();
+            let left = window - crate::notify::after(window);
+            let at = expires_at - left;
+            let message = crate::notify::message(&crate::notify::host(), number, left);
+            tokio::spawn(async move {
+                tokio::time::sleep_until(at).await;
+                tokio::spawn(crate::notify::send(url, message));
+            })
+        });
+
         // Step 4. The verdict, or one of the four ways there is never going to
         // be one. Every one of those four denies.
         let ending = tokio::select! {
@@ -2210,6 +2224,9 @@ impl Daemon {
             () = caller.hung_up() => Ending::HungUp,
             () = tokio::time::sleep_until(expires_at) => Ending::Expired,
         };
+        if let Some(nudge) = nudge {
+            nudge.abort();
+        }
         // One place, after every one of the five endings and before any of
         // them is acted on, so no path can forget it.
         shown.window_ms = Some(opened_at.elapsed().as_millis() as u64);
@@ -6428,6 +6445,66 @@ later"), "");
                 "an empty note belongs on no line: {}",
                 harness.only_record()
             );
+        }
+
+        /// A one-shot HTTP server on loopback: the URL to POST to, and the
+        /// request it got, if one came within `wait`.
+        async fn a_listener(
+            wait: Duration,
+        ) -> (String, tokio::task::JoinHandle<Option<String>>) {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/a-topic", listener.local_addr().unwrap());
+            let got = tokio::spawn(async move {
+                let (mut stream, _) =
+                    tokio::time::timeout(wait, listener.accept()).await.ok()?.ok()?;
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Until the body is in: the message ends in a full stop.
+                while !request.ends_with(b".") {
+                    let read = tokio::time::timeout(wait, stream.read(&mut buf)).await.ok()?.ok()?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                Some(String::from_utf8_lossy(&request).into_owned())
+            });
+            (url, got)
+        }
+
+        #[tokio::test]
+        async fn a_window_nobody_answers_posts_to_the_notify_url_at_half_its_time() {
+            let (url, got) = a_listener(Duration::from_secs(10)).await;
+            let harness = Harness::configured(vec![Reply::silent()], |config| {
+                config.timeout_secs = 2;
+                config.notify_url = url;
+            });
+            let started = std::time::Instant::now();
+            let result =
+                within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            assert!(result_text(&result).contains("timed out awaiting the user"));
+
+            let request = got.await.unwrap().expect("nothing was posted");
+            assert!(request.starts_with("POST /a-topic "), "{request}");
+            assert!(request.contains("Title: hatch"), "{request}");
+            assert!(request.ends_with("is waiting for you: 1 second left to decide."), "{request}");
+            // Nothing of the request: not its title, not its command.
+            assert!(!request.contains("a test"), "{request}");
+            assert!(started.elapsed() >= Duration::from_secs(1), "sent before half the window");
+        }
+
+        #[tokio::test]
+        async fn a_window_decided_before_half_its_time_posts_nothing() {
+            let (url, got) = a_listener(Duration::from_secs(3)).await;
+            let denied = Reply::verdict(Verdict::Deny { note: String::new() });
+            let harness = Harness::configured(vec![denied], |config| {
+                config.timeout_secs = 2;
+                config.notify_url = url;
+            });
+            within(harness.daemon.run_command(run_of("true"), Caller::quiet())).await;
+            assert_eq!(got.await.unwrap(), None, "a decided window still notified");
         }
 
         #[tokio::test]

@@ -163,6 +163,11 @@ pub struct Config {
     /// What is run to make a sound when a window opens, as argv with the
     /// program first. Empty plays nothing. See [`default_sound`].
     pub sound: Vec<String>,
+    /// Where to POST a short message when a window has waited half its time
+    /// with nobody deciding: an ntfy.sh topic, `https://ntfy.sh/<topic>`, for
+    /// a notification on a phone. Empty sends nothing. See [`crate::notify`]
+    /// for what the message says and what it leaves out.
+    pub notify_url: String,
     /// Which tools an agent is offered: `both` or `batch`. See [`Tools`].
     pub tools: Tools,
     /// Which palette the approval window draws in: `dark` or `light`.
@@ -335,6 +340,7 @@ impl Default for Config {
             terminal: default_terminal(),
             denylist_extra: Vec::new(),
             sound: default_sound(),
+            notify_url: String::new(),
             tools: Tools::default(),
             font_size: DEFAULT_FONT_SIZE,
             theme: Theme::default(),

@@ -13,6 +13,7 @@ pub mod denylist;
 pub mod exec;
 pub mod patch;
 pub mod paths;
+pub mod notify;
 pub mod peek;
 pub mod prefs;
 pub mod preview;
