@@ -197,6 +197,10 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// apart.
 pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nAlt+Shift+A";
 
+/// What the send button says while a review editor holds the keyboard, where
+/// Shift+Enter is a line break. See [`Guard::classify`].
+pub const APPROVE_CHORD_COMPOSING: &str = "Ctrl+Enter\nAlt+Shift+A";
+
 /// What the Deny button says the keyboard shortcut is.
 ///
 /// Bare, and the label says so by naming no modifier at all: Escape with
@@ -534,6 +538,13 @@ impl Guard {
             // one; it is here because an `Action` that cannot be carried out
             // is a thing for a later reader to wonder about.
             Some(Key::Enter) if !open => Action::Ignored,
+            // Shift+Enter breaks a line in most editors a person types into,
+            // so where this window has a multiline editor holding the
+            // keyboard it does that and does not send. The other two send
+            // chords still send from there. See `APPROVE_CHORD_COMPOSING`.
+            Some(Key::Enter) if keyboard == Keyboard::Composing && shift_alone(modifiers) => {
+                Action::Passthrough
+            }
             // Every approval, whichever key carries it. Judged after the
             // shut-guard arm above for Enter, and with its own shut check
             // for the rest: `Alt+Shift+A` is as much a decision as
@@ -646,6 +657,11 @@ impl Guard {
 /// not three modifiers — a Linux backend sets `ctrl` and `command` together
 /// for a single key — so any of them counts as Control being held, and the
 /// exactness that matters is that nothing else is.
+/// Shift and nothing else.
+fn shift_alone(m: Modifiers) -> bool {
+    m.shift && !m.alt && !(m.ctrl || m.command || m.mac_cmd)
+}
+
 fn approves(key: Key, m: Modifiers) -> bool {
     let control = m.ctrl || m.command || m.mac_cmd;
     match key {
@@ -871,10 +887,28 @@ mod tests {
         let clock = Clock::new();
         let guard = Guard::new(clock.at(0));
         let now = clock.at(2_000);
-        for modifiers in [Modifiers::CTRL, Modifiers::SHIFT] {
-            let chord = press(Key::Enter, modifiers);
-            assert_eq!(composing(&guard, &chord, modifiers, now), Action::Approve, "{modifiers:?}");
-        }
+        let chord = press(Key::Enter, Modifiers::CTRL);
+        assert_eq!(composing(&guard, &chord, Modifiers::CTRL, now), Action::Approve);
+    }
+
+    #[test]
+    fn shift_enter_breaks_a_line_in_an_editor_and_sends_everywhere_else() {
+        // The report: Shift+Enter sent the output from the middle of an edit,
+        // where it is how a line is broken in most editors a person types
+        // into. It still sends from anywhere else on the window.
+        let clock = Clock::new();
+        let guard = Guard::new(clock.at(0));
+        let now = clock.at(2_000);
+        let chord = press(Key::Enter, Modifiers::SHIFT);
+        assert_eq!(composing(&guard, &chord, Modifiers::SHIFT, now), Action::Passthrough);
+        assert_eq!(asking(&guard, &chord, Modifiers::SHIFT, now), Action::Approve);
+        // And the guard still holds it while shut, as it holds a bare Enter.
+        assert_eq!(composing(&guard, &chord, Modifiers::SHIFT, clock.at(10)), Action::Ignored);
+        // Shift with anything else is not a line break.
+        let both = Modifiers { shift: true, alt: true, ..Modifiers::NONE };
+        assert_ne!(composing(&guard, &press(Key::Enter, both), both, now), Action::Passthrough);
+        assert!(!APPROVE_CHORD_COMPOSING.contains("Shift+Enter"));
+        assert!(APPROVE_CHORD.contains("Shift+Enter"));
     }
 
     #[test]
