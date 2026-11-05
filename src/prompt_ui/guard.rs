@@ -135,6 +135,14 @@ pub const GUARD: Duration = Duration::from_millis(750);
 /// than being a dialog nobody can answer or dismiss.
 pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 
+/// How soon the second `Alt+A` has to follow the first to approve.
+///
+/// A second, which is slow for a double tap and quick for anything else. Past
+/// it the next press is a first one again, so a slip that pressed `Alt+A`
+/// once cannot lie in wait for another slip minutes later. See
+/// [`APPROVE_CHORD`].
+pub const TWICE_WITHIN: Duration = Duration::from_secs(1);
+
 /// What the Approve button says the keyboard shortcuts are.
 ///
 /// Here rather than beside the button, because a shortcut nobody can see is a
@@ -157,8 +165,8 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// the mouse -- which is most of them, most of the time, because that is
 /// where the buttons are -- has no keyboard approval at all, and the whole
 /// point of putting these on the button was that answering should not cost a
-/// trip across the desk. `Alt+Shift+A` is reachable by the left hand alone,
-/// with the thumb on Alt rather than a little finger stretched to Control.
+/// trip across the desk. `Alt+A` is reachable by the left hand alone, with
+/// the thumb on Alt rather than a little finger stretched to Control.
 ///
 /// It was `Ctrl+Alt+A`, and on KDE Plasma that never reached the window:
 /// KWin binds it by default (Activate Window Demanding Attention) and takes
@@ -168,16 +176,25 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// happens either. It cannot misfire, only fail to fire, and the two Enter
 /// chords are still there.
 ///
-/// Not `Alt+A`, although the typing guard would hold it as long as any other
-/// chord. The guard stops keys that were in flight when the window appeared;
+/// # Why twice
+///
+/// The typing guard stops keys that were in flight when the window appeared;
 /// it does nothing about a slip by somebody already using the window, and A
 /// is the key beside S, whose `Alt+S` is a box. A finger that lands one key
-/// over on its way to that box presses `Alt+A`, which does nothing.
+/// over on its way to that box presses `Alt+A` once, and once does nothing.
+/// The second press has to come within [`TWICE_WITHIN`], with no other key
+/// between them, and a held key is one press however long it repeats. The
+/// window losing focus, or a new question appearing on it, forgets a first
+/// press.
+///
+/// It was `Alt+Shift+A`, one press: safe against the same slip, and a
+/// stretch for a hand that already has the thumb on Alt. That chord does
+/// nothing now.
 ///
 /// The cost is macOS, where Option is how a layout types a second letter:
-/// `Option+Shift+A` is `Å` on a US layout, and this chord takes it before the
-/// note field does. The box chords already take `Option+S`, `Option+C` and
-/// `Option+R` the same way.
+/// `Option+A` is `å` on a US layout, so there this chord is a letter the note
+/// field would otherwise have had. The box chords already take `Option+S`,
+/// `Option+C` and `Option+R` the same way.
 ///
 /// One line was tried first and does not fit. The hint may not widen the
 /// button — the two buttons that decide are centred in a rect measured from
@@ -195,11 +212,11 @@ pub const UNFOCUSED_GRACE: Duration = Duration::from_secs(3);
 /// `the_buttons_name_exactly_the_chords_the_guard_takes` reads it the way a
 /// user does — every line — and holds the rule to it, so the two cannot drift
 /// apart.
-pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nAlt+Shift+A";
+pub const APPROVE_CHORD: &str = "Ctrl+Enter\nShift+Enter\nAlt+A twice";
 
 /// What the send button says while a review editor holds the keyboard, where
 /// Shift+Enter is a line break. See [`Guard::classify`].
-pub const APPROVE_CHORD_COMPOSING: &str = "Ctrl+Enter\nAlt+Shift+A";
+pub const APPROVE_CHORD_COMPOSING: &str = "Ctrl+Enter\nAlt+A twice";
 
 /// What the Deny button says the keyboard shortcut is.
 ///
@@ -391,6 +408,9 @@ pub struct Guard {
     /// has been told it cannot. `None` is not "shut forever" — it is
     /// "governed by the grace period instead".
     armed_at: Option<Instant>,
+    /// When `Alt+A` was pressed once, while that press still counts as the
+    /// first of two. See [`APPROVE_CHORD`].
+    alt_a_at: Option<Instant>,
 }
 
 impl Guard {
@@ -404,7 +424,7 @@ impl Guard {
     /// integration reports focus every frame — see [`intercept`] — this
     /// starting assumption only governs the first frame or two.
     pub fn new(now: Instant) -> Guard {
-        Guard { created_at: now, armed_at: Some(now) }
+        Guard { created_at: now, armed_at: Some(now), alt_a_at: None }
     }
 
     /// The window can receive input again. Restart the clock.
@@ -414,6 +434,7 @@ impl Guard {
     /// towards whatever had it before, land now.
     pub fn focus_gained(&mut self, now: Instant) {
         self.armed_at = Some(now);
+        self.alt_a_at = None;
     }
 
     /// A second question has appeared on a window that already had its first
@@ -435,6 +456,7 @@ impl Guard {
         if self.armed_at.is_some() {
             self.armed_at = Some(now);
         }
+        self.alt_a_at = None;
     }
 
     /// The window cannot receive input, and hatch has been told so.
@@ -446,6 +468,7 @@ impl Guard {
     /// over and never open.
     pub fn focus_lost(&mut self, _now: Instant) {
         self.armed_at = None;
+        self.alt_a_at = None;
     }
 
     /// Whether input is being acted on yet.
@@ -520,11 +543,11 @@ impl Guard {
         now: Instant,
     ) -> Action {
         let open = self.is_open(now);
-        let key = match event {
+        let (key, repeat) = match event {
             // Key repeats included: a held-down key is exactly the thing this
             // guard exists to ignore.
-            egui::Event::Key { key, pressed: true, .. } => Some(*key),
-            _ => None,
+            egui::Event::Key { key, pressed: true, repeat, .. } => (Some(*key), *repeat),
+            _ => (None, false),
         };
         match key {
             // Never a passthrough, open or closed. If Enter reached a widget,
@@ -545,10 +568,22 @@ impl Guard {
             Some(Key::Enter) if keyboard == Keyboard::Composing && shift_alone(modifiers) => {
                 Action::Passthrough
             }
-            // Every approval, whichever key carries it. Judged after the
-            // shut-guard arm above for Enter, and with its own shut check
-            // for the rest: `Alt+Shift+A` is as much a decision as
-            // `Ctrl+Enter` and waits exactly as long.
+            // The left hand's approval, which is two presses: the first does
+            // nothing here and is remembered by `Guard::judge`, and this
+            // decides only on the second. A repeat is the first press still
+            // held, so it is never the second. On the guard's clock like the
+            // rest: `Alt+A` twice is as much a decision as `Ctrl+Enter`.
+            Some(Key::A) if alt_alone(modifiers) => match (open, keyboard) {
+                (true, Keyboard::Asking | Keyboard::Composing | Keyboard::Reading)
+                    if !repeat && self.pressed_alt_a_once(now) =>
+                {
+                    Action::Approve
+                }
+                _ => Action::Ignored,
+            },
+            // Every other approval, whichever key carries it. Judged after
+            // the shut-guard arm above for Enter, and with its own shut check
+            // for anything a later chord adds.
             Some(key) if approves(key, modifiers) => match (open, keyboard) {
                 (false, _) => Action::Ignored,
                 (true, Keyboard::Asking | Keyboard::Composing | Keyboard::Reading) => {
@@ -627,9 +662,63 @@ impl Guard {
             }
         }
     }
+
+    /// [`Guard::classify`], and what the event does to a first `Alt+A`.
+    ///
+    /// The one chord that is two presses needs the first remembered, and
+    /// this is where that happens, so `classify` stays a question about one
+    /// event. A first press counts only where the second could approve:
+    /// with the guard open, on a window that is asking. Any other key
+    /// forgets it, and so does the approval it makes. A repeat of the first
+    /// press leaves it as it was.
+    pub fn judge(
+        &mut self,
+        event: &egui::Event,
+        modifiers: Modifiers,
+        keyboard: Keyboard,
+        now: Instant,
+    ) -> Action {
+        let action = self.classify(event, modifiers, keyboard, now);
+        if let egui::Event::Key { key, pressed: true, repeat, .. } = event {
+            let alt_a = *key == Key::A && alt_alone(modifiers);
+            let counts = self.is_open(now) && keyboard != Keyboard::Watching;
+            match (alt_a, *repeat) {
+                (true, true) => {}
+                (true, false) if counts && action == Action::Ignored => {
+                    self.alt_a_at = Some(now);
+                }
+                _ => self.alt_a_at = None,
+            }
+        }
+        action
+    }
+
+    /// Whether `Alt+A` has been pressed once, recently enough that the next
+    /// press is the second. See [`TWICE_WITHIN`].
+    fn pressed_alt_a_once(&self, now: Instant) -> bool {
+        self.alt_a_at.is_some_and(|at| now.duration_since(at) < TWICE_WITHIN)
+    }
 }
 
-/// Is this one of the two deliberate approval chords?
+/// Shift and nothing else.
+fn shift_alone(m: Modifiers) -> bool {
+    m.shift && !m.alt && !(m.ctrl || m.command || m.mac_cmd)
+}
+
+/// Alt and nothing else: the modifier the left hand's approval is pressed
+/// with, twice. `Shift+A` is a capital letter typed into the note field this
+/// window has on it, so Shift is refused, and so is the old `Alt+Shift+A`.
+///
+/// Control is refused rather than ignored, so the older `Ctrl+Alt+A` does
+/// nothing either. On X11 and Wayland AltGr is a level shift that arrives as
+/// `AltGraph`, off the `Alt` modifier entirely, so no layout types a letter
+/// with it; on Windows, where AltGr is Ctrl+Alt, the Control it carries
+/// refuses it. macOS is the exception, and is said at [`APPROVE_CHORD`].
+fn alt_alone(m: Modifiers) -> bool {
+    m.alt && !m.shift && !(m.ctrl || m.command || m.mac_cmd)
+}
+
+/// Is this one of the two deliberate Enter chords that approve?
 ///
 /// Control *or* Shift, and in each case nothing else. Exact, not a
 /// contains-check: `Ctrl+Shift+Enter` and `Ctrl+Alt+Enter` are not approvals,
@@ -657,26 +746,13 @@ impl Guard {
 /// not three modifiers — a Linux backend sets `ctrl` and `command` together
 /// for a single key — so any of them counts as Control being held, and the
 /// exactness that matters is that nothing else is.
-/// Shift and nothing else.
-fn shift_alone(m: Modifiers) -> bool {
-    m.shift && !m.alt && !(m.ctrl || m.command || m.mac_cmd)
-}
-
+///
+/// The third chord, `Alt+A` twice, is two presses and not a key and
+/// modifiers, so it is judged in [`Guard::classify`] and not here.
 fn approves(key: Key, m: Modifiers) -> bool {
     let control = m.ctrl || m.command || m.mac_cmd;
     match key {
         Key::Enter => (control && !m.alt && !m.shift) || (m.shift && !m.alt && !control),
-        // The left hand's. Alt *and* Shift, and neither on its own: `Shift+A`
-        // is a capital letter typed into the note field this window has on
-        // it, and `Alt+A` is one key from the box chords.
-        //
-        // Control is refused rather than ignored, so the old `Ctrl+Alt+A`
-        // does nothing. On X11 and Wayland AltGr is a level shift that
-        // arrives as `AltGraph`, off the `Alt` modifier entirely, so no
-        // layout types a letter with it; on Windows, where AltGr is Ctrl+Alt,
-        // the Control it carries refuses it. macOS is the exception, and is
-        // said at `APPROVE_CHORD`.
-        Key::A => m.alt && m.shift && !control,
         _ => false,
     }
 }
@@ -804,7 +880,7 @@ pub fn intercept(
             egui::Event::Key { modifiers, .. } => *modifiers,
             _ => frame_modifiers,
         };
-        match guard.classify(&event, modifiers, keyboard, now) {
+        match guard.judge(&event, modifiers, keyboard, now) {
             Action::Passthrough => kept.push(event),
             Action::Ignored => {}
             decided => actions.push(decided),
@@ -909,6 +985,87 @@ mod tests {
         assert_ne!(composing(&guard, &press(Key::Enter, both), both, now), Action::Passthrough);
         assert!(!APPROVE_CHORD_COMPOSING.contains("Shift+Enter"));
         assert!(APPROVE_CHORD.contains("Shift+Enter"));
+    }
+
+    /// A key pressed again by a finger that never let go.
+    fn held(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: true, modifiers }
+    }
+
+    #[test]
+    fn alt_a_approves_on_the_second_press_and_only_then() {
+        let clock = Clock::new();
+        let alt_a = press(Key::A, Modifiers::ALT);
+        let judge = |guard: &mut Guard, event: &egui::Event, ms: u64| {
+            guard.judge(event, Modifiers::ALT, Keyboard::Asking, clock.at(ms))
+        };
+
+        // Twice within the second: the first does nothing, the second
+        // approves, and from the review editor as well.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 2_000), Action::Ignored);
+        assert_eq!(judge(&mut guard, &alt_a, 2_999), Action::Approve);
+        let mut guard = Guard::new(clock.at(0));
+        for (ms, then) in [(2_000, Action::Ignored), (2_300, Action::Approve)] {
+            let now = clock.at(ms);
+            assert_eq!(guard.judge(&alt_a, Modifiers::ALT, Keyboard::Composing, now), then);
+        }
+
+        // Too slow, and a second exactly is too slow: the late press is a
+        // first one again, and a third straight after it is its second.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 2_000), Action::Ignored);
+        assert_eq!(judge(&mut guard, &alt_a, 3_000), Action::Ignored);
+        assert_eq!(judge(&mut guard, &alt_a, 3_200), Action::Approve);
+
+        // Another key between the two forgets the first: the slip one key
+        // over, corrected to the box it was aiming for.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 2_000), Action::Ignored);
+        let alt_s = press(Key::S, Modifiers::ALT);
+        assert_eq!(judge(&mut guard, &alt_s, 2_100), Action::Toggle(Toggle::Stream));
+        assert_eq!(judge(&mut guard, &alt_a, 2_200), Action::Ignored);
+
+        // Held down: one press however long it repeats, and the first press
+        // is still the first after it.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 2_000), Action::Ignored);
+        for ms in [2_030, 2_060, 2_090] {
+            assert_eq!(judge(&mut guard, &held(Key::A, Modifiers::ALT), ms), Action::Ignored);
+        }
+        assert_eq!(judge(&mut guard, &alt_a, 2_400), Action::Approve);
+
+        // A first press while the guard is shut is a key in flight, and
+        // does not count.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 700), Action::Ignored);
+        assert_eq!(judge(&mut guard, &alt_a, 800), Action::Ignored);
+        assert_eq!(judge(&mut guard, &alt_a, 900), Action::Approve);
+
+        // Losing focus between the two forgets the first.
+        let mut guard = Guard::new(clock.at(0));
+        assert_eq!(judge(&mut guard, &alt_a, 2_000), Action::Ignored);
+        guard.focus_lost(clock.at(2_100));
+        guard.focus_gained(clock.at(2_200));
+        assert_eq!(judge(&mut guard, &alt_a, 3_000), Action::Ignored);
+
+        // A window that is only being watched has no question to approve.
+        let mut guard = Guard::new(clock.at(0));
+        for ms in [2_000, 2_100] {
+            let watching = guard.judge(&alt_a, Modifiers::ALT, Keyboard::Watching, clock.at(ms));
+            assert_eq!(watching, Action::Ignored);
+        }
+
+        // The chord it replaced, and the one before that, do nothing at all.
+        let alt_shift = Modifiers { alt: true, shift: true, ..Modifiers::NONE };
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        for m in [alt_shift, ctrl_alt] {
+            let mut guard = Guard::new(clock.at(0));
+            for ms in [2_000, 2_100] {
+                let pressed = guard.judge(&press(Key::A, m), m, Keyboard::Asking, clock.at(ms));
+                assert_ne!(pressed, Action::Approve, "{m:?}");
+            }
+        }
     }
 
     #[test]
@@ -1246,18 +1403,23 @@ mod tests {
     /// one spelling the label uses; the three spellings the backends send are
     /// the rule's business and are covered below.
     ///
-    /// A label is one chord per line, so this returns one key-and-modifiers
-    /// pair per line: a label naming one chord gives a list of one, and the
-    /// same rule covers every kind of label.
+    /// A label is one chord per line, so this returns one key, modifiers and
+    /// press count per line: a label naming one chord gives a list of one,
+    /// and the same rule covers every kind of label. A line ending in
+    /// " twice" is that chord pressed twice.
     ///
     /// The lines may name different keys. They could not once — Approve's two
     /// were both Enter, and this asserted it — and the assertion went when a
     /// third chord on a different key was added. What it was protecting is
     /// protected better by the caller, which checks every line against the
     /// rule with the key that line names.
-    fn named(label: &str) -> Vec<(Key, Modifiers)> {
+    fn named(label: &str) -> Vec<(Key, Modifiers, usize)> {
         let mut chords = Vec::new();
         for line in label.lines() {
+            let (line, presses) = match line.strip_suffix(" twice") {
+                Some(chord) => (chord, 2),
+                None => (line, 1),
+            };
             let mut wanted = Modifiers::NONE;
             let mut key = None;
             let mut parts = line.split('+').peekable();
@@ -1283,7 +1445,7 @@ mod tests {
                     }
                 }
             }
-            chords.push((key.expect("a label names a key"), wanted));
+            chords.push((key.expect("a label names a key"), wanted, presses));
         }
         chords
     }
@@ -1301,8 +1463,12 @@ mod tests {
         // written down in the same way — on the control they flip — and a
         // hint that named a chord the guard refuses would be no better there
         // than it is on Approve.
+        //
+        // A chord the label says is pressed twice has to decide on the
+        // second press and not the first, and every combination the label
+        // does not name is pressed twice as well, so that pressing it again
+        // is not a way in either.
         let clock = Clock::new();
-        let guard = Guard::new(clock.at(0));
         let now = clock.at(5000);
 
         for (label, decides) in [
@@ -1316,9 +1482,9 @@ mod tests {
             // Every key the label mentions, against every modifier
             // combination there is -- so a label naming two keys is held to
             // the rule on both, and a chord that works on the wrong one of
-            // them fails here. `Alt+Shift+A` approving while `Alt+A` does
-            // not is exactly this check.
-            let mut keys: Vec<Key> = chords.iter().map(|(key, _)| *key).collect();
+            // them fails here. `Alt+A` twice approving while `Alt+Shift+A`
+            // twice does not is exactly this check.
+            let mut keys: Vec<Key> = chords.iter().map(|(key, _, _)| *key).collect();
             keys.dedup();
             for key in keys {
                 for m in every_modifier_combination() {
@@ -1326,15 +1492,23 @@ mod tests {
                     // of them; they are one modifier, and the label spells it
                     // once.
                     let control = m.ctrl || m.command || m.mac_cmd;
-                    let is_named = chords.iter().any(|(named_key, wanted)| {
-                        *named_key == key
+                    let presses = chords.iter().find_map(|(named_key, wanted, presses)| {
+                        (*named_key == key
                             && control == wanted.ctrl
                             && m.shift == wanted.shift
-                            && m.alt == wanted.alt
+                            && m.alt == wanted.alt)
+                            .then_some(*presses)
                     });
+                    let mut guard = Guard::new(clock.at(0));
+                    let decided: Vec<bool> = (0..presses.unwrap_or(2))
+                        .map(|_| guard.judge(&press(key, m), m, Keyboard::Asking, now) == decides)
+                        .collect();
+                    // Only the last press of a chord the label names.
+                    let named_last: Vec<bool> = (1..=presses.unwrap_or(2))
+                        .map(|n| presses == Some(n))
+                        .collect();
                     assert_eq!(
-                        asking(&guard, &press(key, m), m, now) == decides,
-                        is_named,
+                        decided, named_last,
                         "{label:?} and the guard disagree about {key:?} with {m:?}"
                     );
                 }
@@ -1349,20 +1523,21 @@ mod tests {
         // every modifier held would agree with any rule at all.
         assert_eq!(
             named("Ctrl+Enter\nShift+Enter"),
-            vec![(Key::Enter, Modifiers::CTRL), (Key::Enter, Modifiers::SHIFT)]
+            vec![(Key::Enter, Modifiers::CTRL, 1), (Key::Enter, Modifiers::SHIFT, 1)]
         );
-        assert_eq!(named("Alt+S"), vec![(Key::S, Modifiers::ALT)]);
-
-        // Lines naming different keys, and a line naming two modifiers:
-        // both are what the third approval chord needs read correctly, and
-        // neither was possible to write before it existed.
+        assert_eq!(named("Alt+S"), vec![(Key::S, Modifiers::ALT, 1)]);
         let alt_shift = Modifiers { alt: true, shift: true, ..Modifiers::NONE };
+        assert_eq!(named("Alt+Shift+A"), vec![(Key::A, alt_shift, 1)]);
+
+        // Lines naming different keys, and a line naming a chord pressed
+        // twice: both are what the third approval chord needs read
+        // correctly, and neither was possible to write before it existed.
         assert_eq!(
             named(APPROVE_CHORD),
             vec![
-                (Key::Enter, Modifiers::CTRL),
-                (Key::Enter, Modifiers::SHIFT),
-                (Key::A, alt_shift),
+                (Key::Enter, Modifiers::CTRL, 1),
+                (Key::Enter, Modifiers::SHIFT, 1),
+                (Key::A, Modifiers::ALT, 2),
             ],
             "the label on the Approve button is not the three chords it looks like"
         );

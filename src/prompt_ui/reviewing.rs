@@ -41,7 +41,7 @@
 //!   draw every one of them by name — see [`crate::render::unicode::reveal`].
 //! * **Enter is the guard's except in the editor.** While an editor holds
 //!   the keyboard, Enter and Shift+Enter break the line, and Ctrl+Enter or
-//!   Alt+Shift+A send; everywhere else Enter stays the typing guard's — see
+//!   Alt+A twice send; everywhere else Enter stays the typing guard's — see
 //!   [`super::guard`]. The agent is told only that the output was edited —
 //!   which is also all it is told about a redaction, for the reason
 //!   [`crate::review::heading`] gives.

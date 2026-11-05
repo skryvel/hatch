@@ -8129,12 +8129,21 @@ mod tests {
         // exactly the drift the label is pinned against.
         //
         // The note field is where the left-hand chord has most to prove: it
-        // is carried by a letter, and a letter is what that field is for.
-        let alt_shift = egui::Modifiers { alt: true, shift: true, ..egui::Modifiers::NONE };
-        for (key, held) in [
-            (egui::Key::Enter, egui::Modifiers::CTRL),
-            (egui::Key::Enter, egui::Modifiers::SHIFT),
-            (egui::Key::A, alt_shift),
+        // is carried by a letter, and a letter is what that field is for. It
+        // is pressed twice, with the key let go in between, the way a hand
+        // presses it: a key that is not let go is a repeat, which is one
+        // press.
+        let alt_a = |pressed| egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT,
+        };
+        for pressed in [
+            vec![chord(egui::Key::Enter, egui::Modifiers::CTRL)],
+            vec![chord(egui::Key::Enter, egui::Modifiers::SHIFT)],
+            vec![alt_a(true), alt_a(false), alt_a(true)],
         ] {
             let (mut app, sink) = an_awaiting_window();
             let ctx = egui::Context::default();
@@ -8147,9 +8156,9 @@ mod tests {
             a_live_frame(&mut app, &ctx, vec![egui::Event::Text("go on".to_string())], now);
             assert_eq!(app.note, "go on", "the click did not reach the note field");
 
-            a_live_frame(&mut app, &ctx, vec![chord(key, held)], now);
+            a_live_frame(&mut app, &ctx, pressed.clone(), now);
             let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
-            assert!(out.contains("approve"), "{key:?} with {held:?} did not approve: {out:?}");
+            assert!(out.contains("approve"), "{pressed:?} did not approve: {out:?}");
             assert!(
                 !out.contains("go on a") && !out.contains("go ona"),
                 "the chord typed its letter into the note as well: {out:?}"
@@ -8159,12 +8168,13 @@ mod tests {
 
     #[test]
     fn a_letter_that_carries_an_approval_is_still_a_letter_without_its_chord() {
-        // `A` approves only with Alt *and* Shift. The window has a text
-        // field on it, so every other way of pressing that key has to reach
-        // the field -- including the near misses, which is where a rule
-        // matched loosely would show up as a window that eats what you type.
-        // `Alt+A` among them, one key from `Alt+S`, and the two chords this
-        // one replaced, which are inert now.
+        // `A` approves only with Alt, and only pressed twice. The window has
+        // a text field on it, so every other way of pressing that key once
+        // has to leave the command unanswered -- including the near misses,
+        // which is where a rule matched loosely would show up as a window
+        // that eats what you type. `Alt+A` once among them, one key from
+        // `Alt+S`, and the two chords this one replaced, which are inert now.
+        let alt_shift = egui::Modifiers { alt: true, shift: true, ..egui::Modifiers::NONE };
         let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
         let ctrl_shift = egui::Modifiers { ctrl: true, shift: true, ..egui::Modifiers::NONE };
         let ctrl_alt_shift =
@@ -8174,6 +8184,7 @@ mod tests {
             egui::Modifiers::ALT,
             egui::Modifiers::SHIFT,
             egui::Modifiers::CTRL,
+            alt_shift,
             ctrl_alt,
             ctrl_shift,
             ctrl_alt_shift,
