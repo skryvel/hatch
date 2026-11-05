@@ -2873,7 +2873,9 @@ impl PromptApp {
         // the spawn until the first evidence, which is the span they are
         // shown over. An earlier pair claimed the dialog was being waited on
         // and that nothing had run, and went on saying both after the
-        // password had been typed.
+        // password had been typed. So did "waiting for the system to
+        // authorise this" on its own, once the password was in and the
+        // command was running without a word; the sentence names both now.
         //
         // The first arm is reached only by a window on its way out, after an
         // ending it did not stay for: see `PromptState::drawn_phase`. What it
@@ -2892,7 +2894,7 @@ impl PromptApp {
                 self.state.was_elevated().then_some("The system authorised it."),
             ),
             (false, true) => (
-                "Approved. Waiting for the system to authorise this.",
+                "Approved. Waiting for the system to authorise this or run it.",
                 Some("If a password dialog is up, dismissing it cancels this."),
             ),
             (false, false) if !runs => ("Approved. Writing the file.", None),
