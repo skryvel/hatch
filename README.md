@@ -921,8 +921,11 @@ sequence — is drawn by name, so the text on the screen is the text that goes.
 for the password in the middle of a line that has to stay. The filters are set
 aside while you edit and come back when you undo; the caption counts any
 invisible characters left in what you are editing, since the editor is the one
-place they do not draw; and Enter never reaches the field, so an edit can take
-text out but cannot type new lines in.
+place they do not draw. In the editor, Enter and Shift+Enter break the line.
+Right-click a selection there for **Redact**, which puts `[redacted]` in place
+of every copy of it in the output. A selection across several lines, a whole
+paragraph, becomes one `[redacted]` per line, so no lines are joined and blank
+lines stay.
 
 `Space` pages the output down and `Shift+Space` pages it back up, whenever no
 field on the screen has the keyboard — so the space bar is still a space while

@@ -198,6 +198,25 @@ fn editor_id(name: &str) -> egui::Id {
 
 /// At most the first 40 characters of `text`, and an ellipsis when that was
 /// not all of it: enough of a selection to tell which one it was.
+/// What `text` becomes when it is redacted: [`review::REDACTION`] in place of
+/// each of its lines that has anything on it, and every line ending kept.
+///
+/// A paragraph stays as many lines as it was, so a redaction never joins two
+/// lines, and what the rest of the output says about where things are -- an
+/// error about line 40 -- still points where it did. A blank line has nothing
+/// to hide and stays as it was.
+fn redaction_of(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\n', '\r']);
+            match body.trim().is_empty() {
+                true => line.to_string(),
+                false => format!("{}{}", review::REDACTION, &line[body.len()..]),
+            }
+        })
+        .collect()
+}
+
 fn clipped(text: &str) -> String {
     let mut out: String = text.chars().take(40).collect();
     if out.len() < text.len() {
@@ -419,13 +438,15 @@ impl Draft {
     ///
     /// Every copy and not the one selected: a value worth hiding once is
     /// worth hiding wherever the output repeats it, and a reader who meant
-    /// one copy can still edit the rest back. Nothing happens outside
-    /// editing, or for text that is blank or runs across lines -- a
-    /// redaction takes a value out of a line and does not join two.
+    /// one copy can still edit the rest back. Text that runs across lines,
+    /// a paragraph, is redacted line by line -- see [`redaction_of`] -- so
+    /// no two lines are joined. Nothing happens outside editing, or for text
+    /// that is blank.
     pub fn redact_everywhere(&mut self, text: &str) -> usize {
-        if text.trim().is_empty() || text.contains(['\n', '\r']) {
+        if text.trim().is_empty() {
             return 0;
         }
+        let redaction = redaction_of(text);
         let Some(edits) = self.edits.as_mut() else { return 0 };
         let sections: Vec<&mut String> = match edits {
             Sections::Streams { stdout, stderr } => vec![stdout, stderr],
@@ -435,7 +456,7 @@ impl Draft {
         for section in sections {
             let here = section.matches(text).count();
             if here > 0 {
-                *section = section.replace(text, review::REDACTION);
+                *section = section.replace(text, &redaction);
                 found += here;
             }
         }
@@ -771,16 +792,27 @@ impl PromptApp {
                         .desired_width(f32::INFINITY)
                         .show(ui);
                     edited.response.context_menu(|ui| {
-                        let usable = picked.as_deref().is_some_and(|picked| {
-                            !picked.trim().is_empty() && !picked.contains('\n')
-                        });
+                        let usable =
+                            picked.as_deref().is_some_and(|picked| !picked.trim().is_empty());
+                        let copies = match copies {
+                            1 => "1 copy".to_string(),
+                            n => format!("{n} copies"),
+                        };
                         let label = match (&picked, usable) {
-                            (Some(picked), true) => format!(
-                                "Redact \"{}\" ({copies} {})",
-                                reveal(&clipped(picked)),
-                                if copies == 1 { "copy" } else { "copies" }
-                            ),
-                            (Some(_), false) => "Redact: select within one line".to_string(),
+                            (Some(picked), true) => match picked.trim_end().lines().count() {
+                                1 => format!(
+                                    "Redact \"{}\" ({copies})",
+                                    reveal(&clipped(picked.trim_end_matches(['\n', '\r'])))
+                                ),
+                                lines => {
+                                    let first = picked.trim_start().lines().next().unwrap_or("");
+                                    format!(
+                                        "Redact {lines} lines from \"{}\" ({copies})",
+                                        reveal(&clipped(first))
+                                    )
+                                }
+                            },
+                            (Some(_), false) => "Redact: the selection is blank".to_string(),
                             (None, _) => "Redact: select some text first".to_string(),
                         };
                         if ui.add_enabled(usable, egui::Button::new(label)).clicked() {
@@ -1013,11 +1045,32 @@ mod tests {
         assert_eq!(draft.redact_everywhere("hunter2"), 3);
         assert_eq!(draft.edited(Section::Stdout).unwrap(), "token=[redacted]\nok: [redacted]\n");
         assert_eq!(draft.edited(Section::Stderr).unwrap(), "warn: [redacted] used\n");
-        // Blank, or across lines: refused, so no two lines are joined.
+        // Blank: refused.
         assert_eq!(draft.redact_everywhere("  "), 0);
-        assert_eq!(draft.redact_everywhere("ok\nwarn"), 0);
         assert_eq!(clipped(&"x".repeat(50)).chars().count(), 41);
         assert_eq!(clipped("short"), "short");
+    }
+
+    #[test]
+    fn a_redacted_paragraph_keeps_its_lines() {
+        // The report: what needs hiding may be a whole paragraph and not a
+        // term. Each line of it with anything on it becomes one redaction,
+        // so the output keeps its shape: nothing is joined, and blank lines
+        // and line endings stay as they were, CRLF included.
+        let mut draft = Draft::default();
+        let text = "before\nkey: one\r\n\nkey: two\nafter\n".to_string();
+        let output = Sections::Streams {
+            stdout: Captured { text, truncated: false },
+            stderr: Captured { text: String::new(), truncated: false },
+        };
+        draft.start_editing(&output);
+        // From part-way along one line to part-way along another.
+        assert_eq!(draft.redact_everywhere(": one\r\n\nkey: two\naf"), 1);
+        assert_eq!(
+            draft.edited(Section::Stdout).unwrap(),
+            "before\nkey[redacted]\r\n\n[redacted]\n[redacted]ter\n"
+        );
+        assert_eq!(redaction_of("a\n  \nb"), "[redacted]\n  \n[redacted]");
     }
 
     fn output() -> Sections<Captured> {
