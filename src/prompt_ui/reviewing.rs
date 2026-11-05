@@ -39,13 +39,16 @@
 //!   that draws as nothing, so the caption counts those when there are any
 //!   and says they go as they are. The read-only panes have no such gap: they
 //!   draw every one of them by name — see [`crate::render::unicode::reveal`].
-//! * **It cannot add lines.** Enter is the typing guard's and never reaches a
-//!   field — see [`super::guard`] — so an edit can change or remove text and
-//!   join lines, and cannot compose new ones by typing. Taking a value out
-//!   does not
-//!   need to, and the agent is told only that the output was edited — which
-//!   is also all it is told about a redaction, for the reason
+//! * **Enter is the guard's except in the editor.** While an editor holds
+//!   the keyboard, Enter and Shift+Enter break the line, and Ctrl+Enter or
+//!   Alt+Shift+A send; everywhere else Enter stays the typing guard's — see
+//!   [`super::guard`]. The agent is told only that the output was edited —
+//!   which is also all it is told about a redaction, for the reason
 //!   [`crate::review::heading`] gives.
+//!
+//! A selection in the editor has a context menu with one item, *Redact*,
+//! which puts [`crate::review::REDACTION`] in place of every copy of the
+//! selected text in the edits. See [`Draft::redact_everywhere`].
 //!
 //! # Keys
 //!
@@ -191,6 +194,16 @@ pub const UNEDIT_LABEL: &str = "Undo my edits";
 /// is a text editor. See [`editing_has_the_keyboard`].
 fn editor_id(name: &str) -> egui::Id {
     egui::Id::new(("hatch-review-editor", name))
+}
+
+/// At most the first 40 characters of `text`, and an ellipsis when that was
+/// not all of it: enough of a selection to tell which one it was.
+fn clipped(text: &str) -> String {
+    let mut out: String = text.chars().take(40).collect();
+    if out.len() < text.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// Whether one of the review editors holds the keyboard right now.
@@ -399,6 +412,45 @@ impl Draft {
     /// Throw the edits away and give the filters back.
     pub fn stop_editing(&mut self) {
         self.edits = None;
+    }
+
+    /// Put [`review::REDACTION`] in place of every copy of `text` in every
+    /// section being edited, and say how many there were.
+    ///
+    /// Every copy and not the one selected: a value worth hiding once is
+    /// worth hiding wherever the output repeats it, and a reader who meant
+    /// one copy can still edit the rest back. Nothing happens outside
+    /// editing, or for text that is blank or runs across lines -- a
+    /// redaction takes a value out of a line and does not join two.
+    pub fn redact_everywhere(&mut self, text: &str) -> usize {
+        if text.trim().is_empty() || text.contains(['\n', '\r']) {
+            return 0;
+        }
+        let Some(edits) = self.edits.as_mut() else { return 0 };
+        let sections: Vec<&mut String> = match edits {
+            Sections::Streams { stdout, stderr } => vec![stdout, stderr],
+            Sections::Transcript { transcript } => vec![transcript],
+        };
+        let mut found = 0;
+        for section in sections {
+            let here = section.matches(text).count();
+            if here > 0 {
+                *section = section.replace(text, review::REDACTION);
+                found += here;
+            }
+        }
+        found
+    }
+
+    /// How many copies of `text` the sections being edited hold.
+    pub fn copies(&self, text: &str) -> usize {
+        match &self.edits {
+            Some(Sections::Streams { stdout, stderr }) => {
+                stdout.matches(text).count() + stderr.matches(text).count()
+            }
+            Some(Sections::Transcript { transcript }) => transcript.matches(text).count(),
+            None => 0,
+        }
     }
 
     /// The text being edited, one section of it, while editing.
@@ -659,25 +711,91 @@ impl PromptApp {
         let paging = self.paging;
         panes::pane_frame(ui).show(ui, |ui| {
             ui.set_min_height(ui.available_height());
-            let scroll = egui::ScrollArea::both()
+            // The line at the top of the pane, and whether it was the editor,
+            // as of the last frame. A reader who starts or stops editing is
+            // put back on that line: the two views are laid out apart, so an
+            // offset in points is not a place both of them agree on.
+            let place = egui::Id::new(("hatch-review-place", name));
+            let editing = self.draft.editing();
+            let was = ui.data(|data| data.get_temp::<(bool, f32)>(place));
+            let mut scroll = egui::ScrollArea::both()
                 .id_salt(("hatch-review", name))
                 .auto_shrink([false, false])
                 // A bar across an output that fits is a control for nothing,
                 // drawn under the text of every short review.
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
-            if let Some(text) = self.draft.edited(section) {
-                scroll.show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(text)
-                            // An id of its own, and an absolute one, so the
-                            // guard can ask whether *this* holds the keyboard
-                            // before it lets a bare Enter through. See
-                            // `editor_id`.
-                            .id(editor_id(name))
-                            .code_editor()
-                            .desired_width(f32::INFINITY),
-                    );
+            if let Some((was_editing, line)) = was
+                && was_editing != editing
+            {
+                scroll = scroll.vertical_scroll_offset(line * row);
+            }
+            let id = editor_id(name);
+            // The selection as it was before this frame's pointer reached
+            // the editor. A right-click is a press, and egui's editor moves
+            // its cursor to any press, so by the time a context menu opens
+            // what was selected is gone. Held while the menu is up, because
+            // that is when it is the thing being acted on.
+            let secondary = ui.input(|input| {
+                let pointer = &input.pointer;
+                pointer.button_down(egui::PointerButton::Secondary)
+                    || pointer.button_released(egui::PointerButton::Secondary)
+            });
+            let (picked_id, menu_id) = (id.with("picked"), id.with("menu"));
+            let menu_was_open = ui.data(|data| data.get_temp::<bool>(menu_id)).unwrap_or(false);
+            if !secondary && !menu_was_open {
+                let picked = self.draft.edited(section).and_then(|text| {
+                    let range = egui::TextEdit::load_state(ui.ctx(), id)?.cursor.char_range()?;
+                    let [from, to] = range.sorted_cursors();
+                    let (from, to) = (from.index.0, to.index.0);
+                    let picked: String = text.chars().skip(from).take(to - from).collect();
+                    Some(picked).filter(|picked| !picked.is_empty())
                 });
+                ui.data_mut(|data| match picked {
+                    Some(picked) => {
+                        data.insert_temp(picked_id, picked);
+                    }
+                    None => data.remove::<String>(picked_id),
+                });
+            }
+            let picked = ui.data(|data| data.get_temp::<String>(picked_id));
+            let mut redact = false;
+            let copies = picked.as_deref().map_or(0, |picked| self.draft.copies(picked));
+            if let Some(text) = self.draft.edited(section) {
+                let shown = scroll.show(ui, |ui| {
+                    let edited = egui::TextEdit::multiline(text)
+                        // An id of its own, and an absolute one, so the guard
+                        // can ask whether *this* holds the keyboard before it
+                        // lets a bare Enter through. See `editor_id`.
+                        .id(id)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .show(ui);
+                    edited.response.context_menu(|ui| {
+                        let usable = picked.as_deref().is_some_and(|picked| {
+                            !picked.trim().is_empty() && !picked.contains('\n')
+                        });
+                        let label = match (&picked, usable) {
+                            (Some(picked), true) => format!(
+                                "Redact \"{}\" ({copies} {})",
+                                reveal(&clipped(picked)),
+                                if copies == 1 { "copy" } else { "copies" }
+                            ),
+                            (Some(_), false) => "Redact: select within one line".to_string(),
+                            (None, _) => "Redact: select some text first".to_string(),
+                        };
+                        if ui.add_enabled(usable, egui::Button::new(label)).clicked() {
+                            redact = true;
+                            ui.close();
+                        }
+                    });
+                    let open = edited.response.context_menu_opened();
+                    ui.data_mut(|data| data.insert_temp(menu_id, open));
+                });
+                ui.data_mut(|data| data.insert_temp(place, (true, shown.state.offset.y / row)));
+                if redact && let Some(picked) = picked {
+                    self.draft.redact_everywhere(&picked);
+                    ui.data_mut(|data| data.remove::<String>(picked_id));
+                }
                 return;
             }
             let Some(sent) = sent else { return };
@@ -699,13 +817,19 @@ impl PromptApp {
             // capture is up to a quarter of a megabyte and this is redrawn
             // on every keystroke in a filter.
             let lines: Vec<&str> = review::lines(sent).collect();
-            scroll.show_rows(ui, row, lines.len(), |ui, range| {
+            // No gap between rows, as the editor has none between its lines.
+            // The two share one scroll offset, and with a gap here a reader
+            // who started editing landed further down the further down they
+            // had read.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let shown = scroll.show_rows(ui, row, lines.len(), |ui, range| {
                 panes::page_by(ui, paging, row);
                 for line in &lines[range] {
                     let bare = line.strip_suffix('\n').unwrap_or(line);
                     ui.add(egui::Label::new(egui::RichText::new(reveal(bare)).monospace()).extend());
                 }
             });
+            ui.data_mut(|data| data.insert_temp(place, (false, shown.state.offset.y / row)));
         });
     }
 
@@ -798,7 +922,14 @@ impl PromptApp {
                         centred_row(ui, width, |ui| {
                             send = ui
                                 .add_enabled_ui(sendable, |ui| {
-                                    unfocusable(ui, primary(ui, SEND_LABEL, guard::APPROVE_CHORD))
+                                    // Shift+Enter breaks a line while an
+                                    // editor has the keyboard, so the button
+                                    // does not say it sends then.
+                                    let chord = match editing_has_the_keyboard(ui.ctx()) {
+                                        true => guard::APPROVE_CHORD_COMPOSING,
+                                        false => guard::APPROVE_CHORD,
+                                    };
+                                    unfocusable(ui, primary(ui, SEND_LABEL, chord))
                                 })
                                 .inner
                                 .clicked();
@@ -867,6 +998,27 @@ impl PromptApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_takes_every_copy_of_the_selection_out_of_every_section() {
+        let mut draft = Draft::default();
+        let output = Sections::Streams {
+            stdout: Captured { text: "token=hunter2\nok: hunter2\n".to_string(), truncated: false },
+            stderr: Captured { text: "warn: hunter2 used\n".to_string(), truncated: false },
+        };
+        // Not editing: nothing to redact in.
+        assert_eq!(draft.redact_everywhere("hunter2"), 0);
+        draft.start_editing(&output);
+        assert_eq!(draft.copies("hunter2"), 3);
+        assert_eq!(draft.redact_everywhere("hunter2"), 3);
+        assert_eq!(draft.edited(Section::Stdout).unwrap(), "token=[redacted]\nok: [redacted]\n");
+        assert_eq!(draft.edited(Section::Stderr).unwrap(), "warn: [redacted] used\n");
+        // Blank, or across lines: refused, so no two lines are joined.
+        assert_eq!(draft.redact_everywhere("  "), 0);
+        assert_eq!(draft.redact_everywhere("ok\nwarn"), 0);
+        assert_eq!(clipped(&"x".repeat(50)).chars().count(), 41);
+        assert_eq!(clipped("short"), "short");
+    }
 
     fn output() -> Sections<Captured> {
         Sections::Streams {

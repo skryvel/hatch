@@ -9227,6 +9227,70 @@ mod tests {
         (app, sink)
     }
 
+    #[test]
+    fn starting_to_edit_keeps_the_review_on_the_lines_it_was_on() {
+        // The report: entering the editor lost the reader's place. The two
+        // views share one scroll offset, and the read-only rows had a gap
+        // between them that the editor's lines do not, so the editor opened
+        // further down the further down the reader had got.
+        let text: String = (0..300).map(|n| format!("line {n}\n")).collect();
+        let review = Review {
+            deadline: Utc::now() + chrono::Duration::seconds(600),
+            output: crate::review::Sections::Streams {
+                stdout: crate::review::Captured { text, truncated: false },
+                stderr: crate::review::Captured { text: String::new(), truncated: false },
+            },
+        };
+        let (mut app, _sink) = a_reviewing_window_of(review);
+        let ctx = egui::Context::default();
+        apply_faces(&ctx);
+        apply_font_size(&ctx, 16.0);
+        let now = past_the_guard();
+        let rects = text_rects(&a_settled_frame(&mut app, &ctx, now));
+        let top = rects.iter().find(|(text, _)| text == "line 0").expect("the first line").1;
+        a_live_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(top.center())], now);
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -2000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        a_live_frame(&mut app, &ctx, vec![wheel], now);
+        for _ in 0..30 {
+            a_live_frame(&mut app, &ctx, Vec::new(), now);
+        }
+        // The line at the top of the pane, as the pane itself recorded it.
+        let place = |ctx: &egui::Context| {
+            let id = egui::Id::new(("hatch-review-place", crate::review::Section::Stdout.name()));
+            ctx.data(|data| data.get_temp::<(bool, f32)>(id)).expect("the pane said nothing")
+        };
+        a_settled_frame(&mut app, &ctx, now);
+        let (editing, reading) = place(&ctx);
+        assert!(!editing && reading > 50.0, "the wheel did not scroll: {reading}");
+        // And it is the line drawn there: the read-only rows sit one row
+        // apart, with nothing between them.
+        let drawn = text_rects(&a_settled_frame(&mut app, &ctx, now));
+        let at = |n: usize| {
+            drawn.iter().find(|(text, _)| *text == format!("line {n}")).map(|(_, rect)| *rect)
+        };
+        let (here, next) = (at(reading as usize + 2).unwrap(), at(reading as usize + 3).unwrap());
+        assert_eq!(next.top() - here.top(), top.height(), "rows have a gap between them");
+
+        let edit = drawn_at(&mut app, &ctx, reviewing::EDIT_LABEL, now).expect("no edit button");
+        click_at(&mut app, &ctx, edit.center(), now);
+        a_settled_frame(&mut app, &ctx, now);
+        let (editing, from) = place(&ctx);
+        assert!(editing, "the editor did not open");
+        assert!((from - reading).abs() < 0.5, "read from line {reading}, editing from {from}");
+
+        // And back.
+        let undo = drawn_at(&mut app, &ctx, reviewing::UNEDIT_LABEL, now).expect("no undo button");
+        click_at(&mut app, &ctx, undo.center(), now);
+        a_settled_frame(&mut app, &ctx, now);
+        let (editing, back) = place(&ctx);
+        assert!(!editing && (back - reading).abs() < 0.5, "back on line {back}, not {reading}");
+    }
+
     fn a_reviewing_window() -> (PromptApp, Arc<std::sync::Mutex<Vec<u8>>>) {
         a_reviewing_window_of(a_review())
     }
