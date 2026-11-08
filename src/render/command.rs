@@ -3420,35 +3420,75 @@ fn script_word(command: &str, words: &[Range<usize>]) -> Option<(Range<usize>, L
 ///
 /// # Only from where it will be resolved
 ///
-/// A relative value is resolved against the request's working directory by
-/// whoever uses this, so one is only offered while that is still the working
-/// directory. After a segment that may change it -- `cd`, `pushd`, `popd`,
-/// `source`, `.`, `eval`, a subshell, or a command whose name hatch cannot
-/// read -- relative values are dropped for the rest of the command, and a
-/// segment with an option that moves one program elsewhere (`-C`,
-/// `--directory`) drops its own. Absolute values are kept throughout. Missing
-/// a file is the direction this may be wrong in; showing the wrong one is not.
-pub fn named_paths(command: &str, env: &BTreeMap<String, String>) -> Vec<String> {
+/// A relative value is resolved against the directory the command will be
+/// in when it gets there: the request's working directory, or the one a `cd`
+/// before it moved to. A `cd` counts only when hatch can state where it goes
+/// and nothing after it runs unless it got there: `cd DIR || exit` moves the
+/// rest of the command, and `cd DIR && ...` moves the commands chained to it
+/// by `&&`, after which the directory is unknown again, because a `cd` that
+/// failed has left the shell where it was. `cd /srv/app || exit 1; bash
+/// run.sh` names `/srv/app/run.sh`.
+///
+/// After any other segment that may change it -- a `cd` hatch cannot follow,
+/// `pushd`, `popd`, `source`, `.`, `eval`, a subshell, or a command whose name
+/// hatch cannot read -- relative values are dropped until a `cd` hatch can
+/// follow to an absolute directory, and a segment with an option that moves
+/// one program elsewhere (`-C`, `--directory`) drops its own. Absolute values
+/// are kept throughout. Missing a file is the direction this may be wrong in;
+/// showing the wrong one is not.
+pub fn named_paths(command: &str, env: &BTreeMap<String, String>) -> Vec<NamedPath> {
     let scanned: Vec<Scanned> = scan(command).collect();
     let set_here = assignments(command, env);
     let inputs: Vec<Range<usize>> = read_from(command);
     let mut at = 0;
+    // Where a relative value is resolved: `None` is the request's working
+    // directory, and a relative `Some` is a directory under it.
+    let mut dir: Option<String> = None;
+    // The directory is somewhere hatch cannot name.
     let mut moved = false;
-    let mut out: Vec<String> = Vec::new();
-    for segment in segments(command) {
+    // `dir` holds only while the `&&` chain after its `cd` lasts.
+    let mut chained = false;
+    // How many `if`, loops, `case`s and braces the segment is inside. A `cd`
+    // in one of those may never run, or run once of several times.
+    let mut depth: usize = 0;
+    let mut out: Vec<NamedPath> = Vec::new();
+    let parts = segments_ending(command);
+    for (index, (segment, ending)) in parts.iter().enumerate() {
+        let segment = segment.clone();
+        let ending = ending.as_ref().map(|token| &command[token.clone()]);
         let words = words(&scanned, &mut at, &segment);
         let Some(mut first) = command_at(command, &words) else {
+            // Nothing runs here, and an `&&` chain that ends here has ended.
+            if chained && ending != Some("&&") {
+                (moved, chained) = (true, false);
+            }
             continue;
         };
         let texts: Vec<&str> = words.iter().map(|word| &command[word.clone()]).collect();
         // `then python3 x.py` runs `python3`, not `then`.
         let keyword = |text: &str| readable_name(text).is_some_and(|name| is_keyword(&name));
+        let start = first;
         while first + 1 < texts.len() && keyword(texts[first]) {
             first += 1;
         }
+        for text in &texts[start..=first] {
+            match readable_name(text).as_deref() {
+                Some("if" | "while" | "until" | "for" | "case" | "select" | "{" | "function") => {
+                    depth += 1
+                }
+                Some("fi" | "done" | "esac" | "}") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        // A brace past the command word opens a body as well: `f() {`. One
+        // that is only an argument costs a `cd` hatch could have followed.
+        depth += texts[first + 1..].iter().filter(|text| **text == "{").count();
         let elsewhere = texts.iter().any(|text| moves_one_program(text));
+        let name = readable_name(texts[first]);
+        // `exit 1` names a status, not a file.
+        let status = matches!(name.as_deref(), Some("exit" | "return"));
         let mut found: Vec<(usize, String)> = Vec::new();
-        for (index, word) in words.iter().enumerate().skip(first) {
+        for (index, word) in words.iter().enumerate().skip(first).filter(|_| !status) {
             let text = texts[index];
             let path_only = index == first;
             let declined = text.starts_with('-') || text.contains(STRUCTURE);
@@ -3467,20 +3507,110 @@ pub fn named_paths(command: &str, env: &BTreeMap<String, String>) -> Vec<String>
         found.sort_by_key(|(at, _)| *at);
         for (_, value) in found {
             let relative = !value.starts_with('/');
-            if value.is_empty() || (relative && (moved || elsewhere)) || out.contains(&value) {
+            if value.is_empty() || (relative && (moved || elsewhere)) {
                 continue;
             }
-            out.push(value);
+            let named = NamedPath { value, dir: dir.clone().filter(|_| relative) };
+            if !out.contains(&named) {
+                out.push(named);
+            }
         }
-        let name = readable_name(texts[first]);
+        // Where a `cd` goes, when that is one directory hatch can state. Not
+        // `~user`, which is somebody's home, and not a relative one under a
+        // `CDPATH`, which the shell searches before the working directory.
+        let searched = env.get("CDPATH").is_some_and(|path| !path.is_empty());
+        let to = match (name.as_deref(), &texts[first + 1..]) {
+            (Some("cd"), [target])
+                if depth == 0
+                    && !target.starts_with('-')
+                    && (!target.starts_with('~') || target.starts_with("~/")) =>
+            {
+                let at = words[first + 1].start;
+                expanded(target, at, &set_here, env).filter(|value| !value.is_empty()).and_then(
+                    |value| match value.starts_with('/') {
+                        true => Some(value),
+                        false if moved || searched => None,
+                        false => Some(match &dir {
+                            Some(dir) => format!("{dir}/{value}"),
+                            None => value,
+                        }),
+                    },
+                )
+            }
+            _ => None,
+        };
+        // Whether what follows runs only where the `cd` got to: `cd DIR ||
+        // exit`, with nothing chained to the `exit`, or `cd DIR && ...`.
+        let then = parts.get(index + 1).map(|(next, after)| {
+            let after = after.as_ref().map(|token| &command[token.clone()]);
+            (exits(&command[next.clone()]), matches!(after, None | Some(";")))
+        });
         let leaves = matches!(
             name.as_deref(),
             None | Some("cd" | "pushd" | "popd" | "source" | "." | "eval")
         );
-        if leaves || texts.iter().any(|text| text.contains(STRUCTURE)) {
+        match (to, ending) {
+            (Some(to), Some("||")) if then == Some((true, true)) => {
+                (dir, moved, chained) = (Some(to), false, false);
+            }
+            (Some(to), Some("&&")) => (dir, moved, chained) = (Some(to), false, true),
+            _ if leaves => moved = true,
+            // A `cd` that only held while its `&&` chain ran, which has ended.
+            _ if chained && ending != Some("&&") => (moved, chained) = (true, false),
+            _ => {}
+        }
+        if texts.iter().any(|text| text.contains(STRUCTURE)) {
             moved = true;
         }
     }
+    out
+}
+
+/// A value a command names, and where a relative one is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedPath {
+    /// The value as the program receives it: `run.sh`, or `/srv/x.py` for a
+    /// `"$F"` that holds it.
+    pub value: String,
+    /// For a relative value, the directory a `cd` before it moved to: absolute,
+    /// or under the request's working directory. `None` is that directory.
+    pub dir: Option<String>,
+}
+
+impl NamedPath {
+    /// The value as it reads from the request's working directory: `dir` and
+    /// `value` joined, or `value` alone.
+    pub fn from_cwd(&self) -> String {
+        match &self.dir {
+            Some(dir) => format!("{dir}/{}", self.value),
+            None => self.value.clone(),
+        }
+    }
+}
+
+/// Whether a segment is `exit` or `return`, with a status or without.
+fn exits(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    matches!(words.next(), Some("exit" | "return"))
+        && words.next().is_none_or(|status| status.bytes().all(|b| b.is_ascii_digit()))
+        && words.next().is_none()
+}
+
+/// [`segments`], each with the separator that ends it: `;`, `&&`, `||` or
+/// `|`, or `None` for a newline or the end of the command.
+fn segments_ending(command: &str) -> Vec<(Range<usize>, Option<Range<usize>>)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for boundary in boundaries(command) {
+        let (stop, next, token) = match boundary {
+            Boundary::Separator(token) => (token.start, token.end, Some(token)),
+            Boundary::Newline(end) => (end, end, None),
+            Boundary::HereLine(_) => continue,
+        };
+        out.push((start..stop, token));
+        start = next;
+    }
+    out.push((start..command.len(), None));
     out
 }
 
@@ -6787,8 +6917,9 @@ mod tests {
 
     // ---- paths a command names --------------------------------------------
 
+    /// What `command` names, as each reads from the request's directory.
     fn paths(command: &str) -> Vec<String> {
-        named_paths(command, &BTreeMap::new())
+        named_paths(command, &BTreeMap::new()).iter().map(NamedPath::from_cwd).collect()
     }
 
     #[test]
@@ -6809,10 +6940,10 @@ mod tests {
             ("SCRIPT".to_string(), "/opt/a b.py".to_string()),
             ("HOME".to_string(), "/home/u".to_string()),
         ]);
-        assert_eq!(named_paths("python3 \"$SCRIPT\"", &env), ["/opt/a b.py"]);
+        assert_eq!(from_cwd("python3 \"$SCRIPT\"", &env), ["/opt/a b.py"]);
         // Unquoted, the shell would split it into two words.
-        assert!(named_paths("python3 $SCRIPT", &env).is_empty());
-        assert_eq!(named_paths("python3 ~/bin/x.py", &env), ["/home/u/bin/x.py"]);
+        assert!(from_cwd("python3 $SCRIPT", &env).is_empty());
+        assert_eq!(from_cwd("python3 ~/bin/x.py", &env), ["/home/u/bin/x.py"]);
     }
 
     #[test]
@@ -6836,12 +6967,59 @@ mod tests {
         }
     }
 
+    fn from_cwd(command: &str, env: &BTreeMap<String, String>) -> Vec<String> {
+        named_paths(command, env).iter().map(NamedPath::from_cwd).collect()
+    }
+
     #[test]
     fn a_relative_path_is_not_offered_once_the_directory_may_have_moved() {
-        assert_eq!(paths("cd /srv && python3 run.py /etc/x.conf"), ["/srv", "/etc/x.conf"]);
+        assert_eq!(paths("cd /srv; python3 run.py /etc/x.conf"), ["/srv", "/etc/x.conf"]);
+        assert_eq!(paths("cd \"$D\" || exit 1; python3 run.py"), Vec::<String>::new());
+        assert_eq!(paths("cd -P /srv || exit; python3 run.py"), ["/srv"]);
+        assert_eq!(paths("cd ~me || exit; python3 run.py"), Vec::<String>::new());
+        assert_eq!(paths("pushd /srv && python3 run.py"), ["/srv"]);
         assert_eq!(paths("$CD x; python3 run.py"), ["x"]);
         assert_eq!(paths("(cd x; python3 run.py)"), ["x"]);
         assert_eq!(paths("git -C repo apply fix.patch /tmp/p"), ["/tmp/p"]);
         assert_eq!(paths("make --directory=sub test.mk; cat notes"), ["notes"]);
+    }
+
+    #[test]
+    fn a_cd_that_must_succeed_moves_the_directory_a_relative_path_is_read_in() {
+        // The report: `bash docs/systemd/install.sh` after `cd DIR || exit 1`
+        // offered nothing, because every `cd` dropped every relative path.
+        let script = "cd /srv/app || exit 1\nbash docs/install.sh >/dev/null\ncat notes";
+        assert_eq!(paths(script), ["/srv/app", "/srv/app/docs/install.sh", "/srv/app/notes"]);
+        let named = named_paths(script, &BTreeMap::new());
+        assert_eq!(named[1].value, "docs/install.sh", "the row names it as the command does");
+        assert_eq!(paths("cd /srv || return; cat a"), ["/srv", "/srv/a"]);
+        // `&&` moves what is chained to it, and no further: past the chain
+        // the `cd` may have failed and left the shell where it was.
+        assert_eq!(paths("cd /srv && cat a && cat b; cat c"), ["/srv", "/srv/a", "/srv/b"]);
+        assert_eq!(paths("cd /srv && cd app && cat a"), ["/srv", "/srv/app", "/srv/app/a"]);
+        // A relative `cd` is under the request's directory, and a later
+        // absolute one is followed even after hatch lost track.
+        assert_eq!(paths("cd sub || exit; cat a"), ["sub", "sub/a"]);
+        assert_eq!(paths("source x; cd /srv || exit; cat a"), ["x", "/srv", "/srv/a"]);
+        // Not followed: an `exit` with more chained to it, a plain `;`, a
+        // `cd` inside a subshell, and a relative one under a CDPATH.
+        assert_eq!(paths("cd /srv || exit 1 && cat a; cat b"), ["/srv"]);
+        assert_eq!(paths("cd /srv && FOO=1; cat b"), ["/srv"]);
+        // Nor one that may not run, or may run more than once: in an `if`, a
+        // loop, a `case`, or a function's body.
+        for command in [
+            "if [ -d /srv ]; then cd /srv || exit; fi; cat a",
+            "for d in /srv; do cd $d || exit; done; cat a",
+            "f() {\ncd /srv || exit\n}\ncat a",
+            "while true; do cd /srv || exit 1; break; done\ncat a",
+        ] {
+            assert!(!paths(command).iter().any(|path| path.ends_with("/a")), "{command:?}");
+        }
+        // And once the block has closed, a top-level one is followed again.
+        assert_eq!(paths("if true; then :; fi\ncd /srv || exit\ncat a"), ["/srv", "/srv/a"]);
+        assert_eq!(paths("(cd /srv || exit; cat a); cat b"), ["/srv"]);
+        let env = BTreeMap::from([("CDPATH".to_string(), "/opt".to_string())]);
+        assert_eq!(from_cwd("cd sub || exit; cat a", &env), ["sub"]);
+        assert_eq!(from_cwd("cd /srv || exit; cat a", &env), ["/srv", "/srv/a"]);
     }
 }

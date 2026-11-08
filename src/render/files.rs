@@ -29,8 +29,9 @@ pub struct NamedFile {
     /// The value as the program receives it: `script.py`, or `/srv/x.py`
     /// for a `"$F"` that holds it. Agent-chosen text, defanged where drawn.
     pub named: String,
-    /// Where that is: `named` against the working directory when relative.
-    /// What the window reads.
+    /// Where that is: `named` against the directory the command will be in
+    /// when it gets there, when relative -- the working directory, or where a
+    /// `cd` before it moved to. What the window reads.
     pub path: PathBuf,
     /// Its size when the request was prepared.
     pub size: u64,
@@ -44,20 +45,23 @@ pub struct Named {
     pub more: usize,
 }
 
-/// The regular files `command` names, resolved against `cwd`.
+/// The regular files `command` names, resolved against `cwd` and any `cd`
+/// before them that [`named_paths`] can follow.
 ///
 /// `metadata` follows a link, as the program will, and does not open what it
 /// looks at, so a named pipe is answered without anyone writing to it.
 pub fn named_files(command: &str, env: &BTreeMap<String, String>, cwd: &Path) -> Named {
     let mut named = Named::default();
-    for value in named_paths(command, env) {
-        let path = cwd.join(&value);
+    for found in named_paths(command, env) {
+        let path = cwd.join(found.from_cwd());
         let Ok(metadata) = std::fs::metadata(&path) else { continue };
         if !metadata.is_file() {
             continue;
         }
         match named.files.len() < MAX_NAMED_FILES {
-            true => named.files.push(NamedFile { named: value, path, size: metadata.len() }),
+            true => {
+                named.files.push(NamedFile { named: found.value, path, size: metadata.len() })
+            }
             false => named.more += 1,
         }
     }
@@ -102,6 +106,22 @@ mod tests {
         assert_eq!(named(&set, &BTreeMap::new(), Path::new("/")), vec![full.clone()]);
         let env = BTreeMap::from([("SCRIPT".to_string(), full.clone())]);
         assert_eq!(named("python3 ${SCRIPT}", &env, Path::new("/")), vec![full]);
+    }
+
+    #[test]
+    fn a_file_after_a_cd_is_read_where_the_cd_went() {
+        let dir = a_tree();
+        let sub = dir.path().join("sub");
+        let command = format!("cd {} || exit 1; python3 inner.py", sub.display());
+        let files = named_files(&command, &BTreeMap::new(), Path::new("/"));
+        assert_eq!(
+            files.files,
+            vec![NamedFile {
+                named: "inner.py".to_string(),
+                path: dir.path().join("sub/inner.py"),
+                size: 5,
+            }]
+        );
     }
 
     #[test]

@@ -1139,8 +1139,12 @@ All of these are real. They are stated here rather than discovered later.
 them.** Under the command, a row names the regular files its words name —
 `script.py` in `python script.py`, `deploy.sh` in `bash deploy.sh`, the file
 after a `<` — and clicking one shows it in the command's place until *Back to
-the command*. Nobody has to click, so a window can still be approved without
-the file having been read. And a file a program finds for itself is not named:
+the command*. A relative name is read where the command will be when it gets
+there: after `cd DIR || exit`, or along a `cd DIR && …` chain, that is `DIR`.
+After a `cd` that may not have happened — a bare `cd DIR;`, or one inside an
+`if`, a loop or a function — a relative name is not offered at all, because
+showing the wrong file is worse than showing none. Nobody has to click, so a
+window can still be approved without the file having been read. And a file a program finds for itself is not named:
 `make install` reads a `Makefile` its words never mention. The file could also
 change between being shown and being run; nothing checks yet that it did not.
 
