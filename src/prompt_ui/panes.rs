@@ -57,7 +57,7 @@ use crate::render::blocks::{Block, BlockKind, blocks, program_blocks};
 use crate::render::language::{Evidence, Language, Snippet, snippets};
 use crate::peek::{LIMIT, Peek, peek};
 use crate::render::diff::{CONTEXT_ROWS, Row, Segment, Side, changed_hunks, hidden_rows};
-use crate::render::files::{Named, NamedFile};
+use crate::render::files::{Named, NamedFile, Reading, read_file};
 use crate::render::roster::{Entry, Resolution, Writable};
 use crate::render::unicode::{ChipTier, ScanReport, classify, defang, scan};
 use crate::prompt_ui::guard;
@@ -2713,9 +2713,16 @@ fn draw_opened(ui: &mut Ui, opened: &Opened, paging: Paging) {
     let read = opened.read.lock().unwrap_or_else(PoisonError::into_inner);
     match &*read {
         None => note(ui, "Reading the file…".to_string()),
-        Some(Read::Text { spans, truncated, size }) => {
+        Some(Read::Text { spans, truncated, size, reading }) => {
+            let mut said = Vec::new();
             if *truncated {
-                note(ui, format!("The first {} of {}.", bytes(LIMIT as i64), bytes(*size as i64)));
+                said.push(format!("The first {} of {}.", bytes(LIMIT as i64), bytes(*size as i64)));
+            }
+            if let Some(reading) = reading {
+                said.push(reading_note(*reading));
+            }
+            if !said.is_empty() {
+                note(ui, said.join(" "));
             }
             let pane = PaneBox {
                 id: "hatch-file",
@@ -2727,6 +2734,26 @@ fn draw_opened(ui: &mut Ui, opened: &Opened, paging: Paging) {
             draw_command_pane(ui, spans, pane, &Gutter::default(), paging.asked);
         }
         Some(Read::Other(peeked)) => note(ui, not_shown(peeked)),
+    }
+}
+
+/// What the file was read as, and what said so.
+///
+/// Said whenever there are marks on a file, because a mark is a reading and
+/// the reader is owed where it came from: a `.sh` that is not shell is drawn
+/// with command words in it all the same, and the sentence is what tells them
+/// which word to disbelieve.
+fn reading_note(reading: Reading) -> String {
+    let why = match reading.evidence {
+        Evidence::Shebang => "from its own `#!` line",
+        _ => "from its name",
+    };
+    match reading.language {
+        Language::Shell => format!("Read as shell, {why}."),
+        language => format!(
+            "Its strings and comments are marked as {}, {why}, by a grammar that can be wrong.",
+            language.name()
+        ),
     }
 }
 
@@ -2756,7 +2783,7 @@ struct Opened {
 /// A file as the window draws it: its text classified once, rather than on
 /// every frame it is on screen.
 enum Read {
-    Text { spans: Spans, truncated: bool, size: u64 },
+    Text { spans: Spans, truncated: bool, size: u64, reading: Option<Reading> },
     Other(Peek),
 }
 
@@ -2770,7 +2797,8 @@ impl Opened {
         let spawned = std::thread::Builder::new().name("hatch-peek".to_string()).spawn(move || {
             let got = match peek(&path) {
                 Peek::Text { text, truncated, size } => {
-                    Read::Text { spans: classify(&text), truncated, size }
+                    let (spans, reading) = read_file(&text, &path);
+                    Read::Text { spans, truncated, size, reading }
                 }
                 other => Read::Other(other),
             };
@@ -6258,7 +6286,8 @@ mod tests {
     fn a_named_file_opens_in_the_commands_place_and_back_closes_it() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("script.py"), "print('from the file')\n").unwrap();
-        let command = "python3 script.py";
+        std::fs::write(dir.path().join("install.sh"), "set -e\nmake all # the build\n").unwrap();
+        let command = "python3 script.py; bash install.sh";
         let files = crate::render::files::named_files(command, &BTreeMap::new(), dir.path());
         let shown = Shown::of(&a_command(command).with_files(files)).expect("a real payload");
         let ctx = egui::Context::default();
@@ -6322,6 +6351,11 @@ mod tests {
         let drawn = texts(&opened);
         assert!(drawn.iter().any(|text| text.contains("print('from the file')")), "{drawn:?}");
         assert!(!drawn.iter().any(|text| text.contains("python3")), "the command is still drawn");
+        // Said only by a build that marked something in it.
+        let python = "Its strings and comments are marked as Python, from its name, by a grammar \
+                      that can be wrong.";
+        let said = drawn.iter().any(|text| text == python);
+        assert_eq!(said, cfg!(feature = "highlight"), "{drawn:?}");
 
         let back = place_of(&opened, "Back to the command").expect("no way back is drawn");
         for events in click(back) {
@@ -6330,6 +6364,44 @@ mod tests {
         let closed = texts(&frame(Vec::new()));
         assert!(closed.iter().any(|text| text.contains("python3")), "{closed:?}");
         assert!(!closed.iter().any(|text| text.contains("from the file")), "{closed:?}");
+
+        // A shell script is read as the command is, in every build: its
+        // command words are underlined on screen, and the window says why.
+        let script = place_of(&frame(Vec::new()), "install.sh").expect("the script is not offered");
+        for events in click(script) {
+            frame(events);
+        }
+        let mut opened = frame(Vec::new());
+        for _ in 0..200 {
+            if texts(&opened).iter().any(|text| text.contains("the build")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            opened = frame(Vec::new());
+        }
+        let drawn = texts(&opened);
+        assert!(drawn.iter().any(|text| text == "Read as shell, from its name."), "{drawn:?}");
+        fn underlined(shape: &egui::epaint::Shape, into: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(drawn) => {
+                    let job = &drawn.galley.job;
+                    for section in &job.sections {
+                        let at = section.byte_range.start.0..section.byte_range.end.0;
+                        if section.format.underline.width > 0.0 {
+                            into.push(job.text[at].to_string());
+                        }
+                    }
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().for_each(|shape| underlined(shape, into))
+                }
+                _ => {}
+            }
+        }
+        let mut words = Vec::new();
+        opened.shapes.iter().for_each(|clipped| underlined(&clipped.shape, &mut words));
+        assert!(words.contains(&"set".to_string()), "{words:?}");
+        assert!(words.contains(&"make".to_string()), "{words:?}");
     }
 
     #[test]

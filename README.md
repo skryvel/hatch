@@ -1149,9 +1149,16 @@ there: after `cd DIR || exit`, or along a `cd DIR && …` chain, that is `DIR`.
 After a `cd` that may not have happened — a bare `cd DIR;`, or one inside an
 `if`, a loop or a function — a relative name is not offered at all, because
 showing the wrong file is worse than showing none. Nobody has to click, so a
-window can still be approved without the file having been read. And a file a program finds for itself is not named:
-`make install` reads a `Makefile` its words never mention. The file could also
+window can still be approved without the file having been read. And a file a
+program finds for itself is not named: `make install` reads a `Makefile` its
+words never mention. The file could also
 change between being shown and being run; nothing checks yet that it did not.
+A shown file is read as its own `#!` line or, without one, its name says:
+shell gets the command's reading (command words, separators, strings,
+comments) on the file's own lines, and a language with a grammar gets its
+strings and comments marked. A line above the file says which, and from what.
+A shell file longer than a command may be (16 KiB) is drawn plain, because
+the reading costs more than its length on some files.
 
 **Segmentation models quoting and escaping only, and errs in both
 directions.** It splits on `;`, `&&`, `||`, `|` and newlines, outside quotes.

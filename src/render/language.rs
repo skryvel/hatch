@@ -245,7 +245,7 @@ fn read(command: &str, body: &Range<usize>) -> Option<(Language, Evidence)> {
 ///
 /// `#!/usr/bin/env python3` names `python3` and not `env`, which is the whole
 /// reason this is not one lookup.
-fn shebang(body: &str) -> Option<Language> {
+pub(crate) fn shebang(body: &str) -> Option<Language> {
     let line = body.lines().next()?.strip_prefix("#!")?;
     let mut words = line.split_ascii_whitespace();
     let first = words.next()?;
