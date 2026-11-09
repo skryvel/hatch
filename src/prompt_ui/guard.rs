@@ -824,6 +824,9 @@ fn watching(key: Key, m: Modifiers) -> Option<Action> {
         Key::E | Key::O | Key::Space if m.is_none() => Some(Action::Keep),
         Key::C if m.alt && !m.shift && !control => Some(Action::Copy),
         Key::W if m.alt && !m.shift && !control => Some(Action::Toggle(Toggle::Wrap)),
+        // The review box, which a streamed run keeps on screen while it runs.
+        // The window ignores it once the run has ended.
+        Key::R if m.alt && !m.shift && !control => Some(Action::Toggle(Toggle::Review)),
         _ => None,
     }
 }

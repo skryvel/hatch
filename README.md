@@ -755,7 +755,12 @@ does. stdout and stderr are one block in the order they arrived. Once there is
 stderr, each of its lines starts with `err` and each stdout line with four
 blanks, so the output still starts in one column. **Wrap long lines** (Alt+W)
 over the output turns wrapping off, so a long line runs on and the output
-scrolls sideways; it is remembered. Kill
+scrolls sideways; it is remembered. Beside it, while the command runs, **Show
+me the output before it is sent** (Alt+R) can be ticked or unticked for this
+run alone: having watched the output come in, you can let it go without
+reading it again. hatch reads the box once, when the run ends, so a change in
+that last instant may come too late, and the window shows whichever ending
+hatch chose. Unlike the box on the question, it is not remembered. Kill
 signals the whole process group, not just the shell, so a `make -j8` that left
 children actually stops. **Keep this window** is beside it while you are
 streaming, and what it does is below. A file write has no Kill button, because

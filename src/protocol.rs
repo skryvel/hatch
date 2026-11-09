@@ -17,6 +17,7 @@
 //! |---|---|
 //! | [`PromptMsg::Verdict`] | Exactly one. |
 //! | [`PromptMsg::Kill`] | The user pressed Kill on a running command. |
+//! | [`PromptMsg::ReviewWanted`] | The user changed, mid-run, whether to read the output first. |
 //! | [`PromptMsg::Release`] | What of the reviewed output the user will let the agent have. |
 //!
 //! # What the prompt is not allowed to do
@@ -1185,6 +1186,21 @@ pub enum PromptMsg {
     /// [`Verdict::Approve`], and harmless before one: it can stop a command
     /// and can never start one.
     Kill,
+    /// The reader changed "show me the output before it is sent" while the
+    /// command ran: `review` is the box as it is now.
+    ///
+    /// The daemon reads the latest one when the run ends and decides there,
+    /// once. One that arrives after that changes nothing, and the window
+    /// takes whichever ending the daemon sends: a [`DaemonMsg::Review`] the
+    /// reader has just unticked is still answered, and a run they have just
+    /// ticked may finish unreviewed.
+    ///
+    /// Unlike [`Verdict::Approve`]'s `review`, this can take the person out
+    /// from between the output and the agent. It is the person who does it,
+    /// in the window, which is where that choice was made in the first place.
+    ReviewWanted {
+        review: bool,
+    },
     /// The reader's answer to a [`DaemonMsg::Review`]: what of the output the
     /// agent may have.
     ///
@@ -1748,6 +1764,8 @@ mod tests {
             .map(PromptMsg::Verdict)
             .chain([
                 PromptMsg::Kill,
+                PromptMsg::ReviewWanted { review: false },
+                PromptMsg::ReviewWanted { review: true },
                 PromptMsg::Release(Release::Withhold { note: String::new() }),
                 PromptMsg::Release(Release::Send {
                     output: Sections::Streams {

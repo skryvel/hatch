@@ -3289,6 +3289,11 @@ impl Daemon {
         // Held back, when the reader asked. The window is told the ending
         // here as well, after the output it is about, because the frame it
         // decides on has to find the question already there.
+        //
+        // Asked as the run ends, not as it was approved: the reader can tick
+        // or untick the box while it runs, and this is where that is read,
+        // once. See `PromptMsg::ReviewWanted`.
+        let review = session.review_wanted(review);
         let (reviewed, windup) = match review && carries_output {
             true => {
                 progress.enter(Phase::Reviewing);
@@ -10472,6 +10477,37 @@ later"), "");
             let record = harness.only_record();
             assert_eq!(record["review"], "released");
             assert_eq!(record["prompt"], "held", "a window that answered was filed as a death");
+        }
+
+        #[tokio::test]
+        async fn the_review_box_as_it_was_left_while_the_command_ran_decides() {
+            // The report: a reader watching the output stream wanted to drop
+            // the review they had asked for, as it ran.
+            let unticked = reviewed().reviewing(Reviewer::Answers(sends_everything));
+            let harness = Harness::new(vec![unticked.changing_review_to(false)]);
+            let command = a_secret_to_print(&harness);
+            let result = within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await;
+            let text = result_text(&result);
+            assert!(!text.contains("reviewed:"), "{text}");
+            assert!(text.contains("token=hunter2"), "{text}");
+            let sent = &harness.prompter.recorded()[0].sent;
+            assert!(!sent.iter().any(|m| matches!(m, protocol::DaemonMsg::Review(_))), "{sent:?}");
+
+            // And the other way: ticked as it ran, held as if asked for.
+            let approved = Verdict::Approve {
+                stream: true,
+                terminal: false,
+                closing: false,
+                review: false,
+                note: String::new(),
+            };
+            let ticked = Reply::verdict(approved).reviewing(Reviewer::Answers(sends_everything));
+            let harness = Harness::new(vec![ticked.changing_review_to(true)]);
+            let command = a_secret_to_print(&harness);
+            let result = within(harness.daemon.run_command(run_of(&command), Caller::quiet())).await;
+            let text = result_text(&result);
+            assert!(text.contains("reviewed: the user read this output"), "{text}");
+            assert_eq!(harness.only_record()["review"], "released");
         }
 
         #[tokio::test]

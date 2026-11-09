@@ -152,7 +152,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::exec::Stream;
@@ -239,6 +239,7 @@ impl std::error::Error for PromptGone {}
 pub struct PromptSession {
     verdict: oneshot::Receiver<Verdict>,
     release: oneshot::Receiver<Release>,
+    review: watch::Receiver<Option<bool>>,
     outbox: Outbox,
     kill: CancellationToken,
     gone: CancellationToken,
@@ -281,6 +282,16 @@ impl PromptSession {
     /// review.
     pub async fn release(&mut self) -> Result<Release, PromptGone> {
         (&mut self.release).await.map_err(|_| PromptGone)
+    }
+
+    /// Whether to hold the output for review, now: the box as the reader
+    /// last left it while the command ran, or `asked`, the verdict's answer,
+    /// if they did not touch it. See [`PromptMsg::ReviewWanted`].
+    ///
+    /// Asked once, when the run has ended, and what it answers then is the
+    /// decision. A window that has gone leaves its last answer standing.
+    pub fn review_wanted(&self, asked: bool) -> bool {
+        self.review.borrow().unwrap_or(asked)
     }
 
     /// A handle for sending output and the final outcome to the window.
@@ -448,6 +459,9 @@ pub struct WindowSide {
     /// Deliver the answer to a review. Dropping it without sending, like the
     /// verdict, is how a window says it ended without answering.
     pub release: oneshot::Sender<Release>,
+    /// The review box as the reader last left it while the command ran;
+    /// `None` until they touch it. See [`PromptSession::review_wanted`].
+    pub review: watch::Sender<Option<bool>>,
     /// Output and the final outcome, in the order the daemon sent them.
     pub messages: mpsc::Receiver<DaemonMsg>,
     /// Cancel it when the user presses Kill.
@@ -474,6 +488,7 @@ pub struct WindowSide {
 pub fn session_pair() -> (PromptSession, WindowSide) {
     let (verdict_tx, verdict_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
+    let (review_tx, review_rx) = watch::channel(None);
     let (msg_tx, msg_rx) = mpsc::channel(OUTBOX_CAPACITY);
     let kill = CancellationToken::new();
     let gone = CancellationToken::new();
@@ -484,6 +499,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
     let session = PromptSession {
         verdict: verdict_rx,
         release: release_rx,
+        review: review_rx,
         outbox: Outbox(msg_tx),
         kill: kill.clone(),
         gone: gone.clone(),
@@ -494,6 +510,7 @@ pub fn session_pair() -> (PromptSession, WindowSide) {
     let side = WindowSide {
         verdict: verdict_tx,
         release: release_tx,
+        review: review_tx,
         messages: msg_rx,
         kill,
         shutdown,
@@ -608,6 +625,7 @@ impl Prompter for ProcessPrompter {
         let WindowSide {
             verdict,
             release,
+            review,
             messages,
             kill,
             shutdown,
@@ -616,7 +634,7 @@ impl Prompter for ProcessPrompter {
             detached,
         } = side;
 
-        tokio::spawn(read_from_window(stdout, verdict, release, kill, gone_guard));
+        tokio::spawn(read_from_window(stdout, verdict, release, review, kill, gone_guard));
         tokio::spawn(write_to_window(WriteToWindow {
             child,
             stdin,
@@ -643,6 +661,7 @@ async fn read_from_window(
     stdout: tokio::process::ChildStdout,
     verdict: oneshot::Sender<Verdict>,
     release: oneshot::Sender<Release>,
+    review: watch::Sender<Option<bool>>,
     kill: CancellationToken,
     gone: DropGuard,
 ) {
@@ -662,6 +681,12 @@ async fn read_from_window(
                 }
             }
             Ok(PromptMsg::Kill) => kill.cancel(),
+            // The latest one stands, and is read when the run ends. Like Kill
+            // it means nothing before an approval, because nothing reads it
+            // until a run has ended.
+            Ok(PromptMsg::ReviewWanted { review: wanted }) => {
+                review.send_replace(Some(wanted));
+            }
             // The first answer to a review is the answer, for the reason the
             // first verdict is the verdict. It is not checked against whether
             // a review was sent, and cannot be from here: the writing half
@@ -889,6 +914,8 @@ mod stub {
         then: Then,
         failure: Option<String>,
         reviewer: Reviewer,
+        /// The review box, changed while the command runs.
+        review_now: Option<bool>,
     }
 
     /// What a scripted window does when the daemon hands it output to review.
@@ -933,6 +960,7 @@ mod stub {
                 then: Then::Stay,
                 failure: None,
                 reviewer: Reviewer::Silent,
+                review_now: None,
             }
         }
 
@@ -946,6 +974,7 @@ mod stub {
                 then: Then::Stay,
                 failure: None,
                 reviewer: Reviewer::Silent,
+                review_now: None,
             }
         }
 
@@ -957,6 +986,7 @@ mod stub {
                 then: Then::Die,
                 failure: None,
                 reviewer: Reviewer::Silent,
+                review_now: None,
             }
         }
 
@@ -968,6 +998,7 @@ mod stub {
                 then: Then::Die,
                 failure: Some(message.into()),
                 reviewer: Reviewer::Silent,
+                review_now: None,
             }
         }
 
@@ -994,6 +1025,14 @@ mod stub {
         /// Do this when handed output to review.
         pub fn reviewing(mut self, reviewer: Reviewer) -> Reply {
             self.reviewer = reviewer;
+            self
+        }
+
+        /// Tick or untick the review box while the command runs: as
+        /// [`PromptMsg::ReviewWanted`] does, said before the verdict so that
+        /// no run can end before it is.
+        pub fn changing_review_to(mut self, review: bool) -> Reply {
+            self.review_now = Some(review);
             self
         }
     }
@@ -1106,9 +1145,21 @@ mod stub {
         // same way. Which of the two it was is still worth recording: it is the
         // difference between a window the daemon ended and one it left for a
         // reader, and the server's tests have no other way to see it.
-        let WindowSide { verdict, release, mut messages, kill, shutdown, gone, reaped, detached } =
-            side;
+        let WindowSide {
+            verdict,
+            release,
+            review,
+            mut messages,
+            kill,
+            shutdown,
+            gone,
+            reaped,
+            detached,
+        } = side;
         let mut release = Some(release);
+        if let Some(wanted) = reply.review_now {
+            review.send_replace(Some(wanted));
+        }
 
         if !reply.delay.is_zero() {
             tokio::select! {

@@ -728,6 +728,10 @@ pub struct PromptState {
     output_dropped: bool,
     streaming: bool,
     reviewing: bool,
+    /// Whether `reviewing` has been true at any point since the approval. A
+    /// review the daemon sends is taken on this and not on `reviewing`: the
+    /// reader may untick the box after the daemon has already decided.
+    may_review: bool,
     review: Option<Review>,
     elevating: bool,
     was_elevated: bool,
@@ -760,6 +764,7 @@ impl PromptState {
             output_dropped: false,
             streaming: false,
             reviewing: false,
+            may_review: false,
             review: None,
             elevating: false,
             was_elevated: false,
@@ -926,7 +931,7 @@ impl PromptState {
     /// Whether the reader asked to see the output before the agent does.
     ///
     /// Recorded from the verdict, for the reason [`PromptState::streaming`]
-    /// is.
+    /// is, and changed after it only by [`PromptState::want_review`].
     pub fn reviewing(&self) -> bool {
         self.reviewing
     }
@@ -1168,13 +1173,16 @@ impl PromptState {
                 // daemon describing some other window, and a question about
                 // output this window's reader never asked to see is not one
                 // to put in front of them.
-                if !(self.phase == Phase::Running && self.reviewing && self.review.is_none()) {
+                if !(self.phase == Phase::Running && self.may_review && self.review.is_none()) {
                     self.channel_broken(
                         "hatch sent output to review to a window that did not ask to review it",
                     );
                     return;
                 }
                 self.elevating = false;
+                // Even if the box was unticked since: the daemon decided
+                // before it heard, and this is what it decided.
+                self.reviewing = true;
                 self.review = Some(review);
             }
             DaemonMsg::Finished(outcome) if self.review.is_some() => {
@@ -1360,6 +1368,7 @@ impl PromptState {
         if let Verdict::Approve { stream, review, .. } = verdict {
             self.streaming = stream;
             self.reviewing = review;
+            self.may_review = review;
         }
         match verdict {
             // The reader ticked "Close when I decide", so an approval joins
@@ -1393,6 +1402,27 @@ impl PromptState {
         }
         self.close();
         Some(PromptMsg::Release(release))
+    }
+
+    /// Tick or untick "show me the output before it is sent" while the
+    /// command runs, and hand back the frame that tells the daemon.
+    ///
+    /// Only on a streamed run, the one whose output is already on this
+    /// window, and only while it runs: the daemon reads the box once, when
+    /// the run ends, and after that there is nothing for it to change. See
+    /// [`PromptMsg::ReviewWanted`] for a frame that arrives too late.
+    ///
+    /// A Keep already pressed stays pressed. A review that comes ends the
+    /// window in its question whatever Keep said, and a tick that came too
+    /// late to be one leaves the window kept, as the reader asked.
+    pub fn want_review(&mut self, wanted: bool) -> Option<PromptMsg> {
+        let running = self.phase == Phase::Running && self.shown().is_some_and(Shown::runs);
+        if !(running && self.streaming) || self.review.is_some() || wanted == self.reviewing {
+            return None;
+        }
+        self.reviewing = wanted;
+        self.may_review |= wanted;
+        Some(PromptMsg::ReviewWanted { review: wanted })
     }
 
     /// The Kill frame, if there is something running to kill.
@@ -2413,14 +2443,30 @@ impl PromptApp {
         // Above the output and drawn before there is any, so the output does
         // not move down a row when its first line arrives.
         let mut wrap = self.wrap;
-        let flipped = ui
-            .add(egui::Checkbox::new(
-                &mut wrap,
-                with_chord(egui::RichText::new(WRAP_LABEL).small(), guard::WRAP_CHORD),
-            ))
-            .changed();
-        if flipped {
+        let mut review = self.state.reviewing();
+        let running = self.state.phase() == Phase::Running;
+        let (wrapped, reviewed) = ui
+            .horizontal(|ui| {
+                let wrapped = ui.add(egui::Checkbox::new(
+                    &mut wrap,
+                    with_chord(egui::RichText::new(WRAP_LABEL).small(), guard::WRAP_CHORD),
+                ));
+                // While it runs, and gone when it ends: the daemon reads the
+                // box once, then, and a box after that would change nothing.
+                let reviewed = running.then(|| {
+                    ui.add(egui::Checkbox::new(
+                        &mut review,
+                        with_chord(egui::RichText::new(REVIEW_LABEL).small(), guard::REVIEW_CHORD),
+                    ))
+                });
+                (wrapped.changed(), reviewed.is_some_and(|box_| box_.changed()))
+            })
+            .inner;
+        if wrapped {
             self.set_wrap(wrap);
+        }
+        if reviewed {
+            self.want_review(review);
         }
         if self.state.output().iter().all(|(_, chunk)| chunk.is_empty()) {
             let said = match self.state.outcome() {
@@ -2524,6 +2570,9 @@ impl PromptApp {
                 Action::Keep => self.keep_window(),
                 Action::Toggle(guard::Toggle::Wrap) if self.state.streaming() => {
                     self.set_wrap(!self.wrap)
+                }
+                Action::Toggle(guard::Toggle::Review) if self.state.streaming() => {
+                    self.want_review(!self.state.reviewing())
                 }
                 _ => {}
             }
@@ -3385,6 +3434,15 @@ impl PromptApp {
     fn set_wrap(&mut self, ticked: bool) {
         self.wrap = ticked;
         self.prefs.update(|prefs| prefs.wrap = ticked);
+    }
+
+    /// The review box on a running window: this run only, so nothing is
+    /// written down. Unticking it because the output was watched as it came
+    /// must not take the review away from the next command, which may not be
+    /// watched at all.
+    fn want_review(&mut self, wanted: bool) {
+        let frame = self.state.want_review(wanted);
+        answer(&mut self.out, &mut self.state, frame);
     }
 
     fn set_stream(&mut self, ticked: bool) {
@@ -6798,6 +6856,65 @@ mod tests {
         assert_eq!(app.state.phase(), Phase::Running, "Escape closed a window mid-run");
         assert!(sink.lock().expect("sink").is_empty(), "Escape answered something");
         assert!(window_text(&mut app, true).contains("Kill"), "the Kill button went");
+    }
+
+    #[test]
+    fn a_streamed_run_can_take_up_or_drop_its_review_while_it_runs() {
+        // The report: a reader watching the output come in wanted to say,
+        // there and then, whether to read it again before it goes.
+        let (_root, paths) = a_prefs_file();
+        let (mut app, sink) = a_running_window();
+        app.prefs = PrefsFile::at(&paths);
+        let remembered = PrefsFile::at(&paths).read().review;
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(drawn.contains(REVIEW_LABEL), "no review box while it runs: {drawn}");
+        assert!(drawn.contains(guard::REVIEW_CHORD), "the chord is not on the screen: {drawn}");
+
+        press_key(&mut app, egui::Key::R, egui::Modifiers::ALT);
+        assert!(app.state.reviewing(), "Alt+R did not tick it");
+        app.act(&egui::Context::default(), Action::Toggle(guard::Toggle::Review));
+        assert!(!app.state.reviewing(), "and again did not untick it");
+        let out = String::from_utf8(sink.lock().expect("sink").clone()).expect("utf-8");
+        let said: Vec<PromptMsg> =
+            out.lines().map(|line| protocol::read_message(line).expect("a frame")).collect();
+        let wanted = |review| PromptMsg::ReviewWanted { review };
+        assert_eq!(said, [wanted(true), wanted(false)]);
+        assert_eq!(PrefsFile::at(&paths).read().review, remembered, "it is this run's alone");
+
+        // Once the run has ended the daemon has read it, so it is gone.
+        app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        let drawn = window_text_sized(&mut app, opening_size());
+        assert!(!drawn.contains(REVIEW_LABEL), "a box that can change nothing: {drawn}");
+        app.act(&egui::Context::default(), Action::Toggle(guard::Toggle::Review));
+        assert_eq!(sink.lock().expect("sink").len(), out.len(), "the chord said something");
+
+        // A run nobody watches has no box, and writes nothing.
+        let (mut unwatched, sink) = an_awaiting_window();
+        unwatched.state.decide(approved(false));
+        assert!(!window_text_sized(&mut unwatched, opening_size()).contains(REVIEW_LABEL));
+        unwatched.act(&egui::Context::default(), Action::Toggle(guard::Toggle::Review));
+        assert!(sink.lock().expect("sink").is_empty());
+    }
+
+    #[test]
+    fn a_review_sent_before_the_daemon_heard_of_the_untick_is_still_answered() {
+        // The daemon reads the box once, when the run ends. A reader who
+        // unticks it in that instant gets the review the daemon had decided
+        // on, and not a window that calls the daemon a liar.
+        let (mut app, _sink) = an_awaiting_window();
+        let watched_and_reviewed = Verdict::Approve {
+            stream: true,
+            terminal: false,
+            closing: false,
+            review: true,
+            note: String::new(),
+        };
+        app.state.decide(watched_and_reviewed);
+        assert!(app.state.want_review(false).is_some());
+        app.state.handle(DaemonMsg::Review(a_review()));
+        app.state.handle(DaemonMsg::Finished(Outcome::Exit { code: 0 }));
+        assert_eq!(app.state.phase(), Phase::Reviewing);
+        assert!(app.state.reviewing());
     }
 
     #[test]
